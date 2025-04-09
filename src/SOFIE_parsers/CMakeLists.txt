@@ -11,7 +11,7 @@
 
 #sofie is built only if protobuf is found
 
-add_library(SOFIE_parsers)
+add_library(SOFIE_parsers SHARED)
 
 protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS "onnx_proto3")
 set_source_files_properties(${PROTO_SRCS} ${PROTO_HDRS} PROPERTIES GENERATED TRUE)

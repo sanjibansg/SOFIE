@@ -11,7 +11,7 @@
 
 #sofie is built only if protobuf is found
 
-add_library(SOFIE_core)
+add_library(SOFIE_core SHARED)
 
 set(source_headers
    SOFIE/OperatorList.hxx
