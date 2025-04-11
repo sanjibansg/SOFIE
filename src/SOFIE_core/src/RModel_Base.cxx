@@ -58,6 +58,38 @@ void RModel_Base::GenerateHeaderInfo(std::string& hgname) {
     }
 }
 
+void RModel_Base::GenerateHeaderInfo_GPU_ALPAKA(std::string& hgname) {
+    fGC += ("//Code generated automatically by TMVA for ALPAKA Inference of Model file [" + fFileName + "] at [" + fParseTime.substr(0, fParseTime.length()-1) +"] \n");
+    // add header guards
+    hgname = fName;
+    std::transform(hgname.begin(), hgname.end(), hgname.begin(), [](unsigned char c) {
+                       return std::toupper(c);
+                   } );
+    hgname = "SOFIE_" + hgname;
+    fGC += "\n#ifndef " + hgname + "\n";
+    fGC += "#define " + hgname + "\n\n";
+    for (auto& i: fNeededStdLib) {
+        fGC += "#include <" + i + ">\n";
+    }
+    for (auto& i: fCustomOpHeaders) {
+        fGC += "#include \"" + i + "\"\n";
+    }
+    fGC += "#include <alpaka/alpaka.hpp>\n";
+    fGC += "#include <Kokkos_Core.hpp>\n";
+    fGC += "#include <KokkosBlas3_gemm.hpp>\n";
+
+    // for the session we need to include SOFIE_Common functions
+    //needed for convolution operator (need to add a flag)
+    fGC += "#include \"SOFIE/SOFIE_common.hxx\"\n";
+    if (fUseWeightFile)
+        fGC += "#include <fstream>\n";
+    // Include TFile when saving the weights in a binary ROOT file
+    if (fWeightFile == WeightFileType::RootBinary)
+        fGC += "#include \"TFile.h\"\n";
+
+    fGC += "\nnamespace SOFIE_" + fName + "{\n";
+}
+
 void RModel_Base::OutputGenerated(std::string filename, bool append) {
     // the model can be appended only if a file name is provided
     if (filename.empty()) {
