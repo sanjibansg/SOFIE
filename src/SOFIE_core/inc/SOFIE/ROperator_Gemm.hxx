@@ -488,10 +488,11 @@ namespace SOFIE{
 
 
          if (fType == "float"){
-            out << SP << "Kokkos::View<float**, Kokkos::LayoutLeft, Kokkos::CudaSpace> kokkos_dev_"<<fNA<<"((float*)std::data(bufDev_"<<fNA<<"), "<<opName<<"_m, "<<opName<<"_k);\n"
-            out << SP << "Kokkos::View<float**, Kokkos::LayoutLeft, Kokkos::CudaSpace> kokkos_dev_"<<fNB<<"((float*)std::data(bufDev_"<<fNB<"), "<<opName<<"_k, "<<opName<<"_n);\n"
-            out << SP << "Kokkos::View<float**, Kokkos::LayoutLeft, Kokkos::CudaSpace> kokkos_dev_"<<fNY<<"((float*)std::data(bufDev_"<<fNY<"), "<<opName<<"_m, "<<opName<<"_n);\n"
+            out << SP << "Kokkos::View<float**, Kokkos::LayoutLeft, Kokkos::CudaSpace> kokkos_dev_"<<fNA<<"((float*)std::data(bufDev_"<<fNA<<"), "<<opName<<"_m, "<<opName<<"_k);\n";
+            out << SP << "Kokkos::View<float**, Kokkos::LayoutLeft, Kokkos::CudaSpace> kokkos_dev_"<<fNB<<"((float*)std::data(bufDev_"<<fNB<<"), "<<opName<<"_k, "<<opName<<"_n);\n";
+            out << SP << "Kokkos::View<float**, Kokkos::LayoutLeft, Kokkos::CudaSpace> kokkos_dev_"<<fNY<<"((float*)std::data(bufDev_"<<fNY<<"), "<<opName<<"_m, "<<opName<<"_n);\n";
             out << SP << "KokkosBlas::gemm(&" << opName << "_transB, &" << opName << "_transA, "<< opName << "_alpha, kokkos_dev_" << fNA <<", kokkos_dev_" << fNB << ", " << opName << "_beta, kokkos_dev_"<<fNY<<");\n";
+
          }
 
          return out.str();

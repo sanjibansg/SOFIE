@@ -59,7 +59,7 @@ void RModel_Base::GenerateHeaderInfo(std::string& hgname) {
 }
 
 void RModel_Base::GenerateHeaderInfo_GPU_ALPAKA(std::string& hgname) {
-    fGC += ("//Code generated automatically by TMVA for ALPAKA Inference of Model file [" + fFileName + "] at [" + fParseTime.substr(0, fParseTime.length()-1) +"] \n");
+    fGC += ("//Code generated automatically by TMVA for GPU Inference using ALPAKA of Model file [" + fFileName + "] at [" + fParseTime.substr(0, fParseTime.length()-1) +"] \n");
     // add header guards
     hgname = fName;
     std::transform(hgname.begin(), hgname.end(), hgname.begin(), [](unsigned char c) {
@@ -87,6 +87,9 @@ void RModel_Base::GenerateHeaderInfo_GPU_ALPAKA(std::string& hgname) {
     if (fWeightFile == WeightFileType::RootBinary)
         fGC += "#include \"TFile.h\"\n";
 
+    fGC += "\nusing Dim1D = alpaka::DimInt<1>;\n";
+    fGC += "using Acc = alpaka::TagToAcc<alpaka::TagGpuCudaRt, Dim1D, Idx>;\n";
+    fGC += "using Queue = alpaka::Queue<Acc, alpaka::Blocking>;\n";
     fGC += "\nnamespace SOFIE_" + fName + "{\n";
 }
 
