@@ -141,6 +141,11 @@ public:
    {
       Generate(static_cast<std::underlying_type_t<Options>>(options), batchSize, pos, verbose);
    }
+   void GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int batchSize = -1, bool verbose = false);
+   void GenerateGPU_ALPAKA(Options options = Options::kDefault, int batchSize = -1, bool verbose = false)
+   {
+      GenerateGPU_ALPAKA(static_cast<std::underlying_type_t<Options>>(options), batchSize, verbose);
+   }
    // generate the infer function signature. If isdecl= false generate the calling infer function
    // used to infer the sub-graphs
    std::string GenerateInferSignature(bool isdecl = true);
@@ -153,18 +158,28 @@ protected:
    // internal functions
    // generate code for the initialized tensors
    void GenerateInitializedTensorInfo();
+
+   void GenerateInitializedTensorInfo_GPU_ALPAKA(); 
    // generate code for the intermediate tensors
    void GenerateIntermediateTensorInfo();
    // generate code for the dynamic tensors
    void GenerateDynamicTensorInfo();
+
+   void GenerateDynamicTensorInfo_GPU_ALPAKA();
    // generate code for declarations needed by operators
    void GenerateOperatorDeclarations();
    // generate code for inference
    void GenerateOutput();
+
+   void GenerateOutput_GPU_ALPAKA();
+
+   void MoveInitializedTensorsToBuffers_ALPAKA();
    // generate code for initializing memory pool for intermediate tensors
    void GenerateIntermediateMemoryPool();
    // Generate all session code
    void GenerateSessionCode();
+   void GenerateSessionCode_GPU_ALPAKA();
+   void GenerateGPU_ALPAKA_Buffers();
 
 public:
    const std::vector<std::string> &GetInputTensorNames() const { return fInputTensorNames; }

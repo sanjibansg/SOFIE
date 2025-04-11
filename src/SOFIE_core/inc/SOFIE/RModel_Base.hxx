@@ -82,6 +82,7 @@ public:
        fCustomOpHeaders.insert(filename);
    }
    void GenerateHeaderInfo(std::string &hgname);
+   void GenerateHeaderInfo_GPU_ALPAKA(std::string& hgname);
    void PrintGenerated() { std::cout << fGC; }
 
    std::string ReturnGenerated() { return fGC; }

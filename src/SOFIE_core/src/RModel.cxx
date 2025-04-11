@@ -594,6 +594,28 @@ void RModel::GenerateInitializedTensorInfo()
    }
 }
 
+void RModel::GenerateInitializedTensorInfo_GPU_ALPAKA()
+{
+   if (!fInitializedTensors.empty())
+      fGC += "// initialized tensors\n";
+
+   for (auto &i : fInitializedTensors) {
+      if (!fUseWeightFile || i.second.IsConstantTensor()) {
+         if (i.second.type() == ETensorType::FLOAT)
+            fGC += GenerateConstantTensorCode<float>(i);
+         else if (i.second.type() == ETensorType::INT64)
+            fGC += GenerateConstantTensorCode<int64_t>(i);
+
+      } else {
+         // case of tensors which are read from a file
+         size_t length = ConvertShapeToLength(i.second.shape());
+         if (i.second.type() == ETensorType::FLOAT) {
+            fGC += "auto deviceBuf_"+i.first+" = alpaka::allocBuf<float, size_t>(devAcc, "+std::to_string(length)+");\n";
+         }
+      }
+   }
+}
+
 void RModel::GenerateIntermediateMemoryPool() {
    if (fIntermediateMemoryInfo.total_stack.size() == 0) return;
    fGC += "\n//--- Allocating session memory pool to be used for allocating intermediate tensors\n";
@@ -612,7 +634,7 @@ void RModel::GenerateIntermediateTensorInfo() {
                tensor_declaration_block += "std::vector<bool> fTensor_" + i.first + " = std::vector<bool>(" + std::to_string(ConvertShapeToLength(i.second.shape)) + ");\n";
                // No pointer allocation needed for BOOL
          }
-         if (fIntermediateTensorFrequencyLookup.find(i.first) == fIntermediateTensorFrequencyLookup.end() && std::find(fOutputTensorNames.begin(), fOutputTensorNames.end(), i.first) == fOutputTensorNames.end()) {
+         if (std::find(fOutputTensorNames.begin(), fOutputTensorNames.end(), i.first) == fOutputTensorNames.end()) {
             size_t length = ConvertShapeToLength(i.second.shape);
 
             if (i.second.type == ETensorType::FLOAT) {
@@ -652,6 +674,55 @@ void RModel::GenerateIntermediateTensorInfo() {
    }
 }
 
+void RModel::GenerateGPU_ALPAKA_Buffers(){
+   if (!fIntermediateTensorInfos.empty()) {
+      std::string tensor_declaration_block = "";
+
+      for (auto &i : fIntermediateTensorInfos) {
+         if (i.second.type == ETensorType::BOOL) {
+               tensor_declaration_block += "std::vector<bool> fTensor_" + i.first + " = std::vector<bool>(" + std::to_string(ConvertShapeToLength(i.second.shape)) + ");\n";
+               // No pointer allocation needed for BOOL
+         }
+         if (std::find(fOutputTensorNames.begin(), fOutputTensorNames.end(), i.first) == fOutputTensorNames.end()) {
+            size_t length = ConvertShapeToLength(i.second.shape);
+
+            if (i.second.type == ETensorType::FLOAT) {
+               tensor_declaration_block += "auto bufDev_" + i.first + " = alpaka::allocBuf<float, size_t>(devAcc," + std::to_string(length) + ");\n";
+            }
+            else if (i.second.type == ETensorType::DOUBLE) {
+               tensor_declaration_block += "auto bufDev_" + i.first + " = alpaka::allocBuf<double, size_t>(devAcc," + std::to_string(length) + ");\n";
+            }
+            else if (i.second.type == ETensorType::INT64) {
+               tensor_declaration_block += "auto bufDev_" + i.first + " = alpaka::allocBuf<int64_t, size_t>(devAcc," + std::to_string(length) + ");\n";
+
+            }
+         }
+      }
+
+      if (tensor_declaration_block.length()) {
+         fGC += "\n//--- declare and allocate the intermediate tensors\n" + tensor_declaration_block;
+      }
+   }
+   // add also the dynamic tensors (only declarations, allocation will be done later)
+   if (!fDynamicTensorInfos.empty()) {
+      fGC += "//--- declare the dynamic tensors\n";
+      fGC += "using bufDev_float = alpaka::Buf<devAcc, float, alpaka::DimInt<1u>, size_t>;\n";
+      fGC += "using bufDev_double = alpaka::Buf<devAcc, double, alpaka::DimInt<1u>, size_t>;\n";
+      fGC += "using bufDev_int64= alpaka::Buf<devAcc, int64_t, alpaka::DimInt<1u>, size_t>;\n";
+      for (auto &i : fDynamicTensorInfos) {
+         if (i.second.type == ETensorType::FLOAT) {
+            fGC += "bufDev_float bufDev_" + i.first + ";\n";
+         } else if (i.second.type == ETensorType::DOUBLE) {
+            fGC += "bufDev_double bufDev_" + i.first + ";\n";
+         } else if (i.second.type == ETensorType::INT64) {
+            fGC += "bufDev_int64 bufDev_" + i.first + ";\n";
+
+         }
+      }
+   }
+}
+
+
 // generate code for specific operator declarations  to be defined in the Session class
 void RModel::GenerateOperatorDeclarations() {
    std::string strcode;
@@ -665,13 +736,25 @@ void RModel::GenerateOperatorDeclarations() {
 }
 
 void RModel::GenerateDynamicTensorInfo() {
+   fGC += "//---- allocate the intermediate dynamic tensors\n";
+   std::stringstream out;
+   for (auto & i: fDynamicTensorInfos) {
+       auto length = ConvertDynamicShapeToLength(i.second.shape);
+       out << SP <<  "if (" << length << " > 0) {\n";
+       out << SP << SP <<  "fTensor_" <<  i.first  <<  ".resize(" <<  length << ");\n";
+       out << SP << SP <<  "tensor_" << i.first << " = fTensor_" << i.first  << ".data();\n";
+       out << SP << "}\n";
+   }
+   fGC += out.str();
+}
+
+void RModel::GenerateDynamicTensorInfo_GPU_ALPAKA() {
     fGC += "//---- allocate the intermediate dynamic tensors\n";
     std::stringstream out;
     for (auto & i: fDynamicTensorInfos) {
         auto length = ConvertDynamicShapeToLength(i.second.shape);
         out << SP <<  "if (" << length << " > 0) {\n";
-        out << SP << SP <<  "fTensor_" <<  i.first  <<  ".resize(" <<  length << ");\n";
-        out << SP << SP <<  "tensor_" << i.first << " = fTensor_" << i.first  << ".data();\n";
+        out << "auto bufDev_" + i.first + " = alpaka::allocBuf<float, size_t>(devAcc," << length << ");\n";
         out << SP << "}\n";
     }
     fGC += out.str();
@@ -741,7 +824,7 @@ std::string createOutputTensor(RModel const &rmodel, std::string const &name, bo
 
 } // namespace
 
-void RModel::GenerateOutput() {
+void RModel::GenerateOutput_GPU_ALPAKA() {
 
    if (fVerbose)
       std::cout << "Generating main inference code for " << fName << std::endl;
@@ -785,7 +868,7 @@ void RModel::GenerateOutput() {
 
    for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
       if (fVerbose) std::cout << "Generating code for operator .... " << op_idx << std::endl;
-      fGC += (fOperators[op_idx]->Generate(std::to_string(op_idx)));
+      fGC += (fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx)));
    }
 
    fGC += SP + "return {";
@@ -804,40 +887,40 @@ void RModel::GenerateSessionCode()
 {
 
    // define the Session struct (for GNN this is generated in RModel_GNN)
-   if (fUseSession && !fIsGNNComponent) {
+   if (fUseSession) {
       if (!fIsSubGraph)
-         fGC += "struct Session {\n";
+         fGC += "struct Session {\n\n";
       else
-         fGC += "struct Session_" + fName + " {\n";
+         fGC += "struct Session_" + fName + " {\n\n";
    }
 
    // generate code for declaring the initialized tensors
    GenerateInitializedTensorInfo();
 
-   // evaluate total intermediate memory and position intermediate tensor addresses
-   std::string intermediate_memory_alloc_string = "";
-   intermediate_memory_alloc_string += "\n// --- Positioning intermediate tensor memory --";
-   for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
-      intermediate_memory_alloc_string += AllocateIntermediateMemory(fOperators[op_idx]->GetOpOutputTensors());
-      CheckAndFlushIntermediateMemory(fOperators[op_idx]->GetOpInputTensors(), op_idx);
-   }
-
-   // to check remaining unused fragments after memory allocation (lesser the better)
-   // for (const auto &it: fIntermediateMemoryInfo.available_stack){
-   //    std::cout<<"chunk_idx: "<<it.first<<", chunk_size: "<<it.second<<"\n";
+   // // evaluate total intermediate memory and position intermediate tensor addresses
+   // std::string intermediate_memory_alloc_string = "";
+   // intermediate_memory_alloc_string += "\n// --- Positioning intermediate tensor memory --";
+   // for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
+   //    intermediate_memory_alloc_string += AllocateIntermediateMemory(fOperators[op_idx]->GetOpOutputTensors());
+   //    CheckAndFlushIntermediateMemory(fOperators[op_idx]->GetOpInputTensors(), op_idx);
    // }
 
-   // generate the memory pool to be used by intermediate tensors
-   GenerateIntermediateMemoryPool();
+   // // to check remaining unused fragments after memory allocation (lesser the better)
+   // // for (const auto &it: fIntermediateMemoryInfo.available_stack){
+   // //    std::cout<<"chunk_idx: "<<it.first<<", chunk_size: "<<it.second<<"\n";
+   // // }
 
-   // position intermediate tensors
-   fGC += intermediate_memory_alloc_string;
+   // // generate the memory pool to be used by intermediate tensors
+   // GenerateIntermediateMemoryPool();
+
+   // // position intermediate tensors
+   // fGC += intermediate_memory_alloc_string;
 
    // generate the declaring the intermediate tensors
    GenerateIntermediateTensorInfo();
+
    // generate code for declarations of some specific operators
    GenerateOperatorDeclarations();
-
 
 
    // add subgraph session
@@ -853,11 +936,11 @@ void RModel::GenerateSessionCode()
          sessionName += "_" + fName;
       // add here specific operator code that needs to define session data members
       fGC += "\n";
-      for (size_t id = 0; id < fOperators.size(); id++) {
-         std::string opName = std::to_string(id);
-         fGC += fOperators[id]->GenerateSessionMembersCode(opName);
-      }
-      fGC += "\n";
+      // for (size_t id = 0; id < fOperators.size(); id++) {
+      //    std::string opName = std::to_string(id);
+      //    fGC += fOperators[id]->GenerateSessionMembersCode(opName);
+      // }
+      // fGC += "\n";
       // here add initialization and reading of weight tensors
       if (fUseWeightFile) {
          std::string fileName = fName;
@@ -902,6 +985,117 @@ void RModel::GenerateSessionCode()
    }
    // generate the inference code
    GenerateOutput();
+
+   // end of session
+   if (fUseSession && !fIsGNNComponent) {
+      fGC += "};   // end of Session\n";
+   }
+}
+
+void RModel::GenerateSessionCode_GPU_ALPAKA()
+{
+
+   // define the Session struct (for GNN this is generated in RModel_GNN)
+   if (fUseSession) {
+      if (!fIsSubGraph)
+         fGC += "struct Session {\n\n";
+      else
+         fGC += "struct Session_" + fName + " {\n\n";
+   }
+
+   // // generate code for declaring the initialized tensors
+   GenerateInitializedTensorInfo_GPU_ALPAKA();
+
+   // // evaluate total intermediate memory and position intermediate tensor addresses
+   // std::string intermediate_memory_alloc_string = "";
+   // intermediate_memory_alloc_string += "\n// --- Positioning intermediate tensor memory --";
+   // for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
+   //    intermediate_memory_alloc_string += AllocateIntermediateMemory(fOperators[op_idx]->GetOpOutputTensors());
+   //    CheckAndFlushIntermediateMemory(fOperators[op_idx]->GetOpInputTensors(), op_idx);
+   // }
+
+   // // to check remaining unused fragments after memory allocation (lesser the better)
+   // // for (const auto &it: fIntermediateMemoryInfo.available_stack){
+   // //    std::cout<<"chunk_idx: "<<it.first<<", chunk_size: "<<it.second<<"\n";
+   // // }
+
+   // // generate the memory pool to be used by intermediate tensors
+   // GenerateIntermediateMemoryPool();
+
+   // // position intermediate tensors
+   // fGC += intermediate_memory_alloc_string;
+
+   // generate the declaring the intermediate tensors
+   GenerateGPU_ALPAKA_Buffers();
+
+   // generate code for declarations of some specific operators
+   GenerateOperatorDeclarations();
+
+
+   // add subgraph session
+   if (!fSubGraphs.empty()) fGC += "//   subgraph sessions\n";
+   for (auto & graph : fSubGraphs) {
+      fGC += "Session_" + graph->fName + "  fSession_" + graph->fName + ";\n";
+   }
+
+   // Generate code for Session constructor
+   if (fUseSession) {
+      std::string sessionName = "Session";
+      if (fIsSubGraph)
+         sessionName += "_" + fName;
+      // add here specific operator code that needs to define session data members
+      // fGC += "\n";
+      // for (size_t id = 0; id < fOperators.size(); id++) {
+      //    std::string opName = std::to_string(id);
+      //    fGC += fOperators[id]->GenerateSessionMembersCode(opName);
+      // }
+      fGC += "\n";
+      // here add initialization and reading of weight tensors
+      if (fUseWeightFile) {
+         std::string fileName = fName;
+         if (fWeightFile == WeightFileType::Text) {
+            fileName += ".dat";
+         }
+         if (fWeightFile == WeightFileType::RootBinary) {
+            fileName += ".root";
+         }
+         fGC += sessionName + "(std::string filename =\"" + fileName + "\"";
+      } else {
+         // no need to pass weight file since it is not used
+         // keep passing a string for compatibility
+         fGC += sessionName + "(std::string = \"\"";
+      }
+      // add initialization of shape parameters
+      // assume all parameters are of type size_t
+      if (!fShapeParams.empty()) {
+         for (auto &p : fShapeParams) {
+            fGC += ",\n";
+            fGC += "        size_t " + p.first + " = " + p.second;
+         }
+      }
+      fGC += ") {\n";
+
+      if (fUseWeightFile) {
+         fGC += "\n//--- reading weights from file\n";
+         ReadInitializedTensorsFromFile(0);
+         fGC += "\n";
+         // fUseWeightFile = fUseWeightFile;
+      }
+
+      MoveInitializedTensorsToBuffers_ALPAKA();
+
+      // now we have passed the parameters we can allocate the dynamic tensors
+      GenerateDynamicTensorInfo_GPU_ALPAKA();
+
+      // add here initialization code  for operator
+      for (size_t id = 0; id < fOperators.size(); id++) {
+         fGC += fOperators[id]->GenerateInitCode_GPU_ALPAKA();
+      }
+
+      fGC += "}\n\n";
+   }
+   // generate the inference code
+   GenerateOutput_GPU_ALPAKA();
 
    // end of session
    if (fUseSession && !fIsGNNComponent) {
@@ -967,6 +1161,62 @@ void RModel::Generate(std::underlying_type_t<Options> options, int batchSize, lo
    }
 }
 
+void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int batchSize, bool verbose)
+{
+   fVerbose = verbose;
+   fBatchSize = batchSize;
+
+   // session flag is used in operator initialize
+   if (static_cast<std::underlying_type_t<Options>>(Options::kNoSession) & options) {
+      fUseSession = false;
+      fWeightFile = WeightFileType::None;
+   }
+   if (static_cast<std::underlying_type_t<Options>>(Options::kNoWeightFile) & options) {
+      fUseWeightFile = false;
+      fWeightFile = WeightFileType::None;
+   }
+   if (static_cast<std::underlying_type_t<Options>>(Options::kRootBinaryWeightFile) & options) {
+      fUseWeightFile = true;
+      fWeightFile = WeightFileType::RootBinary;
+   }
+   if (fUseWeightFile && !fUseSession) {
+      throw std::runtime_error(
+         "TMVA-SOFIE: RModel::Generate: cannot use a separate weight file without generating a Session class");
+   }
+
+   if (static_cast<std::underlying_type_t<Options>>(Options::kGNN) & options || static_cast<std::underlying_type_t<Options>>(Options::kGNNComponent) & options)
+      throw std::runtime_error("SOFIE GPU does not yet supports GNN Inference.");
+
+   // initialize the model including all operators and sub-graphs
+   Initialize(batchSize, verbose);
+
+   std::string hgname;
+   if (!fIsSubGraph) {
+      fGC.clear();
+      GenerateHeaderInfo_GPU_ALPAKA(hgname);
+   }
+
+   // generate first code for the subgraphs
+   // for (auto &graph : fSubGraphs) {
+   //    if (fVerbose)
+   //       std::cout << "generate session code for subgraph " << graph->fName << std::endl;
+   //    graph->GenerateSessionCode();
+   //    fGC += graph->fGC;
+   // }
+
+   if (fVerbose)
+      std::cout << "generate Main session code - model  " << fName << std::endl;
+
+   // generate main session code
+   GenerateSessionCode_GPU_ALPAKA();
+
+   if (!fIsSubGraph) {
+      fGC += ("} //SOFIE_" + fName + "\n");
+      fGC += "\n#endif  // " + hgname + "\n";
+   }
+}
+
+
 void RModel::ReadInitializedTensorsFromFile(long pos) {
     // generate the code to read initialized tensors from a text data file
     if (fWeightFile == WeightFileType::Text) {
@@ -978,9 +1228,9 @@ void RModel::ReadInitializedTensorsFromFile(long pos) {
         fGC += "      throw std::runtime_error(\"tmva-sofie failed to open file \" + filename + \" for input weights\");\n";
         fGC += "   }\n";
 
-        if(fIsGNNComponent) {
-            fGC += "   f.seekg(" + std::to_string(pos) + ");\n";
-        }
+      //   if(fIsGNNComponent) {
+      //       fGC += "   f.seekg(" + std::to_string(pos) + ");\n";
+      //   }
 
         fGC += "   std::string tensor_name;\n";
         fGC += "   size_t length;\n";
@@ -1048,10 +1298,34 @@ void RModel::ReadInitializedTensorsFromFile(long pos) {
                std::runtime_error("tmva-sofie tensor " + tensor_name + " with type " + ConvertTypeToString(i.second.type()) + " cannot be read from a ROOT file");
             }
             fGC += "  }\n";
-        }
-        fGC += "  }\n";
+        }        
     }
-}
+  }
+
+  void RModel::MoveInitializedTensorsToBuffers_ALPAKA(){
+      for (auto &i : fInitializedTensors) {
+         // skip Constant and shape tensors
+         if (!i.second.IsWeightTensor()) continue;
+         std::string tensor_name = "tensor_" + i.first;
+         auto length = ConvertShapeToLength(i.second.shape());
+         std::string slength = std::to_string(length);
+         if (i.second.type() == ETensorType::FLOAT) {
+            fGC += "     auto hostBuf_"+i.first+" = alpaka::allocBuf<DataType, Idx>(hostAcc,"+ slength+");\n";
+            fGC += "     std::memcpy(alpaka::getPtrNative(hostBuf_"+i.first+"), tensor_"+i.first+", "+slength+"* sizeof(float));\n";
+            fGC += "     alpaka::memcpy(queue, deviceBuf_"+i.first+", hostBuf"+i.first+", "+slength+");\n";
+         } else if (i.second.type() == ETensorType::DOUBLE) {
+            fGC += "     auto hostBuf_"+i.first+" = alpaka::allocBuf<DataType, Idx>(hostAcc,"+ slength+");\n";
+            fGC += "     std::memcpy(alpaka::getPtrNative(hostBuf_"+i.first+"), tensor_"+i.first+", "+slength+"* sizeof(doub;e));";
+            fGC += "     alpaka::memcpy(queue, deviceBuf_"+i.first+", hostBuf"+i.first+", "+slength+");\n";
+         } else if (i.second.type() == ETensorType::INT64) {
+            fGC += "     auto hostBuf_"+i.first+" = alpaka::allocBuf<DataType, Idx>(hostAcc,"+ slength+");\n";
+            fGC += "     std::memcpy(alpaka::getPtrNative(hostBuf_"+i.first+"), tensor_"+i.first+", "+slength+"* sizeof(int64_t));";
+            fGC += "     alpaka::memcpy(queue, deviceBuf_"+i.first+", hostBuf"+i.first+", "+slength+");\n";
+         } else {
+            std::runtime_error("tmva-sofie tensor " + tensor_name + " with type " + ConvertTypeToString(i.second.type()) + " cannot be read from a ROOT file");
+         }
+   }
+  }
 
 long RModel::WriteInitializedTensorsToFile(std::string filename) {
     // Determine the file extension based on the weight file type
