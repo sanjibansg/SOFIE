@@ -65,6 +65,31 @@ public:
       return out.str();
    }
 
+   std::string Generate_GPU_ALPAKA(std::string OpName) override {
+      OpName = "op_" + OpName;
+      if (fShape.empty()) {
+         throw std::runtime_error("TMVA SOFIE Operator Relu called to Generate without being initialized first");
+      }
+      std::stringstream out;
+      auto length = ConvertDynamicShapeToLength(fShape);
+      out << "\n//------ RELU_GPU_ALPAKA\n";
+      out << SP << "{\n";
+      out << SP << SP <<"Idx totalElems = "<<length<<";\n";
+      out << SP << SP <<" auto workDiv = alpaka::WorkDivMembers<Dim1D, Idx>{\n"
+             <<"alpaka::workdiv::getValidWorkDiv<Acc>(devAcc, {totalElems}, true, alpaka::GridBlockExtent::All)\n"
+             <<"};\n";
+      out<< SP << SP << "alpaka::exec<Acc>(queue, workDiv,\n"
+             <<"[] ALPAKA_FN_ACC (auto const& acc, auto buf, Idx size) {\n"
+             <<"Idx const idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n"
+             <<"    if (idx < size) {\n"
+             <<"        auto& x = alpaka::getPtrNative(buf)[idx];\n"
+             <<"        x = x < 0 ? 0 : x;\n"
+             <<"    }\n"
+             <<"}, bufDev_"<<fNX<<", totalElems\n"
+         <<");\n"
+         <<"alpaka::wait(queue);\n";
+   }
+
 };
 
 }//SOFIE
