@@ -827,7 +827,7 @@ std::string createOutputTensor(RModel const &rmodel, std::string const &name, bo
 
 } // namespace
 
-void RModel::GenerateOutput() {
+void RModel::GenerateOutput_GPU_ALPAKA() {
 
    if (fVerbose)
       std::cout << "Generating main inference code for " << fName << std::endl;
@@ -871,7 +871,7 @@ void RModel::GenerateOutput() {
 
    for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
       if (fVerbose) std::cout << "Generating code for operator .... " << op_idx << std::endl;
-      fGC += (fOperators[op_idx]->Generate(std::to_string(op_idx)));
+      fGC += (fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx)));
    }
 
    fGC += SP + "return {";
@@ -1092,13 +1092,13 @@ void RModel::GenerateSessionCode_GPU_ALPAKA()
 
       // add here initialization code  for operator
       for (size_t id = 0; id < fOperators.size(); id++) {
-         fGC += fOperators[id]->GenerateInitCode();
+         fGC += fOperators[id]->GenerateInitCode_GPU_ALPAKA();
       }
 
       fGC += "}\n\n";
    }
    // generate the inference code
-   GenerateOutput();
+   GenerateOutput_GPU_ALPAKA();
 
    // end of session
    if (fUseSession && !fIsGNNComponent) {
