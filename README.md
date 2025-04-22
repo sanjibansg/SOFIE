@@ -27,5 +27,5 @@ Now ROOT should also access the SOFIE libraries while it runs. This helps to acc
 
 
     
-## Other Common Github Profile Sections
+## Inspiration
 The standalone version of SOFIE is developed with inspiration from the standalone version of RooFit developed by Jonas Rembser that can be found [here](https://github.com/guitargeek/roofit).
