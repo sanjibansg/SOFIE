@@ -289,6 +289,28 @@ namespace SOFIE{
          return out.str();
       }
 
+      std::string GenerateInitCode_GPU_ALPAKA() override {
+         std::stringstream out;
+         // generate initialization code for broadcasting of bias tensor
+         if (fShapeC.size() != fShapeY.size() && fNC != fNC2) {
+            // we broadcast here always C in Y output, so target shape is the one of Y
+            // no need to call UTILITY::UnidirectionalBroadcastShape.
+            // here in case of parametric shape we need to assume that the parameters will be defined in the initialization code.
+            auto targetShape = fShapeY;
+            // include a separate scope to avoid defining unique operator temp variables
+            out << "//--- broadcast bias tensor " << fNC << "for Gemm op\n";
+            out << SP << "{\n";
+            out << "      float * data = SOFIE::UTILITY::UnidirectionalBroadcast<float>(tensor_"
+               << fNC << "," << ConvertShapeToString(fShapeC) << ", " << ConvertDynamicShapeToString(fShapeY) << ");\n";
+            auto length = SOFIE::ConvertDynamicShapeToLength(fShapeY); // output size
+            out << SP << SP << "auto hostBuf_"<< fNC2 << " = alpaka::allocBuf<float, size_t>(hostAcc,"+ length +");\n";
+            out << SP << SP << "std::memcpy(alpaka::getPtrNative(hostBuf_"<< fNC2 <<"), data, "<< length << " * sizeof(float));\n";
+            out << SP << SP << "alpaka::memcpy(queue, deviceBuf_"<< fNC2 << ", hostBuf_"<< fNC2 << " , "<< length << ");\n";
+            out << SP << "}\n";
+         }
+         return out.str();
+      }
+
       std::string Generate(std::string opName) override {
          opName = "op_" + opName;
 
@@ -384,6 +406,93 @@ namespace SOFIE{
          if (doStackMul) {
             out << SP << SP <<  opName << "_yoffset += " << lengthGemm << ";\n";
             out << "}\n"; // end of loop on the stacked multiplications
+         }
+
+         return out.str();
+      }
+
+      std::string Generate_GPU_ALPAKA(std::string opName) override {
+         opName = "op_" + opName;
+
+         if (fShapeA.empty() || fShapeB.empty() || fShapeY.empty() || (fNC != "" && fShapeC.empty())) {
+            throw std::runtime_error("TMVA SOFIE Gemm Op called to Generate without being initialized first");
+         }
+         std::stringstream out;
+         out << "\n//--------- Gemm_GPU_ALPAKA\n";
+         out << SP << "char " << opName << "_transA = " << (fAttrTransA ? "\'t\'" : "\'n\'") << ";\n";
+         out << SP << "char " << opName << "_transB = " << (fAttrTransB ? "\'t\'" : "\'n\'") << ";\n";
+         // need to consider case A and B have dim > 2 (for MatMul)
+         int64_t dimA = fShapeA.size();
+         int64_t dimB = fShapeB.size();
+         int64_t dimY = fShapeY.size();
+         if (dimA != dimB || dimA != dimY) {
+             throw std::runtime_error("TMVA SOFIE Gemm(MatMul) has invalid shape for inputs or output");
+         }
+         auto m = (fAttrTransA ? fShapeA[dimA-1].GetVal() : fShapeA[dimA-2].GetVal());
+         auto n = (fAttrTransB ? fShapeB[dimB-2].GetVal() : fShapeB[dimB-1].GetVal());
+         auto k = (fAttrTransA ? fShapeA[dimA-2].GetVal() : fShapeA[dimA-1].GetVal());
+         std::vector<Dim> sY = {fShapeY[dimY-2], fShapeY[dimY-1]};
+         // extra dimensions in case of stacked MatMul
+         std::vector<Dim> sA;
+         for (int64_t i = 0; i < dimY-2; i++) {
+            sA.push_back(fShapeY[i]);
+         }
+         auto lengthGemm = ConvertDynamicShapeToLength(sY); // size of the Gemm operation
+         auto lengthExtra = ConvertDynamicShapeToLength(sA); // extra length in case input tensors are of dim>2 (MatMul)
+
+         out << SP << "int " << opName << "_m = " << m << ";\n";
+         out << SP << "int " << opName << "_n = " << n << ";\n";
+         out << SP << "int " << opName << "_k = " << k << ";\n";
+         out << SP << "float " << opName << "_alpha = " << std::setprecision(std::numeric_limits<float>::max_digits10) << fAttrAlpha << ";\n";
+         out << SP << "float " << opName << "_beta = " << std::setprecision(std::numeric_limits<float>::max_digits10) << fAttrBeta << ";\n";
+         out << SP << "int " << opName << "_lda = " << (fAttrTransA ? m : k) << ";\n";
+         out << SP << "int " << opName << "_ldb = " << (fAttrTransB ? k : n) << ";\n";
+
+         // case bias is present
+         if (!fNC.empty()){
+            if (fNC2 == fNC) {
+               // add a check in case broadcasting was not needed or done outside of session
+               // C should have smaller dimension of Y
+               if (!fIsDynamic) {
+                  if (std::stoi(lengthGemm) != static_cast<int>(ConvertShapeToLength(fShapeC)))
+                     throw std::runtime_error("TMVA SOFIE Gemm Op " + opName + " Bias tensor has not correct size "
+                            + ConvertShapeToString(fShapeC) + " output length " + lengthGemm);
+               } else {
+                  // add a dynamic check (C should not be a dynamic tensor)
+                  out << SP << "assert(" << lengthGemm << " != " <<  ConvertShapeToLength(fShapeC) << ");\n";
+               }
+            }
+         } else {
+            //in this case fAttrBeta needs to be equal to zero otherwise second time we run we will use
+            // the previous result
+            if (fAttrBeta != 0) {
+               throw std::runtime_error("TMVA SOFIE Gemm Op " + opName + " Bias tensor is not present but beta value in Gemm is not zero");
+            }
+         }
+
+         // include MatMul case where we stack the Gemm operations
+         // exclude case where we have only 1's in the additional dims
+         bool doStackMul = dimY > 2 && ( fIsDynamic  || std::stoi(lengthExtra) > 1);
+         if (doStackMul) {
+            out << SP << "size_t " << opName << "_yoffset = 0;\n"; // needed if we stack the gemm operations
+            out << SP << "for (int i = 0; i < " << lengthExtra << "; i++){\n";
+            out << SP;
+         }
+         // in the case of bias
+         if (!fNC.empty()){
+            out << SP << "std::copy(" << "tensor_" << fNC2 << ", " << "tensor_" << fNC2 << " + " << lengthGemm << ", "
+               << "tensor_" << fNY;
+            if (doStackMul) out << " + " << opName << "_yoffset";
+            out << ");\n";
+         }
+
+
+         if (fType == "float"){
+            out << SP << "Kokkos::View<float**, Kokkos::LayoutLeft, Kokkos::CudaSpace> kokkos_dev_"<<fNA<<"((float*)std::data(bufDev_"<<fNA<<"), "<<opName<<"_m, "<<opName<<"_k);\n";
+            out << SP << "Kokkos::View<float**, Kokkos::LayoutLeft, Kokkos::CudaSpace> kokkos_dev_"<<fNB<<"((float*)std::data(bufDev_"<<fNB<<"), "<<opName<<"_k, "<<opName<<"_n);\n";
+            out << SP << "Kokkos::View<float**, Kokkos::LayoutLeft, Kokkos::CudaSpace> kokkos_dev_"<<fNY<<"((float*)std::data(bufDev_"<<fNY<<"), "<<opName<<"_m, "<<opName<<"_n);\n";
+            out << SP << "KokkosBlas::gemm(&" << opName << "_transB, &" << opName << "_transA, "<< opName << "_alpha, kokkos_dev_" << fNA <<", kokkos_dev_" << fNB << ", " << opName << "_beta, kokkos_dev_"<<fNY<<");\n";
+
          }
 
          return out.str();
