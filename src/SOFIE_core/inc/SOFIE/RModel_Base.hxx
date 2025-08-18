@@ -29,8 +29,15 @@ enum class Options {
 
 enum class WeightFileType { None, RootBinary, Text };
 
-std::underlying_type_t<Options> operator|(Options opA, Options opB);
-std::underlying_type_t<Options> operator|(std::underlying_type_t<Options> opA, Options opB);
+
+inline std::underlying_type_t<Options> operator|(Options opA, Options opB) {
+    return static_cast<std::underlying_type_t<Options>>(opA) |
+           static_cast<std::underlying_type_t<Options>>(opB);
+}
+
+inline std::underlying_type_t<Options> operator|(std::underlying_type_t<Options> opA, Options opB) {
+    return opA | static_cast<std::underlying_type_t<Options>>(opB);
+}
 
 class RModel_Base {
 

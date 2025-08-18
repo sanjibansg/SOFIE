@@ -75,8 +75,7 @@ void RModel_Base::GenerateHeaderInfo_GPU_ALPAKA(std::string& hgname) {
         fGC += "#include \"" + i + "\"\n";
     }
     fGC += "#include <alpaka/alpaka.hpp>\n";
-    fGC += "#include <Kokkos_Core.hpp>\n";
-    fGC += "#include <KokkosBlas3_gemm.hpp>\n";
+    fGC += "#include <sofieBLAS/sofieBLAS.hpp>\n";
 
     // for the session we need to include SOFIE_Common functions
     //needed for convolution operator (need to add a flag)
@@ -88,8 +87,6 @@ void RModel_Base::GenerateHeaderInfo_GPU_ALPAKA(std::string& hgname) {
         fGC += "#include \"TFile.h\"\n";
 
     fGC += "\nusing Dim1D = alpaka::DimInt<1>;\n";
-    fGC += "using Acc = alpaka::TagToAcc<alpaka::TagGpuCudaRt, Dim1D, Idx>;\n";
-    fGC += "using Queue = alpaka::Queue<Acc, alpaka::Blocking>;\n";
     fGC += "\nnamespace SOFIE_" + fName + "{\n";
 }
 

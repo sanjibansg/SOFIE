@@ -704,6 +704,11 @@ inline GNN_Data Copy(const GNN_Data & data) {
    return out;
 }
 
+// Function to generate the code for declaring and initializing constant tensors
+// This is for tensors which are not part of weight files and can be created from the Constant operator
+template <typename T>
+std::string GenerateConstantTensorCode(const std::pair<std::string, InitializedTensor> &t);
+
 }//SOFIE
 
 #endif //TMVA_SOFIE_RMODEL

@@ -76,6 +76,7 @@ list(TRANSFORM sources_headers PREPEND "inc/")
 set(sources_cxx
     src/RModel_Base.cxx
     src/RModel.cxx
+    src/RModel_ALPAKA.cxx
     src/RModel_GNN.cxx
     src/RModel_GraphIndependent.cxx
     src/RFunction.cxx

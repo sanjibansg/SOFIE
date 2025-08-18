@@ -162,6 +162,10 @@ protected:
    void GenerateInitializedTensorInfo_GPU_ALPAKA(); 
    // generate code for the intermediate tensors
    void GenerateIntermediateTensorInfo();
+
+   // generate code for the temporary initialized tensors containers
+   void GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA();
+
    // generate code for the dynamic tensors
    void GenerateDynamicTensorInfo();
 
