@@ -56,7 +56,10 @@ if(ccache)
 endif()
 
 if(testing)
+    find_package(GTest REQUIRED)
   enable_testing()
 endif()
+
+include(cmake/modules/RoottestMacros.cmake)
 
 add_subdirectory(src)

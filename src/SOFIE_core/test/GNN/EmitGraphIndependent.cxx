@@ -7,9 +7,9 @@
 #include "SOFIE/SOFIE_common.hxx"
 
 
-using namespace SOFIE;
-
-int main(int argc, char *argv[]){
+int main()
+{
+    using namespace SOFIE;
 
     GraphIndependent_Init init;
     init.num_nodes=2;
