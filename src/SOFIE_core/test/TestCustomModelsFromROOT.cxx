@@ -101,7 +101,7 @@ TEST(ROOT, Linear16)
    // Preparing the standard all-ones input
    std::vector<float> input(1600);
    std::fill_n(input.data(), input.size(), 1.0f);
-   TMVA_SOFIE_Linear_16::Session s("Linear_16_FromROOT.root");
+   SOFIE_Linear_16::Session s("Linear_16_FromROOT.root");
    std::vector<float> output = s.infer(input.data());
 
    // Testing the actual and expected output sizes
@@ -123,7 +123,7 @@ TEST(ROOT, Linear32)
    // Preparing the standard all-ones input
    std::vector<float> input(3200);
    std::fill_n(input.data(), input.size(), 1.0f);
-   TMVA_SOFIE_Linear_32::Session s("Linear_32_FromROOT.dat");
+   SOFIE_Linear_32::Session s("Linear_32_FromROOT.dat");
    std::vector<float> output = s.infer(input.data());
 
    // Testing the actual and expected output sizes
@@ -145,7 +145,7 @@ TEST(ROOT, Linear64)
    // Preparing the standard all-ones input
    std::vector<float> input(6400);
    std::fill_n(input.data(), input.size(), 1.0f);
-   TMVA_SOFIE_Linear_64::Session s("Linear_64_FromROOT.dat");
+   SOFIE_Linear_64::Session s("Linear_64_FromROOT.dat");
    std::vector<float> output = s.infer(input.data());
 
    // Testing the actual and expected output values
@@ -167,7 +167,7 @@ TEST(ROOT, LinearWithSelu)
    // Preparing the standard all-ones input
    std::vector<float> input(48);
    std::fill_n(input.data(), input.size(), 1.0f);
-   TMVA_SOFIE_LinearWithSelu::Session s; // we don;t use weight file
+   SOFIE_LinearWithSelu::Session s; // we don;t use weight file
    std::vector<float> output = s.infer(input.data());
 
    // Checking output size
@@ -189,7 +189,7 @@ TEST(ROOT, LinearWithSigmoid)
    // Preparing the standard all-ones input
    std::vector<float> input(48);
    std::fill_n(input.data(), input.size(), 1.0f);
-   TMVA_SOFIE_LinearWithSigmoid::Session s;  // we don't use weight file in this case
+   SOFIE_LinearWithSigmoid::Session s;  // we don't use weight file in this case
    std::vector<float> output = s.infer(input.data());
 
 
@@ -212,7 +212,7 @@ TEST(ROOT, ConvWithPadding)
    // Preparing the standard all-ones input
    std::vector<float> input(25);
    std::iota(input.begin(), input.end(), 0.0f);
-   std::vector<float> output = TMVA_SOFIE_ConvWithPadding::infer(input.data());
+   std::vector<float> output = SOFIE_ConvWithPadding::infer(input.data());
 
    // Checking output size
    EXPECT_EQ(output.size(), sizeof(ConvWithPadding_ExpectedOutput::all_ones) / sizeof(float));
@@ -233,7 +233,7 @@ TEST(ROOT, ConvWithoutPadding)
    // Preparing the standard all-ones input
    std::vector<float> input(25);
    std::iota(input.begin(), input.end(), 0.0f);
-   std::vector<float> output = TMVA_SOFIE_ConvWithoutPadding::infer(input.data());
+   std::vector<float> output = SOFIE_ConvWithoutPadding::infer(input.data());
 
    // Checking output size
    EXPECT_EQ(output.size(), sizeof(ConvWithoutPadding_ExpectedOutput::all_ones) / sizeof(float));
@@ -254,7 +254,7 @@ TEST(ROOT, ConvWithAutopadSameLower)
    // Preparing the standard all-ones input
    std::vector<float> input(25);
    std::iota(input.begin(), input.end(), 0.0f);
-   std::vector<float> output = TMVA_SOFIE_ConvWithAutopadSameLower::infer(input.data());
+   std::vector<float> output = SOFIE_ConvWithAutopadSameLower::infer(input.data());
 
    // Checking output size
    EXPECT_EQ(output.size(), sizeof(ConvWithAutopadSameLower_ExpectedOutput::all_ones) / sizeof(float));
@@ -275,7 +275,7 @@ TEST(ROOT, ConvWithStridesPadding)
    // Preparing the standard all-ones input
    std::vector<float> input(35);
    std::iota(input.begin(), input.end(), 0.0f);
-   std::vector<float> output = TMVA_SOFIE_ConvWithStridesPadding::infer(input.data());
+   std::vector<float> output = SOFIE_ConvWithStridesPadding::infer(input.data());
 
    // Checking output size
    EXPECT_EQ(output.size(), sizeof(ConvWithStridesPadding_ExpectedOutput::all_ones) / sizeof(float));
@@ -296,7 +296,7 @@ TEST(ROOT, ConvWithStridesNoPadding)
    // Preparing the standard all-ones input
    std::vector<float> input(35);
    std::iota(input.begin(), input.end(), 0.0f);
-   std::vector<float> output = TMVA_SOFIE_ConvWithStridesNoPadding::infer(input.data());
+   std::vector<float> output = SOFIE_ConvWithStridesNoPadding::infer(input.data());
 
    // Checking output size
    EXPECT_EQ(output.size(), sizeof(ConvWithStridesNoPadding_ExpectedOutput::all_ones) / sizeof(float));
@@ -317,7 +317,7 @@ TEST(DISABLED_ROOT, ConvWithAsymmetricPadding)
    // Preparing the standard all-ones input
    std::vector<float> input(35);
    std::iota(input.begin(), input.end(), 0.0f);
-   std::vector<float> output = TMVA_SOFIE_ConvWithAsymmetricPadding::infer(input.data());
+   std::vector<float> output = SOFIE_ConvWithAsymmetricPadding::infer(input.data());
 
    // Checking output size
    EXPECT_EQ(output.size(), sizeof(ConvWithAsymmetricPadding_ExpectedOutput::all_ones) / sizeof(float));
@@ -337,7 +337,7 @@ TEST(ROOT, RNNBatchwise)
    // Preparing the standard all-ones input
    std::vector<float> input(6);
    std::iota(input.begin(), input.end(), 1.0f);
-   std::vector<std::vector<float>> output = TMVA_SOFIE_RNNBatchwise::infer(input.data());
+   std::vector<std::vector<float>> output = SOFIE_RNNBatchwise::infer(input.data());
    std::vector<float> output_y = output[0];
    std::vector<float> output_yh = output[1];
 
@@ -362,7 +362,7 @@ TEST(ROOT, RNNBidirectional)
    std::vector<float> input({0.,    0.01, 0.02, 0.03, 0.04, 0.05,
                              0.06, 0.07, 0.08, 0.09, 0.1,  0.11,
                              0.12, 0.13, 0.14, 0.15, 0.16, 0.17});
-   std::vector<std::vector<float>> output = TMVA_SOFIE_RNNBidirectional::infer(input.data());
+   std::vector<std::vector<float>> output = SOFIE_RNNBidirectional::infer(input.data());
    std::vector<float> output_y = output[0];
    std::vector<float> output_yh = output[1];
 
@@ -396,7 +396,7 @@ TEST(ROOT, RNNBidirectionalBatchwise)
       0,    0.01, 0.06, 0.07, 0.12, 0.13,
       0.02, 0.03, 0.08, 0.09, 0.14, 0.15,
       0.04, 0.05, 0.1,  0.11, 0.16, 0.17});
-   std::vector<std::vector<float>> output = TMVA_SOFIE_RNNBidirectionalBatchwise::infer(input.data());
+   std::vector<std::vector<float>> output = SOFIE_RNNBidirectionalBatchwise::infer(input.data());
    std::vector<float> output_y = output[0];
    std::vector<float> output_yh = output[1];
 
@@ -428,7 +428,7 @@ TEST(ROOT, RNNDefaults)
    // Preparing the standard all-ones input
    std::vector<float> input(9);
    std::iota(input.begin(), input.end(), 1.0f);
-   std::vector<std::vector<float>> output = TMVA_SOFIE_RNNDefaults::infer(input.data());
+   std::vector<std::vector<float>> output = SOFIE_RNNDefaults::infer(input.data());
    std::vector<float> output_y = output[0];
    std::vector<float> output_yh = output[1];
 
@@ -460,7 +460,7 @@ TEST(ROOT, RNNSeqLength)
    // Preparing the standard all-ones input
    std::vector<float> input(18);
    std::iota(input.begin(), input.end(), 1.0f);
-   std::vector<std::vector<float>> output = TMVA_SOFIE_RNNSeqLength::infer(input.data());
+   std::vector<std::vector<float>> output = SOFIE_RNNSeqLength::infer(input.data());
    std::vector<float> output_y = output[0];
    std::vector<float> output_yh = output[1];
 
@@ -500,7 +500,7 @@ TEST(ROOT, RNNSequence)
       0.06,    0.087,  0.01,    0.3,  -0.001,
       0.0,     0.0,    0.0,     0.0,   0.0,
       0.0,     0.0,    0.0,     0.0,   0.0});
-   std::vector<std::vector<float>> output = TMVA_SOFIE_RNNSequence::infer(input.data());
+   std::vector<std::vector<float>> output = SOFIE_RNNSequence::infer(input.data());
    std::vector<float> output_y = output[0];
    std::vector<float> output_yh = output[1];
 
@@ -540,7 +540,7 @@ TEST(ROOT, RNNSequenceBatchwise)
       0.16,  -0.19,   0.003,  0.0,   0.0001,
       0.0,     0.0,   0.0,    0.0,   0.0,
       0.0,     0.0,   0.0,    0.0,   0.0});
-   std::vector<std::vector<float>> output = TMVA_SOFIE_RNNSequenceBatchwise::infer(input.data());
+   std::vector<std::vector<float>> output = SOFIE_RNNSequenceBatchwise::infer(input.data());
    std::vector<float> output_y = output[0];
    std::vector<float> output_yh = output[1];
 
@@ -572,7 +572,7 @@ TEST(ROOT, LSTMBatchwise)
    // Preparing the standard all-ones input
    std::vector<float> input(6);
    std::iota(input.begin(), input.end(), 1.0f);
-   std::vector<std::vector<float>> output = TMVA_SOFIE_LSTMBatchwise::infer(input.data());
+   std::vector<std::vector<float>> output = SOFIE_LSTMBatchwise::infer(input.data());
    std::vector<float> output_y = output[0];
    std::vector<float> output_yh = output[1];
 
@@ -602,7 +602,7 @@ TEST(ROOT, LSTMBidirectional)
    // Preparing the standard all-ones input
    std::vector<float> input(6);
    std::iota(input.begin(), input.end(), 1.0f);
-   std::vector<std::vector<float>> output = TMVA_SOFIE_LSTMBidirectional::infer(input.data());
+   std::vector<std::vector<float>> output = SOFIE_LSTMBidirectional::infer(input.data());
    std::vector<float> output_y = output[0];
    std::vector<float> output_yh = output[1];
    std::vector<float> output_yc = output[2];
@@ -645,7 +645,7 @@ TEST(ROOT, LSTMDefaults)
    // Preparing the standard all-ones input
    std::vector<float> input(6);
    std::iota(input.begin(), input.end(), 1.0f);
-   std::vector<std::vector<float>> output = TMVA_SOFIE_LSTMDefaults::infer(input.data());
+   std::vector<std::vector<float>> output = SOFIE_LSTMDefaults::infer(input.data());
    std::vector<float> output_y = output[0];
    std::vector<float> output_yh = output[1];
 
@@ -677,7 +677,7 @@ TEST(ROOT, LSTMInitialBias)
    // Preparing the standard all-ones input
    std::vector<float> input(9);
    std::iota(input.begin(), input.end(), 1.0f);
-   std::vector<std::vector<float>> output = TMVA_SOFIE_LSTMInitialBias::infer(input.data());
+   std::vector<std::vector<float>> output = SOFIE_LSTMInitialBias::infer(input.data());
    std::vector<float> output_y = output[0];
    std::vector<float> output_yh = output[1];
 
@@ -709,7 +709,7 @@ TEST(ROOT, LSTMPeepholes)
    // Preparing the standard all-ones input
    std::vector<float> input(8);
    std::iota(input.begin(), input.end(), 1.0f);
-   std::vector<std::vector<float>> output = TMVA_SOFIE_LSTMPeepholes::infer(input.data());
+   std::vector<std::vector<float>> output = SOFIE_LSTMPeepholes::infer(input.data());
    std::vector<float> output_y = output[0];
    std::vector<float> output_yh = output[1];
 
@@ -739,7 +739,7 @@ TEST(ROOT, GRUBatchwise)
    // Preparing the standard all-ones input
    std::vector<float> input(6);
    std::iota(input.begin(), input.end(), 1.0f);
-   std::vector<std::vector<float>> output = TMVA_SOFIE_GRUBatchwise::infer(input.data());
+   std::vector<std::vector<float>> output = SOFIE_GRUBatchwise::infer(input.data());
    std::vector<float> output_y = output[0];
    std::vector<float> output_yh = output[1];
 
@@ -769,7 +769,7 @@ TEST(ROOT, GRUBidirectional)
    // Preparing the standard all-ones input
    std::vector<float> input(6);
    std::iota(input.begin(), input.end(), 1.0f);
-   std::vector<std::vector<float>> output = TMVA_SOFIE_GRUBidirectional::infer(input.data());
+   std::vector<std::vector<float>> output = SOFIE_GRUBidirectional::infer(input.data());
    std::vector<float> output_y = output[0];
    std::vector<float> output_yh = output[1];
 
@@ -799,7 +799,7 @@ TEST(ROOT, GRUDefaults)
    // Preparing the standard all-ones input
    std::vector<float> input(6);
    std::iota(input.begin(), input.end(), 1.0f);
-   std::vector<std::vector<float>> output = TMVA_SOFIE_GRUDefaults::infer(input.data());
+   std::vector<std::vector<float>> output = SOFIE_GRUDefaults::infer(input.data());
    std::vector<float> output_y = output[0];
    std::vector<float> output_yh = output[1];
 
@@ -829,7 +829,7 @@ TEST(ROOT, GRUInitialBias)
    // Preparing the standard all-ones input
    std::vector<float> input(9);
    std::iota(input.begin(), input.end(), 1.0f);
-   std::vector<std::vector<float>> output = TMVA_SOFIE_GRUInitialBias::infer(input.data());
+   std::vector<std::vector<float>> output = SOFIE_GRUInitialBias::infer(input.data());
    std::vector<float> output_y = output[0];
    std::vector<float> output_yh = output[1];
 
@@ -859,7 +859,7 @@ TEST(ROOT, GRUSeqLength)
    // Preparing the standard all-ones input
    std::vector<float> input(18);
    std::iota(input.begin(), input.end(), 1.0f);
-   std::vector<std::vector<float>> output = TMVA_SOFIE_GRUSeqLength::infer(input.data());
+   std::vector<std::vector<float>> output = SOFIE_GRUSeqLength::infer(input.data());
    std::vector<float> output_y = output[0];
    std::vector<float> output_yh = output[1];
 
@@ -891,7 +891,7 @@ TEST(ROOT, RangeFloat) {
    float start = 1.;
    float limit = 10.;
    float delta = 2.;
-   std::vector<float> output = TMVA_SOFIE_RangeFloat::infer(&start, &limit, &delta);
+   std::vector<float> output = SOFIE_RangeFloat::infer(&start, &limit, &delta);
 
    // Checking the output size
    EXPECT_EQ(output.size(), sizeof(RangeFloat_ExpectedOutput::outputs) / sizeof(float));
@@ -909,7 +909,7 @@ TEST(ROOT, RangeInt) {
    int64_t start = 1;
    int64_t limit = 10;
    int64_t delta = 2;
-   std::vector<int64_t> output = TMVA_SOFIE_RangeInt::infer(&start, &limit, &delta);
+   std::vector<int64_t> output = SOFIE_RangeInt::infer(&start, &limit, &delta);
 
    // Checking the output size
    EXPECT_EQ(output.size(), sizeof(RangeInt_ExpectedOutput::outputs) / sizeof(int64_t));

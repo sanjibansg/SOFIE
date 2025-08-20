@@ -13,7 +13,7 @@
 
 add_library(SOFIE_core SHARED)
 
-set(source_headers
+set(sources_headers
    SOFIE/OperatorList.hxx
    SOFIE/RModel_Base.hxx
    SOFIE/RModel.hxx
@@ -89,12 +89,15 @@ target_sources(SOFIE_core PRIVATE ${sources_headers} ${sources_cxx})
 target_include_directories(SOFIE_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/inc)
 target_link_libraries(SOFIE_core PUBLIC
     Tree
+    Core
+    RIO
 )
-# ROOT_GENERATE_DICTIONARY(G__SOFIE ${sources_headers}
-#     LINKDEF inc/LinkDef1.h
-#     MODULE SOFIE_core
-#     OPTIONS --deep
-# )
+
+ROOT_GENERATE_DICTIONARY(G__SOFIE ${sources_headers}
+    LINKDEF inc/LinkDef.h
+    MODULE SOFIE_core
+    OPTIONS --deep
+)
 
 install(TARGETS SOFIE_core
         LIBRARY DESTINATION lib
