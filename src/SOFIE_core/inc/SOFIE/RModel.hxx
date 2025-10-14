@@ -150,6 +150,10 @@ public:
    // used to infer the sub-graphs
    std::string GenerateInferSignature(bool isdecl = true);
 
+   void RemoveIntermediateTensor(const std::string& tensor_name){
+      fIntermediateTensorInfos.erase(tensor_name);
+   }
+
    // calculate total intermediate memory and position intermediate tensor addresses
    std::string AllocateIntermediateMemory(std::span<const std::string_view> op_output_tensors);
    void CheckAndFlushIntermediateMemory(std::span<const std::string_view> op_output_tensors, const size_t& op_idx);
@@ -184,6 +188,8 @@ protected:
    void GenerateSessionCode();
    void GenerateSessionCode_GPU_ALPAKA();
    void GenerateGPU_ALPAKA_Buffers();
+
+   void CheckAndFuseOperators();
 
 public:
    const std::vector<std::string> &GetInputTensorNames() const { return fInputTensorNames; }

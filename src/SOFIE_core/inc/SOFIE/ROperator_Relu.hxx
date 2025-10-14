@@ -24,6 +24,7 @@ public:
    ROperator_Relu(){}
    ROperator_Relu(std::string nameX, std::string nameY):
       fNX(UTILITY::Clean_name(nameX)), fNY(UTILITY::Clean_name(nameY)){
+         fKind = OperatorKind::RELU;
          fInputTensorNames = { fNX };
          fOutputTensorNames = { fNY };
       }
@@ -65,6 +66,23 @@ public:
       return out.str();
    }
 
+   std::string Generate_GPU_Kernel_ALPAKA() override {
+      std::string op;
+      op = "\n//------ RELU_KERNEL_ALPAKA\n";
+      op += SP + "struct ReluKernel{\n";
+      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T* data, std::size_t numElements) const {\n";
+      op += SP + SP + SP + "for (auto i : alpaka::uniformElements(acc, numElements)) {\n";
+      op += SP + SP + SP + "data[i] = (data[i] < 0) ? 0 : data[i];\n";
+      op += SP + SP + "}\n";
+      op += SP + "}\n};\n";
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA() override {
+      return SP + "ReluKernel reluKernel;\n";
+   }
+
    std::string Generate_GPU_ALPAKA(std::string OpName) override {
       OpName = "op_" + OpName;
       if (fShape.empty()) {
@@ -73,23 +91,27 @@ public:
       std::stringstream out;
       auto length = ConvertDynamicShapeToLength(fShape);
       out << "\n//------ RELU_GPU_ALPAKA\n";
-      out << SP << "{\n";
-      out << SP << SP <<"Idx totalElems = "<<length<<";\n";
-      out << SP << SP <<" auto workDiv = alpaka::WorkDivMembers<Dim1D, Idx>{\n"
-             <<"alpaka::workdiv::getValidWorkDiv<Acc>(devAcc, {totalElems}, true, alpaka::GridBlockExtent::All)\n"
-             <<"};\n";
-      out<< SP << SP << "alpaka::exec<Acc>(queue, workDiv,\n"
-             <<"[] ALPAKA_FN_ACC (auto const& acc, auto buf, Idx size) {\n"
-             <<"Idx const idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n"
-             <<"    if (idx < size) {\n"
-             <<"        auto& x = alpaka::getPtrNative(buf)[idx];\n"
-             <<"        x = x < 0 ? 0 : x;\n"
-             <<"    }\n"
-             <<"}, bufDev_"<<fNX<<", totalElems\n"
-         <<");\n"
-         <<"alpaka::wait(queue);\n";
+      // out << SP << "Vec elementsPerThread_" << fNX << " = static_cast<Idx>(1);\n";
+      // out << SP << "Vec elementsPerGrid_" << fNX << " = static_cast<Idx>(" << length << ");\n";
+      // out << SP << "alpaka::KernelCfg<Acc> kernelCfg_" << fNX << " = {elementsPerGrid_" << fNX << ", elementsPerThread_" << fNX << "};\n";
+      // out << SP << "auto workDiv_" << fNX << " = alpaka::getValidWorkDiv(kernelCfg_" << fNX << ", devAcc, reluKernel,  alpaka::getPtrNative(deviceBuf_" << fNX << "), static_cast<Idx>(" << length << "));\n";
+      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fNX<<"(alpaka::Vec<Dim, Idx>::all("<<(stoi(length)+256-1)/256<<"), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX << ", reluKernel, alpaka::getPtrNative(deviceBuf_" << fNX << "), static_cast<Idx>(" << length << ")); \n";
+      return out.str();
    }
 
+   std::string GetFusableOutputTensorName() override {
+         return fNY;
+   }
+
+   void UpdateFusableTensorName(std::string fusable_tensor_name, const std::function<void(const std::string&)>& removal_func){
+      removal_func(fNX);
+      removal_func(fNY);
+      fNX = fusable_tensor_name;
+      fNY = fusable_tensor_name;
+      fInputTensorNames[0] =  fNX;
+      fOutputTensorNames[0] = fNY;
+   }
 };
 
 }//SOFIE

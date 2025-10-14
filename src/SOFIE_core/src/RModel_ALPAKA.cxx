@@ -10,13 +10,14 @@
 
 namespace SOFIE {
 
-//====================================================================
-// RModel - GPU Alpaka Codegen
-//====================================================================
-
 void RModel::GenerateInitializedTensorInfo_GPU_ALPAKA() {
-   if (!fInitializedTensors.empty())
-      fGC += "\n// temporary initialized tensors for loading weights\n";
+   if (!fInitializedTensors.empty()){
+      fGC += "\n// initialized tensors for weights\n";
+      fGC += "using BufF1D = alpaka::Buf<Acc, float, Dim, Idx>;\n";
+      fGC += "using BufD1D = alpaka::Buf<Acc, double, Dim, Idx>;\n";
+      fGC += "using BufI641D = alpaka::Buf<Acc, int64_t, Dim, Idx>;\n";
+
+   }
 
    for (auto &i : fInitializedTensors) {
       if (!fUseWeightFile || i.second.IsConstantTensor()) {
@@ -29,9 +30,9 @@ void RModel::GenerateInitializedTensorInfo_GPU_ALPAKA() {
          // case of tensors which are read from a file
          size_t length = ConvertShapeToLength(i.second.shape());
          if (i.second.type() == ETensorType::FLOAT) {
-            fGC += "auto deviceBuf_" + i.first +
-                   " = alpaka::allocBuf<float, size_t>(devAcc, " +
-                   std::to_string(length) + ");\n";
+            fGC += "BufF1D deviceBuf_" + i.first +
+                   " = alpaka::allocBuf<float, Idx>(devAcc, Ext1D::all(Idx{" +
+                   std::to_string(length) + "}));\n";
          }
       }
    }
@@ -40,7 +41,7 @@ void RModel::GenerateInitializedTensorInfo_GPU_ALPAKA() {
 void RModel::GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA()
 {
    if (!fInitializedTensors.empty())
-      fGC += "// initialized tensors\n";
+      fGC += "// temporary initialized tensors for loading weights\n";
 
    for (auto &i : fInitializedTensors) {
       if (!fUseWeightFile || i.second.IsConstantTensor()) {
@@ -53,7 +54,7 @@ void RModel::GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA()
          // case of tensors which are read from a file
          size_t length = ConvertShapeToLength(i.second.shape());
          if (i.second.type() == ETensorType::FLOAT) {
-            fGC += "float tensor_" + i.first + "[" + std::to_string(length) + "];\n";
+            fGC += "std::vector<float> tensor_" + i.first + "(" + std::to_string(length) + ");\n";
          }
       }
    }
@@ -71,23 +72,21 @@ void RModel::GenerateGPU_ALPAKA_Buffers() {
                                         ");\n";
             // No pointer allocation needed for BOOL
          }
-         if (std::find(fOutputTensorNames.begin(), fOutputTensorNames.end(), i.first) ==
-             fOutputTensorNames.end()) {
-            size_t length = ConvertShapeToLength(i.second.shape);
 
-            if (i.second.type == ETensorType::FLOAT) {
-               tensor_declaration_block += "auto bufDev_" + i.first +
-                                           " = alpaka::allocBuf<float, size_t>(devAcc," +
-                                           std::to_string(length) + ");\n";
-            } else if (i.second.type == ETensorType::DOUBLE) {
-               tensor_declaration_block += "auto bufDev_" + i.first +
-                                           " = alpaka::allocBuf<double, size_t>(devAcc," +
-                                           std::to_string(length) + ");\n";
-            } else if (i.second.type == ETensorType::INT64) {
-               tensor_declaration_block += "auto bufDev_" + i.first +
-                                           " = alpaka::allocBuf<int64_t, size_t>(devAcc," +
-                                           std::to_string(length) + ");\n";
-            }
+         size_t length = ConvertShapeToLength(i.second.shape);
+
+         if (i.second.type == ETensorType::FLOAT) {
+            tensor_declaration_block += "BufF1D deviceBuf_" + i.first +
+                                          " = alpaka::allocBuf<float, size_t>(devAcc, Ext1D::all(Idx{" +
+                                          std::to_string(length) + "}));\n";
+         } else if (i.second.type == ETensorType::DOUBLE) {
+            tensor_declaration_block += "BufD1D deviceBuf_" + i.first +
+                                          " = alpaka::allocBuf<double, size_t>(devAcc, Ext1D::all(Idx{" +
+                                          std::to_string(length) + "}));\n";
+         } else if (i.second.type == ETensorType::INT64) {
+            tensor_declaration_block += "BufI641D deviceBuf_" + i.first +
+                                          " = alpaka::allocBuf<int64_t, size_t>(devAcc, Ext1D::all(Idx{" +
+                                          std::to_string(length) + "}));\n";
          }
       }
 
@@ -123,40 +122,11 @@ void RModel::GenerateDynamicTensorInfo_GPU_ALPAKA() {
       auto length = ConvertDynamicShapeToLength(i.second.shape);
       out << SP << "if (" << length << " > 0) {\n";
       out << "auto bufDev_" + i.first +
-                 " = alpaka::allocBuf<float, size_t>(devAcc," << length << ");\n";
+                 " = alpaka::allocBuf<float, size_t>(devAcc, Ext1D::all(Idx{" << length << "}));\n";
       out << SP << "}\n";
    }
    fGC += out.str();
 }
-
-namespace {
-
-std::string createOutputTensor(RModel const &rmodel, std::string const &name, bool isIntermediateTensor)
-{
-   if(name.empty()) return "{}";
-   ETensorType eOutputType = rmodel.GetTensorType(name);
-   std::string outputType = ConvertTypeToString(eOutputType);
-   if (isIntermediateTensor) {
-
-      if (eOutputType == ETensorType::BOOL) {
-         return "fTensor_" + name;
-      } else {
-         // need to check is size is the same(don't want to return a vector with larger size)
-         // in that case better to copy
-         return "std::vector<" + ConvertTypeToString(eOutputType) + ">(tensor_" + name + ", tensor_" + name + " + " +
-                std::to_string(ConvertShapeToLength(rmodel.GetTensorShape(name))) + ")";
-      }
-   }
-   // include also dynamic tensors since the vectors can be allocated with a size larger than their output
-   // we need a special handling for bool type allocated as vector<bool>
-   auto outputLength = ConvertDynamicShapeToLength(rmodel.GetDynamicTensorShape(name));
-   if (rmodel.IsDynamicTensor(name) && eOutputType == ETensorType::BOOL) {
-      return "std::vector<bool>(fTensor_" + name + ".begin(), fTensor_" + name + ".begin() + " + outputLength + ")";
-   }
-   return "std::vector<" + outputType + ">(tensor_" + name + ", tensor_" + name + " + " + outputLength + ")";
-}
-
-} // namespace
 
 void RModel::GenerateOutput_GPU_ALPAKA() {
    if (fVerbose)
@@ -173,26 +143,9 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
 
    fGC += "\n\n";
    if (outputSize == 1) {
-      fGC += "std::vector<" + outputType + ">";
+      fGC += "alpaka::Buf<Acc, float, Dim, Idx>";
    } else {
-      for (size_t i = 1; i < outputSize; i++) {
-         if (GetTensorType(fOutputTensorNames[i]) != eOutputType)
-            sameOutputTypes = false;
-      }
-      if (sameOutputTypes) {
-         fGC += "std::vector<std::vector<" + outputType + ">>";
-      } else {
-         inferReturnType = "std::tuple<";
-         for (size_t i = 0; i < outputSize; i++) {
-            inferReturnType += "std::vector<" +
-                               ConvertTypeToString(GetTensorType(fOutputTensorNames[i])) +
-                               ">";
-            if (i < outputSize - 1)
-               inferReturnType += ",";
-         }
-         inferReturnType += ">";
-         fGC += inferReturnType;
-      }
+      throw std::runtime_error("TMVA-SOFIE: multiple output tensors are not supported in ALPAKA code generation");
    }
 
    fGC += " infer(";
@@ -205,21 +158,37 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
       fGC += (fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx)));
    }
 
-   fGC += SP + "return {";
+   fGC += "\n\n   alpaka::wait(queue);\n";
+   fGC += SP + "return ";
+   if (outputSize>1) fGC += " {";
    for (size_t i = 0; i < outputSize; i++) {
       std::string tensorName = *(fOutputTensorNames.begin() + i);
       bool isIntermediate = fIntermediateTensorInfos.count(tensorName) > 0;
-      fGC += createOutputTensor(*this, tensorName, isIntermediate);
+      fGC += "deviceBuf_"+tensorName;
       if (i < outputSize - 1)
          fGC += ",";
    }
-   fGC += "};\n";
+   if (outputSize>1) fGC += " };\n";
+   else fGC += ";\n";
    fGC += "}\n"; // end of infer function scope
 }
 
 void RModel::GenerateSessionCode_GPU_ALPAKA() {
+   
+   std::set<SOFIE::OperatorKind> registered_operators;
+
+   fGC += "\n//--- ALPAKA Kernels\n";
+   for (size_t id = 0; id < fOperators.size(); id++) {
+      std::cout<<toString(fOperators[id]->GetKind())<<std::endl;
+      if(registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+         std::cout<<"Generating ALPAKA kernel for operator"<< std::endl;
+         fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA();
+         registered_operators.insert(fOperators[id]->GetKind());
+      }
+   }
+
    // define the Session struct (for GNN this is generated in RModel_GNN)
-   fGC += "template <typename tagAcc>\n;";
+  fGC += "\n\ntemplate <typename tagAcc>\n";
    if (fUseSession) {
       if (!fIsSubGraph)
          fGC += "struct Session {\n\n";
@@ -228,11 +197,25 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    }
 
    // define host and device accelerators
-    fGC += "using Idx = alpaka::Idx<devAcc>;\n";
-    fGC += "using devAcc = alpaka::AccGpuCudaRt<alpaka::DimInt<1>, Idx, tagAcc>;\n";
-    fGC += "using hostAcc = alpaka::AccCpuSerial<alpaka::DimInt<1>, Idx>;\n\n";
+    fGC += "using Idx = std::size_t;\n";
+    fGC += "using Dim = alpaka::DimInt<1>;\n";
+    fGC += "using Acc = alpaka::TagToAcc<tagAcc, Dim, Idx>;\n";
+    fGC += "using DevAcc = alpaka::Dev<Acc>;\n";
+    fGC += "using QueueProperty = alpaka::NonBlocking;\n";
+    fGC += "using QueueAcc = alpaka::Queue<Acc, QueueProperty>;\n";
+    fGC += "\nalpaka::Platform<Acc> const platform{};\n";
+    fGC += "DevAcc devAcc = alpaka::getDevByIdx(platform, 0);\n";
+    fGC += "alpaka::PlatformCpu platformHost{};\n";
+    fGC += "alpaka::DevCpu hostAcc = alpaka::getDevByIdx(platformHost, 0);\n";
+    fGC += "QueueAcc queue{devAcc};\n";
+    fGC += "Idx threadsPerBlock = 256;\n";
+    fGC += "\nusing Ext1D = alpaka::Vec<Dim, Idx>;\n";
+    fGC += "using Vec = alpaka::Vec<Dim, Idx>;\n";
+    if (registered_operators.find(SOFIE::OperatorKind::GEMM) != registered_operators.end()) {
+         fGC += "\n\n// BLAS declarations\n";
+         fGC += "sofieBLAS<tagAcc> blas{queue};\n";
+    }
 
-   
    GenerateInitializedTensorInfo_GPU_ALPAKA();
    GenerateGPU_ALPAKA_Buffers();
    GenerateOperatorDeclarations();
@@ -282,9 +265,23 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
       for (size_t id = 0; id < fOperators.size(); id++) {
          fGC += fOperators[id]->GenerateInitCode_GPU_ALPAKA();
+         if (fOperators[id]->GetKind() == OperatorKind::GEMM){
+            fGC += "\nblas.AddLayoutConfig("+fOperators[id]->GetBlasConfig()+");";
+         }
       }
 
+      fGC += "alpaka::wait(queue);\n";
       fGC += "}\n\n";
+   }
+
+   registered_operators.clear();
+      for (size_t id = 0; id < fOperators.size(); id++) {
+      std::cout<<toString(fOperators[id]->GetKind())<<std::endl;
+      if(registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+         std::cout<<"Declaring ALPAKA kernel for operator"<< std::endl;
+         fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA();
+         registered_operators.insert(fOperators[id]->GetKind());
+      }
    }
 
    GenerateOutput_GPU_ALPAKA();
@@ -346,17 +343,17 @@ void RModel::MoveInitializedTensorsToBuffers_ALPAKA(){
          auto length = ConvertShapeToLength(i.second.shape());
          std::string slength = std::to_string(length);
          if (i.second.type() == ETensorType::FLOAT) {
-            fGC += "     auto hostBuf_"+i.first+" = alpaka::allocBuf<float, Idx>(hostAcc,"+ slength+");\n";
-            fGC += "     std::memcpy(alpaka::getPtrNative(hostBuf_"+i.first+"), tensor_"+i.first+", "+slength+"* sizeof(float));\n";
-            fGC += "     alpaka::memcpy(queue, deviceBuf_"+i.first+", hostBuf_"+i.first+", "+slength+");\n";
+            fGC += "     auto hostBuf_"+i.first+" = alpaka::allocBuf<float, Idx>(hostAcc, Ext1D::all(Idx{"+ slength+"}));\n";
+            fGC += "     std::memcpy(alpaka::getPtrNative(hostBuf_"+i.first+"), tensor_"+i.first+".data(), "+slength+"* sizeof(float));\n";
+            fGC += "     alpaka::memcpy(queue, deviceBuf_"+i.first+", hostBuf_"+i.first+");\n";
          } else if (i.second.type() == ETensorType::DOUBLE) {
-            fGC += "     auto hostBuf_"+i.first+" = alpaka::allocBuf<double, Idx>(hostAcc,"+ slength+");\n";
-            fGC += "     std::memcpy(alpaka::getPtrNative(hostBuf_"+i.first+"), tensor_"+i.first+", "+slength+"* sizeof(doub;e));";
-            fGC += "     alpaka::memcpy(queue, deviceBuf_"+i.first+", hostBuf_"+i.first+", "+slength+");\n";
+            fGC += "     auto hostBuf_"+i.first+" = alpaka::allocBuf<double, Idx>(hostAcc, Ext1D::all(Idx{"+ slength+"}));\n";
+            fGC += "     std::memcpy(alpaka::getPtrNative(hostBuf_"+i.first+"), tensor_"+i.first+".data(), "+slength+"* sizeof(double));\n";
+            fGC += "     alpaka::memcpy(queue, deviceBuf_"+i.first+", hostBuf_"+i.first+");\n";
          } else if (i.second.type() == ETensorType::INT64) {
-            fGC += "     auto hostBuf_"+i.first+" = alpaka::allocBuf<int64_t, Idx>(hostAcc,"+ slength+");\n";
-            fGC += "     std::memcpy(alpaka::getPtrNative(hostBuf_"+i.first+"), tensor_"+i.first+", "+slength+"* sizeof(int64_t));";
-            fGC += "     alpaka::memcpy(queue, deviceBuf_"+i.first+", hostBuf_"+i.first+", "+slength+");\n";
+            fGC += "     auto hostBuf_"+i.first+" = alpaka::allocBuf<int64_t, Idx>(hostAcc, Ext1D::all(Idx{" + slength + "}));\n";
+            fGC += "     std::memcpy(alpaka::getPtrNative(hostBuf_"+i.first+"), tensor_"+i.first+".data(), "+slength+"* sizeof(int64_t));";
+            fGC += "     alpaka::memcpy(queue, deviceBuf_"+i.first+", hostBuf_"+i.first+");\n";
          } else {
             std::runtime_error("tmva-sofie tensor " + tensor_name + " with type " + ConvertTypeToString(i.second.type()) + " cannot be read from a ROOT file");
          }

@@ -48,6 +48,8 @@ namespace SOFIE{
          fAttrAlpha(alpha), fAttrBeta(beta), fAttrTransA(transA), fAttrTransB(transB), fNA(UTILITY::Clean_name(nameA)),
          fNB(UTILITY::Clean_name(nameB)), fNY(UTILITY::Clean_name(nameY))
       {
+
+         fKind = OperatorKind::GEMM;
          fActivation = activation;
          fType = "float";
          static_assert(std::is_same_v<T, float>,
@@ -60,9 +62,11 @@ namespace SOFIE{
          fAttrAlpha(alpha), fAttrBeta(beta), fAttrTransA(transA), fAttrTransB(transB), fNA(UTILITY::Clean_name(nameA)),
          fNB(UTILITY::Clean_name(nameB)), fNC(UTILITY::Clean_name(nameC)), fNY(UTILITY::Clean_name(nameY)), fActivation(activation)
       {
+         fKind = OperatorKind::GEMM;
          fActivation = activation;
          fType = "float";
 
+         fInputTensorNames = { fNA, fNB, fNC };
          fOutputTensorNames = { fNY };
       }
 
@@ -252,8 +256,10 @@ namespace SOFIE{
                shapeY.erase(shapeY.end()-1);
          }
 
-         if (!fIsDynamic)
+         if (!fIsDynamic){
             model.AddIntermediateTensor(fNY, model.GetTensorType(fNA), shapeY);
+            std::cout<<"currently adding: "<<fNY;
+         }
          else
             model.AddDynamicTensor(fNY, model.GetTensorType(fNA), fShapeY);
 
@@ -279,7 +285,7 @@ namespace SOFIE{
             // include a separate scope to avoid defining unique operator temp variables
             out << "//--- broadcast bias tensor " << fNC << "for Gemm op\n";
             out << SP << "{\n";
-            out << "      float * data = SOFIE::UTILITY::UnidirectionalBroadcast<float>(tensor_"
+            out << "      float * data =  TMVA::Experimental::SOFIE::UTILITY::UnidirectionalBroadcast<float>(tensor_"
                << fNC << "," << ConvertShapeToString(fShapeC) << ", " << ConvertDynamicShapeToString(fShapeY) << ");\n";
             auto length = SOFIE::ConvertDynamicShapeToLength(fShapeY); // output size
             out << SP << SP << "std::copy(data, data + " << length << ", tensor_" << fNC2 << ");\n";
@@ -300,12 +306,13 @@ namespace SOFIE{
             // include a separate scope to avoid defining unique operator temp variables
             out << "//--- broadcast bias tensor " << fNC << "for Gemm op\n";
             out << SP << "{\n";
-            out << "      float * data = SOFIE::UTILITY::UnidirectionalBroadcast<float>(tensor_"
-               << fNC << "," << ConvertShapeToString(fShapeC) << ", " << ConvertDynamicShapeToString(fShapeY) << ");\n";
+            out << "      float * data =  TMVA::Experimental::SOFIE::UTILITY::UnidirectionalBroadcast<float>(tensor_"
+               << fNC << ".data()," << ConvertShapeToString(fShapeC) << ", " << ConvertDynamicShapeToString(fShapeY) << ");\n";
             auto length = SOFIE::ConvertDynamicShapeToLength(fShapeY); // output size
-            out << SP << SP << "auto hostBuf_"<< fNC2 << " = alpaka::allocBuf<float, size_t>(hostAcc,"+ length +");\n";
+            out << SP << SP << "auto hostBuf_"<< fNC2 << " = alpaka::allocBuf<float, Idx>(hostAcc, Ext1D::all(Idx{" << length << "}));\n";
             out << SP << SP << "std::memcpy(alpaka::getPtrNative(hostBuf_"<< fNC2 <<"), data, "<< length << " * sizeof(float));\n";
-            out << SP << SP << "alpaka::memcpy(queue, deviceBuf_"<< fNC2 << ", hostBuf_"<< fNC2 << " , "<< length << ");\n";
+            out << SP << SP << "alpaka::memcpy(queue, deviceBuf_"<< fNC2 << ", hostBuf_"<< fNC2 << ");\n";
+            out << SP << SP << "delete [] data;\n";
             out << SP << "}\n";
          }
          return out.str();
@@ -429,8 +436,8 @@ namespace SOFIE{
              throw std::runtime_error("TMVA SOFIE Gemm(MatMul) has invalid shape for inputs or output");
          }
          auto m = (fAttrTransA ? fShapeA[dimA-1].GetVal() : fShapeA[dimA-2].GetVal());
-         auto n = (fAttrTransB ? fShapeB[dimB-2].GetVal() : fShapeB[dimB-1].GetVal());
-         auto k = (fAttrTransA ? fShapeA[dimA-2].GetVal() : fShapeA[dimA-1].GetVal());
+         auto n = (fAttrTransA ? fShapeA[dimA-2].GetVal() : fShapeA[dimA-1].GetVal());
+         auto k = (fAttrTransB ? fShapeB[dimB-2].GetVal() : fShapeB[dimB-1].GetVal());
          std::vector<Dim> sY = {fShapeY[dimY-2], fShapeY[dimY-1]};
          // extra dimensions in case of stacked MatMul
          std::vector<Dim> sA;
@@ -445,8 +452,6 @@ namespace SOFIE{
          out << SP << "int " << opName << "_k = " << k << ";\n";
          out << SP << "float " << opName << "_alpha = " << std::setprecision(std::numeric_limits<float>::max_digits10) << fAttrAlpha << ";\n";
          out << SP << "float " << opName << "_beta = " << std::setprecision(std::numeric_limits<float>::max_digits10) << fAttrBeta << ";\n";
-         out << SP << "int " << opName << "_lda = " << (fAttrTransA ? m : k) << ";\n";
-         out << SP << "int " << opName << "_ldb = " << (fAttrTransB ? k : n) << ";\n";
 
          // case bias is present
          if (!fNC.empty()){
@@ -479,27 +484,35 @@ namespace SOFIE{
             out << SP;
          }
          // in the case of bias
-         if (!fNC.empty()){
-            out << SP << "std::copy(" << "tensor_" << fNC2 << ", " << "tensor_" << fNC2 << " + " << lengthGemm << ", "
-               << "tensor_" << fNY;
-            if (doStackMul) out << " + " << opName << "_yoffset";
-            out << ");\n";
+         if (!fNC.empty() && fActivation == EActivationType::RELU){
+            out << SP << "blas.gemmrelu("<<opName<<"_transA,"<<opName<<"_transB, "<<opName<<"_m, "<<opName<<"_n, "<<opName<<"_k, "<< opName << "_alpha, deviceBuf_"<<fNA<<",  "<<"deviceBuf_"<<fNB<<", "<<opName << "_beta, deviceBuf_"<<fNC<<", deviceBuf_"<<fNY<<");\n";
          }
 
-
-         if (fType == "float"){
-            out << SP << "Kokkos::View<float**, Kokkos::LayoutLeft, Kokkos::CudaSpace> kokkos_dev_"<<fNA<<"((float*)std::data(bufDev_"<<fNA<<"), "<<opName<<"_m, "<<opName<<"_k);\n";
-            out << SP << "Kokkos::View<float**, Kokkos::LayoutLeft, Kokkos::CudaSpace> kokkos_dev_"<<fNB<<"((float*)std::data(bufDev_"<<fNB<<"), "<<opName<<"_k, "<<opName<<"_n);\n";
-            out << SP << "Kokkos::View<float**, Kokkos::LayoutLeft, Kokkos::CudaSpace> kokkos_dev_"<<fNY<<"((float*)std::data(bufDev_"<<fNY<<"), "<<opName<<"_m, "<<opName<<"_n);\n";
-            out << SP << "KokkosBlas::gemm(&" << opName << "_transB, &" << opName << "_transA, "<< opName << "_alpha, kokkos_dev_" << fNA <<", kokkos_dev_" << fNB << ", " << opName << "_beta, kokkos_dev_"<<fNY<<");\n";
-
-         }
 
          return out.str();
       }
 
       std::vector<std::string> GetBlasRoutines() override { return { std::string("Gemm"), std::string("Gemv") }; }
+      std::string GetFusableOutputTensorName() override {
+         return fNY;
+      }
 
+      void UpdateFusableTensorName(std::string fusable_tensor_name, const std::function<void(const std::string&)>& removal_func){
+         removal_func(fNY);
+         fNY = fusable_tensor_name;
+         fOutputTensorNames[0] = fNY;
+      }
+
+      std::string GetBlasConfig(){
+
+         int64_t dimA = fShapeA.size();
+         int64_t dimB = fShapeB.size();
+
+         std::string m = (fAttrTransA ? fShapeA[dimA-1].GetVal() : fShapeA[dimA-2].GetVal());
+         std::string n = (fAttrTransA ? fShapeA[dimA-2].GetVal() : fShapeA[dimA-1].GetVal());
+         std::string k = (fAttrTransB ? fShapeB[dimB-2].GetVal() : fShapeB[dimB-1].GetVal());
+         return m+", "+n+", "+k;
+      }
    };
 
 

@@ -386,6 +386,55 @@ void RModel::CheckAndFlushIntermediateMemory(std::span<const std::string_view> o
    }
 }
 
+void RModel::CheckAndFuseOperators() {
+   size_t idx = 0;
+   std::vector<size_t> fusable_indices;
+   std::string fusable_propagate_tensor_name;
+   while (idx < fOperators.size()) {
+      if (fOperators[idx]->GetKind() != OperatorKind::GEMM && fOperators[idx]->GetKind() != OperatorKind::CONV) {
+          ++idx;
+          continue;
+      }
+
+      fusable_indices.clear();
+      fusable_propagate_tensor_name.clear();
+
+      fusable_indices.push_back(idx);
+      size_t j = idx + 1;
+      for (; j < fOperators.size()-1; ++j) {
+          auto opKind = fOperators[j]->GetKind();
+          // Only consider operators with fusable kinds
+          if (!FusableKinds.count(opKind)) {
+            break;
+          }
+
+          const auto& tensorName = fOperators[j]->GetFusableOutputTensorName();
+          auto freqIt = fIntermediateTensorFrequencyLookup.find(tensorName);
+
+          // Propagate tensor name only if it's not used multiple times
+          fusable_indices.push_back(j);
+          if (freqIt != fIntermediateTensorFrequencyLookup.end() &&
+          (freqIt->second != fOperators[j + 1]->GetOpOrder() ||
+           FusableKinds.count(fOperators[j + 1]->GetKind()) == 0)) {
+              fusable_propagate_tensor_name = tensorName;
+              break;
+          }
+      }
+      if (!fusable_propagate_tensor_name.empty()) {
+         auto fusable_tensor_type = GetTensorType(fusable_propagate_tensor_name);
+         auto fusable_tensor_shape = GetDynamicTensorShape(fusable_propagate_tensor_name);
+          for (auto& index : fusable_indices) {
+            fOperators[index]->UpdateFusableTensorName(fusable_propagate_tensor_name, [this](const std::string& name) {
+               this->RemoveIntermediateTensor(name);
+           });
+          }
+          AddIntermediateTensor(fusable_propagate_tensor_name, fusable_tensor_type, fusable_tensor_shape);
+      }
+
+      idx = std::max(idx + 1, j);
+   }
+}
+
 
 
 void RModel::Initialize(int batchSize, bool verbose) {
@@ -494,7 +543,7 @@ void RModel::Initialize(const std::map<std::string, size_t> & inputParams, bool 
       }
       i++;
    }
-
+   CheckAndFuseOperators();
    fIsInitialized = true;
 }
 
@@ -653,14 +702,15 @@ std::string RModel::GenerateInferSignature(bool isdecl) {
             }
          }
       }
+      rGC += "alpaka::Buf<Acc, ";
       if (isdecl) {
          std::string type = ConvertTypeToString(GetTensorType(name));
          if (type == "other")
             throw std::runtime_error("TMVA-SOFIE: input tensor " + name +
                                      " is of a data type which is not yet supported.");
-         rGC += type + "* ";
+         rGC += type + ", Dim, Idx> ";
       }
-      rGC += "tensor_" + name + ",";
+      rGC += "deviceBuf_" + name + ",";
       i_input++;
    }
 
