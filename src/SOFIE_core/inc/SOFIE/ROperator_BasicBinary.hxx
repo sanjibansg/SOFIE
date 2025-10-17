@@ -390,29 +390,105 @@ public:
 
    std::string Generate_GPU_Kernel_ALPAKA() override {
       std::string op;
-      op = "\n//------ BINARY_"+BinaryOperatorTrait<T, Op>::Name()+"_KERNEL_ALPAKA\n";
+      op = "\n//------ "+opName+"_"+BinaryOperatorTrait<T, Op>::Name()+"_KERNEL_ALPAKA\n";
       op += SP + "struct Binary"+BinaryOperatorTrait<T, Op>::Name()+"Kernel {\n";
       op += SP + SP + "template<typename TAcc, typename T>\n";
-      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * A, T const * B, T * C, const size_t * shape_A, const size_t * shape_B,\n";
-      op += SP + SP + SP + "const size_t * shape_C, const size_t * strides_A, const size_t * strides_B, const size_t * strides_C, size_t ndim) const{\n";
-      op += SP + SP + SP + SP + "size_t threadIdx1 = alpaka::getIdx<Dim, alpaka::Block, alpaka::Threads>(acc)[0];\n"; 
-      op += SP + SP + SP + SP + "size_t blockIdx1  = alpaka::getIdx<Dim, alpaka::Grid, alpaka::Blocks>(acc)[0];\n";
-      op += SP + SP + SP + SP + "size_t blockDim1  = alpaka::getWorkDiv<Dim, alpaka::Threads>(acc)[0];\n\n";
-      op += SP + SP + SP + SP + "size_t outer_dim = blockIdx1;\n";
-      op += SP + SP + SP + SP + "size_t inner_start = threadIdx1;\n";
-      op += SP + SP + SP + SP + "size_t inner_stride = blockDim1;\n";
-      op += SP + SP + SP + SP + "if (outer_dim >= shape_C[0]) return;\n\n";
-      op += SP + SP + SP + SP + "size_t idx_A[ndim], idx_B[ndim];\n\n";
-      op += SP + SP + SP + SP + "size_t flat_idx_A = 0, flat_idx_B = 0, flat_idx_C = 0;\n\n";
-      op += SP + SP + SP + SP + "for(size_t inner = inner_start; inner < shape_C[1]; inner += inner_stride){\n";
-      op += SP + SP + SP + SP + "for(size_t tensor_idx=0; tensor_idx<ndim; ++tensor_idx){\n";
-      op += SP + SP + SP + SP + SP + "size_t idx_A[tensor_idx] = (shape_A[tensor_idx] == 1) ? 0 : outer_dim;\n";
-      op += SP + SP + SP + SP + SP + "size_t idx_B[tensor_idx] = (shape_B[tensor_idx] == 1) ? 0 : outer_dim;\n";
-      op += SP + SP + SP + SP + SP + "flat_idx_A += idx_A[tensor_idx]*strides_A[tensor_idx];\n";
-      op += SP + SP + SP + SP + SP + "flat_idx_B += idx_B[tensor_idx]*strides_B[tensor_idx];\n";
-      op += SP + SP + SP + SP + SP + "flat_idx_C += outer*strides_B[tensor_idx];\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * A, T const * B, T * C,\n";
+      for( size_t i=0; i<fDimShapeY.size(); i++){
+         op += SP + SP + SP + "const size_t size_" + std::to_string(i) + ",\n";
+      }
+      op += SP + SP + SP + ") const{\n";
+      op += SP + SP + SP + SP + "auto elements = alpaka::uniformElementsND(acc, alpaka::Vec<" + std::to_string(fDimShapeY.size()) + ", std::size_t>(";
+      for (size_t i = 0; i < fDimShapeY.size(); i++) {
+         op += "size_" + std::to_string(i);
+      }
+      op.pop_back();
+      op += "));\n";
 
+      op += SP + SP + SP + SP + "for (auto const& elem : elements) {\n";
 
+      auto stridesA = UTILITY::ComputeStrideFromShape(fDimShapeA);
+      auto stridesB = UTILITY::ComputeStrideFromShape(fDimShapeB);
+      auto stridesY = UTILITY::ComputeStrideFromShape(fDimShapeY);
+
+      std::string compute_idx_A, compute_idx_B, compute_idx_Y;
+      if (fDimShapeA.empty() ||
+          std::all_of(fDimShapeA.begin(), fDimShapeA.end(), [](Dim d) { return d.dim == 1 || d.GetVal() == "1"; })) {
+         compute_idx_A = "0";
+      } else {
+         for (size_t i = 0; i < fDimShapeA.size(); ++i) {
+            if (fDimShapeA[i].dim == 1 || fDimShapeA[i].GetVal() == "1")
+               continue;
+            compute_idx_A += "elem[" + std::to_string(i + (fDimShapeY.size() - fDimShapeA.size())) + "]";
+            if (stridesA[i].GetVal() != "1")
+               compute_idx_A += " * " + stridesA[i].GetVal();
+            compute_idx_A += " + ";
+         }
+         // remove last 3 character " + "
+         for (int j = 0; j < 3; j++)
+            compute_idx_A.pop_back();
+      }
+      if (fDimShapeB.empty() ||
+          std::all_of(fDimShapeB.begin(), fDimShapeB.end(), [](Dim d) { return d.dim == 1 || d.GetVal() == "1"; })) {
+         compute_idx_B = "0";
+      } else {
+         for (size_t i = 0; i < fDimShapeB.size(); ++i) {
+            if (fDimShapeB[i].dim == 1 || fDimShapeB[i].GetVal() == "1")
+               continue;
+            compute_idx_B += "elem[" + std::to_string(i + (fDimShapeY.size() - fDimShapeB.size())) + "]";
+            if (stridesB[i].GetVal() != "1")
+               compute_idx_B += " * " + stridesB[i].GetVal();
+            compute_idx_B += " + ";
+         }
+          // remove last 3 character " + "
+         for (int j = 0; j < 3; j++)
+            compute_idx_B.pop_back();
+      }
+      int nloop = 0;
+      if (fDimShapeY.empty() ||
+          std::all_of(fDimShapeY.begin(), fDimShapeY.end(), [](Dim d) { return d.dim == 1 || d.GetVal() == "1"; })) {
+         compute_idx_Y = "0";
+      } else {
+         for (size_t i = 0; i < fDimShapeY.size(); ++i) {
+            if (fDimShapeY[i].dim != 1 && fDimShapeY[i].GetVal() != "1") {
+               nloop++;
+               for (int j = 0; j < nloop; j++) out << SP;
+               compute_idx_Y += "elem[" + std::to_string(i) + "]";
+               if (stridesY[i].GetVal() != "1")
+                  compute_idx_Y += " * " + stridesY[i].GetVal();
+               compute_idx_Y += " + ";
+            }
+         }
+         // remove last 3 characters " + "
+         for (int j = 0; j < 3; j++)
+            compute_idx_Y.pop_back();
+      }
+      for (int j = 0; j < nloop + 1; j++) out << SP;
+      out << "C[" << compute_idx_Y << "] = "
+          << BinaryOperatorTrait<T, Op>::Op("A[" + compute_idx_A + "]",
+                                            "B[" + compute_idx_B + "]")
+          << " ;\n";
+
+      for (int i = nloop; i > 0; i--) {
+         for (int j = 0; j < i; j++) out << SP;
+         out << "}\n";
+      }
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA() override {
+      return SP + "Binary"+BinaryOperatorTrait<T, Op>::Name()+"Kernel " + OpName + "Kernel;\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string OpName) override {
+      if (fShape.empty()) {
+         throw std::runtime_error("TMVA SOFIE Operator Basic Binary called to Generate without being initialized first");
+      }
+      std::stringstream out;
+      auto length = ConvertDynamicShapeToLength(fShape);
+      out << "\n//------ "+OpName+"_ALPAKA\n";
+      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fNX<<"(alpaka::Vec<Dim, Idx>::all("<<(stoi(length)+256-1)/256<<"), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX << ", " << OpName << "Kernel, alpaka::getPtrNative(deviceBuf_" << fNA << "), alpaka::getPtrNative(deviceBuf_"<<fNB<<"), alpaka::getPtrNative(deviceBuf_"<<fNC<<")); \n";
+      return out.str();
    }
 
    std::vector<std::string> GetStdLibs() override
