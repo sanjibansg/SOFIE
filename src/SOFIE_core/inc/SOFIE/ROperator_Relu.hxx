@@ -91,10 +91,6 @@ public:
       std::stringstream out;
       auto length = ConvertDynamicShapeToLength(fShape);
       out << "\n//------ RELU_GPU_ALPAKA\n";
-      // out << SP << "Vec elementsPerThread_" << fNX << " = static_cast<Idx>(1);\n";
-      // out << SP << "Vec elementsPerGrid_" << fNX << " = static_cast<Idx>(" << length << ");\n";
-      // out << SP << "alpaka::KernelCfg<Acc> kernelCfg_" << fNX << " = {elementsPerGrid_" << fNX << ", elementsPerThread_" << fNX << "};\n";
-      // out << SP << "auto workDiv_" << fNX << " = alpaka::getValidWorkDiv(kernelCfg_" << fNX << ", devAcc, reluKernel,  alpaka::getPtrNative(deviceBuf_" << fNX << "), static_cast<Idx>(" << length << "));\n";
       out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fNX<<"(alpaka::Vec<Dim, Idx>::all("<<(stoi(length)+256-1)/256<<"), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
       out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX << ", reluKernel, alpaka::getPtrNative(deviceBuf_" << fNX << "), static_cast<Idx>(" << length << ")); \n";
       return out.str();

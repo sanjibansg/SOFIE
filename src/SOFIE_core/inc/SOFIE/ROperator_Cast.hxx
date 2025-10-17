@@ -90,6 +90,36 @@ public:
       return out.str();
    }
 
+   std::string Generate_GPU_Kernel_ALPAKA() override {
+      std::string op;
+      op = "\n//------ CAST_KERNEL_ALPAKA\n";
+      op += SP + "struct CastKernel{\n";
+      op += SP + SP + "template<typename TAcc, typename SrcT, typename DstT>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, SrcT const * src, DstT * dst, std::size_t numElements) const {\n";
+      op += SP + SP + SP + "for (auto i : alpaka::uniformElements(acc, numElements)) {\n";
+      op += SP + SP + SP + "dst[i] = static_cast<DstT>(src[i]);\n";
+      op += SP + SP + "}\n";
+      op += SP + "}\n};\n";
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA() override {
+      return SP + "CastKernel castKernel;\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string OpName) override {
+      OpName = "op_" + OpName;
+      if (fShape.empty()) {
+         throw std::runtime_error("TMVA SOFIE Operator Cast called to Generate without being initialized first");
+      }
+      std::stringstream out;
+      auto length = ConvertDynamicShapeToLength(fShape);
+      out << "\n//------ CAST_GPU_ALPAKA\n";
+      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fNX<<"(alpaka::Vec<Dim, Idx>::all("<<(stoi(length)+256-1)/256<<"), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX << ", castKernel, alpaka::getPtrNative(deviceBuf_" << fNX << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), static_cast<Idx>(" << length << ")); \n";
+      return out.str();
+   }
+
 };
 
 }//SOFIE
