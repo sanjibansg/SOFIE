@@ -244,6 +244,35 @@ public:
           << ");\n";
       return out.str();
    }
+
+   
+   std::string Generate_GPU_ALPAKA(std::string opName) override {
+      if (fIsOutputConstant) return "";  //no op for constant tensors
+
+      OpName = "op_" + OpName;
+
+      // output of reshape is same as input
+      size_t length = ConvertShapeToLength(fShapeOutput);
+      if (length != ConvertShapeToLength(fShapeInput)) {
+         throw std::runtime_error("TMVA SOFIE Reshape Op : wrong output shape - is " +
+                                  ConvertShapeToString(fShapeOutput) + " and input is " +
+                                  ConvertShapeToString(fShapeInput));
+      }
+      std::stringstream out;
+      std::string opName = "Reshape";
+      if (fOpMode == Flatten)
+         opName = "Flatten";
+      else if (fOpMode == Squeeze)
+         opName = "Squeeze";
+      else if (fOpMode == Unsqueeze)
+         opName = "Unsquueze";
+      
+
+      out << SP << "///-------" << opName << " operator\n" << std::endl;
+      out << SP << "alpaka::memcpy(queue, deviceBuf_" << fNOutput << ", deviceBuf_" << fNData << ");\n";
+      return out.str();
+   }
+
 };
 
 }//SOFIE

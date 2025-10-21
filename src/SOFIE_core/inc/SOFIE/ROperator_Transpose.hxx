@@ -165,6 +165,18 @@ public:
       return out.str();
    }
 
+   std::string Generate_GPU_Kernel_ALPAKA() override {
+      std::string op;
+      op = "\n//------ TRANSPOSE_KERNEL_ALPAKA\n";
+      op += SP + "struct TransposeKernel{\n";
+      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * input, T const * output, std::size_t * shape, std::size_t * strides) const {\n";
+      op += SP + SP + SP + "for (auto i : alpaka::uniformElementsND(acc, shape)) {\n";
+      op += SP + SP + SP + SP + "size_t input_idx = 0;\n";
+
+      return op;
+   }
+
 
 };
 
