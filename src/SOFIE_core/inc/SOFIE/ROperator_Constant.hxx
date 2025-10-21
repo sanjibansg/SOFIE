@@ -101,6 +101,11 @@ public:
       // no code to generate here. Tensor are defined in Session constructor
       return "//---------------------------------------\n";
    }
+
+   std::string Generate_GPU_ALPAKA(std::string /* OpName */) override {
+      // no code to generate here. Tensor are defined in Session constructor
+      return "//---------------------------------------\n";
+   }
 };
 
 }//SOFIE
