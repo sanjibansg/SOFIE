@@ -101,6 +101,26 @@ public:
       return out.str();
    }
 
+   std::string Generate_GPU_ALPAKA(std::string OpName) override {
+      // no need to generate code if the output is constant
+      if (fIsOutputConstant) return "";
+
+      OpName = "op_" + OpName;
+      if (fShape.empty()) {
+         throw std::runtime_error("TMVA SOFIE Shape op called to Generate without being initialized first");
+      }
+      std::stringstream out;
+
+      out << "\n//------ Shape\n";
+      // add a dummy statement to avoid warning for unused input
+      out << SP << "(void) deviceBuf_" << fNX << ";\n";
+      size_t length = ConvertShapeToLength(fOutput_shape);
+      for (size_t id = 0; id < length; id++) {
+         out << SP << "deviceBuf_" << fNY << "["<< id << "] = " << fShape[fStart+id] << ";\n";
+      }
+      return out.str();
+   }
+
 };
 
 }//SOFIE
