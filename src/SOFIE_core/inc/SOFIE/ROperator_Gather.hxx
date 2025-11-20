@@ -212,6 +212,77 @@ public:
       return out.str();
    }
 
+      std::string Generate_GPU_Kernel_ALPAKA() override {
+      std::string op;
+      op = "\n//------ GATHER_KERNEL_ALPAKA\n";
+      op += SP + "struct GatherKernel {\n";
+      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * input, T const * indices, T * output, std::size_t const * output_shape, std::size_t const axis, std::size_t const axisDim, std::size_t const indicesNumElements, std::size_t const * output_strides, std::size_t const * input_strides, std::size_t const ndim) const {\n";
+      op += SP + SP + SP + SP + "auto elements = alpaka::uniformElementsND(acc, alpaka::Vec<ndim, std::size_t>(output_shape));\n";
+      op += SP + SP + SP + SP + "for (auto const& elem : elements) {\n";
+      
+      // find flattened index for indices tensor
+      op += SP + SP + SP + SP + "int64_t idxLinear = 0;\n{\n";
+      op += SP + SP + SP + SP + SP + "int64_t stride = 1;\n";
+      op += SP + SP + SP + SP + SP + "for (int i = ndim - 1; i >= axis; --i) {;\n";
+      op += SP + SP + SP + SP + SP + "stride *= (i > axis ? output_shape[i] : 1);\n}\n";
+      op += SP + SP + SP + SP + SP + "idxLinear = elem[axis];\n";
+      op += SP + SP + SP + SP + SP + "if (idxLinear >= indicesNumElements) idxLinear %= indicesNumElements;\n}\n";
+
+      // load gather index and wrap negative if any
+      op += SP + SP + SP + SP + "int64_t k = indices[idxLinear];\n";
+      op += SP + SP + SP + SP + "if (k < 0) k += axisDim;\n";
+      op += SP + SP + SP + SP + "if (k < 0) k = 0;\n";
+      op += SP + SP + SP + SP + "if (k >= axisDim) k = axisDim - 1;\n";
+
+      // compute input flattened index
+      op += SP + SP + SP + SP + "size_t input_idx = 0;\n";
+      op += SP + SP + SP + SP + "size_t output_idx = 0;\n";
+      op += SP + SP + SP + SP + "for (int i = 0; i < ndim; ++i) {\n";
+      op += SP + SP + SP + SP + SP + "size_t coord = elem[i];\n";
+      op += SP + SP + SP + SP + SP + "output_idx += coord * output_strides[i];\n}\n";
+      op += SP + SP + SP + SP + SP + "if (i == axis) coord = k;\n";
+      op += SP + SP + SP + SP + SP + "input_idx += coord * input_strides[i];\n}\n";
+
+      // write to output tensor
+      op += SP + SP + SP + SP + "output[output_idx] = input[input_idx];\n";
+      op += SP + SP + SP + SP + "}\n";
+      op += SP + SP + "}\n";
+      op += SP + "};\n";   
+
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA() override {
+      return SP + "GatherKernel gatherKernel;\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string OpName) override {
+      OpName = "op_" + OpName;
+      if (fShape.empty()) {
+         throw std::runtime_error("TMVA SOFIE Operator Gather called to Generate without being initialized first");
+      }
+
+      std::stringstream out;
+      auto length = ConvertDynamicShapeToLength(fShapeY);
+      out << "\n//------ GATHER_GPU_ALPAKA\n";
+      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_" << fNY
+         << "(alpaka::Vec<Dim, Idx>::all((" << length << " + 256 - 1) / 256), "
+         << "alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
+
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNY
+         << ", gatherKernel, alpaka::getPtrNative(deviceBuf_" << fNX
+         << "), alpaka::getPtrNative(deviceBuf_" << fNIndices
+         << "), alpaka::getPtrNative(deviceBuf_" << fNY
+         << "), "<< UTILITY::ConvertShapeToString(fShapeY) <<", "<< fAttrAxis <<", "<< fShapeX[fAttrAxis] <<", "
+         << fShapeIndices.size() <<", "
+         << UTILITY::ConvertShapeToString(ComputeStrideFromShape(fShapeY)) <<", "
+         << UTILITY::ConvertShapeToString(ComputeStrideFromShape(fShapeX)) <<", "<< fShapeY.size()
+         << ",static_cast<Idx>(" << length << "));\n";
+
+      return out.str();
+   }
+
 };
 
 }//SOFIE

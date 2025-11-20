@@ -122,6 +122,60 @@ public:
       return out.str();
    }
 
+   std::string Generate_GPU_Kernel_ALPAKA() override {
+      std::string op;
+      op = "\n//------ Expand_KERNEL_ALPAKA\n";
+      op += SP + "struct ExpandKernel {\n";
+      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * input, T * output, const size_t * input_shape, const size_t * output_shape, const size_t * input_strides, const size_t * output_strides, const size_t ndim){\n";
+      op += SP + SP + SP + SP + "size_t input_idx = 0;\n";
+      op += SP + SP + SP + SP + "size_t output_idx = 0;\n";
+      op += SP + SP + SP + SP + "size_t coord_out;\n";
+      op += SP + SP + SP + SP + "size_t coord_in;\n";
+      op += SP + SP + SP + SP + "auto elements = alpaka::uniformElementsND(acc, alpaka::Vec<ndim, std::size_t>(output_shape));\n";
+      op += SP + SP + SP + SP + "for (auto const& elem : elements) {\n";
+      op += SP + SP + SP + SP + "input_idx = 0;\n";
+      op += SP + SP + SP + SP + "output_idx = 0;\n";
+      op += SP + SP + SP + SP + "for (int i = 0; i < ndim; ++i) {\n";
+      op += SP + SP + SP + SP + SP + "coord_out = elem[i];\n";
+      op += SP + SP + SP + SP + SP + "coord_in = (input_shape[i] == 1) ? 0 : coord_out;\n";
+      op += SP + SP + SP + SP + SP + "input_idx += coord_in * input_strides[i];\n}\n";
+      op += SP + SP + SP + SP + SP + "output_idx += coord_out * output_strides[i];\n}\n";
+      op += SP + SP + SP + SP + SP + "output[output_idx] = input[input_idx];\n";
+      op += SP + SP + SP + SP + "}\n";
+      op += SP + SP + "}\n";
+      op += SP + "};\n";
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA() override {
+      return SP + "ExpandKernel expandKernel;\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string OpName) override {
+      OpName = "op_" + OpName;
+      if (fShape.empty()) {
+         throw std::runtime_error("TMVA SOFIE Operator Expand called to Generate without being initialized first");
+      }
+
+      std::stringstream out;
+      auto length = ConvertDynamicShapeToLength(fShape);
+      out << "\n//------ EXPAND_GPU_ALPAKA\n";
+      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_" << fNX
+         << "(alpaka::Vec<Dim, Idx>::all((" << length << " + 256 - 1) / 256), "
+         << "alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
+
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX
+         << ", expandKernel, alpaka::getPtrNative(deviceBuf_" << fNX
+         << "), alpaka::getPtrNative(deviceBuf_" << fNY
+         << "), "<< UTILITY::ConvertShapeToString(fShapeX) <<", "<<UTILITY::ConvertShapeToString(fShapeY)<<", "<<UTILITY::ConvertShapeToString(ComputeStrideFromShape(fShapeX))<<", "
+         << UTILITY::ConvertShapeToString(ComputeStrideFromShape(fShapeX))<<", "<<fShapeY.length()<<");\n";
+
+      return out.str();
+   }
+
+
+
 };
 
 }//SOFIE

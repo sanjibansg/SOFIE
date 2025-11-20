@@ -141,6 +141,56 @@ public:
       out << "}\n";  // end of scope
       return out.str();
    }
+
+   std::string Generate_GPU_Kernel_ALPAKA() override {
+      std::string op;
+      op = "\n//------ TILE_KERNEL_ALPAKA\n";
+      op += SP + "struct TileKernel {\n";
+      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * __restrict__ tensor_X,";
+      op += SP + SP + SP + "T * __restrict__ tensor_Y, const int64_t * __restrict__ shape_X,";
+      op += SP + SP + SP + "const int64_t * __restrict__ stride_X, const int64_t * __restrict__ shape_Y,";
+      op += SP + SP + SP + "const int64_t * __restrict__ stride_Y, std::size_t const ndim) const {\n";
+      op += SP + SP + SP + SP + "auto elements = alpaka::uniformElementsND(acc, alpaka::Vec<ndim, std::size_t>(shape_Y));\n";
+      op += SP + SP + SP + SP + "for (auto const& elem: elements) {\n";
+      op += SP + SP + SP + SP + SP + "size_t input_idx = 0;\n";
+      op += SP + SP + SP + SP + SP + "size_t output_idx = 0;\n";
+      op += SP + SP + SP + SP + SP + "for (int i = 0; i < ndim; ++i) {\n";
+      op += SP + SP + SP + SP + SP + SP + "size_t input_coord = elem[i] % shape_X[i];\n";
+      op += SP + SP + SP + SP + SP + SP + "input_idx += input_coord * stride_X[i];\n";
+      op += SP + SP + SP + SP + SP + "output_idx += elem[i] * stride_Y[i];\n}\n";
+      op += SP + SP + SP + SP + SP + "tensor_Y[output_idx] = tensor_X[input_idx];\n";
+      op += SP + SP + SP + SP + "}\n";
+      op += SP + SP + "}\n";
+      op += SP + "};\n";
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA() override {
+      return SP + "TileKernel tileKernel;\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string OpName) override {
+      OpName = "op_" + OpName;
+      if (fShape.empty()) {
+         throw std::runtime_error("TMVA SOFIE Operator Tile called to Generate without being initialized first");
+      }
+      std::stringstream out;
+      auto length = ConvertDynamicShapeToLength(fShapeY);
+      out << "\n//------ TILE_GPU_ALPAKA\n";
+      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_" << fNY
+            << "(alpaka::Vec<Dim, Idx>::all((" << length << " + 256 - 1) / 256), "
+            << "alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
+
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNY
+         << ", tileKernel, alpaka::getPtrNative(deviceBuf_" << fNInput
+         << "), alpaka::getPtrNative(deviceBuf_" << fNY
+         << "), "<< UTILITY::ConvertShapeToString(fShapeInput)<<", "<< UTILITY::ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeInput)) <<", "
+         <<UTILITY::ConvertShapeToString(fShapeY)<<", "<<UTILITY::ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeY))<<", "<<fNY.length()<<");\n";
+
+      return out.str();
+   }
+
 };
 
 }//SOFIE

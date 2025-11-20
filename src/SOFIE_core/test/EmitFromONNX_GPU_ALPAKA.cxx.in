@@ -1,0 +1,24 @@
+// Author: Sanjiban Sengupta
+
+#include "SOFIE/RModel_Base.hxx"
+#include "SOFIE/RModel.hxx"
+#include "SOFIE/RModelParser_ONNX.hxx"
+
+using namespace SOFIE;
+
+int EmitModel(std::string filename, std::string outname) {
+
+   RModelParser_ONNX parser;
+   RModel model = parser.Parse(filename);
+   model.GenerateGPU_ALPAKA();
+   model.OutputGenerated(outname+"_FromONNX.hxx");
+
+   return 0;
+}
+
+int main(int argc, char *argv[]){
+
+@EMIT_CAPTURES@ ;
+
+}
+

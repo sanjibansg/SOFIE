@@ -484,10 +484,10 @@ public:
          throw std::runtime_error("TMVA SOFIE Operator Basic Binary called to Generate without being initialized first");
       }
       std::stringstream out;
-      auto length = ConvertDynamicShapeToLength(fShape);
+      auto length = ConvertDynamicShapeToLength(fShapeY);
       out << "\n//------ "+OpName+"_ALPAKA\n";
-      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fNX<<"(alpaka::Vec<Dim, Idx>::all("<<(stoi(length)+256-1)/256<<"), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX << ", " << OpName << "Kernel, alpaka::getPtrNative(deviceBuf_" << fNA << "), alpaka::getPtrNative(deviceBuf_"<<fNB<<"), alpaka::getPtrNative(deviceBuf_"<<fNC<<")); \n";
+      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fNY<<"(alpaka::Vec<Dim, Idx>::all("<<(stoi(length)+256-1)/256<<"), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNY << ", " << OpName << "Kernel, alpaka::getPtrNative(deviceBuf_" << fNA << "), alpaka::getPtrNative(deviceBuf_"<<fNB<<"), alpaka::getPtrNative(deviceBuf_"<<fNC<<")); \n";
       return out.str();
    }
 
