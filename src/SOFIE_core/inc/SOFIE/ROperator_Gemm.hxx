@@ -152,7 +152,7 @@ namespace SOFIE{
             }
          }
          if (model.IsDynamicTensor(fNA) || model.IsDimInputTensor(fNA) ) {
-            fShapeA = model.GetDynamicTensorShape(fNA);
+            fShapeA = model.GetDimTensorShape(fNA);
             fIsDynamic = true;
          } else {
             auto shapeA_int = model.GetTensorShape(fNA);
@@ -166,7 +166,7 @@ namespace SOFIE{
          }
 
          if (model.IsDynamicTensor(fNB) || model.IsDimInputTensor(fNB)) {
-            fShapeB = model.GetDynamicTensorShape(fNB);
+            fShapeB = model.GetDimTensorShape(fNB);
             fIsDynamic = true;
          }
          else {
@@ -195,7 +195,7 @@ namespace SOFIE{
          if (!fIsDynamic) {
             shapeY = ConvertShapeToInt(fShapeY);
             if (shapeY.empty()) {
-               throw std::runtime_error("TMVA SOFIE Gemm Op " + fNY + " has invalid shape" + ConvertDynamicShapeToString(fShapeY));
+               throw std::runtime_error("TMVA SOFIE Gemm Op " + fNY + " has invalid shape" + ConvertDimShapeToString(fShapeY));
             }
          }
 
@@ -266,7 +266,7 @@ namespace SOFIE{
          if (model.Verbose()){
             std::cout << "Gemm (or MatMul) " << " ---> " << fNY << " shape ";
             if (fIsDynamic)
-               std::cout << ConvertDynamicShapeToString(fShapeY) << std::endl;
+               std::cout << ConvertDimShapeToString(fShapeY) << std::endl;
             else
                std::cout << ConvertShapeToString(shapeY) << std::endl;
          }
@@ -285,9 +285,9 @@ namespace SOFIE{
             // include a separate scope to avoid defining unique operator temp variables
             out << "//--- broadcast bias tensor " << fNC << "for Gemm op\n";
             out << SP << "{\n";
-            out << "      float * data =  TMVA::Experimental::SOFIE::UTILITY::UnidirectionalBroadcast<float>(tensor_"
-               << fNC << "," << ConvertShapeToString(fShapeC) << ", " << ConvertDynamicShapeToString(fShapeY) << ");\n";
-            auto length = SOFIE::ConvertDynamicShapeToLength(fShapeY); // output size
+            out << "      float * data =  SOFIE::UTILITY::UnidirectionalBroadcast<float>(tensor_"
+               << fNC << "," << ConvertShapeToString(fShapeC) << ", " << ConvertDimShapeToString(fShapeY) << ");\n";
+            auto length = SOFIE::ConvertDimShapeToLength(fShapeY); // output size
             out << SP << SP << "std::copy(data, data + " << length << ", tensor_" << fNC2 << ");\n";
             out << SP << SP << "delete [] data;\n";
             out << SP << "}\n";
@@ -306,9 +306,9 @@ namespace SOFIE{
             // include a separate scope to avoid defining unique operator temp variables
             out << "//--- broadcast bias tensor " << fNC << "for Gemm op\n";
             out << SP << "{\n";
-            out << "      float * data =  TMVA::Experimental::SOFIE::UTILITY::UnidirectionalBroadcast<float>(tensor_"
-               << fNC << ".data()," << ConvertShapeToString(fShapeC) << ", " << ConvertDynamicShapeToString(fShapeY) << ");\n";
-            auto length = SOFIE::ConvertDynamicShapeToLength(fShapeY); // output size
+            out << "      float * data = SOFIE::UTILITY::UnidirectionalBroadcast<float>(tensor_"
+               << fNC << ".data()," << ConvertShapeToString(fShapeC) << ", " << ConvertDimShapeToString(fShapeY) << ");\n";
+            auto length = SOFIE::ConvertDimShapeToLength(fShapeY); // output size
             out << SP << SP << "auto hostBuf_"<< fNC2 << " = alpaka::allocBuf<float, Idx>(hostAcc, Ext1D::all(Idx{" << length << "}));\n";
             out << SP << SP << "std::memcpy(alpaka::getPtrNative(hostBuf_"<< fNC2 <<"), data, "<< length << " * sizeof(float));\n";
             out << SP << SP << "alpaka::memcpy(queue, deviceBuf_"<< fNC2 << ", hostBuf_"<< fNC2 << ");\n";

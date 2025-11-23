@@ -1,9 +1,9 @@
 #ifndef SOFIE_ROPERATOR_BatchNormalization
 #define SOFIE_ROPERATOR_BatchNormalization
 
-#include "SOFIE_common.hxx"
-#include "ROperator.hxx"
-#include "RModel.hxx"
+#include "SOFIE/SOFIE_common.hxx"
+#include "SOFIE/ROperator.hxx"
+#include "SOFIE/RModel.hxx"
 
 
 #include <cmath>

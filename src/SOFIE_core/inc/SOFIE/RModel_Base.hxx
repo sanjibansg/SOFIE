@@ -27,6 +27,15 @@ enum class Options {
    kGNNComponent = 0x10,
 };
 
+// Optimization levels inspired by ONNXRuntime.
+// We only get Operator Fusion with the Basic, and
+// memory reuse with Extended. kExtended is enabled
+// by default
+enum class OptimizationLevel {
+   kBasic = 0x0,
+   kExtended = 0x1,
+};
+
 enum class WeightFileType { None, RootBinary, Text };
 
 
@@ -59,6 +68,43 @@ protected:
    bool fUseSession = true;
    bool fIsGNN = false;
    bool fIsGNNComponent = false;
+
+   // Function to generate the code for declaring and initializing constant tensors
+   // This is for tensors which are not part of weight files and can be created from the Constant operator
+   template <typename T>
+   std::string GenerateConstantTensorCode(const std::pair<std::string, InitializedTensor> &t)
+   {
+      std::stringstream strs;
+      std::string type = ConvertTypeToString(t.second.type());
+      size_t length = ConvertShapeToLength(t.second.shape());
+      // avoid using stack sizes for constant tensors to reduce compilation time
+      bool allocateOnStack = (length > 100) ? false : true;
+
+      const T *data = t.second.data<T>();
+
+      // and check if all values are the same
+      bool sameData = false;
+      // for non stack allocation check if data are the same
+      if (!allocateOnStack && length > 1) {
+         size_t idx = 1;
+         do {
+            sameData = (data[idx] == data[idx - 1]);
+            idx++;
+         } while (sameData && idx < length);
+      }
+      if (allocateOnStack) {
+         strs << type << " tensor_" << t.first << "[" << length << "] = " << ConvertValuesToString(length, data) << ";\n";
+      } else {
+         strs << "std::vector<" << type << "> fTensor_" << t.first << " = ";
+         if (sameData)
+            strs << "std::vector<" << type << ">(" << length << ", " << ConvertValToString(data[0]) << ");\n";
+         else {
+            strs << ConvertValuesToString(length, data) << ";\n";
+         }
+         strs << "const " << type << " * tensor_" + t.first + " = fTensor_" + t.first + ".data();\n";
+      }
+      return strs.str();
+   }
 
 public:
    /**

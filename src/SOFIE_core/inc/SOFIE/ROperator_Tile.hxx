@@ -142,7 +142,7 @@ public:
       return out.str();
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA() override {
+   std::string Generate_GPU_Kernel_ALPAKA() {
       std::string op;
       op = "\n//------ TILE_KERNEL_ALPAKA\n";
       op += SP + "struct TileKernel {\n";
@@ -166,17 +166,17 @@ public:
       return op;
    }
 
-   std::string Generate_GPU_Kernel_Definitions_ALPAKA() override {
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) override {
       return SP + "TileKernel tileKernel;\n";
    }
 
    std::string Generate_GPU_ALPAKA(std::string OpName) override {
       OpName = "op_" + OpName;
-      if (fShape.empty()) {
+      if (fShapeInput.empty() || fShapeY.empty()) {
          throw std::runtime_error("TMVA SOFIE Operator Tile called to Generate without being initialized first");
       }
       std::stringstream out;
-      auto length = ConvertDynamicShapeToLength(fShapeY);
+      auto length = ConvertShapeToLength(fShapeY);
       out << "\n//------ TILE_GPU_ALPAKA\n";
       out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_" << fNY
             << "(alpaka::Vec<Dim, Idx>::all((" << length << " + 256 - 1) / 256), "
@@ -185,8 +185,8 @@ public:
       out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNY
          << ", tileKernel, alpaka::getPtrNative(deviceBuf_" << fNInput
          << "), alpaka::getPtrNative(deviceBuf_" << fNY
-         << "), "<< UTILITY::ConvertShapeToString(fShapeInput)<<", "<< UTILITY::ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeInput)) <<", "
-         <<UTILITY::ConvertShapeToString(fShapeY)<<", "<<UTILITY::ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeY))<<", "<<fNY.length()<<");\n";
+         << "), "<< ConvertShapeToString(fShapeInput)<<", "<< ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeInput)) <<", "
+         <<ConvertShapeToString(fShapeY)<<", "<<ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeY))<<", "<<fNY.length()<<");\n";
 
       return out.str();
    }

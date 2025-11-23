@@ -33,6 +33,7 @@ endforeach()
 string(REPLACE ";" ";\n" EMIT_CAPTURES "${ALL_CAPTURES}")
 configure_file(EmitFromONNX.cxx.in EmitFromONNX_all.cxx @ONLY)
 configure_file(EmitFromRoot.cxx.in EmitFromRoot_all.cxx @ONLY)
+configure_file(EmitFromONNX_GPU_ALPAKA.cxx.in EmitFromONNX_GPU_ALPAKA_all.cxx @ONLY)
 
 ROOTTEST_GENERATE_EXECUTABLE(emitFromONNX EmitFromONNX_all.cxx
     LIBRARIES protobuf::libprotobuf SOFIE_core SOFIE_parsers
@@ -129,3 +130,17 @@ ROOT_ADD_TEST(tmva-sofie-EmitGNN COMMAND emitGNN)
 
 ROOT_EXECUTABLE(EmitGraphIndependent GNN/EmitGraphIndependent.cxx LIBRARIES SOFIE_core)
 ROOT_ADD_TEST(tmva-sofie-EmitGraphIndependent COMMAND EmitGraphIndependent)
+
+# Generating inference code for heterogeneous testing using ALPAKA
+# ROOTTEST_GENERATE_EXECUTABLE(emitFromONNXAlpaka EmitFromONNX_GPU_ALPAKA_all.cxx
+#     LIBRARIES protobuf::libprotobuf SOFIE_core SOFIE_parsers
+#                              FIXTURES_SETUP sofie-compile-models-onnx-alpaka-build)
+
+# # silence protobuf warnings seen in version 3.0 and 3.6. Not needed from protobuf version 3.17
+# target_compile_options(emitFromONNXAlpaka PRIVATE -Wno-unused-parameter -Wno-array-bounds)
+
+# ROOTTEST_ADD_TEST(SofieCompileModels_ONNX_Alpaka
+#   COMMAND ${CMAKE_COMMAND} -E env ROOTIGNOREPREFIX=1 ./emitFromONNXAlpaka ${onnx_file} ${CMAKE_CURRENT_BINARY_DIR}/${fname}
+#   FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka-build
+#   FIXTURES_SETUP sofie-compile-models-onnx-alpaka
+# )

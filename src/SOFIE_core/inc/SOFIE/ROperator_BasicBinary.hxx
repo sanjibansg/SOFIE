@@ -1,14 +1,12 @@
 #ifndef TMVA_SOFIE_ROperator_BasicBinary
 #define TMVA_SOFIE_ROperator_BasicBinary
 
-#include "TMVA/SOFIE_common.hxx"
-#include "TMVA/ROperator.hxx"
-#include "TMVA/RModel.hxx"
+#include "SOFIE/SOFIE_common.hxx"
+#include "SOFIE/ROperator.hxx"
+#include "SOFIE/RModel.hxx"
 
 #include <sstream>
 
-namespace TMVA {
-namespace Experimental {
 namespace SOFIE {
 
 enum EBasicBinaryOperator {
@@ -106,7 +104,7 @@ public:
       }
       int dynamicInputs = 0;
       if (model.IsDynamicTensor(fNA)) {
-         fDimShapeA = model.GetDynamicTensorShape(fNA);
+         fDimShapeA = model.GetDimTensorShape(fNA);
          dynamicInputs |= 1;
       } else {
          fShapeA = model.GetTensorShape(fNA);
@@ -114,17 +112,17 @@ public:
       }
       if (model.IsDynamicTensor(fNB)) {
          dynamicInputs |= 2;
-         fDimShapeB = model.GetDynamicTensorShape(fNB);
+         fDimShapeB = model.GetDimTensorShape(fNB);
       } else {
          fShapeB = model.GetTensorShape(fNB);
          fDimShapeB = ConvertShapeToDim(fShapeB);
       }
       if (dynamicInputs & 1 && model.Verbose())
          std::cout << BinaryOperatorTrait<T, Op>::Name() << " : input " << fNA << " is dynamic "
-                   << ConvertShapeToString(fDimShapeA) << "  ";
+                   << ConvertDimShapeToString(fDimShapeA) << "  ";
       if (dynamicInputs & 2 && model.Verbose())
          std::cout << BinaryOperatorTrait<T, Op>::Name() << " : input " << fNB << " is dynamic "
-                   << ConvertShapeToString(fDimShapeB) << "  ";
+                   << ConvertDimShapeToString(fDimShapeB) << "  ";
       std::cout << std::endl;
       // check if need to broadcast at initialization time if shapes are known and different
       // (we could broadcast the tensor tensor to maximum values of dynamic shapes - to be done)
@@ -388,7 +386,7 @@ public:
       return out.str();
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA() override {
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) {
       std::string op;
       op = "\n//------ "+opName+"_"+BinaryOperatorTrait<T, Op>::Name()+"_KERNEL_ALPAKA\n";
       op += SP + "struct Binary"+BinaryOperatorTrait<T, Op>::Name()+"Kernel {\n";
@@ -452,7 +450,7 @@ public:
          for (size_t i = 0; i < fDimShapeY.size(); ++i) {
             if (fDimShapeY[i].dim != 1 && fDimShapeY[i].GetVal() != "1") {
                nloop++;
-               for (int j = 0; j < nloop; j++) out << SP;
+               for (int j = 0; j < nloop; j++) op += SP;
                compute_idx_Y += "elem[" + std::to_string(i) + "]";
                if (stridesY[i].GetVal() != "1")
                   compute_idx_Y += " * " + stridesY[i].GetVal();
@@ -463,31 +461,31 @@ public:
          for (int j = 0; j < 3; j++)
             compute_idx_Y.pop_back();
       }
-      for (int j = 0; j < nloop + 1; j++) out << SP;
-      out << "C[" << compute_idx_Y << "] = "
-          << BinaryOperatorTrait<T, Op>::Op("A[" + compute_idx_A + "]",
+      for (int j = 0; j < nloop + 1; j++) op += SP;
+      op += "C[" + compute_idx_Y + "] = "
+          + BinaryOperatorTrait<T, Op>::Op("A[" + compute_idx_A + "]",
                                             "B[" + compute_idx_B + "]")
-          << " ;\n";
+          + " ;\n";
 
       for (int i = nloop; i > 0; i--) {
-         for (int j = 0; j < i; j++) out << SP;
-         out << "}\n";
+         for (int j = 0; j < i; j++) op += SP;
+         op += "}\n";
       }
    }
 
-   std::string Generate_GPU_Kernel_Definitions_ALPAKA() override {
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string OpName) {
       return SP + "Binary"+BinaryOperatorTrait<T, Op>::Name()+"Kernel " + OpName + "Kernel;\n";
    }
 
-   std::string Generate_GPU_ALPAKA(std::string OpName) override {
-      if (fShape.empty()) {
+   std::string Generate_GPU_ALPAKA(std::string OpName) {
+      if (fDimShapeY.empty()) {
          throw std::runtime_error("TMVA SOFIE Operator Basic Binary called to Generate without being initialized first");
       }
       std::stringstream out;
-      auto length = ConvertDynamicShapeToLength(fShapeY);
+      auto length = ConvertDimShapeToLength(fDimShapeY);
       out << "\n//------ "+OpName+"_ALPAKA\n";
       out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fNY<<"(alpaka::Vec<Dim, Idx>::all("<<(stoi(length)+256-1)/256<<"), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNY << ", " << OpName << "Kernel, alpaka::getPtrNative(deviceBuf_" << fNA << "), alpaka::getPtrNative(deviceBuf_"<<fNB<<"), alpaka::getPtrNative(deviceBuf_"<<fNC<<")); \n";
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNY << ", " << OpName << "Kernel, alpaka::getPtrNative(deviceBuf_" << fNA << "), alpaka::getPtrNative(deviceBuf_"<<fNB<<"), alpaka::getPtrNative(deviceBuf_"<<fNY<<")); \n";
       return out.str();
    }
 
@@ -504,7 +502,5 @@ public:
 };
 
 } // namespace SOFIE
-} // namespace Experimental
-} // namespace TMVA
 
 #endif // TMVA_SOFIE_ROperator_BasicBinary

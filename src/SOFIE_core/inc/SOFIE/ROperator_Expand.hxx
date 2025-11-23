@@ -122,7 +122,7 @@ public:
       return out.str();
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA() override {
+   std::string Generate_GPU_Kernel_ALPAKA() {
       std::string op;
       op = "\n//------ Expand_KERNEL_ALPAKA\n";
       op += SP + "struct ExpandKernel {\n";
@@ -148,7 +148,7 @@ public:
       return op;
    }
 
-   std::string Generate_GPU_Kernel_Definitions_ALPAKA() override {
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) override {
       return SP + "ExpandKernel expandKernel;\n";
    }
 
@@ -159,7 +159,7 @@ public:
       }
 
       std::stringstream out;
-      auto length = ConvertDynamicShapeToLength(fShape);
+      auto length = ConvertShapeToLength(fShape);
       out << "\n//------ EXPAND_GPU_ALPAKA\n";
       out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_" << fNX
          << "(alpaka::Vec<Dim, Idx>::all((" << length << " + 256 - 1) / 256), "
@@ -168,8 +168,8 @@ public:
       out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX
          << ", expandKernel, alpaka::getPtrNative(deviceBuf_" << fNX
          << "), alpaka::getPtrNative(deviceBuf_" << fNY
-         << "), "<< UTILITY::ConvertShapeToString(fShapeX) <<", "<<UTILITY::ConvertShapeToString(fShapeY)<<", "<<UTILITY::ConvertShapeToString(ComputeStrideFromShape(fShapeX))<<", "
-         << UTILITY::ConvertShapeToString(ComputeStrideFromShape(fShapeX))<<", "<<fShapeY.length()<<");\n";
+         << "), "<< ConvertShapeToString(fShapeX) <<", "<<ConvertShapeToString(fShapeY)<<", "<<ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeX))<<", "
+         << ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeX))<<", "<<fShapeY.size()<<");\n";
 
       return out.str();
    }

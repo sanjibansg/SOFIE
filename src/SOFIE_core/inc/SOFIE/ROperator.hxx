@@ -1,14 +1,11 @@
-#ifndef SOFIE_ROPERATOR
-#define SOFIE_ROPERATOR
+#ifndef TMVA_SOFIE_ROPERATOR
+#define TMVA_SOFIE_ROPERATOR
 
 #include <vector>
 #include <set>
 #include <memory>
 
 #include "SOFIE/SOFIE_common.hxx"
-//#include "RModel.hxx"
-
-
 
 
 namespace SOFIE{
@@ -31,10 +28,10 @@ inline const char* toString(OperatorKind kind) {
        case OperatorKind::GEMM:       return "GEMM";
        case OperatorKind::LAYERNORM:  return "LAYERNORM";
        case OperatorKind::RELU:       return "RELU";
-       case OperatorKind::CONSTANT:       return "CONSTANT";
-       case OperatorKind::CONSTANTOFSHAPE:       return "CONSTANTOFSHAPE";
-              case OperatorKind::BATCHNORM:       return "batchnorm";  
-                   case OperatorKind::CONV:       return "conv";
+       case OperatorKind::CONSTANT:        return "CONSTANT";
+       case OperatorKind::CONSTANTOFSHAPE: return "CONSTANTOFSHAPE";
+       case OperatorKind::BATCHNORM:       return "BATCHNORM";  
+       case OperatorKind::CONV:       return "CONV";
        case OperatorKind::UNDEFINED:  return "UNDEFINED";
        default:                       return "UNKNOWN";
    }
@@ -48,11 +45,11 @@ class ROperator{
 public:
    virtual std::vector<std::string> GetBlasRoutines() { return {}; }
    virtual std::vector<std::string> GetStdLibs() { return {}; }
-   virtual std::vector<std::vector<size_t>> ShapeInference(std::vector<std::vector<size_t>>) = 0;
-   virtual std::vector<ETensorType> TypeInference(std::vector<ETensorType>) = 0;
+   virtual std::vector<std::vector<size_t>> ShapeInference(std::vector<std::vector<size_t>>) { return {}; };
+   virtual std::vector<ETensorType> TypeInference(std::vector<ETensorType>) { return {}; };
    virtual void Initialize(RModel&) = 0;
    virtual std::string Generate(std::string OpName) = 0;  //expect unique opName for each operator within the same RModel
-   virtual std::string Generate_GPU_ALPAKA(std::string OpName){ return "";}  //expect unique opName for each operator within the same RModel
+   virtual std::string Generate_GPU_ALPAKA(std::string OpName){ return "";} //expect unique opName for each operator within the same RModel
    // generate initialization code for session constructor
    virtual std::string GenerateInitCode() { return "";}
    virtual std::string GenerateInitCode_GPU_ALPAKA() { return "";};
@@ -60,10 +57,9 @@ public:
    virtual std::string GenerateDeclCode() { return "";}
    // generate session data members specific to operator
    virtual std::string GenerateSessionMembersCode(std::string /*opName*/) { return ""; }
-   virtual std::string Generate_GPU_Kernel_ALPAKA() { return ""; }
-   virtual std::string Generate_GPU_Kernel_Definitions_ALPAKA() { return ""; }
+   virtual std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) { return ""; }
+   virtual std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) { return ""; }
    virtual std::string Header() { return "";}
-
    virtual std::string GetFusableOutputTensorName() { return "";}
    virtual std::string GetBlasConfig() { return ""; }
    virtual void UpdateFusableTensorName(std::string, const std::function<void(const std::string&)>& removal_func){ return;};
@@ -78,7 +74,8 @@ protected:
    const std::string SP = "   ";    ///< space used to correctly indent the generated C++ code
    bool fUseSession = false;        ///< flag to identify if using the session class
    bool fIsOutputConstant = false;  ///< flag to identify if operator has a constant output (no need to generate code)
-   
+   bool fIsOutputParamShape = false;     ///< flag to identify of the output represents a parametric shape (can be knwon at compile time)
+
    mutable std::vector<std::string> fInputTensorNames;
    mutable std::vector<std::string> fOutputTensorNames;
 
@@ -99,12 +96,11 @@ public:
    size_t GetOpOrder(){
       return fOpOrder;
    }
-   
+
 };
 
 
 
 }//SOFIE
 
-
-#endif //SOFIE_OPERATOR
+#endif //TMVA_SOFIE_OPERATOR

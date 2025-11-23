@@ -29,7 +29,7 @@ void RModel_Base::GenerateHeaderInfo(std::string& hgname) {
     }
     // for the session we need to include SOFIE_Common functions
     //needed for convolution operator (need to add a flag)
-    fGC += "#include \"TMVA/SOFIE_common.hxx\"\n";
+    fGC += "#include \"SOFIE/SOFIE_common.hxx\"\n";
     if (fUseWeightFile)
         fGC += "#include <fstream>\n";
     // Include TFile when saving the weights in a binary ROOT file
@@ -79,7 +79,7 @@ void RModel_Base::GenerateHeaderInfo_GPU_ALPAKA(std::string& hgname) {
 
     // for the session we need to include SOFIE_Common functions
     //needed for convolution operator (need to add a flag)
-    fGC += "#include \"TMVA/SOFIE_common.hxx\"\n";
+    fGC += "#include \"SOFIE/SOFIE_common.hxx\"\n";
     if (fUseWeightFile)
         fGC += "#include <fstream>\n";
     // Include TFile when saving the weights in a binary ROOT file

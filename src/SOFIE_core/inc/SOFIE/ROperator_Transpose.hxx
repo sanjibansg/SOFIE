@@ -165,7 +165,7 @@ public:
       return out.str();
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA() override {
+   std::string Generate_GPU_Kernel_ALPAKA() {
       std::string op;
       op = "\n//------ TRANSPOSE_KERNEL_ALPAKA\n";
       op += SP + "struct TransposeKernel{\n";

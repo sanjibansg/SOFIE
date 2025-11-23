@@ -94,7 +94,7 @@ void RModel_GNN::Generate() {
 
     // the number of output edges features can be smaller, so we need to correct here
     auto num_edge_features_input = num_edge_features;
-    auto edges_update_output_shape =  edges_update_block->GetFunctionBlock()->GetDynamicTensorShape(edges_update_block->GetFunctionBlock()->GetOutputTensorNames()[0]);
+    auto edges_update_output_shape =  edges_update_block->GetFunctionBlock()->GetDimTensorShape(edges_update_block->GetFunctionBlock()->GetOutputTensorNames()[0]);
       if(!edges_update_output_shape[1].isParam && edges_update_output_shape[1].dim != num_edge_features_input) {
           num_edge_features = edges_update_output_shape[1].dim;
     }
@@ -117,7 +117,7 @@ void RModel_GNN::Generate() {
 
     // we need to correct the output number of node features
     auto num_node_features_input = num_node_features;
-    auto nodes_update_output_shape =  nodes_update_block->GetFunctionBlock()->GetDynamicTensorShape(nodes_update_block->GetFunctionBlock()->GetOutputTensorNames()[0]);
+    auto nodes_update_output_shape =  nodes_update_block->GetFunctionBlock()->GetDimTensorShape(nodes_update_block->GetFunctionBlock()->GetOutputTensorNames()[0]);
       if(!nodes_update_output_shape[1].isParam && nodes_update_output_shape[1].dim != num_node_features_input) {
           num_node_features = nodes_update_output_shape[1].dim;
     }

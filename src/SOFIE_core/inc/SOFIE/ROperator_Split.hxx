@@ -153,7 +153,7 @@ public:
       return out.str();
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA() override {
+   std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) {
       std::string op;
       op = "\n//------ SPLIT_KERNEL_ALPAKA\n";
       op += SP + "struct SplitKernel {\n";
@@ -178,24 +178,24 @@ public:
       return op;
    }
 
-   std::string Generate_GPU_Kernel_Definitions_ALPAKA() override {
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) override {
       return SP + "SplitKernel splitKernel;\n";
    }
 
    std::string Generate_GPU_ALPAKA(std::string OpName) override {
       OpName = "op_" + OpName;
-      if (fShape.empty()) {
+      if (fOutputShapes.empty()){
          throw std::runtime_error("TMVA SOFIE Operator Split called to Generate without being initialized first");
       }
 
       std::stringstream out;
       out << "\n//------ SPLIT_GPU_ALPAKA\n";
 
-      bool axis_is_innermost = (axis == static_cast<int>(fInputShape.size()) - 1)
-                           && (UTILITY::ComputeStridesFromShape(fInputShape)[fInputShape.size()-1] == 1);
+      bool axis_is_innermost = (fAxis == static_cast<int>(fInputShape.size()) - 1)
+                           && (UTILITY::ComputeStrideFromShape(fInputShape)[fInputShape.size()-1] == 1);
       out << SP <<"size_t "<<OpName<<"_axis_offset = 0;\n";
       for(size_t i=0; i<fNYs.size(); ++i){
-            auto length = ConvertDynamicShapeToLength(fOututputShapes[i]);
+            auto length = ConvertShapeToLength(fOutputShapes[i]);
             out << SP << SP << "int64_t part = "<<fNSplit<<"[i];\n";
             out << SP << SP << "if (part == 0) { continue; }\n";
          if(axis_is_innermost) {
@@ -209,9 +209,9 @@ public:
 
             out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNYs[i]
                << ", splitKernel, alpaka::getPtrNative(deviceBuf_" << fNX
-               << "), alpaka::getPtrNative(deviceBuf_" << fNY
-               << "), "<< UTILITY::ConvertShapeToString(UTILITY::ComputeStrideFromShape(fInputShape)) <<", "<<UTILITY::ConvertShapeToString(UTILITY::ComputeStrideFromShape(fOutputShapes[i]))<<", "<<fAxis<<", "
-               << "axis_offset, "<<fNYs.length()<<");\n";
+               << "), alpaka::getPtrNative(deviceBuf_" << fNYs[i]
+               << "), "<< ConvertShapeToString(UTILITY::ComputeStrideFromShape(fInputShape)) <<", "<<ConvertShapeToString(UTILITY::ComputeStrideFromShape(fOutputShapes[i]))<<", "<<fAxis<<", "
+               << "axis_offset, "<<fNYs[i].size()<<");\n";
          }
          if (i < fNYs.size()-1) out << SP << OpName << "_axis_offset += part;\n";
       }

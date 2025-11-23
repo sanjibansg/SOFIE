@@ -1,9 +1,9 @@
 #ifndef SOFIE_SOFIE_ROPERATOR_CONVTRANSPOSE_HXX
 #define SOFIE_SOFIE_ROPERATOR_CONVTRANSPOSE_HXX
 
-#include <SOFIE/SOFIE_common.hxx>
-#include <SOFIE/ROperator.hxx>
-#include <SOFIE/RModel.hxx>
+#include "SOFIE/SOFIE_common.hxx"
+#include "SOFIE/ROperator.hxx"
+#include "SOFIE/RModel.hxx"
 
 #include <memory>
 #include <sstream>

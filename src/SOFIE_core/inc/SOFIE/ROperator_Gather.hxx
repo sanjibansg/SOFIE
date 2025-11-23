@@ -212,7 +212,7 @@ public:
       return out.str();
    }
 
-      std::string Generate_GPU_Kernel_ALPAKA() override {
+      std::string Generate_GPU_Kernel_ALPAKA() {
       std::string op;
       op = "\n//------ GATHER_KERNEL_ALPAKA\n";
       op += SP + "struct GatherKernel {\n";
@@ -253,19 +253,15 @@ public:
       return op;
    }
 
-   std::string Generate_GPU_Kernel_Definitions_ALPAKA() override {
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) override {
       return SP + "GatherKernel gatherKernel;\n";
    }
 
    std::string Generate_GPU_ALPAKA(std::string OpName) override {
       OpName = "op_" + OpName;
-      if (fShape.empty()) {
-         throw std::runtime_error("TMVA SOFIE Operator Gather called to Generate without being initialized first");
-      }
-
       std::stringstream out;
-      auto length = ConvertDynamicShapeToLength(fShapeY);
-      out << "\n//------ GATHER_GPU_ALPAKA\n";
+      auto length = ConvertShapeToLength(fShapeY);
+      out << "\n//------ "<<OpName<<"_GATHER_GPU_ALPAKA\n";
       out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_" << fNY
          << "(alpaka::Vec<Dim, Idx>::all((" << length << " + 256 - 1) / 256), "
          << "alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
@@ -274,10 +270,10 @@ public:
          << ", gatherKernel, alpaka::getPtrNative(deviceBuf_" << fNX
          << "), alpaka::getPtrNative(deviceBuf_" << fNIndices
          << "), alpaka::getPtrNative(deviceBuf_" << fNY
-         << "), "<< UTILITY::ConvertShapeToString(fShapeY) <<", "<< fAttrAxis <<", "<< fShapeX[fAttrAxis] <<", "
+         << "), "<< ConvertShapeToString(fShapeY) <<", "<< fAttrAxis <<", "<< fShapeX[fAttrAxis] <<", "
          << fShapeIndices.size() <<", "
-         << UTILITY::ConvertShapeToString(ComputeStrideFromShape(fShapeY)) <<", "
-         << UTILITY::ConvertShapeToString(ComputeStrideFromShape(fShapeX)) <<", "<< fShapeY.size()
+         << ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeY)) <<", "
+         << ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeX)) <<", "<< fShapeY.size()
          << ",static_cast<Idx>(" << length << "));\n";
 
       return out.str();

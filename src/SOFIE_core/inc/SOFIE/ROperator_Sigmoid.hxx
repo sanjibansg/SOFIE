@@ -61,7 +61,7 @@ public:
       return out.str();
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA() override {
+   std::string Generate_GPU_Kernel_ALPAKA() {
       std::string op;
       op = "\n//------ SIGMOID_KERNEL_ALPAKA\n";
       op += SP + "struct SigmoidKernel {\n";
@@ -76,7 +76,7 @@ public:
    }
 
 
-   std::string Generate_GPU_Kernel_Definitions_ALPAKA() override {
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) override {
       return SP + "SigmoidKernel sigmoidKernel;\n";
    }
 
@@ -87,7 +87,7 @@ public:
       }
 
       std::stringstream out;
-      auto length = ConvertDynamicShapeToLength(fShape);
+      auto length = ConvertShapeToLength(fShape);
       out << "\n//------ SIGMOID_GPU_ALPAKA\n";
       out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_" << fNX
          << "(alpaka::Vec<Dim, Idx>::all((" << length << " + 256 - 1) / 256), "

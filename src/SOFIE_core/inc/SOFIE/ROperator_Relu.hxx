@@ -43,11 +43,11 @@ public:
          throw std::runtime_error("TMVA SOFIE Relu Op Input Tensor " + fNX + " is not found in model");
       }
 
-      fShape = model.GetDynamicTensorShape(fNX);
+      fShape = model.GetDimTensorShape(fNX);
 
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShape);
       if (model.Verbose()) {
-         std::cout << "Relu : " << fNX << " -> " << fNY << " " << ConvertDynamicShapeToString(fShape) << std::endl;
+         std::cout << "Relu : " << fNX << " -> " << fNY << " " << ConvertDimShapeToString(fShape) << std::endl;
       }
    }
 
@@ -66,7 +66,7 @@ public:
       return out.str();
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA() override {
+   std::string Generate_GPU_Kernel_ALPAKA() {
       std::string op;
       op = "\n//------ RELU_KERNEL_ALPAKA\n";
       op += SP + "struct ReluKernel{\n";
@@ -79,7 +79,7 @@ public:
       return op;
    }
 
-   std::string Generate_GPU_Kernel_Definitions_ALPAKA() override {
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) override {
       return SP + "ReluKernel reluKernel;\n";
    }
 
