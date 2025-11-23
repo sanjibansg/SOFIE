@@ -65,9 +65,9 @@ public:
 
    int Verbose() const { return fVerbose;}
 
-   const std::vector<size_t> &GetTensorShape(std::string name) const;
+   const std::vector<size_t> &GetTensorShape(const std::string & name) const;
    std::vector<Dim> GetDimTensorShape(const std::string & name) const;
-   const ETensorType &GetTensorType(std::string name) const;
+   const ETensorType &GetTensorType(const std::string & name) const;
    std::vector<Dim> GetDynamicTensorShape(const std::string & name) const ;
 
    // get the values for the tensor representing a shape
@@ -140,7 +140,7 @@ public:
    void AddIntermediateTensor(std::string tensor_name, ETensorType type, std::vector<std::size_t> shape);
    // Add an intermediate dynamic tensor
    void AddDynamicTensor(std::string tensor_name, ETensorType type, std::vector<Dim> shape);
-
+   void AddShapeParam(const std::string & name, size_t def_value = 0);
    void AddInputTensorName(std::string name);
    void AddOutputTensorNameList(std::vector<std::string> output_tensor_names);
    void
