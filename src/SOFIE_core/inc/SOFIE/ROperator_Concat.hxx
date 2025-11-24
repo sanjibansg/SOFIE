@@ -1,5 +1,5 @@
-#ifndef TMVA_SOFIE_ROPERATOR_Concat
- #define TMVA_SOFIE_ROPERATOR_Concat
+#ifndef SOFIE_ROPERATOR_Concat
+#define SOFIE_ROPERATOR_Concat
 
 
  #include "SOFIE/SOFIE_common.hxx"
@@ -320,4 +320,4 @@
  }//SOFIE
 
 
- #endif //TMVA_SOFIE_ROPERATOR_CONCAT
+ #endif //SOFIE_ROPERATOR_CONCAT

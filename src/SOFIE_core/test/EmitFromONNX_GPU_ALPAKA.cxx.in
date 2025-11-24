@@ -11,14 +11,17 @@ int EmitModel(std::string filename, std::string outname) {
    RModelParser_ONNX parser;
    RModel model = parser.Parse(filename);
    model.GenerateGPU_ALPAKA();
-   model.OutputGenerated(outname+"_FromONNX.hxx");
+   model.OutputGenerated(outname+"_FromONNX_GPU_ALPAKA.hxx");
 
    return 0;
 }
 
-int main(int argc, char *argv[]){
+int main(int argc, char *argv[]) {
 
-@EMIT_CAPTURES@ ;
+    int failures = 0;
 
+@EMIT_CAPTURES@
+
+    std::cout << "[SUMMARY] Completed with " << failures << " failures" << std::endl;
+    return failures == 0 ? 0 : 1;
 }
-

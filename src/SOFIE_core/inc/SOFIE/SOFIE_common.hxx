@@ -1,5 +1,5 @@
-#ifndef TMVA_SOFIE_SOFIE_COMMON
-#define TMVA_SOFIE_SOFIE_COMMON
+#ifndef SOFIE_SOFIE_COMMON
+#define SOFIE_SOFIE_COMMON
 
 #include "TMVA/RTensor.hxx"
 
@@ -806,4 +806,4 @@ void ReadTensorFromStream(std::istream &is, T &target, std::string const &expect
 
 } // namespace SOFIE
 
-#endif //TMVA_SOFIE_COMMON
+#endif //SOFIE_COMMON

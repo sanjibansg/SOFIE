@@ -1,5 +1,5 @@
-#ifndef TMVA_SOFIE_ROPERATOR
-#define TMVA_SOFIE_ROPERATOR
+#ifndef SOFIE_ROPERATOR
+#define SOFIE_ROPERATOR
 
 #include <vector>
 #include <set>
@@ -103,4 +103,4 @@ public:
 
 }//SOFIE
 
-#endif //TMVA_SOFIE_OPERATOR
+#endif //SOFIE_OPERATOR

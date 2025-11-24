@@ -23,7 +23,7 @@ int EmitModel(std::string filename, std::string outname) {
 
 int main(int argc, char *argv[]){
 
-@EMIT_CAPTURES@ ;
+@EMIT_CAPTURES@
 
 }
 

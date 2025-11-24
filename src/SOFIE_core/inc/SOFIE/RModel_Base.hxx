@@ -12,7 +12,6 @@
 #include <fstream>
 #include <sstream>
 #include "SOFIE/SOFIE_common.hxx"
-#include "SOFIE/ROperator.hxx"
 #include "TBuffer.h"
 
 

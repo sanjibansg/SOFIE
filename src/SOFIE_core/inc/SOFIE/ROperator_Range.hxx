@@ -1,5 +1,5 @@
-#ifndef TMVA_SOFIE_ROPERATOR_RANGE
-#define TMVA_SOFIE_ROPERATOR_RANGE
+#ifndef SOFIE_ROPERATOR_RANGE
+#define SOFIE_ROPERATOR_RANGE
 
 #include "SOFIE/SOFIE_common.hxx"
 #include "SOFIE/ROperator.hxx"
@@ -121,4 +121,4 @@ public:
 
 }//SOFIE
    
-#endif //TMVA_SOFIE_ROPERATOR_RANGE
+#endif //SOFIE_ROPERATOR_RANGE

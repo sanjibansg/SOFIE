@@ -94,11 +94,16 @@ target_link_libraries(SOFIE_core PUBLIC
     RIO
 )
 
-ROOT_GENERATE_DICTIONARY(G__SOFIE ${sources_headers}
+ROOT_GENERATE_DICTIONARY(G__SOFIE_core ${sources_headers}
     LINKDEF inc/LinkDef.h
     MODULE SOFIE_core
     OPTIONS --deep
 )
+
+# Install the dictionaries.
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libSOFIE_core_rdict.pcm
+              ${CMAKE_CURRENT_BINARY_DIR}/libSOFIE_core.rootmap
+        DESTINATION lib)
 
 install(TARGETS SOFIE_core
         LIBRARY DESTINATION lib

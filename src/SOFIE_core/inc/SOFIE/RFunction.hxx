@@ -3,6 +3,7 @@
 
 #include "SOFIE/RModel_Base.hxx"
 #include "SOFIE/SOFIE_common.hxx"
+#include "SOFIE/ROperator.hxx"
 
 #include <memory>
 #include <string>

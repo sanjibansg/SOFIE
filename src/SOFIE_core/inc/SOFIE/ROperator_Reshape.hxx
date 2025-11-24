@@ -1,5 +1,5 @@
-#ifndef TMVA_SOFIE_ROPERATOR_RESHAPE
-#define TMVA_SOFIE_ROPERATOR_RESHAPE
+#ifndef SOFIE_ROPERATOR_RESHAPE
+#define SOFIE_ROPERATOR_RESHAPE
 
 #include "SOFIE/SOFIE_common.hxx"
 #include "SOFIE/ROperator.hxx"

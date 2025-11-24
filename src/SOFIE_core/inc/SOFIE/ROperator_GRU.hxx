@@ -1,5 +1,5 @@
-#ifndef TMVA_SOFIE_ROPERATOR_GRU
-#define TMVA_SOFIE_ROPERATOR_GRU
+#ifndef SOFIE_ROPERATOR_GRU
+#define SOFIE_ROPERATOR_GRU
 
 #include "SOFIE/RModel.hxx"
 #include "SOFIE/ROperator.hxx"

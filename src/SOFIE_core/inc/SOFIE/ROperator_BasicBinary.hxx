@@ -1,5 +1,5 @@
-#ifndef TMVA_SOFIE_ROperator_BasicBinary
-#define TMVA_SOFIE_ROperator_BasicBinary
+#ifndef SOFIE_SOFIE_ROperator_BasicBinary
+#define SOFIE_SOFIE_ROperator_BasicBinary
 
 #include "SOFIE/SOFIE_common.hxx"
 #include "SOFIE/ROperator.hxx"
@@ -402,7 +402,7 @@ public:
       }
       op.pop_back();
       op += "));\n";
-
+      std::cout<<"okay till here 1\n";
       op += SP + SP + SP + SP + "for (auto const& elem : elements) {\n";
 
       auto stridesA = UTILITY::ComputeStrideFromShape(fDimShapeA);
@@ -426,6 +426,7 @@ public:
          for (int j = 0; j < 3; j++)
             compute_idx_A.pop_back();
       }
+      std::cout<<"okay till here 2\n";
       if (fDimShapeB.empty() ||
           std::all_of(fDimShapeB.begin(), fDimShapeB.end(), [](Dim d) { return d.dim == 1 || d.GetVal() == "1"; })) {
          compute_idx_B = "0";
@@ -442,6 +443,7 @@ public:
          for (int j = 0; j < 3; j++)
             compute_idx_B.pop_back();
       }
+      std::cout<<"okay till here 3\n";
       int nloop = 0;
       if (fDimShapeY.empty() ||
           std::all_of(fDimShapeY.begin(), fDimShapeY.end(), [](Dim d) { return d.dim == 1 || d.GetVal() == "1"; })) {
@@ -461,16 +463,18 @@ public:
          for (int j = 0; j < 3; j++)
             compute_idx_Y.pop_back();
       }
+      std::cout<<"okay till here 4\n";
       for (int j = 0; j < nloop + 1; j++) op += SP;
       op += "C[" + compute_idx_Y + "] = "
           + BinaryOperatorTrait<T, Op>::Op("A[" + compute_idx_A + "]",
                                             "B[" + compute_idx_B + "]")
           + " ;\n";
-
+      std::cout<<"okay till here 5\n";
       for (int i = nloop; i > 0; i--) {
          for (int j = 0; j < i; j++) op += SP;
          op += "}\n";
       }
+      return op;
    }
 
    std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string OpName) {
@@ -503,4 +507,4 @@ public:
 
 } // namespace SOFIE
 
-#endif // TMVA_SOFIE_ROperator_BasicBinary
+#endif // SOFIE_ROperator_BasicBinary

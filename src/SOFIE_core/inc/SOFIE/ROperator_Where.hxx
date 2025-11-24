@@ -1,5 +1,5 @@
-#ifndef TMVA_SOFIE_ROperator_Where
-#define TMVA_SOFIE_ROperator_Where
+#ifndef SOFIE_ROperator_Where
+#define SOFIE_ROperator_Where
 
 #include "SOFIE/SOFIE_common.hxx"
 #include "SOFIE/ROperator.hxx"
@@ -292,4 +292,4 @@ public:
 }//SOFIE
 
 
-#endif //TMVA_SOFIE_ROperator_Where
+#endif // SOFIE_ROperator_Where
