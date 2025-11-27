@@ -75,6 +75,7 @@
         "format": "cpp",
         "any": "cpp",
         "source_location": "cpp",
-        "run_inference_particle_net.C": "cpp"
+        "run_inference_particle_net.C": "cpp",
+        "test.C": "cpp"
     }
 }

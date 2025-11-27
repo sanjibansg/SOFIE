@@ -266,11 +266,11 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       for (size_t id = 0; id < fOperators.size(); id++) {
          fGC += fOperators[id]->GenerateInitCode_GPU_ALPAKA();
          if (fOperators[id]->GetKind() == OperatorKind::GEMM){
-            fGC += "\nblas.AddLayoutConfig("+fOperators[id]->GetBlasConfig()+");";
+            fGC += "\nblas.AddLayoutConfig("+fOperators[id]->GetBlasConfig()+");\n";
          }
       }
 
-      fGC += "alpaka::wait(queue);\n";
+      fGC += "\nalpaka::wait(queue);\n";
       fGC += "}\n\n";
    }
 

@@ -20,7 +20,7 @@ int main(int argc, char *argv[]) {
 
     int failures = 0;
 
-@EMIT_CAPTURES@
+    @EMIT_CAPTURES@
 
     std::cout << "[SUMMARY] Completed with " << failures << " failures" << std::endl;
     return failures == 0 ? 0 : 1;

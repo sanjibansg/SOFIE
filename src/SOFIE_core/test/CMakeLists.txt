@@ -39,7 +39,7 @@ foreach(onnx_file ${ONNX_FILES})
 
   string(REPLACE "@1" "${onnx_file}" cap "${CAPTURE_STR}")
   string(REPLACE "@2" "${fname}" cap "${cap}")
-  list(APPEND ALL_CAPTURES ${cap})
+  string(APPEND ALL_CAPTURES "${cap}")
 endforeach()
 
 # Now generate the combined source files for CPU, ROOT and ALPAKA

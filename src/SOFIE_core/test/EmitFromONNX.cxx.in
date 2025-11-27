@@ -23,7 +23,13 @@ int EmitModel(std::string filename, std::string outname) {
 
 int main(int argc, char *argv[]){
 
-@EMIT_CAPTURES@
+
+    int failures = 0;
+
+    @EMIT_CAPTURES@
+
+    std::cout << "[SUMMARY] Completed with " << failures << " failures" << std::endl;
+    return failures == 0 ? 0 : 1;
 
 }
 
