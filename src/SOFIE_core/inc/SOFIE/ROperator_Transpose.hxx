@@ -165,18 +165,48 @@ public:
       return out.str();
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA() {
+   std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) {
       std::string op;
       op = "\n//------ TRANSPOSE_KERNEL_ALPAKA\n";
-      op += SP + "struct TransposeKernel{\n";
+      op += SP + "struct TransposeKernel {\n";
       op += SP + SP + "template<typename TAcc, typename T>\n";
-      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * input, T const * output, std::size_t * shape, std::size_t * strides) const {\n";
-      op += SP + SP + SP + "for (auto i : alpaka::uniformElementsND(acc, shape)) {\n";
-      op += SP + SP + SP + SP + "size_t input_idx = 0;\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * input, T * output,";
+      op +=  "std::size_t const * input_strides, std::size_t const * output_strides, std::size_t const * perm, ";
+      op +=  "std::size_t const ndim) const {\n";
+      op += SP + SP + SP + SP + "auto elements = alpaka::uniformElementsND(acc, alpaka::Vec<ndim, std::size_t>(output_shape));\n";
+      op += SP + SP + SP + SP + "for (auto const& elem : elements) {\n";
+      op += SP + SP + SP + SP + SP + "size_t input_idx = 0;\n";
+      op += SP + SP + SP + SP + SP + "size_t output_idx = 0;\n";
+      op += SP + SP + SP + SP + SP + "for (int i = 0; i < ndim; ++i) {\n";
+      op += SP + SP + SP + SP + SP + SP + "size_t out_coord = elem[i];\n";
+      op += SP + SP + SP + SP + SP + SP + "size_t in_axis = perm[i];\n";
+      op += SP + SP + SP + SP + SP + SP + "input_idx  += out_coord * input_strides[in_axis];\n";
+      op += SP + SP + SP + SP + SP + SP + "output_idx += out_coord * output_strides[i];\n";
+      op += SP + SP + SP + SP + SP + "}\n";
+      op += SP + SP + SP + SP + SP + "output[output_idx] = input[input_idx];\n";
+      op += SP + SP + SP + SP + "}\n";
+      op += SP + SP + "}\n";
+      op += SP + "};\n";
 
       return op;
    }
 
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) override {
+      return SP + "TransposeKernel transposeKernel;\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string OpName) override {
+      OpName = "op_" + OpName;
+      if (fShape.empty()) {
+         throw std::runtime_error("TMVA SOFIE Operator Transpose called to Generate without being initialized first");
+      }
+      std::stringstream out;
+      auto length = ConvertDynamicShapeToLength(fShape);
+      out << "\n//------ TRANSPOSE_GPU_ALPAKA\n";
+      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fNX<<"(alpaka::Vec<Dim, Idx>::all("<<(stoi(length)+256-1)/256<<"), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX << ", transposeKernel, alpaka::getPtrNative(deviceBuf_" << fNX << "), static_cast<Idx>(" << length << ")); \n";
+      return out.str();
+   }
 
 };
 
