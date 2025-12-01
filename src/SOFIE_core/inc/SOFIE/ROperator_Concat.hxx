@@ -316,7 +316,59 @@
 
             return out.str();
          }
-     };
+
+   std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) {
+      std::string op;
+      op = "\n//------ CONCAT_KERNEL_ALPAKA\n";
+      op += SP + "struct ConcatKernel {\n";
+      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * const * input_ptrs,";
+      op += " T * output, std::size_t const * input_strides, std::size_t const * output_strides, ";
+      op += "std::size_t const * axis_offsets, std::size_t const * axis_sizes, std::size_t const num_inputs, ";
+      op += "std::size_t const concat_axis, std::size_t const ndim) const {\n";
+      op += SP + SP + SP + SP + "auto elements = alpaka::uniformElementsND(acc, alpaka::Vec<ndim, std::size_t>(output_shape));\n";
+      op += SP + SP + SP + SP + "for (auto const& elem : elements) {\n";
+      op += SP + SP + SP + SP + SP + "size_t out_idx = 0;\n";
+      op += SP + SP + SP + SP + SP + "size_t in_idx  = 0;\n";
+      op += SP + SP + SP + SP + SP + "size_t axis_coord = elem[concat_axis];\n\n";
+      op += SP + SP + SP + SP + SP + "size_t chosen_input = 0;\n";
+      op += SP + SP + SP + SP + SP + "for (size_t i = 0; i < num_inputs; ++i) {\n";
+      op += SP + SP + SP + SP + SP + SP + "size_t start = axis_offsets[i];\n";
+      op += SP + SP + SP + SP + SP + SP + "size_t size  = axis_sizes[i];\n";
+      op += SP + SP + SP + SP + SP + SP + "if (axis_coord >= start && axis_coord < start + size) { chosen_input = i; break; }\n";
+      op += SP + SP + SP + SP + SP + "}\n";
+      op += SP + SP + SP + SP + SP + "for (int d = 0; d < (int)ndim; ++d) {\n";
+      op += SP + SP + SP + SP + SP + SP + "size_t out_coord = elem[d];\n";
+      op += SP + SP + SP + SP + SP + SP + "size_t in_coord  = (d == (int)concat_axis) ? (out_coord - axis_offsets[chosen_input]) : out_coord;\n";
+      op += SP + SP + SP + SP + SP + SP + "in_idx  += in_coord * input_strides[d];\n";
+      op += SP + SP + SP + SP + SP + SP + "out_idx += out_coord * output_strides[d];\n";
+      op += SP + SP + SP + SP + SP + "}\n";
+      op += SP + SP + SP + SP + SP + "T const * src = input_ptrs[chosen_input];\n";
+      op += SP + SP + SP + SP + SP + "output[out_idx] = src[in_idx];\n";
+      op += SP + SP + SP + SP + "}\n"; // end for elements
+      op += SP + SP + "}\n"; // end operator()
+      op += SP + "};\n";
+
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) override {
+      return SP + "ConcatKernel concatKernel;\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string OpName) override {
+      OpName = "op_" + OpName;
+      if (fShape.empty()) {
+         throw std::runtime_error("TMVA SOFIE Operator Transpose called to Generate without being initialized first");
+      }
+      std::stringstream out;
+      auto length = ConvertDynamicShapeToLength(fShape);
+      out << "\n//------ CONCAT_GPU_ALPAKA\n";
+      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fNX<<"(alpaka::Vec<Dim, Idx>::all("<<(stoi(length)+256-1)/256<<"), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX << ", concatKernel, alpaka::getPtrNative(deviceBuf_" << fNX << "), static_cast<Idx>(" << length << ")); \n";
+      return out.str();
+   }
+   };
  }//SOFIE
 
 
