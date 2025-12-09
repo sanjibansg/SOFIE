@@ -203,8 +203,9 @@ public:
       std::stringstream out;
       auto length = ConvertDynamicShapeToLength(fShape);
       out << "\n//------ TRANSPOSE_GPU_ALPAKA\n";
-      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fNX<<"(alpaka::Vec<Dim, Idx>::all("<<(stoi(length)+256-1)/256<<"), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX << ", transposeKernel, alpaka::getPtrNative(deviceBuf_" << fNX << "), static_cast<Idx>(" << length << ")); \n";
+      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fNData<<"(alpaka::Vec<Dim, Idx>::all("<<(stoi(length)+256-1)/256<<"), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNData << ", transposeKernel, alpaka::getPtrNative(deviceBuf_" << fNOutput << "), " << ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeData))<<", "
+         << ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeOutput)) << ", " << ConvertShapeToString(fAttrPerm) << ", " << fShapeOutput.size()<<");\n";
       return out.str();
    }
 
