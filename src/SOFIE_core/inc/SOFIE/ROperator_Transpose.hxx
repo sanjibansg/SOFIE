@@ -210,7 +210,7 @@ public:
       auto length = ConvertDynamicShapeToLength(fShape);
       out << "\n//------ TRANSPOSE_GPU_ALPAKA\n";
       out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fNData<<"(alpaka::Vec<Dim, Idx>::all("<<(stoi(length)+256-1)/256<<"), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNData << ", transposeKernel, alpaka::getPtrNative(deviceBuf_" << fNOutput << "), " << ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeData))<<", "
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNData << ", transposeKernel, alpaka::getPtrNative(deviceBuf_" << fNData << "), alpaka::getPtrNative(deviceBuf_" << fNOutput << "), " << ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeData))<<", "
          << ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeOutput)) << ", " << ConvertShapeToString(fShapeData) << ", " << ConvertShapeToString(fShapeOutput) << ", " << ConvertShapeToString(fAttrPerm) << ", " << fShapeOutput.size()<<");\n";
       return out.str();
    }
