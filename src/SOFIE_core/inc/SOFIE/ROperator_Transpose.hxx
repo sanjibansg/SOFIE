@@ -170,23 +170,29 @@ public:
       op = "\n//------ TRANSPOSE_KERNEL_ALPAKA\n";
       op += SP + "struct TransposeKernel {\n";
       op += SP + SP + "template<typename TAcc, typename T>\n";
-      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * input, T * output,";
-      op +=  "std::size_t const * input_strides, std::size_t const * output_strides, std::size_t const * perm, ";
-      op +=  "std::size_t const ndim) const {\n";
-      op += SP + SP + SP + SP + "auto elements = alpaka::uniformElementsND(acc, alpaka::Vec<ndim, std::size_t>(output_shape));\n";
-      op += SP + SP + SP + SP + "for (auto const& elem : elements) {\n";
-      op += SP + SP + SP + SP + SP + "size_t input_idx = 0;\n";
-      op += SP + SP + SP + SP + SP + "size_t output_idx = 0;\n";
-      op += SP + SP + SP + SP + SP + "for (int i = 0; i < ndim; ++i) {\n";
-      op += SP + SP + SP + SP + SP + SP + "size_t out_coord = elem[i];\n";
-      op += SP + SP + SP + SP + SP + SP + "size_t in_axis = perm[i];\n";
-      op += SP + SP + SP + SP + SP + SP + "input_idx  += out_coord * input_strides[in_axis];\n";
-      op += SP + SP + SP + SP + SP + SP + "output_idx += out_coord * output_strides[i];\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc, T const* input, T* output, const std::size_t* input_strides,,";
+      op +=  "const std::size_t* output_strides, const std::size_t* input_shape,";
+      op +=  "const std::size_t* output_shape, const std::size_t* perm,";
+      op +=  "const std::size_t ndim) const {\n";
+      op += SP + SP + SP + SP + "using DimAcc = alpaka::Dim<TAcc>;\n";
+      op += SP + SP + SP + SP + "using IdxAcc = alpaka::Idx<TAcc>;\n";
+      op += SP + SP + SP + SP + "constexpr std::size_t D = static_cast<std::size_t>(DimAcc::value);\n";
+      op += SP + SP + SP + SP + "alpaka::Vec<DimAcc, IdxAcc> shapeVec{};\n";
+      op += SP + SP + SP + SP + "for (std::size_t d = 0; d < D; ++d) shapeVec[d] = output_shape[d];\n";
+      op += SP + SP + SP + SP + "auto elements = alpaka::uniformElementsND(acc, shapeVec);\n";
+      op += SP + SP + SP + SP + "for (auto const& idx : elements) {\n";
+      op += SP + SP + SP + SP + SP + "std::size_t input_idx = 0;\n";
+      op += SP + SP + SP + SP + SP + "std::size_t output_idx = 0;\n";
+      op += SP + SP + SP + SP + SP + "for (std::size_t d = 0; d < D; ++d) {\n";
+      op += SP + SP + SP + SP + SP + SP + "std::size_t out_coord = idx[d];\n";
+      op += SP + SP + SP + SP + SP + SP + "std::size_t in_axis = perm[d];\n";
+      op += SP + SP + SP + SP + SP + SP + "input_idx += out_coord * input_strides[in_axis];\n";
+      op += SP + SP + SP + SP + SP + SP + "output_idx += out_coord * output_strides[d];\n";
       op += SP + SP + SP + SP + SP + "}\n";
       op += SP + SP + SP + SP + SP + "output[output_idx] = input[input_idx];\n";
       op += SP + SP + SP + SP + "}\n";
-      op += SP + SP + "}\n";
-      op += SP + "};\n";
+      op += SP + SP + SP" + }\n";
+      op += SP + SP + "};\n";
 
       return op;
    }
@@ -205,7 +211,7 @@ public:
       out << "\n//------ TRANSPOSE_GPU_ALPAKA\n";
       out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fNData<<"(alpaka::Vec<Dim, Idx>::all("<<(stoi(length)+256-1)/256<<"), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
       out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNData << ", transposeKernel, alpaka::getPtrNative(deviceBuf_" << fNOutput << "), " << ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeData))<<", "
-         << ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeOutput)) << ", " << ConvertShapeToString(fAttrPerm) << ", " << fShapeOutput.size()<<");\n";
+         << ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeOutput)) << ", " << ConvertShapeToString(fShapeData) << ", " << ConvertShapeToString(fShapeOutput) << ", " << ConvertShapeToString(fAttrPerm) << ", " << fShapeOutput.size()<<");\n";
       return out.str();
    }
 
