@@ -202,8 +202,12 @@ inline std::size_t ConvertShapeToLength(const std::vector<size_t> & shape){
 }
 
 std::string ConvertShapeToString(const std::vector<size_t> & shape);
+std::string ConvertStringShapeToString(const std::vector<std::string> & shape);
+std::string ConvertShapeToString(const std::vector<std::string> & shape);
 std::string ConvertDimShapeToString(const std::vector<Dim> & shape);
 std::string ConvertShapeToString(const std::vector<Dim> & shape);
+std::string ConvertVectorDimShapeToString(const std::vector<std::vector<Dim>> & shapes);
+std::string ConvertShapeToString(const std::vector<std::vector<Dim>> & shapes);
 
 
 
@@ -513,6 +517,7 @@ void UnidirectionalBroadcast(const T* data, const std::vector<size_t>& shape, co
 /// compute stride of a tensor given its shape (assume layout is row-major)
 std::vector<size_t> ComputeStrideFromShape(const std::vector<size_t> & shape);
 std::vector<Dim> ComputeStrideFromShape(const std::vector<Dim> & shape);
+std::vector<std::vector<Dim>> ComputeStrideFromShape(const std::vector<std::vector<Dim>> & shapes);
 
 /// function to check if a >> 0 and a < MAX using a single comparison
 //// use trick casting to unsigned values so it becomes a single comparison

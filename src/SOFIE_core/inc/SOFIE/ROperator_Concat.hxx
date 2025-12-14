@@ -365,16 +365,16 @@
 
    std::string Generate_GPU_ALPAKA(std::string OpName) override {
       OpName = "op_" + OpName;
-      if (fShape.empty()) {
+      if (fOutputShape.empty()) {
          throw std::runtime_error("TMVA SOFIE Operator Concat called to Generate without being initialized first");
       }
       std::stringstream out;
-      auto length = ConvertDynamicShapeToLength(fShape);
+      auto length = ConvertDynamicShapeToLength(fOutputShape);
       out << "\n//------ CONCAT_GPU_ALPAKA\n";
-      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fInputs<<"(alpaka::Vec<Dim, Idx>::all("<<(stoi(length)+256-1)/256<<"), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fInputs << ", concatKernel, alpaka::getPtrNative(deviceBuf_" << fInputs << "), alpaka::getPtrNative(deviceBuf_" << fOutput << "), "
-      << ConvertShapeToString(UTILITY::ComputeStrideFromShape(fInputShapes)) << ", " << fInputShapes[fAxis] << ", " << fInputs.size() << ", " << fAxis << ", "
-      << ConvertShapeToString(UTILITY::ComputeStrideFromShape(fOutputShape)) << ", " << fOutputShape << ");\n";
+      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<ConvertShapeToString(fInputs)<<"(alpaka::Vec<Dim, Idx>::all("<< length << " + 256 - 1) / 256), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << ConvertShapeToString(fInputs) << ", concatKernel, alpaka::getPtrNative(deviceBuf_" << ConvertShapeToString(fInputs) << "), alpaka::getPtrNative(deviceBuf_" << fOutput << "), "
+      << ConvertShapeToString(UTILITY::ComputeStrideFromShape(fInputShapes)) << ", " << ConvertShapeToString(fInputShapes[fAxis]) << ", " << fInputs.size() << ", " << fAxis << ", "
+      << ConvertShapeToString(UTILITY::ComputeStrideFromShape(fOutputShape)) << ", " << ConvertShapeToString(fOutputShape) << ");\n";
       return out.str();
    }
    };

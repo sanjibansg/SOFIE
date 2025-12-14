@@ -116,6 +116,20 @@ std::string ConvertShapeToString(const std::vector<size_t> & shape) {
    return out.str();
 }
 
+std::string ConvertStringShapeToString(const std::vector<std::string> & shape) {
+   std::stringstream out;
+   out << "{ ";
+   for (size_t i = 0; i < shape.size(); i++) {
+      out << shape[i];
+      if (i < shape.size()-1) out << " , ";
+   }
+   out << " }";
+   return out.str();
+}
+std::string ConvertShapeToString(const std::vector<std::string> & shape) {
+   return ConvertStringShapeToString(shape);
+}
+
 std::string ConvertDimShapeToString(const std::vector<Dim> & shape) {
    std::stringstream out;
    out << "{ ";
@@ -162,6 +176,20 @@ std::string ConvertShapeToString(const std::vector<Dim> & shape) {
 }
 std::string ConvertDynamicShapeToLength(const std::vector<Dim> & shape) {
    return ConvertDimShapeToLength(shape);
+}
+
+std::string ConvertVectorDimShapeToString(const std::vector<std::vector<Dim>> & shapes) {
+    std::stringstream out;
+    out << "{ ";
+    for (size_t i = 0; i < shapes.size(); i++) {
+        out << ConvertShapeToString(shapes[i]);
+        if (i < shapes.size() - 1) out << " , ";
+    }
+    out << " }";
+    return out.str();
+}
+std::string ConvertShapeToString(const std::vector<std::vector<Dim>> & shapes) {
+    return ConvertVectorDimShapeToString(shapes);
 }
 
 
@@ -535,6 +563,18 @@ std::vector<Dim> UTILITY::ComputeStrideFromShape(const std::vector<Dim> & shape)
       }
    }
    return strides;
+}
+
+std::vector<std::vector<Dim>> UTILITY::ComputeStrideFromShape(const std::vector<std::vector<Dim>> & shapes) {
+    std::vector<std::vector<Dim>> all_strides;
+    all_strides.reserve(shapes.size());
+    
+    // Process each shape individually using the existing single-vector implementation
+    for (const auto& shape : shapes) {
+        all_strides.push_back(ComputeStrideFromShape(shape));
+    }
+    
+    return all_strides;
 }
 
 } // namespace SOFIE
