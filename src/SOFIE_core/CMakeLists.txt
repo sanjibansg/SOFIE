@@ -88,6 +88,7 @@ set(sources_cxx
 
 target_sources(SOFIE_core PRIVATE ${sources_headers} ${sources_cxx})
 target_include_directories(SOFIE_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/inc)
+target_link_libraries(SOFIE_core PUBLIC utils)
 target_link_libraries(SOFIE_core PUBLIC
     Tree
     Core

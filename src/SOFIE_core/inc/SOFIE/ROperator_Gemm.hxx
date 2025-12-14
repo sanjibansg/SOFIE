@@ -436,8 +436,8 @@ namespace SOFIE{
              throw std::runtime_error("TMVA SOFIE Gemm(MatMul) has invalid shape for inputs or output");
          }
          auto m = (fAttrTransA ? fShapeA[dimA-1].GetVal() : fShapeA[dimA-2].GetVal());
-         auto n = (fAttrTransA ? fShapeA[dimA-2].GetVal() : fShapeA[dimA-1].GetVal());
-         auto k = (fAttrTransB ? fShapeB[dimB-2].GetVal() : fShapeB[dimB-1].GetVal());
+         auto n = (fAttrTransB ? fShapeB[dimB-2].GetVal() : fShapeB[dimB-1].GetVal());
+         auto k = (fAttrTransA ? fShapeA[dimA-2].GetVal() : fShapeA[dimA-1].GetVal());
          std::vector<Dim> sY = {fShapeY[dimY-2], fShapeY[dimY-1]};
          // extra dimensions in case of stacked MatMul
          std::vector<Dim> sA;
@@ -451,7 +451,9 @@ namespace SOFIE{
          out << SP << "int " << opName << "_n = " << n << ";\n";
          out << SP << "int " << opName << "_k = " << k << ";\n";
          out << SP << "float " << opName << "_alpha = " << std::setprecision(std::numeric_limits<float>::max_digits10) << fAttrAlpha << ";\n";
-         out << SP << "float " << opName << "_beta = " << std::setprecision(std::numeric_limits<float>::max_digits10) << fAttrBeta << ";\n";
+         
+         // restricting to a 0 beta since BIAS is configured separately through sofieBLAS interface
+         out << SP << "float " << opName << "_beta = 0;\n";
 
          // case bias is present
          if (!fNC.empty()){
@@ -484,10 +486,14 @@ namespace SOFIE{
             out << SP;
          }
          // in the case of bias
-         if (!fNC.empty() && fActivation == EActivationType::RELU){
-            out << SP << "blas.gemmrelu("<<opName<<"_transA,"<<opName<<"_transB, "<<opName<<"_m, "<<opName<<"_n, "<<opName<<"_k, "<< opName << "_alpha, deviceBuf_"<<fNA<<",  "<<"deviceBuf_"<<fNB<<", "<<opName << "_beta, deviceBuf_"<<fNC<<", deviceBuf_"<<fNY<<");\n";
+         if (!fNC.empty()){
+            if (fActivation == EActivationType::RELU){
+               out << SP << "blas.gemmrelu("<<opName<<"_transB, "<<opName<<"_transA, "<<opName<<"_n, "<<opName<<"_m, "<<opName<<"_k, "<< opName << "_alpha, deviceBuf_"<<fNB<<",  "<<"deviceBuf_"<<fNA<<", "<<opName << "_beta, deviceBuf_"<<fNC2<<", deviceBuf_"<<fNY<<");\n";
+            } else {
+               out << SP << "blas.gemm("<<opName<<"_transB,"<<opName<<"_transA, "<<opName<<"_n, "<<opName<<"_m, "<<opName<<"_k, "<< opName << "_alpha, deviceBuf_"<<fNB<<",  "<<"deviceBuf_"<<fNA<<", "<<opName << "_beta, deviceBuf_"<<fNC2<<", deviceBuf_"<<fNY<<");\n";
+            }
          }
-
+         // need to implement for matmul case without bias
 
          return out.str();
       }
@@ -504,14 +510,12 @@ namespace SOFIE{
       }
 
       std::string GetBlasConfig(){
-
          int64_t dimA = fShapeA.size();
          int64_t dimB = fShapeB.size();
-
-         std::string m = (fAttrTransA ? fShapeA[dimA-1].GetVal() : fShapeA[dimA-2].GetVal());
-         std::string n = (fAttrTransA ? fShapeA[dimA-2].GetVal() : fShapeA[dimA-1].GetVal());
-         std::string k = (fAttrTransB ? fShapeB[dimB-2].GetVal() : fShapeB[dimB-1].GetVal());
-         return m+", "+n+", "+k;
+         auto m = (fAttrTransA ? fShapeA[dimA-1].GetVal() : fShapeA[dimA-2].GetVal());
+         auto n = (fAttrTransB ? fShapeB[dimB-2].GetVal() : fShapeB[dimB-1].GetVal());
+         auto k = (fAttrTransA ? fShapeA[dimA-2].GetVal() : fShapeA[dimA-1].GetVal());
+         return n+", "+m+", "+k;
       }
    };
 

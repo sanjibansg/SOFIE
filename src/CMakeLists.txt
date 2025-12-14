@@ -8,3 +8,4 @@ set(sofie_legacy_eval_backend ON CACHE BOOL "" FORCE)
 
 add_subdirectory(SOFIE_core)
 add_subdirectory(SOFIE_parsers)
+add_subdirectory(utils)

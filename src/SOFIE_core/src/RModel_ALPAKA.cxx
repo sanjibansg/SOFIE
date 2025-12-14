@@ -128,6 +128,42 @@ void RModel::GenerateDynamicTensorInfo_GPU_ALPAKA() {
    fGC += out.str();
 }
 
+// only supports BufF1D buffer data types for now
+std::string RModel::GenerateInferSignature_GPU_ALPAKA(bool isdecl) {
+   // generate the infer signature given the inputs: eg. "BufF1D const deviceBuf_A, BufF1D const deviceBuf_B"
+   // if (decl = false) generate only calling signature (deviceBuf_A, deviceBuf_B, ....)
+   std::string rGC;
+   std::unordered_map<std::string, int> inputParams;
+   int i_input = 0;
+   for (auto &name : fInputTensorNames) {
+      // if is a dynamic tensor pass initial parameters
+      if (IsDimInputTensor(name)) {
+         auto shape = GetDynamicTensorShape(name);
+         for (auto &d : shape) {
+            std::string pName = d.param;
+            // need to check if the input parameters is already existing in another input tensor
+            if (d.isParam && inputParams.count(pName) == 0) {
+               if (isdecl) rGC += "size_t ";
+               rGC += d.param + ",";
+               inputParams[pName] = i_input;
+            }
+         }
+      }
+      if (isdecl) {
+         std::string type = "BufF1D";
+         if (type == "other")
+            throw std::runtime_error("TMVA-SOFIE: input tensor " + name +
+                                     " is of a data type which is not yet supported.");
+         rGC += type + " const ";
+      }
+      rGC += "deviceBuf_" + name + ",";
+      i_input++;
+   }
+
+   if (fInputTensorNames.size() > 0) rGC.pop_back();// remove last ","
+   return rGC;
+}
+
 void RModel::GenerateOutput_GPU_ALPAKA() {
    if (fVerbose)
       std::cout << "Generating main inference code for " << fName << std::endl;
@@ -149,7 +185,7 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    }
 
    fGC += " infer(";
-   fGC += GenerateInferSignature();
+   fGC += GenerateInferSignature_GPU_ALPAKA();
    fGC += "){\n";
 
    for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {

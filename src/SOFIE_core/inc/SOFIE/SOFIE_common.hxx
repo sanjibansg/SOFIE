@@ -1,7 +1,7 @@
 #ifndef SOFIE_SOFIE_COMMON
 #define SOFIE_SOFIE_COMMON
 
-#include "TMVA/RTensor.hxx"
+#include "SOFIE/RTensor.hxx"
 
 #include "ROOT/RSpan.hxx"
 
@@ -194,7 +194,12 @@ std::vector<Dim> ConvertShapeToDim(const std::vector<size_t> & shape);
 
 std::vector<size_t> ConvertShapeToInt(const std::vector<Dim> & shape);
 
-std::size_t ConvertShapeToLength(const std::vector<size_t> & shape);
+inline std::size_t ConvertShapeToLength(const std::vector<size_t> & shape){
+   // Empty shape represent scalar values, so we return a length=1
+   std::size_t fLength = 1;
+   for (auto& dim: shape) fLength *= dim;
+   return fLength;
+}
 
 std::string ConvertShapeToString(const std::vector<size_t> & shape);
 std::string ConvertDimShapeToString(const std::vector<Dim> & shape);
@@ -692,20 +697,20 @@ extern "C" void sgemm_(const char * transa, const char * transb, const int * m, 
 
 
 struct GNN_Data {
-      TMVA::Experimental::RTensor<float> node_data;      // the node feature data, tensor with shape (num_nodes, num_node_features)
-      TMVA::Experimental::RTensor<float> edge_data;      // the edge feature data, tensor with shape (num_edges, num_edge_features)
-      TMVA::Experimental::RTensor<float> global_data;    // the global features, tensor with shape (1, num_global_features)
-      TMVA::Experimental::RTensor<int> edge_index;       // the edge index (receivers and senders for each edge), tensor with shape (2, num_edges)
+      SOFIE::RTensor<float> node_data;      // the node feature data, tensor with shape (num_nodes, num_node_features)
+      SOFIE::RTensor<float> edge_data;      // the edge feature data, tensor with shape (num_edges, num_edge_features)
+      SOFIE::RTensor<float> global_data;    // the global features, tensor with shape (1, num_global_features)
+      SOFIE::RTensor<int> edge_index;       // the edge index (receivers and senders for each edge), tensor with shape (2, num_edges)
                                      // edge_index[0,:] are the receivers and edge_index[1,:] are the senders
 
 
       // need to have default constructor since RTensor has not one
-      GNN_Data(): node_data(TMVA::Experimental::RTensor<float>({})), edge_data(TMVA::Experimental::RTensor<float>({})), global_data(TMVA::Experimental::RTensor<float>({})), edge_index(TMVA::Experimental::RTensor<int>({})) {}
+      GNN_Data(): node_data(SOFIE::RTensor<float>({})), edge_data(SOFIE::RTensor<float>({})), global_data(SOFIE::RTensor<float>({})), edge_index(SOFIE::RTensor<int>({})) {}
 
 };
 
 template<typename T>
-TMVA::Experimental::RTensor<T> Concatenate( TMVA::Experimental::RTensor<T> & t1,  TMVA::Experimental::RTensor<T> & t2, int axis = 0)
+SOFIE::RTensor<T> Concatenate( SOFIE::RTensor<T> & t1,  SOFIE::RTensor<T> & t2, int axis = 0)
 {
    // concatenate tensor along axis. Shape must be the same except in the dimension of the concatenated axis
    if (t1.GetMemoryLayout() != t2.GetMemoryLayout())
@@ -720,8 +725,8 @@ TMVA::Experimental::RTensor<T> Concatenate( TMVA::Experimental::RTensor<T> & t1,
    }
    std::vector<size_t> outShape = shape1;
    outShape[axis] = shape1[axis] + shape2[axis];
-   TMVA::Experimental::RTensor<T> tout(outShape, t1.GetMemoryLayout());
-   if (t1.GetMemoryLayout() == TMVA::Experimental::MemoryLayout::ColumnMajor) {
+   SOFIE::RTensor<T> tout(outShape, t1.GetMemoryLayout());
+   if (t1.GetMemoryLayout() == SOFIE::MemoryLayout::ColumnMajor) {
       throw std::runtime_error("TMVA RTensor Concatenate is not yet supported for column major tensors");
    }
 
@@ -754,10 +759,10 @@ inline GNN_Data Concatenate(GNN_Data & data1, GNN_Data & data2, int axis = 0) {
 
 inline GNN_Data Copy(const GNN_Data & data) {
    GNN_Data out;
-   out.node_data = TMVA::Experimental::RTensor<float>(data.node_data.GetShape());
-   out.edge_data = TMVA::Experimental::RTensor<float>(data.edge_data.GetShape());
-   out.global_data = TMVA::Experimental::RTensor<float>(data.global_data.GetShape());
-   out.edge_index = TMVA::Experimental::RTensor<int>(data.edge_index.GetShape());
+   out.node_data = SOFIE::RTensor<float>(data.node_data.GetShape());
+   out.edge_data = SOFIE::RTensor<float>(data.edge_data.GetShape());
+   out.global_data = SOFIE::RTensor<float>(data.global_data.GetShape());
+   out.edge_index = SOFIE::RTensor<int>(data.edge_index.GetShape());
    std::copy(data.node_data.GetData(), data.node_data.GetData()+ data.node_data.GetSize(), out.node_data.GetData());
    std::copy(data.edge_data.GetData(), data.edge_data.GetData()+ data.edge_data.GetSize(), out.edge_data.GetData());
    std::copy(data.global_data.GetData(), data.global_data.GetData()+ data.global_data.GetSize(), out.global_data.GetData());

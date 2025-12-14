@@ -25,7 +25,6 @@ SOFIE works in a parser-generator working architecture. With SOFIE, the user get
 From ROOT command line, or in a ROOT macro, we can proceed with an ONNX model:
 
 ```c++
-using namespace TMVA::Experimental;
 SOFIE::RModelParser_ONNX parser;
 SOFIE::RModel model = parser.Parse(“./example_model.onnx”);
 model.Generate();
@@ -73,7 +72,6 @@ SOFIE also supports generating inference code with RDataFrame as inputs, refer t
 
 Here is the updated list of supported ONNX operators. You can obtain this list by doing
 ```cpp
-using namespace TMVA::Experimental;
 SOFIE::RModelParser_ONNX parser;
 std::vector<std::string> supportedOperators = parser.GetRegisteredOperators();
 ```
@@ -164,7 +162,6 @@ The above operators are supported for tensors of the following types:
 
 You can also check your model whether all operators are implemented by doing the following:
 ```c++
-using namespace TMVA::Experimental;
 SOFIE::RModelParser_ONNX parser;
 parser.CheckModel("example_model.ONNX");
 ```

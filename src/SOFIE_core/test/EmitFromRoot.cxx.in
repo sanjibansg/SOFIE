@@ -43,7 +43,12 @@ int EmitModel(std::string inputfile, std::string outname){
 
 int main(int argc, char *argv[]){
 
-   int failures = 0;
+    int failures = 0;
+
+    @EMIT_CAPTURES@
+
+    std::cout << "[SUMMARY for generation from ROOT] Completed with " << failures << " failures" << std::endl;
+    return failures == 0 ? 0 : 1;
 
    @EMIT_CAPTURES@;
 

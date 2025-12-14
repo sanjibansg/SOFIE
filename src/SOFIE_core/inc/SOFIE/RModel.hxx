@@ -168,6 +168,10 @@ public:
    // used to infer the sub-graphs
    std::string GenerateInferSignature(bool isdecl = true);
 
+   // generate the infer function signature for inference on ALPAKA. If isdecl= false generate the calling infer function
+   // used to infer the sub-graphs
+   std::string GenerateInferSignature_GPU_ALPAKA(bool isdecl = true);
+
    void RemoveIntermediateTensor(const std::string& tensor_name){
       fIntermediateTensorInfos.erase(tensor_name);
    }
