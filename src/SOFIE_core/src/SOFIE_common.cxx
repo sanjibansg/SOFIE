@@ -116,6 +116,20 @@ std::string ConvertShapeToString(const std::vector<size_t> & shape) {
    return out.str();
 }
 
+std::string ConvertIntShapeToString(const std::vector<int_t> & shape) {
+   std::stringstream out;
+   out << "{ ";
+   for (size_t i = 0; i < shape.size(); i++) {
+      out << shape[i];
+      if (i < shape.size()-1) out << " , ";
+   }
+   out << " }";
+   return out.str();
+}
+std::string ConvertShapeToString(const std::vector<int_t> & shape) {
+   return ConvertIntShapeToString(shape);
+}
+
 std::string ConvertDimShapeToString(const std::vector<Dim> & shape) {
    std::stringstream out;
    out << "{ ";

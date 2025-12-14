@@ -191,7 +191,7 @@ public:
       op += SP + SP + SP + SP + SP + "}\n";
       op += SP + SP + SP + SP + SP + "output[output_idx] = input[input_idx];\n";
       op += SP + SP + SP + SP + "}\n";
-      op += SP + SP + SP" + }\n";
+      op += SP + SP + SP + "}\n";
       op += SP + SP + "};\n";
 
       return op;
@@ -203,13 +203,10 @@ public:
 
    std::string Generate_GPU_ALPAKA(std::string OpName) override {
       OpName = "op_" + OpName;
-      if (fShape.empty()) {
-         throw std::runtime_error("TMVA SOFIE Operator Transpose called to Generate without being initialized first");
-      }
       std::stringstream out;
-      auto length = ConvertDynamicShapeToLength(fShape);
+      auto length = ConvertShapeToLength(fShapeOutput);
       out << "\n//------ TRANSPOSE_GPU_ALPAKA\n";
-      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fNData<<"(alpaka::Vec<Dim, Idx>::all("<<(stoi(length)+256-1)/256<<"), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
+      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fNData<<"(alpaka::Vec<Dim, Idx>::all("<< length << " + 256 - 1) / 256), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
       out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNData << ", transposeKernel, alpaka::getPtrNative(deviceBuf_" << fNData << "), alpaka::getPtrNative(deviceBuf_" << fNOutput << "), " << ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeData))<<", "
          << ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeOutput)) << ", " << ConvertShapeToString(fShapeData) << ", " << ConvertShapeToString(fShapeOutput) << ", " << ConvertShapeToString(fAttrPerm) << ", " << fShapeOutput.size()<<");\n";
       return out.str();

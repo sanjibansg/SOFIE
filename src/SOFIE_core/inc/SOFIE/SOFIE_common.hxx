@@ -202,6 +202,8 @@ inline std::size_t ConvertShapeToLength(const std::vector<size_t> & shape){
 }
 
 std::string ConvertShapeToString(const std::vector<size_t> & shape);
+std::string ConvertIntShapeToString(const std::vector<int_t> & shape);
+std::string ConvertShapeToString(const std::vector<int_t> & shape);
 std::string ConvertDimShapeToString(const std::vector<Dim> & shape);
 std::string ConvertShapeToString(const std::vector<Dim> & shape);
 
