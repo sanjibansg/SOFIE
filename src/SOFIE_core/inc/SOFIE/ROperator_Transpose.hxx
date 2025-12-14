@@ -203,6 +203,9 @@ public:
 
    std::string Generate_GPU_ALPAKA(std::string OpName) override {
       OpName = "op_" + OpName;
+      if (fShapeOutput.empty()) {
+         throw std::runtime_error("TMVA SOFIE Operator Concat called to Generate without being initialized first");
+      }
       std::stringstream out;
       auto length = ConvertShapeToLength(fShapeOutput);
       out << "\n//------ TRANSPOSE_GPU_ALPAKA\n";
