@@ -215,9 +215,11 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
    fGC += "\n//--- ALPAKA Kernels\n";
    for (size_t id = 0; id < fOperators.size(); id++) {
-      std::cout<<toString(fOperators[id]->GetKind())<<std::endl;
       if(registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
-         std::cout<<"Generating ALPAKA kernel for operator"<< std::endl;
+         
+         if (fVerbose)
+            std::cout<<"Generating ALPAKA kernel for operator"<< toString(fOperators[id]->GetKind()) << std::endl;
+         
          fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
          registered_operators.insert(fOperators[id]->GetKind());
       }
@@ -312,9 +314,11 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
    registered_operators.clear();
       for (size_t id = 0; id < fOperators.size(); id++) {
-      std::cout<<toString(fOperators[id]->GetKind())<<std::endl;
       if(registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
-         std::cout<<"Declaring ALPAKA kernel for operator"<< std::endl;
+         
+         if (fVerbose)
+         std::cout<<"Declaring ALPAKA kernel for operator"<< toString(fOperators[id]->GetKind())<<std::endl;
+         
          fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
          registered_operators.insert(fOperators[id]->GetKind());
       }

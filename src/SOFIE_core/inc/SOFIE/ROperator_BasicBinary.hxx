@@ -387,6 +387,9 @@ public:
    }
 
    std::string Generate_GPU_Kernel_ALPAKA(std::string opName) {
+      if (fIsOutputConstant)
+         return "";
+
       std::string op;
       op = "\n//------ "+opName+"_"+BinaryOperatorTrait<T, Op>::Name()+"_KERNEL_ALPAKA\n";
       op += SP + "struct Binary"+BinaryOperatorTrait<T, Op>::Name()+"Kernel {\n";
@@ -402,7 +405,6 @@ public:
       }
       op.pop_back();
       op += "));\n";
-      std::cout<<"okay till here 1\n";
       op += SP + SP + SP + SP + "for (auto const& elem : elements) {\n";
 
       auto stridesA = UTILITY::ComputeStrideFromShape(fDimShapeA);
@@ -426,7 +428,6 @@ public:
          for (int j = 0; j < 3; j++)
             compute_idx_A.pop_back();
       }
-      std::cout<<"okay till here 2\n";
       if (fDimShapeB.empty() ||
           std::all_of(fDimShapeB.begin(), fDimShapeB.end(), [](Dim d) { return d.dim == 1 || d.GetVal() == "1"; })) {
          compute_idx_B = "0";
@@ -443,7 +444,6 @@ public:
          for (int j = 0; j < 3; j++)
             compute_idx_B.pop_back();
       }
-      std::cout<<"okay till here 3\n";
       int nloop = 0;
       if (fDimShapeY.empty() ||
           std::all_of(fDimShapeY.begin(), fDimShapeY.end(), [](Dim d) { return d.dim == 1 || d.GetVal() == "1"; })) {
@@ -463,13 +463,11 @@ public:
          for (int j = 0; j < 3; j++)
             compute_idx_Y.pop_back();
       }
-      std::cout<<"okay till here 4\n";
       for (int j = 0; j < nloop + 1; j++) op += SP;
       op += "C[" + compute_idx_Y + "] = "
           + BinaryOperatorTrait<T, Op>::Op("A[" + compute_idx_A + "]",
                                             "B[" + compute_idx_B + "]")
           + " ;\n";
-      std::cout<<"okay till here 5\n";
       for (int i = nloop; i > 0; i--) {
          for (int j = 0; j < i; j++) op += SP;
          op += "}\n";
@@ -478,10 +476,16 @@ public:
    }
 
    std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string OpName) {
+      if (fIsOutputConstant)
+         return "";
+
       return SP + "Binary"+BinaryOperatorTrait<T, Op>::Name()+"Kernel " + OpName + "Kernel;\n";
    }
 
    std::string Generate_GPU_ALPAKA(std::string OpName) {
+      if (fIsOutputConstant)
+         return "";
+
       if (fDimShapeY.empty()) {
          throw std::runtime_error("TMVA SOFIE Operator Basic Binary called to Generate without being initialized first");
       }

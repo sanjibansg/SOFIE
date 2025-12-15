@@ -258,7 +258,6 @@ namespace SOFIE{
 
          if (!fIsDynamic){
             model.AddIntermediateTensor(fNY, model.GetTensorType(fNA), shapeY);
-            std::cout<<"currently adding: "<<fNY;
          }
          else
             model.AddDynamicTensor(fNY, model.GetTensorType(fNA), fShapeY);

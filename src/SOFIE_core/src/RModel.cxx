@@ -213,6 +213,7 @@ bool RModel::IsInitializedTensor(const std::string& tensorName) const {
     std::string name = UTILITY::Clean_name(tensorName);
     return fInitializedTensors.find(name) != fInitializedTensors.end();
 }
+
 bool RModel::IsConstantTensor(const std::string& tensorName) const {
     std::string name = UTILITY::Clean_name(tensorName);
     auto itr = fInitializedTensors.find(name);
