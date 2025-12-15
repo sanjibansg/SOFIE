@@ -25,7 +25,11 @@ source setup.sh
 ```
 Now ROOT should also access the SOFIE libraries while it runs. This helps to accelerate development. Submit your developments here and we will proceed with the developments in ROOT carefull.
 
-
+3. To enable testing generated code with alpaka implementations, build using the following command:
+```bash
+cmake -Dtesting=ON -DENABLE_ALPAKA_TESTS=ON -DCMAKE_INSTALL_PREFIX=../install -DCMAKE_BUILD_TYPE=RelWithDebInfo ..
+```
+The default architecture is CUDA, but can be configured using an additional`-DALPAKA_BACKEND=hip` cmake option.
     
 ## Inspiration
 The standalone version of SOFIE is developed with inspiration from the standalone version of RooFit developed by Jonas Rembser that can be found [here](https://github.com/guitargeek/roofit).
