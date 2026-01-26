@@ -100,8 +100,6 @@ public:
          throw std::runtime_error("TMVA SOFIE Operator LeakyRelu called to Generate without being initialized first");
       }
 
-
-
       std::stringstream out;
       auto length = ConvertShapeToLength(fShape);
       out << "\n//------ LEAKY_RELU_GPU_ALPAKA\n";

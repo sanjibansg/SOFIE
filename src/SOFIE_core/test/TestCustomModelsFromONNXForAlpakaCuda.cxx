@@ -13,6 +13,9 @@
 #include "LinearWithLeakyRelu_FromONNX_GPU_ALPAKA.hxx"
 #include "input_models/references/LinearWithLeakyRelu.ref.hxx"
 
+#include "LinearWithSigmoid_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/LinearWithSigmoid.ref.hxx"
+
 #include <alpaka/alpaka.hpp>
 #include <cuda_runtime.h>
 #include <nvml.h>
@@ -184,7 +187,6 @@ TEST_F(SofieAlpakaTest, LinearWithLeakyRelu)
    auto A_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
    alpaka::memcpy(queue, A_d, A);
    alpaka::wait(queue);
-    cudaDeviceSynchronize();
 
    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{24}));
    
@@ -201,6 +203,41 @@ TEST_F(SofieAlpakaTest, LinearWithLeakyRelu)
    float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
    float *correct = LinearWithLeakyRelu_ExpectedOutput::outputs;
 
+   for (size_t i = 0; i < 24; ++i) {
+      EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE);
+   }
+}
+
+TEST_F(SofieAlpakaTest, LinearWithSigmoid)
+{
+
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+   auto A = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{48}));
+   float *A_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(A));
+
+   for (Idx i = 0; i < 48; ++i) {
+      A_ptr[i] = 1.0;
+   }
+
+   auto A_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{48}));
+   alpaka::memcpy(queue, A_d, A);
+   alpaka::wait(queue);
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{48}));
+   
+   {
+      SOFIE_LinearWithSigmoid::Session<alpaka::TagGpuCudaRt> session("LinearWithSigmoid_FromONNX_GPU_ALPAKA.dat");
+      auto result = session.infer(A_d);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float *correct = LinearWithSigmoid_ExpectedOutput::all_ones;
    for (size_t i = 0; i < 24; ++i) {
       EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE);
    }

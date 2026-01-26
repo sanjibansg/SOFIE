@@ -61,14 +61,15 @@ public:
       return out.str();
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA() {
+   std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) override {
       std::string op;
       op = "\n//------ SIGMOID_KERNEL_ALPAKA\n";
-      op += SP + "struct SigmoidKernel {\n";
-      op += SP + SP + "template<typename TAcc, typename T>\n";
-      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T* data, std::size_t numElements) const {\n";
-      op += SP + SP + SP + "for (auto i : alpaka::uniformElements(acc, numElements)) {\n";
-      op += SP + SP + SP + SP + "data[i] = static_cast<T>(1) / (static_cast<T>(1) + exp(-data[i]));\n";
+      op += "struct SigmoidKernel {\n";
+      op += SP + "template<typename TAcc, typename T>\n";
+      op += SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const* __restrict__ data, T* __restrict__ out, std::size_t numElements) const {\n";
+      op += SP + SP + "const auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + "if(idx < numElements) {\n";
+      op += SP + SP + SP + SP + "out[idx] = static_cast<T>(1) / (static_cast<T>(1) + exp(-data[idx]));\n";
       op += SP + SP + SP + "}\n";
       op += SP + SP + "}\n";
       op += SP + "};\n";
@@ -89,14 +90,14 @@ public:
       std::stringstream out;
       auto length = ConvertShapeToLength(fShape);
       out << "\n//------ SIGMOID_GPU_ALPAKA\n";
-      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_" << fNX
-         << "(alpaka::Vec<Dim, Idx>::all((" << length << " + 256 - 1) / 256), "
-         << "alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
-
+      out << SP << "auto const elementsPerThread_"<<fNX<<" = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_"<<fNX<<" = Vec::all(Idx{"<< length << "});\n";
+      out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << fNX << " = {elementsPerGrid_" << fNX << ", elementsPerThread_" << fNX << "};\n";
+      out << SP << "auto const workDiv_" << fNX << " = alpaka::getValidWorkDiv(kernelCfg_" << fNX << ", devAcc, sigmoidKernel, alpaka::getPtrNative(deviceBuf_" << fNX
+         << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), static_cast<Idx>(" << length << "));\n";
       out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX
          << ", sigmoidKernel, alpaka::getPtrNative(deviceBuf_" << fNX
-         << "), static_cast<Idx>(" << length << "));\n";
-
+         << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), static_cast<Idx>(" << length << "));\n";
       return out.str();
    }
 
