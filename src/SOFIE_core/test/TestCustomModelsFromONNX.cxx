@@ -812,7 +812,7 @@ TEST(ONNX, LinearWithLeakyRelu)
 {
    constexpr float TOLERANCE = 1;
 
-   // Preparing the standard all-ones input
+   // Preparing input
    std::vector<float> input({
       0.4369, -0.6882,  1.0309, -1.0263, -0.1519,  1.2237, -0.7054, -0.1762,
       -0.6811, -2.2597,  1.0388, -0.7993,  0.1468,  1.3257, -0.4714, -0.0958,

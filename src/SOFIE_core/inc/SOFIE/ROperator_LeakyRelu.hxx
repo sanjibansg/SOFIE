@@ -75,22 +75,23 @@ public:
       return out.str();
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA() {
+   std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) override {
       std::string op;
       op = "\n//------ LEAKY_RELU_KERNEL_ALPAKA\n";
-      op += SP + "struct LeakyReluKernel {\n";
-      op += SP + SP + "template<typename TAcc, typename T>\n";
-      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T* data, std::size_t numElements, T alpha = static_cast<T>(0.01)) const {\n";
-      op += SP + SP + SP + "for (auto i : alpaka::uniformElements(acc, numElements)) {\n";
-      op += SP + SP + SP + SP + "data[i] = (data[i] < static_cast<T>(0)) ? alpha * data[i] : data[i];\n";
-      op += SP + SP + SP + "}\n";
+      op += "struct LeakyReluKernel {\n";
+      op += SP + "template<typename TAcc, typename T>\n";
+      op += SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const* __restrict__ data, T* __restrict__ out, std::size_t numElements, T alpha) const {\n";
+      op += SP + SP + "const auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + "if(idx < numElements) {\n";
+      op += SP + SP + "out[idx] = data[idx] >= 0 ? data[idx] : alpha * data[idx];\n";
       op += SP + SP + "}\n";
-      op += SP + "};\n";
+      op += SP + "}\n";
+      op += "};\n";
       return op;
    }
 
    std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) override {
-      return SP + "LeakyReluKernel leakyReluKernel;\n";
+      return "LeakyReluKernel leakyReluKernel;\n";
    }
 
    std::string Generate_GPU_ALPAKA(std::string OpName) override {
@@ -99,17 +100,20 @@ public:
          throw std::runtime_error("TMVA SOFIE Operator LeakyRelu called to Generate without being initialized first");
       }
 
+
+
       std::stringstream out;
       auto length = ConvertShapeToLength(fShape);
       out << "\n//------ LEAKY_RELU_GPU_ALPAKA\n";
-      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_" << fNX
-         << "(alpaka::Vec<Dim, Idx>::all((" << length << " + 256 - 1) / 256), "
-         << "alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
-
+      out << SP << "constexpr float " << OpName << "_alpha = " << std::setprecision(std::numeric_limits<float>::max_digits10) << falpha << ";\n";
+      out << SP << "auto const elementsPerThread_"<<fNX<<" = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_"<<fNX<<" = Vec::all(Idx{"<< length << "});\n";
+      out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << fNX << " = {elementsPerGrid_" << fNX << ", elementsPerThread_" << fNX << "};\n";
+      out << SP << "auto const workDiv_" << fNX << " = alpaka::getValidWorkDiv(kernelCfg_" << fNX << ", devAcc, leakyReluKernel, alpaka::getPtrNative(deviceBuf_" << fNX
+         << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), static_cast<Idx>(" << length << "), " << OpName << "_alpha);\n";
       out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX
          << ", leakyReluKernel, alpaka::getPtrNative(deviceBuf_" << fNX
-         << "), static_cast<Idx>(" << length << "), static_cast<float>(0.01));\n";
-
+         << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), static_cast<Idx>(" << length << "), " << OpName << "_alpha);\n";
       return out.str();
    }
 

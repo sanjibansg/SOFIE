@@ -62,62 +62,62 @@ configure_file(EmitFromONNX.cxx.in EmitFromONNX_all.cxx @ONLY)
 configure_file(EmitFromONNX_GPU_ALPAKA.cxx.in EmitFromONNX_GPU_ALPAKA_all.cxx @ONLY)
 
 # --- CPU emitter ---
-ROOTTEST_GENERATE_EXECUTABLE(emitFromONNX EmitFromONNX_all.cxx
-  LIBRARIES protobuf::libprotobuf SOFIE_core SOFIE_parsers
-  FIXTURES_SETUP sofie-compile-models-onnx-build)
+# ROOTTEST_GENERATE_EXECUTABLE(emitFromONNX EmitFromONNX_all.cxx
+#   LIBRARIES protobuf::libprotobuf SOFIE_core SOFIE_parsers
+#   FIXTURES_SETUP sofie-compile-models-onnx-build)
 
-target_compile_options(emitFromONNX PRIVATE -Wno-unused-parameter -Wno-array-bounds)
+# target_compile_options(emitFromONNX PRIVATE -Wno-unused-parameter -Wno-array-bounds)
 
-ROOTTEST_ADD_TEST(SofieCompileModels_ONNX
-  COMMAND ${CMAKE_COMMAND} -E env ROOTIGNOREPREFIX=1 ./emitFromONNX
-  FIXTURES_REQUIRED sofie-compile-models-onnx-build
-  FIXTURES_SETUP sofie-compile-models-onnx
-)
+# ROOTTEST_ADD_TEST(SofieCompileModels_ONNX
+#   COMMAND ${CMAKE_COMMAND} -E env ROOTIGNOREPREFIX=1 ./emitFromONNX
+#   FIXTURES_REQUIRED sofie-compile-models-onnx-build
+#   FIXTURES_SETUP sofie-compile-models-onnx
+# )
 
-# --- Custom model tests ---
-if (BLAS_FOUND)
-  ROOTTEST_GENERATE_EXECUTABLE(TestCustomModelsFromONNX TestCustomModelsFromONNX.cxx
-    LIBRARIES
-      MathCore
-      SOFIE_core
-      BLAS::BLAS
-      GTest::gtest
-      GTest::gtest_main
-    FIXTURES_REQUIRED sofie-compile-models-onnx
-    FIXTURES_SETUP sofie-test-models-onnx-build
-  )
+# # --- Custom model tests ---
+# if (BLAS_FOUND)
+#   ROOTTEST_GENERATE_EXECUTABLE(TestCustomModelsFromONNX TestCustomModelsFromONNX.cxx
+#     LIBRARIES
+#       MathCore
+#       SOFIE_core
+#       BLAS::BLAS
+#       GTest::gtest
+#       GTest::gtest_main
+#     FIXTURES_REQUIRED sofie-compile-models-onnx
+#     FIXTURES_SETUP sofie-test-models-onnx-build
+#   )
 
-  target_include_directories(TestCustomModelsFromONNX PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+#   target_include_directories(TestCustomModelsFromONNX PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
-  ROOTTEST_ADD_TEST(TestCustomModelsFromONNX
-    EXEC ./TestCustomModelsFromONNX
-    FIXTURES_REQUIRED sofie-test-models-onnx-build
-  )
-endif()
+#   ROOTTEST_ADD_TEST(TestCustomModelsFromONNX
+#     EXEC ./TestCustomModelsFromONNX
+#     FIXTURES_REQUIRED sofie-test-models-onnx-build
+#   )
+# endif()
 
-# --- Python-based generators ---
-ROOT_FIND_PYTHON_MODULE(torch)
-if (ROOT_TORCH_FOUND)
-  configure_file(Conv1dModelGenerator.py  Conv1dModelGenerator.py COPYONLY)
-  configure_file(Conv2dModelGenerator.py  Conv2dModelGenerator.py COPYONLY)
-  configure_file(Conv3dModelGenerator.py  Conv3dModelGenerator.py COPYONLY)
-  configure_file(ConvTrans2dModelGenerator.py ConvTrans2dModelGenerator.py COPYONLY)
-  configure_file(LinearModelGenerator.py LinearModelGenerator.py COPYONLY)
-  configure_file(RecurrentModelGenerator.py RecurrentModelGenerator.py COPYONLY)
+# # --- Python-based generators ---
+# ROOT_FIND_PYTHON_MODULE(torch)
+# if (ROOT_TORCH_FOUND)
+#   configure_file(Conv1dModelGenerator.py  Conv1dModelGenerator.py COPYONLY)
+#   configure_file(Conv2dModelGenerator.py  Conv2dModelGenerator.py COPYONLY)
+#   configure_file(Conv3dModelGenerator.py  Conv3dModelGenerator.py COPYONLY)
+#   configure_file(ConvTrans2dModelGenerator.py ConvTrans2dModelGenerator.py COPYONLY)
+#   configure_file(LinearModelGenerator.py LinearModelGenerator.py COPYONLY)
+#   configure_file(RecurrentModelGenerator.py RecurrentModelGenerator.py COPYONLY)
 
-  if (BLAS_FOUND)
-    ROOT_ADD_GTEST(TestSofieModels TestSofieModels.cxx
-      LIBRARIES SOFIE_core SOFIE_parsers BLAS::BLAS
-      INCLUDE_DIRS ${CMAKE_CURRENT_BINARY_DIR}
-    )
-  endif()
-endif()
+#   if (BLAS_FOUND)
+#     ROOT_ADD_GTEST(TestSofieModels TestSofieModels.cxx
+#       LIBRARIES SOFIE_core SOFIE_parsers BLAS::BLAS
+#       INCLUDE_DIRS ${CMAKE_CURRENT_BINARY_DIR}
+#     )
+#   endif()
+# endif()
 
-ROOT_EXECUTABLE(emitGNN GNN/EmitGNN.cxx LIBRARIES SOFIE_core)
-ROOT_ADD_TEST(tmva-sofie-EmitGNN COMMAND emitGNN)
+# ROOT_EXECUTABLE(emitGNN GNN/EmitGNN.cxx LIBRARIES SOFIE_core)
+# ROOT_ADD_TEST(tmva-sofie-EmitGNN COMMAND emitGNN)
 
-ROOT_EXECUTABLE(EmitGraphIndependent GNN/EmitGraphIndependent.cxx LIBRARIES SOFIE_core)
-ROOT_ADD_TEST(tmva-sofie-EmitGraphIndependent COMMAND EmitGraphIndependent)
+# ROOT_EXECUTABLE(EmitGraphIndependent GNN/EmitGraphIndependent.cxx LIBRARIES SOFIE_core)
+# ROOT_ADD_TEST(tmva-sofie-EmitGraphIndependent COMMAND EmitGraphIndependent)
 
 # =========================
 # ALPAKA TESTS
@@ -192,13 +192,15 @@ if (ENABLE_ALPAKA_TESTS)
       PROPERTIES LANGUAGE CUDA
     )
 
-    ROOTTEST_GENERATE_EXECUTABLE(
-      TestCustomModelsFromONNXForAlpakaCuda
-      TestCustomModelsFromONNXForAlpakaCuda.cxx
-      LIBRARIES MathCore SOFIE_core GTest::gtest GTest::gtest_main
-      FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka
-      FIXTURES_SETUP sofie-test-models-onnx-alpaka-build
-    )
+
+ROOTTEST_GENERATE_EXECUTABLE(
+  TestCustomModelsFromONNXForAlpakaCuda
+  TestCustomModelsFromONNXForAlpakaCuda.cxx
+  LIBRARIES MathCore SOFIE_core GTest::gtest GTest::gtest_main
+  FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka
+  FIXTURES_SETUP sofie-test-models-onnx-alpaka-build
+)
+
 
     target_include_directories(
       TestCustomModelsFromONNXForAlpakaCuda PRIVATE

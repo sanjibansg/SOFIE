@@ -13,10 +13,6 @@ namespace SOFIE {
 void RModel::GenerateInitializedTensorInfo_GPU_ALPAKA() {
    if (!fInitializedTensors.empty()){
       fGC += "\n// initialized tensors for weights\n";
-      fGC += "using BufF1D = alpaka::Buf<Acc, float, Dim, Idx>;\n";
-      fGC += "using BufD1D = alpaka::Buf<Acc, double, Dim, Idx>;\n";
-      fGC += "using BufI641D = alpaka::Buf<Acc, int64_t, Dim, Idx>;\n";
-
    }
 
    for (auto &i : fInitializedTensors) {
@@ -238,9 +234,13 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
     fGC += "using Idx = std::size_t;\n";
     fGC += "using Dim = alpaka::DimInt<1>;\n";
     fGC += "using Acc = alpaka::TagToAcc<tagAcc, Dim, Idx>;\n";
-    fGC += "using DevAcc = alpaka::Dev<Acc>;\n";
+    fGC += "using DevAcc = alpaka::Dev<Acc>;\n\n";
     fGC += "using QueueProperty = alpaka::NonBlocking;\n";
-    fGC += "using QueueAcc = alpaka::Queue<Acc, QueueProperty>;\n";
+    fGC += "using QueueAcc = alpaka::Queue<Acc, QueueProperty>;\n\n";
+    fGC += "using BufF1D = alpaka::Buf<Acc, float, Dim, Idx>;\n";
+    fGC += "using BufD1D = alpaka::Buf<Acc, double, Dim, Idx>;\n";
+    fGC += "using BufI641D = alpaka::Buf<Acc, int64_t, Dim, Idx>;\n\n";
+
     fGC += "\nalpaka::Platform<Acc> const platform{};\n";
     fGC += "DevAcc devAcc = alpaka::getDevByIdx(platform, 0);\n";
     fGC += "alpaka::PlatformCpu platformHost{};\n";
