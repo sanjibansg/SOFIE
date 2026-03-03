@@ -394,84 +394,75 @@ public:
       op = "\n//------ "+opName+"_"+BinaryOperatorTrait<T, Op>::Name()+"_KERNEL_ALPAKA\n";
       op += SP + "struct Binary"+BinaryOperatorTrait<T, Op>::Name()+"Kernel {\n";
       op += SP + SP + "template<typename TAcc, typename T>\n";
-      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * A, T const * B, T * C,\n";
-      for( size_t i=0; i<fDimShapeY.size(); i++){
-         op += SP + SP + SP + "const size_t size_" + std::to_string(i) + ",\n";
-      }
-      op += SP + SP + SP + ") const{\n";
-      op += SP + SP + SP + SP + "auto elements = alpaka::uniformElementsND(acc, alpaka::Vec<" + std::to_string(fDimShapeY.size()) + ", std::size_t>(";
-      for (size_t i = 0; i < fDimShapeY.size(); i++) {
-         op += "size_" + std::to_string(i);
-      }
-      op.pop_back();
-      op += "));\n";
-      op += SP + SP + SP + SP + "for (auto const& elem : elements) {\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * A, T const * B, T * C) const {\n";
+      op += SP + SP + SP + "auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (idx < " + ConvertShapeToLength(fShapeY) + ") {\n";
+      auto stridesA = UTILITY::ComputeStrideFromShape(fShapeA);
+      auto stridesB = UTILITY::ComputeStrideFromShape(fShapeB);
 
-      auto stridesA = UTILITY::ComputeStrideFromShape(fDimShapeA);
-      auto stridesB = UTILITY::ComputeStrideFromShape(fDimShapeB);
-      auto stridesY = UTILITY::ComputeStrideFromShape(fDimShapeY);
+      for(size_t id_s = 0; id_s < stridesA.size(); ++id_s){
+         if(fShapeA[id_s] == 1)
+            stridesA[id_s] = 0;
+      }
 
-      std::string compute_idx_A, compute_idx_B, compute_idx_Y;
-      if (fDimShapeA.empty() ||
-          std::all_of(fDimShapeA.begin(), fDimShapeA.end(), [](Dim d) { return d.dim == 1 || d.GetVal() == "1"; })) {
-         compute_idx_A = "0";
-      } else {
-         for (size_t i = 0; i < fDimShapeA.size(); ++i) {
-            if (fDimShapeA[i].dim == 1 || fDimShapeA[i].GetVal() == "1")
-               continue;
-            compute_idx_A += "elem[" + std::to_string(i + (fDimShapeY.size() - fDimShapeA.size())) + "]";
-            if (stridesA[i].GetVal() != "1")
-               compute_idx_A += " * " + stridesA[i].GetVal();
-            compute_idx_A += " + ";
-         }
-         // remove last 3 character " + "
-         for (int j = 0; j < 3; j++)
-            compute_idx_A.pop_back();
+      for(size_t id_s = 0; id_s < stridesB.size(); ++id_s){
+         if(fShapeB[id_s] == 1)
+            stridesB[id_s] = 0;
       }
-      if (fDimShapeB.empty() ||
-          std::all_of(fDimShapeB.begin(), fDimShapeB.end(), [](Dim d) { return d.dim == 1 || d.GetVal() == "1"; })) {
-         compute_idx_B = "0";
-      } else {
-         for (size_t i = 0; i < fDimShapeB.size(); ++i) {
-            if (fDimShapeB[i].dim == 1 || fDimShapeB[i].GetVal() == "1")
-               continue;
-            compute_idx_B += "elem[" + std::to_string(i + (fDimShapeY.size() - fDimShapeB.size())) + "]";
-            if (stridesB[i].GetVal() != "1")
-               compute_idx_B += " * " + stridesB[i].GetVal();
-            compute_idx_B += " + ";
-         }
-          // remove last 3 character " + "
-         for (int j = 0; j < 3; j++)
-            compute_idx_B.pop_back();
+
+      auto stridesY = UTILITY::ComputeStrideFromShape(fShapeY);
+
+      std::string flattened_index_A = "";
+      std::string flattened_index_B = "";
+      std::string temp = "idx";
+
+      op += "// stridesY " + ConvertShapeToString(stridesY) + "\n";
+      op += "// stridesA " + ConvertShapeToString(stridesA) + "\n";
+      op += "// stridesB " + ConvertShapeToString(stridesB) + "\n";
+
+      for (size_t id_s = 0; id_s < fShapeA.size(); ++id_s) {
+
+         auto strideY = stridesY[id_s];
+         auto strideA = stridesA[id_s];
+
+         // coord expression
+         std::string coord = "(int)(" + temp + " / " + std::to_string(strideY) + ")";
+
+         // accumulate into final index
+         flattened_index_A += coord + " * " + std::to_string(strideA) + " + ";
+
+         // update temp correctly
+         temp = temp + " - (" + coord + " * " + std::to_string(strideY) + ")";
       }
-      int nloop = 0;
-      if (fDimShapeY.empty() ||
-          std::all_of(fDimShapeY.begin(), fDimShapeY.end(), [](Dim d) { return d.dim == 1 || d.GetVal() == "1"; })) {
-         compute_idx_Y = "0";
-      } else {
-         for (size_t i = 0; i < fDimShapeY.size(); ++i) {
-            if (fDimShapeY[i].dim != 1 && fDimShapeY[i].GetVal() != "1") {
-               nloop++;
-               for (int j = 0; j < nloop; j++) op += SP;
-               compute_idx_Y += "elem[" + std::to_string(i) + "]";
-               if (stridesY[i].GetVal() != "1")
-                  compute_idx_Y += " * " + stridesY[i].GetVal();
-               compute_idx_Y += " + ";
-            }
-         }
-         // remove last 3 characters " + "
-         for (int j = 0; j < 3; j++)
-            compute_idx_Y.pop_back();
+
+      // remove trailing " + "
+      if (!flattened_index_A.empty())
+         flattened_index_A.erase(flattened_index_A.size() - 3);
+
+      temp = "idx";
+
+      for (size_t id_s = 0; id_s < fShapeB.size(); ++id_s) {
+
+         auto strideY = stridesY[id_s];
+         auto strideB = stridesB[id_s];
+
+         // coord expression
+         std::string coord = "(int)(" + temp + " / " + std::to_string(strideY)  + ")";
+
+         // accumulate into final index
+         flattened_index_B += coord + " * " + std::to_string(strideB) + " + ";
+
+         // update temp correctly
+         temp = temp + " - (" + coord + " * " + std::to_string(strideY) + ")";
       }
-      for (int j = 0; j < nloop + 1; j++) op += SP;
-      op += "C[" + compute_idx_Y + "] = "
-          + BinaryOperatorTrait<T, Op>::Op("A[" + compute_idx_A + "]",
-                                            "B[" + compute_idx_B + "]")
-          + " ;\n";
-      for (int i = nloop; i > 0; i--) {
-         for (int j = 0; j < i; j++) op += SP;
-         op += "}\n";
-      }
+
+      // remove trailing " + "
+      if (!flattened_index_B.empty())
+         flattened_index_B.erase(flattened_index_B.size() - 3);
+         
+
+      op += "C[idx] = " + BinaryOperatorTrait<T, Op>::Op("A["+flattened_index_A+"]", "B["+flattened_index_B+"]") + ";\n";
+      op += "}\n}\n};\n";
       return op;
    }
 
@@ -479,7 +470,7 @@ public:
       if (fIsOutputConstant)
          return "";
 
-      return SP + "Binary"+BinaryOperatorTrait<T, Op>::Name()+"Kernel " + OpName + "Kernel;\n";
+      return SP + "Binary"+BinaryOperatorTrait<T, Op>::Name()+"Kernel binary" + OpName + "Kernel;\n";
    }
 
    std::string Generate_GPU_ALPAKA(std::string OpName) {
@@ -492,8 +483,14 @@ public:
       std::stringstream out;
       auto length = ConvertDimShapeToLength(fDimShapeY);
       out << "\n//------ "+OpName+"_ALPAKA\n";
-      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fNY<<"(alpaka::Vec<Dim, Idx>::all("<<(stoi(length)+256-1)/256<<"), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNY << ", " << OpName << "Kernel, alpaka::getPtrNative(deviceBuf_" << fNA << "), alpaka::getPtrNative(deviceBuf_"<<fNB<<"), alpaka::getPtrNative(deviceBuf_"<<fNY<<")); \n";
+      out << SP << "auto const elementsPerThread_"<<fNY<<" = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_"<<fNY<<" = Vec::all(Idx{"<< length << "});\n";
+      out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << fNY << " = {elementsPerGrid_" << fNY << ", elementsPerThread_" << fNY << "};\n";
+      out << SP << "auto const workDiv_" << fNY << " = alpaka::getValidWorkDiv(kernelCfg_" << fNY << ", devAcc, binary" << OpName << "Kernel, alpaka::getPtrNative(deviceBuf_" << fNA
+         << "), alpaka::getPtrNative(deviceBuf_" << fNB << "), alpaka::getPtrNative(deviceBuf_" << fNY << "));\n";
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNY
+         << ", binary" << OpName << "Kernel, alpaka::getPtrNative(deviceBuf_" << fNA
+         << "), alpaka::getPtrNative(deviceBuf_" << fNB << "), alpaka::getPtrNative(deviceBuf_" << fNY << "));\n";
       return out.str();
    }
 

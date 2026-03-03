@@ -303,15 +303,13 @@ namespace SOFIE{
             // here in case of parametric shape we need to assume that the parameters will be defined in the initialization code.
             auto targetShape = fShapeY;
             // include a separate scope to avoid defining unique operator temp variables
+            auto length = SOFIE::ConvertDimShapeToLength(fShapeY); // output size
             out << "//--- broadcast bias tensor " << fNC << "for Gemm op\n";
             out << SP << "{\n";
-            out << "      float * data = SOFIE::UTILITY::UnidirectionalBroadcast<float>(tensor_"
-               << fNC << ".data()," << ConvertShapeToString(fShapeC) << ", " << ConvertDimShapeToString(fShapeY) << ");\n";
-            auto length = SOFIE::ConvertDimShapeToLength(fShapeY); // output size
-            out << SP << SP << "auto hostBuf_"<< fNC2 << " = alpaka::allocBuf<float, Idx>(hostAcc, Ext1D::all(Idx{" << length << "}));\n";
-            out << SP << SP << "std::memcpy(alpaka::getPtrNative(hostBuf_"<< fNC2 <<"), data, "<< length << " * sizeof(float));\n";
+            out << "      std::vector<float> data(" << length  << ");\n";
+            out << "      SOFIE::UTILITY::UnidirectionalBroadcast<float>(tensor_" << fNC << ".data()," << ConvertShapeToString(fShapeC) << ", " << ConvertDimShapeToString(fShapeY) << ", " << "std::span<float>(data));\n";
+            out << SP << SP << "auto hostBuf_"<< fNC2 << " = alpaka::createView(hostAcc, data);\n";
             out << SP << SP << "alpaka::memcpy(queue, deviceBuf_"<< fNC2 << ", hostBuf_"<< fNC2 << ");\n";
-            out << SP << SP << "delete [] data;\n";
             out << SP << "}\n";
          }
          return out.str();
@@ -489,7 +487,7 @@ namespace SOFIE{
             if (fActivation == EActivationType::RELU){
                out << SP << "blas.gemmrelu("<<opName<<"_transB, "<<opName<<"_transA, "<<opName<<"_n, "<<opName<<"_m, "<<opName<<"_k, "<< opName << "_alpha, deviceBuf_"<<fNB<<",  "<<"deviceBuf_"<<fNA<<", "<<opName << "_beta, deviceBuf_"<<fNC2<<", deviceBuf_"<<fNY<<");\n";
             } else {
-               out << SP << "blas.gemm("<<opName<<"_transB,"<<opName<<"_transA, "<<opName<<"_n, "<<opName<<"_m, "<<opName<<"_k, "<< opName << "_alpha, deviceBuf_"<<fNB<<",  "<<"deviceBuf_"<<fNA<<", "<<opName << "_beta, deviceBuf_"<<fNC2<<", deviceBuf_"<<fNY<<");\n";
+               out << SP << "blas.gemm("<<opName<<"_transB, "<<opName<<"_transA, "<<opName<<"_n, "<<opName<<"_m, "<<opName<<"_k, "<< opName << "_alpha, deviceBuf_"<<fNB<<",  "<<"deviceBuf_"<<fNA<<", "<<opName << "_beta, deviceBuf_"<<fNC2<<", deviceBuf_"<<fNY<<");\n";
             }
          }
          // need to implement for matmul case without bias
@@ -514,7 +512,10 @@ namespace SOFIE{
          auto m = (fAttrTransA ? fShapeA[dimA-1].GetVal() : fShapeA[dimA-2].GetVal());
          auto n = (fAttrTransB ? fShapeB[dimB-2].GetVal() : fShapeB[dimB-1].GetVal());
          auto k = (fAttrTransA ? fShapeA[dimA-2].GetVal() : fShapeA[dimA-1].GetVal());
-         return n+", "+m+", "+k;
+         auto lda = (fAttrTransA ? m : k);
+         auto ldb = (fAttrTransB ? k : n);
+         auto ldc = n;
+         return n+", "+m+", "+k+", "+ldb+", "+lda+", "+ldc;
       }
    };
 

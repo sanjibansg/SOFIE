@@ -81,9 +81,9 @@ public:
       op += "struct LeakyReluKernel {\n";
       op += SP + "template<typename TAcc, typename T>\n";
       op += SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const* __restrict__ data, T* __restrict__ out, std::size_t numElements, T alpha) const {\n";
-      op += SP + SP + "const auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
-      op += SP + "if(idx < numElements) {\n";
-      op += SP + SP + "out[idx] = data[idx] >= 0 ? data[idx] : alpha * data[idx];\n";
+      op += SP + SP + SP + "auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (idx < numElements) {\n";
+      op += SP + SP + SP + "out[idx] = data[idx] >= T(0) ? data[idx] : alpha * data[idx];\n";
       op += SP + SP + "}\n";
       op += SP + "}\n";
       op += "};\n";

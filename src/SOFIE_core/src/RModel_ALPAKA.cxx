@@ -383,16 +383,15 @@ void RModel::MoveInitializedTensorsToBuffers_ALPAKA(){
          auto length = ConvertShapeToLength(i.second.shape());
          std::string slength = std::to_string(length);
          if (i.second.type() == ETensorType::FLOAT) {
-            fGC += "     auto hostBuf_"+i.first+" = alpaka::allocBuf<float, Idx>(hostAcc, Ext1D::all(Idx{"+ slength+"}));\n";
-            fGC += "     std::memcpy(alpaka::getPtrNative(hostBuf_"+i.first+"), tensor_"+i.first+".data(), "+slength+"* sizeof(float));\n";
+            fGC += "     auto hostBuf_"+i.first+" = alpaka::createView(hostAcc, tensor_"+i.first+");\n";
             fGC += "     alpaka::memcpy(queue, deviceBuf_"+i.first+", hostBuf_"+i.first+");\n";
          } else if (i.second.type() == ETensorType::DOUBLE) {
-            fGC += "     auto hostBuf_"+i.first+" = alpaka::allocBuf<double, Idx>(hostAcc, Ext1D::all(Idx{"+ slength+"}));\n";
+            fGC += "     auto hostBuf_"+i.first+" = alpaka::createView(hostAcc, tensor_"+i.first+");\n";
             fGC += "     std::memcpy(alpaka::getPtrNative(hostBuf_"+i.first+"), tensor_"+i.first+".data(), "+slength+"* sizeof(double));\n";
             fGC += "     alpaka::memcpy(queue, deviceBuf_"+i.first+", hostBuf_"+i.first+");\n";
          } else if (i.second.type() == ETensorType::INT64) {
-            fGC += "     auto hostBuf_"+i.first+" = alpaka::allocBuf<int64_t, Idx>(hostAcc, Ext1D::all(Idx{" + slength + "}));\n";
-            fGC += "     std::memcpy(alpaka::getPtrNative(hostBuf_"+i.first+"), tensor_"+i.first+".data(), "+slength+"* sizeof(int64_t));";
+            fGC += "     auto hostBuf_"+i.first+" = alpaka::createView(hostAcc, tensor_"+i.first+");\n";
+            fGC += "     std::memcpy(alpaka::getPtrNative(hostBuf_"+i.first+"), tensor_"+i.first+".data(), "+slength+"* sizeof(int64_t));\n";
             fGC += "     alpaka::memcpy(queue, deviceBuf_"+i.first+", hostBuf_"+i.first+");\n";
          } else {
             std::runtime_error("tmva-sofie tensor " + tensor_name + " with type " + ConvertTypeToString(i.second.type()) + " cannot be read from a ROOT file");
