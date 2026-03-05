@@ -168,6 +168,114 @@ public:
       return out.str();
    }
 
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      if (fShapeY.empty()) {
+         throw std::runtime_error("TMVA SOFIE ScatterElements Op called to Generate without being initialized first");
+      }
+
+      const std::size_t D = fShapeI.size();
+
+      auto strideY = UTILITY::ComputeStrideFromShape(fShapeY);
+      auto strideI = UTILITY::ComputeStrideFromShape(fShapeI);
+
+      std::size_t totalElements = 1;
+      for (std::size_t d = 0; d < D; ++d)
+         totalElements *= fShapeI[d];
+
+      std::string op;
+      op  = "\n//------ SCATTERELEMENTS_KERNEL_ALPAKA\n";
+      op += SP + "struct ScatterElementsKernel_" + opName + " {\n";
+      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
+      op += SP + SP + SP + "TAcc const& acc,\n";
+      op += SP + SP + SP + "T* Y,\n";
+      op += SP + SP + SP + "int64_t const* I,\n";
+      op += SP + SP + SP + "T const* U,\n";
+      op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
+
+      op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (global_thread_idx >= totalElements) return;\n";
+      op += SP + SP + SP + "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+
+      op += SP + SP + SP + "for (std::size_t elem_idx = global_thread_idx; elem_idx < totalElements; elem_idx += grid_thread_extent) {\n\n";
+
+      op += SP + SP + SP + SP + "std::size_t remaining = elem_idx;\n";
+      for (std::size_t d = 0; d < D; ++d) {
+         op += SP + SP + SP + SP + "std::size_t const idx_" + std::to_string(d)
+               + " = remaining / " + strideI[d] + ";\n";
+         op += SP + SP + SP + SP + "remaining -= idx_" + std::to_string(d)
+               + " * " + strideI[d] + ";\n";
+      }
+      op += "\n";
+
+      op += SP + SP + SP + SP + "int64_t iAxis = I[elem_idx];\n";
+      op += SP + SP + SP + SP + "if (iAxis < 0) iAxis += " + std::to_string(fShapeY[fAxis]) + ";\n\n";
+
+      op += SP + SP + SP + SP + "std::size_t const out_idx =\n";
+      for (std::size_t d = 0; d < D; ++d) {
+         std::string coord = (d == (std::size_t)fAxis)
+               ? "static_cast<std::size_t>(iAxis)"
+               : "idx_" + std::to_string(d);
+         op += SP + SP + SP + SP + SP + coord + " * " + std::to_string(strideY[d]);
+         op += (d + 1 < D) ? " +\n" : ";\n\n";
+      }
+
+      if (fReduction.empty() || fReduction == "none") {
+         op += SP + SP + SP + SP + "Y[out_idx] = U[elem_idx];\n";
+      } else if (fReduction == "add") {
+         op += SP + SP + SP + SP + "alpaka::atomicAdd(acc, &Y[out_idx], U[elem_idx]);\n";
+      } else if (fReduction == "mul") {
+         op += SP + SP + SP + SP + "alpaka::atomicMul(acc, &Y[out_idx], U[elem_idx]);\n";
+      } else if (fReduction == "max") {
+         op += SP + SP + SP + SP + "alpaka::atomicMax(acc, &Y[out_idx], U[elem_idx]);\n";
+      } else if (fReduction == "min") {
+         op += SP + SP + SP + SP + "alpaka::atomicMin(acc, &Y[out_idx], U[elem_idx]);\n";
+      }
+
+      op += SP + SP + SP + "}\n";
+      op += SP + SP + "}\n";
+      op += SP + "};\n";
+
+      return op;
+   }
+
+std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
+    opName = "op_" + opName;
+    return SP + "ScatterElementsKernel_" + opName + " scatterElementsKernel_" + opName + ";\n";
+}
+
+std::string Generate_GPU_ALPAKA(std::string opName) override {
+    opName = "op_" + opName;
+    if (fShapeY.empty()) {
+        throw std::runtime_error("TMVA SOFIE ScatterElements Op called to Generate without being initialized first");
+    }
+
+    std::size_t totalElements = ConvertShapeToLength(fShapeI);
+
+    std::stringstream out;
+    out << "\n//------ SCATTERELEMENTS_GPU_ALPAKA\n";
+
+    out << SP << "alpaka::memcpy(queue, deviceBuf_" << fNY << ", deviceBuf_" << fNX << ");\n";
+    out << SP << "alpaka::wait(queue);\n\n";
+
+    out << SP << "auto const elementsPerThread_" << opName << " = Vec::all(static_cast<Idx>(1));\n";
+    out << SP << "auto const elementsPerGrid_" << opName << " = Vec::all(Idx{" << totalElements << "});\n";
+    out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << opName << " = {elementsPerGrid_" << opName << ", elementsPerThread_" << opName << "};\n";
+    out << SP << "auto const workDiv_" << opName << " = alpaka::getValidWorkDiv(kernelCfg_" << opName << ", devAcc, scatterElementsKernel_" << opName
+        << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+        << ", alpaka::getPtrNative(deviceBuf_" << fNI << ")"
+        << ", alpaka::getPtrNative(deviceBuf_" << fNU << ")"
+        << ", static_cast<Idx>(" << totalElements << "));\n";
+    out << SP << "alpaka::exec<Acc>(queue, workDiv_" << opName
+        << ", scatterElementsKernel_" << opName
+        << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+        << ", alpaka::getPtrNative(deviceBuf_" << fNI << ")"
+        << ", alpaka::getPtrNative(deviceBuf_" << fNU << ")"
+        << ", static_cast<Idx>(" << totalElements << "));\n";
+
+    return out.str();
+}
 };
 
 }//SOFIE

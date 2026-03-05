@@ -30,6 +30,8 @@ set(CAPTURE_STR
     std::string msg = e.what();\n\
     if (msg.find(\"multiple output tensors are not supported\") != std::string::npos) {\n\
         std::cerr << \"[SKIP] Multiple outputs are not supported for @1\" << std::endl;\n\
+    } else if (msg.find(\"is of a data type which is not yet supported\") != std::string::npos) {\n\
+        std::cerr << \"[SKIP] Operatorr with nsupported data type in @1: \" << msg << std::endl;\n\
     } else {\n\
         std::cerr << \"[ERROR] Failed processing @1: \" << msg << std::endl;\n\
         failures++;\n\

@@ -124,10 +124,19 @@ void RModel::GenerateDynamicTensorInfo_GPU_ALPAKA() {
    fGC += out.str();
 }
 
-// only supports BufF1D buffer data types for now
 std::string RModel::GenerateInferSignature_GPU_ALPAKA(bool isdecl) {
    // generate the infer signature given the inputs: eg. "BufF1D const deviceBuf_A, BufF1D const deviceBuf_B"
-   // if (decl = false) generate only calling signature (deviceBuf_A, deviceBuf_B, ....)
+   // if (isdecl = false) generate only calling signature (deviceBuf_A, deviceBuf_B, ....)
+
+   auto GetBufType = [this](const std::string& name) -> std::string {
+      ETensorType type = GetTensorType(name);
+      if (type == ETensorType::FLOAT)  return "BufF1D";
+      if (type == ETensorType::DOUBLE) return "BufD1D";
+      if (type == ETensorType::INT64)  return "BufI641D";
+      throw std::runtime_error("TMVA-SOFIE: input tensor " + name +
+                               " is of a data type which is not yet supported.");
+   };
+
    std::string rGC;
    std::unordered_map<std::string, int> inputParams;
    int i_input = 0;
@@ -137,7 +146,6 @@ std::string RModel::GenerateInferSignature_GPU_ALPAKA(bool isdecl) {
          auto shape = GetDynamicTensorShape(name);
          for (auto &d : shape) {
             std::string pName = d.param;
-            // need to check if the input parameters is already existing in another input tensor
             if (d.isParam && inputParams.count(pName) == 0) {
                if (isdecl) rGC += "size_t ";
                rGC += d.param + ",";
@@ -146,17 +154,13 @@ std::string RModel::GenerateInferSignature_GPU_ALPAKA(bool isdecl) {
          }
       }
       if (isdecl) {
-         std::string type = "BufF1D";
-         if (type == "other")
-            throw std::runtime_error("TMVA-SOFIE: input tensor " + name +
-                                     " is of a data type which is not yet supported.");
-         rGC += type + " const ";
+         rGC += GetBufType(name) + " const ";
       }
       rGC += "deviceBuf_" + name + ",";
       i_input++;
    }
 
-   if (fInputTensorNames.size() > 0) rGC.pop_back();// remove last ","
+   if (fInputTensorNames.size() > 0) rGC.pop_back(); // remove last ","
    return rGC;
 }
 
