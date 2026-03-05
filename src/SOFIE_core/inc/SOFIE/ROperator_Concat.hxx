@@ -316,7 +316,122 @@
 
             return out.str();
          }
-     };
+
+      std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+         opName = "op_" + opName;
+         if (fOutputShape.empty()) {
+            throw std::runtime_error("TMVA SOFIE Operator Concat called to Generate without being initialized first");
+         }
+
+         const std::size_t D   = fOutputShape.size();
+         const std::size_t Nin = fInputs.size();
+
+         auto outStrides = UTILITY::ComputeStrideFromShape(fOutputShape);
+
+         std::vector<std::size_t> prefix(Nin);
+         prefix[0] = 0;
+         for (std::size_t k = 1; k < Nin; ++k)
+            prefix[k] = prefix[k - 1] + std::stoul(fInputShapes[k - 1][fAxis].GetVal());
+
+         std::vector<std::vector<Dim>> inStrides(Nin);
+         for (std::size_t k = 0; k < Nin; ++k)
+            inStrides[k] = UTILITY::ComputeStrideFromShape(fInputShapes[k]);
+
+         std::string op;
+         op  = "\n//------ CONCAT_KERNEL_ALPAKA\n";
+         op += SP + "struct ConcatKernel_" + opName + " {\n";
+         op += SP + SP + "template<typename TAcc, typename T>\n";
+         op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
+         op += SP + SP + SP + "TAcc const& acc,\n";
+         op += SP + SP + SP + "std::array<T const*, " + std::to_string(Nin) + "> inputs,\n";
+         op += SP + SP + SP + "T* output,\n";
+         op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
+
+         op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+         op += SP + SP + SP + "if (global_thread_idx >= totalElements) return;\n";
+         op += SP + SP + SP + "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+         
+         op += SP + SP + SP + "std::size_t remaining;\n";
+         op += SP + SP + SP + "for (std::size_t elem_idx = global_thread_idx; elem_idx < totalElements; elem_idx += grid_thread_extent) {\n\n";
+
+         op += SP + SP + SP + SP + "remaining = elem_idx;\n";
+         for (std::size_t d = 0; d < D; ++d) {
+            std::string stride_val = outStrides[d].GetVal();
+            op += SP + SP + SP + SP + "std::size_t const out_" + std::to_string(d)
+                  + " = remaining * " + 1/std::stoul(stride_val) + ";\n";
+            op += SP + SP + SP + SP + "remaining -= out_" + std::to_string(d)
+                  + " * " + stride_val + ";\n";
+         }
+         op += "\n";
+
+         op += SP + SP + SP + SP + "std::size_t chosen = 0;\n";
+         for (std::size_t k = 0; k < Nin; ++k) {
+            std::size_t end_k = prefix[k] + std::stoul(fInputShapes[k][fAxis].GetVal());
+            op += SP + SP + SP + SP + "chosen += static_cast<std::size_t>("
+                  + std::to_string(end_k) + " <= out_" + std::to_string(fAxis) + ");\n";
+         }
+         op += "\n";
+
+         op += SP + SP + SP + SP + "std::size_t const output_idx =\n";
+         for (std::size_t d = 0; d < D; ++d) {
+            op += SP + SP + SP + SP + SP + "out_" + std::to_string(d)
+                  + " * " + outStrides[d].GetVal();
+            op += (d + 1 < D) ? " +\n" : ";\n\n";
+         }
+
+         op += SP + SP + SP + SP + "std::size_t const input_idx =\n";
+         for (std::size_t k = 0; k < Nin; ++k) {
+            op += SP + SP + SP + SP + SP + "(chosen == " + std::to_string(k) + ") * (\n";
+            for (std::size_t d = 0; d < D; ++d) {
+                  std::string coord = (d == fAxis)
+                     ? ("(out_" + std::to_string(d) + " - " + std::to_string(prefix[k]) + ")")
+                     : ("out_" + std::to_string(d));
+                  op += SP + SP + SP + SP + SP + SP + coord
+                     + " * " + inStrides[k][d].GetVal();
+                  op += (d + 1 < D) ? " +\n" : "\n";
+            }
+            op += SP + SP + SP + SP + SP + ")";
+            op += (k + 1 < Nin) ? " +\n" : ";\n\n";
+         }
+
+         op += SP + SP + SP + SP + "output[output_idx] = inputs[chosen][input_idx];\n";
+         op += SP + SP + SP + "}\n";
+         op += SP + SP + "}\n";
+         op += SP + "};\n";
+
+         return op;
+      }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      return SP + "ConcatKernel_" + opName + " concatKernel_" + opName + ";\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string OpName) override {
+      OpName = "op_" + OpName;
+      if (fOutputShape.empty()) {
+         throw std::runtime_error("TMVA SOFIE Operator Concat called to Generate without being initialized first");
+      }
+      std::stringstream out;
+      auto length = ConvertDynamicShapeToLength(fOutputShape);
+      out << "\n//------ CONCAT_GPU_ALPAKA\n";
+      out << SP << "std::array<const float *, " << fInputs.size() << "> input_ptrs_" << OpName << " = {";
+      for(size_t i=0; i<fInputs.size(); ++i){
+         if(i>0) out << ", ";
+         out << "alpaka::getPtrNative(deviceBuf_" << fInputs[i] << ")";
+      }
+      out << "};\n";
+
+      out << SP << "auto const elementsPerThread_"<<OpName<<" = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_"<<OpName<<" = Vec::all(Idx{"<< length << "});\n";
+      out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << OpName << " = {elementsPerGrid_" << OpName << ", elementsPerThread_" << OpName << "};\n";
+      out << SP << "auto const workDiv_" << OpName << " = alpaka::getValidWorkDiv(kernelCfg_" << OpName << ", devAcc, concatKernel_" << OpName << ", input_ptrs_" << OpName << ", alpaka::getPtrNative(deviceBuf_" << fOutput << "), static_cast<Idx>(" << length << "));\n";
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << OpName
+         << ", concatKernel_" << OpName << ", input_ptrs_" << OpName << ", alpaka::getPtrNative(deviceBuf_" << fOutput << "), static_cast<Idx>(" << length << "));\n";
+      return out.str();
+   }
+
+ };
  }//SOFIE
 
 
