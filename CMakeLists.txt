@@ -44,6 +44,7 @@ endif()
 
 find_package(ROOT REQUIRED COMPONENTS Core TMVA Tree)
 include(${ROOT_USE_FILE})
+include(GNUInstallDirs)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_INSTALL_BINDIR "bin" CACHE PATH "user executables (bin)")
