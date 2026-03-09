@@ -809,6 +809,13 @@ void ReadTensorFromStream(std::istream &is, T &target, std::string const &expect
    }
 }
 
+inline std::string ConvertOutputTypeToString(ETensorType t) {
+   // The std::vector<bool> is a special type that is not wrapping continuous memory.
+   // We don't want to use it as a return type.
+   if (t == ETensorType::BOOL) t = ETensorType::UINT8;
+   return ConvertTypeToString(t);
+}
+
 } // namespace SOFIE
 
 #endif //SOFIE_COMMON

@@ -41,6 +41,7 @@ public:
    ROperator_Einsum(const std::string & equation, const std::vector<std::string> & namesX, const std::string & nameY):
       fNInputs(namesX.size()), fNY(UTILITY::Clean_name(nameY))
    {
+      fKind = OperatorKind::EINSUM;
       for (size_t i = 0; i < namesX.size(); i++)
          fNInputs[i] = UTILITY::Clean_name(namesX[i]);
 

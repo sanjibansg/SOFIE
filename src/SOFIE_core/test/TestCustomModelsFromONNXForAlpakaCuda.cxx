@@ -18,6 +18,9 @@
 #include "Concat_0D_FromONNX_GPU_ALPAKA.hxx"
 #include "ScatterElements_FromONNX_GPU_ALPAKA.hxx"
 
+#include "Split_0_FromONNX_GPU_ALPAKA.hxx"
+#include "Split_1_FromONNX_GPU_ALPAKA.hxx"
+#include "Split_2_FromONNX_GPU_ALPAKA.hxx"
 
 #include <alpaka/alpaka.hpp>
 #include <cuda_runtime.h>
@@ -387,4 +390,122 @@ TEST_F(SofieAlpakaTest, ScatterElements)
     for (size_t i = 0; i < correct.size(); ++i){
         EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE);
     }
+}
+
+TEST_F(SofieAlpakaTest, Split_0)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+    // split in axis 0 in 2 tensors {2,2,3} -> {1,2,3} each
+    std::vector<float> input {1.,2.,3.,4.,5.,6.,7.,8.,9.,10.,11.,12.};
+    std::vector<std::vector<float>> correct_output = { {1.,2.,3.,4.,5.,6.}, {7.,8.,9.,10.,11.,12.} };
+
+    auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+    float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+    for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
+
+    auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+    alpaka::memcpy(queue, input_d, input_h);
+    alpaka::wait(queue);
+
+    auto result0_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{correct_output[0].size()}));
+    auto result1_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{correct_output[1].size()}));
+
+    {
+        SOFIE_Split_0::Session<alpaka::TagGpuCudaRt> session;
+        auto [result0, result1] = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+
+        alpaka::memcpy(queue, result0_h, result0);
+        alpaka::memcpy(queue, result1_h, result1);
+        alpaka::wait(queue);
+    }
+
+    float* res0_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result0_h));
+    float* res1_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result1_h));
+
+    for (size_t j = 0; j < correct_output[0].size(); ++j)
+        EXPECT_LE(std::abs(res0_ptr[j] - correct_output[0][j]), TOLERANCE);
+    for (size_t j = 0; j < correct_output[1].size(); ++j)
+        EXPECT_LE(std::abs(res1_ptr[j] - correct_output[1][j]), TOLERANCE);
+}
+
+TEST_F(SofieAlpakaTest, Split_1)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+    // split in axis 1 in 2 tensors {2,2,3} -> {2,1,3} each
+    std::vector<float> input {1.,2.,3.,4.,5.,6.,7.,8.,9.,10.,11.,12.};
+    std::vector<std::vector<float>> correct_output = { {1.,2.,3.,7.,8.,9.}, {4.,5.,6.,10.,11.,12.} };
+
+    auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+    float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+    for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
+
+    auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+    alpaka::memcpy(queue, input_d, input_h);
+    alpaka::wait(queue);
+
+    auto result0_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{correct_output[0].size()}));
+    auto result1_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{correct_output[1].size()}));
+
+    {
+        SOFIE_Split_1::Session<alpaka::TagGpuCudaRt> session;
+        auto [result0, result1] = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+
+        alpaka::memcpy(queue, result0_h, result0);
+        alpaka::memcpy(queue, result1_h, result1);
+        alpaka::wait(queue);
+    }
+
+    float* res0_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result0_h));
+    float* res1_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result1_h));
+
+    for (size_t j = 0; j < correct_output[0].size(); ++j)
+        EXPECT_LE(std::abs(res0_ptr[j] - correct_output[0][j]), TOLERANCE);
+    for (size_t j = 0; j < correct_output[1].size(); ++j)
+        EXPECT_LE(std::abs(res1_ptr[j] - correct_output[1][j]), TOLERANCE);
+}
+
+TEST_F(SofieAlpakaTest, Split_2)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+    // split in axis 2 in 2 tensors {2,2,3} -> {2,2,2} and {2,2,1}
+    std::vector<float> input {1.,2.,3.,4.,5.,6.,7.,8.,9.,10.,11.,12.};
+    std::vector<std::vector<float>> correct_output = { {1.,2.,4.,5.,7.,8.,10.,11.}, {3.,6.,9.,12.} };
+
+    auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+    float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+    for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
+
+    auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+    alpaka::memcpy(queue, input_d, input_h);
+    alpaka::wait(queue);
+
+    // outputs have different sizes: {2,2,2}=8 and {2,2,1}=4
+    auto result0_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{correct_output[0].size()}));
+    auto result1_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{correct_output[1].size()}));
+
+    {
+        SOFIE_Split_2::Session<alpaka::TagGpuCudaRt> session;
+        auto [result0, result1] = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+
+        alpaka::memcpy(queue, result0_h, result0);
+        alpaka::memcpy(queue, result1_h, result1);
+        alpaka::wait(queue);
+    }
+
+    float* res0_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result0_h));
+    float* res1_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result1_h));
+
+    for (size_t j = 0; j < correct_output[0].size(); ++j)
+        EXPECT_LE(std::abs(res0_ptr[j] - correct_output[0][j]), TOLERANCE);
+    for (size_t j = 0; j < correct_output[1].size(); ++j)
+        EXPECT_LE(std::abs(res1_ptr[j] - correct_output[1][j]), TOLERANCE);
 }

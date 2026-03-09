@@ -153,71 +153,109 @@ public:
       return out.str();
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) {
-      std::string op;
-      op = "\n//------ SPLIT_KERNEL_ALPAKA\n";
-      op += SP + "struct SplitKernel {\n";
-      op += SP + SP + "template<typename TAcc, typename T>\n";
-      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * input, T * output,";
-      op +=  "std::size_t const * input_strides, std::size_t const * output_strides,  std::size_t const split_axis, ";
-      op +=  "std::size_t const axis_offset, std::size_t const ndim) const {\n";
-      op += SP + SP + SP + SP + "auto elements = alpaka::uniformElementsND(acc, alpaka::Vec<ndim, std::size_t>(output_shape));\n";
-      op += SP + SP + SP + SP + "for (auto const& elem : elements) {\n";
-      op += SP + SP + SP + SP + SP + "size_t input_idx = 0;\n";
-      op += SP + SP + SP + SP + SP + "size_t output_idx = 0;\n";
-      op += SP + SP + SP + SP + SP + "for (int i = 0; i < ndim; ++i) {\n";
-      op += SP + SP + SP + SP + SP + SP + "size_t output_coord = elem[i];\n";
-      op += SP + SP + SP + SP + SP + SP + "size_t input_coord  = (i == split_axis) ? (output_coord + axis_offset) : output_coord;\n";
-      op += SP + SP + SP + SP + SP + SP + "input_idx += input_coord * input_strides[i];\n";
-      op += SP + SP + SP + SP + SP + SP + "output_idx += output_coord * output_strides[i];\n}\n";
-      op += SP + SP + SP + SP + SP + "output[output_idx] = input[input_idx];\n";
-      op += SP + SP + SP + SP + "}\n";
-      op += SP + SP + "}\n";
-      op += SP + "};\n";
+std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+    opName = "op_" + opName;
+    if (fOutputShapes.empty())
+        throw std::runtime_error("TMVA SOFIE Operator Split called to Generate without being initialized first");
 
-      return op;
-   }
+    const std::size_t D   = fInputShape.size();
+    const std::size_t Nin = fNYs.size();
 
-   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) override {
-      return SP + "SplitKernel splitKernel;\n";
-   }
+    auto inputStrides = UTILITY::ComputeStrideFromShape(fInputShape);
 
-   std::string Generate_GPU_ALPAKA(std::string OpName) override {
-      OpName = "op_" + OpName;
-      if (fOutputShapes.empty()){
-         throw std::runtime_error("TMVA SOFIE Operator Split called to Generate without being initialized first");
-      }
+    std::string op;
+    op  = "\n//------ SPLIT_KERNEL_ALPAKA\n";
+   std::cout<<"Generating GPU kernel for Split operator with input shape "<< ConvertShapeToString(fInputShape) << " and output shapes : ";
+    for (std::size_t i = 0; i < Nin; ++i) {
+      std::cout<<"Loop running for output "<<i<<" with shape "<< ConvertShapeToString(fOutputShapes[i]) << " and split size "<<fSplit[i]<<std::endl;
+        auto outputStrides = UTILITY::ComputeStrideFromShape(fOutputShapes[i]);
 
-      std::stringstream out;
-      out << "\n//------ SPLIT_GPU_ALPAKA\n";
+        std::size_t axis_offset = 0;
+        for (std::size_t k = 0; k < i; ++k)
+            axis_offset += fSplit[k];
 
-      bool axis_is_innermost = (fAxis == static_cast<int>(fInputShape.size()) - 1)
-                           && (UTILITY::ComputeStrideFromShape(fInputShape)[fInputShape.size()-1] == 1);
-      out << SP <<"size_t "<<OpName<<"_axis_offset = 0;\n";
-      for(size_t i=0; i<fNYs.size(); ++i){
-            auto length = ConvertShapeToLength(fOutputShapes[i]);
-            out << SP << SP << "int64_t part = "<<fNSplit<<"[i];\n";
-            out << SP << SP << "if (part == 0) { continue; }\n";
-         if(axis_is_innermost) {
-            out << SP << SP << "auto src_ptr = "<<fNX<< " + "<<OpName<<"_axis_offset;\n";
-            out << SP << SP << SP << "size_t bytes = static_cast<size_t>(" << length << ") * sizeof(float);\n";
-            out << SP << SP << SP << "alpaka::memcpy(queue, "<<fNYs[i]<<", src_ptr, bytes);\n"; 
-         } else {
-            out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_" << fNYs[i]
-                  << "(alpaka::Vec<Dim, Idx>::all((" << length << " + 256 - 1) / 256), "
-                  << "alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
+        std::string kname = "SplitKernel_" + opName + "_" + std::to_string(i);
 
-            out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNYs[i]
-               << ", splitKernel, alpaka::getPtrNative(deviceBuf_" << fNX
-               << "), alpaka::getPtrNative(deviceBuf_" << fNYs[i]
-               << "), "<< ConvertShapeToString(UTILITY::ComputeStrideFromShape(fInputShape)) <<", "<<ConvertShapeToString(UTILITY::ComputeStrideFromShape(fOutputShapes[i]))<<", "<<fAxis<<", "
-               << "axis_offset, "<<fNYs[i].size()<<");\n";
-         }
-         if (i < fNYs.size()-1) out << SP << OpName << "_axis_offset += part;\n";
-      }
-      return out.str();
-   }
+        op += SP + "struct " + kname + " {\n";
+        op += SP + SP + "template<typename TAcc, typename T>\n";
+        op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
+        op += SP + SP + SP + "TAcc const& acc,\n";
+        op += SP + SP + SP + "T const* input,\n";
+        op += SP + SP + SP + "T* output,\n";
+        op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
 
+        op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+        op += SP + SP + SP + "if (global_thread_idx >= totalElements) return;\n";
+        op += SP + SP + SP + "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+
+        op += SP + SP + SP + "for (std::size_t elem_idx = global_thread_idx; elem_idx < totalElements; elem_idx += grid_thread_extent) {\n\n";
+
+        for (std::size_t d = 0; d < D; ++d) {
+            op += SP + SP + SP + SP + "std::size_t const out_" + std::to_string(d)
+                + " = (elem_idx / " + std::to_string(outputStrides[d]) + "u) % "
+                + std::to_string(fOutputShapes[i][d]) + "u;\n";
+        }
+        op += "\n";
+
+        op += SP + SP + SP + SP + "std::size_t const input_idx =\n";
+        for (std::size_t d = 0; d < D; ++d) {
+            std::string coord = (d == static_cast<std::size_t>(fAxis))
+                ? ("(out_" + std::to_string(d) + " + " + std::to_string(axis_offset) + "u)")
+                : ("out_" + std::to_string(d));
+            op += SP + SP + SP + SP + SP + coord + " * " + std::to_string(inputStrides[d]) + "u";
+            op += (d + 1 < D) ? " +\n" : ";\n\n";
+        }
+
+        op += SP + SP + SP + SP + "output[elem_idx] = input[input_idx];\n";
+        op += SP + SP + SP + "}\n";
+        op += SP + SP + "}\n";
+        op += SP + "};\n\n";
+    }
+    std::cout<<"Finished generating GPU kernel for Split operator "<<op<<std::endl;
+    return op;
+}
+
+std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
+    opName = "op_" + opName;
+    std::string op;
+    for (std::size_t i = 0; i < fNYs.size(); ++i) {
+        std::string kname = "SplitKernel_" + opName + "_" + std::to_string(i);
+        op += SP + kname + " splitKernel_" + opName + "_" + std::to_string(i) + ";\n";
+    }
+    return op;
+}
+
+std::string Generate_GPU_ALPAKA(std::string opName) override {
+    opName = "op_" + opName;
+    if (fOutputShapes.empty())
+        throw std::runtime_error("TMVA SOFIE Operator Split called to Generate without being initialized first");
+
+    std::stringstream out;
+    out << "\n//------ SPLIT_GPU_ALPAKA\n";
+
+    for (std::size_t i = 0; i < fNYs.size(); ++i) {
+        std::size_t length = ConvertShapeToLength(fOutputShapes[i]);
+        std::string kname  = "splitKernel_" + opName + "_" + std::to_string(i);
+
+        out << SP << "{\n";
+        out << SP << SP << "auto const elementsPerThread_" << i << " = Vec::all(static_cast<Idx>(1));\n";
+        out << SP << SP << "auto const elementsPerGrid_"   << i << " = Vec::all(Idx{" << length << "});\n";
+        out << SP << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << i
+            << " = {elementsPerGrid_" << i << ", elementsPerThread_" << i << "};\n";
+        out << SP << SP << "auto const workDiv_" << i << " = alpaka::getValidWorkDiv(kernelCfg_" << i
+            << ", devAcc, " << kname
+            << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
+            << ", alpaka::getPtrNative(deviceBuf_" << fNYs[i] << ")"
+            << ", static_cast<Idx>(" << length << "));\n";
+        out << SP << SP << "alpaka::exec<Acc>(queue, workDiv_" << i
+            << ", " << kname
+            << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
+            << ", alpaka::getPtrNative(deviceBuf_" << fNYs[i] << ")"
+            << ", static_cast<Idx>(" << length << "));\n";
+        out << SP << "}\n";
+    }
+    return out.str();
+}
 
 };
 

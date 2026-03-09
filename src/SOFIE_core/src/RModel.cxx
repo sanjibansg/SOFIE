@@ -793,17 +793,6 @@ std::string RModel::GenerateInferSignature(bool isdecl) {
    return rGC;
 }
 
-namespace {
-
-std::string typeForOutput(ETensorType t) {
-   // The std::vector<bool> is a special type that is not wrapping continuous memory.
-   // We don't want to use it as a return type.
-   if (t == ETensorType::BOOL) t = ETensorType::UINT8;
-   return ConvertTypeToString(t);
-}
-
-}
-
 void RModel::GenerateOutput()
 {
    size_t outputSize = fOutputTensorNames.size();
@@ -814,7 +803,7 @@ void RModel::GenerateOutput()
    ETensorType eFirstOutputType = GetTensorType(*fOutputTensorNames.begin());
    fGC += "\n\n";
    if (outputSize == 1) {
-      fGC += "std::vector<" + typeForOutput(eFirstOutputType) + ">";
+      fGC += "std::vector<" + ConvertOutputTypeToString(eFirstOutputType) + ">";
    } else {
       // if all output types are the same we return an std::vector - otherwise a tuple
       for (std::string const &name : fOutputTensorNames) {
@@ -822,11 +811,11 @@ void RModel::GenerateOutput()
             sameOutputTypes = false;
       }
       if (sameOutputTypes)
-         fGC += "std::vector<std::vector<" + typeForOutput(eFirstOutputType) + ">>";
+         fGC += "std::vector<std::vector<" + ConvertOutputTypeToString(eFirstOutputType) + ">>";
       else {
          inferReturnType = "std::tuple<";
          for (size_t i = 0; i < outputSize; i++) {
-            inferReturnType += "std::vector<" + typeForOutput(GetTensorType(fOutputTensorNames[i])) + ">";
+            inferReturnType += "std::vector<" + ConvertOutputTypeToString(GetTensorType(fOutputTensorNames[i])) + ">";
             if (i < outputSize - 1)
                inferReturnType += ",";
          }
@@ -841,7 +830,7 @@ void RModel::GenerateOutput()
    if (!doInferArgs.empty())
       doInferArgs += ",";
    for (std::string const &name : fOutputTensorNames) {
-      fGC += SP + "std::vector<" + typeForOutput(GetTensorType(name)) + " > output_tensor_" + name + ";\n";
+      fGC += SP + "std::vector<" + ConvertOutputTypeToString(GetTensorType(name)) + " > output_tensor_" + name + ";\n";
       doInferArgs += " output_tensor_" + name + ",";
    }
    if (!doInferArgs.empty())
@@ -866,7 +855,7 @@ void RModel::GenerateSessionCode()
    if (!doInferSignature.empty())
       doInferSignature += ", ";
    for (auto const &name : fOutputTensorNames) {
-      doInferSignature += " std::vector<" + typeForOutput(GetTensorType(name)) + "> &output_tensor_" + name + ",";
+      doInferSignature += " std::vector<" + ConvertOutputTypeToString(GetTensorType(name)) + "> &output_tensor_" + name + ",";
    }
    doInferSignature.back() = ' ';
 

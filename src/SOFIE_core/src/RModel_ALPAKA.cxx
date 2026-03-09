@@ -174,14 +174,29 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
 
    bool sameOutputTypes = true;
    std::string inferReturnType;
-   ETensorType eOutputType = GetTensorType(*fOutputTensorNames.begin());
-   std::string outputType = ConvertTypeToString(eOutputType);
+   ETensorType eFirstOutputType = GetTensorType(*fOutputTensorNames.begin());
 
    fGC += "\n\n";
    if (outputSize == 1) {
-      fGC += "alpaka::Buf<Acc, float, Dim, Idx>";
+      fGC += "alpaka::Buf<Acc, " + ConvertOutputTypeToString(eFirstOutputType) + ", Dim, Idx>";
    } else {
-      throw std::runtime_error("TMVA-SOFIE: multiple output tensors are not supported in ALPAKA code generation");
+      // if all output types are the same we return an std::vector - otherwise a tuple
+      for (std::string const &name : fOutputTensorNames) {
+         if (GetTensorType(name) != eFirstOutputType)
+            sameOutputTypes = false;
+      }
+      if (sameOutputTypes)
+         fGC += "std::array<alpaka::Buf<Acc, " + ConvertOutputTypeToString(eFirstOutputType) + ", Dim, Idx>, " + std::to_string(outputSize) + ">";
+      else {
+         inferReturnType = "std::tuple<";
+         for (size_t i = 0; i < outputSize; i++) {
+            inferReturnType += "alpaka::Buf<Acc, " + ConvertOutputTypeToString(eFirstOutputType) + ", Dim, Idx>";
+            if (i < outputSize - 1)
+               inferReturnType += ",";
+         }
+         inferReturnType += ">";
+         fGC += inferReturnType;
+      }
    }
 
    fGC += " infer(";
@@ -212,16 +227,38 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
 void RModel::GenerateSessionCode_GPU_ALPAKA() {
    
    std::set<SOFIE::OperatorKind> registered_operators;
+   std::set<SOFIE::OperatorKind> single_initialized_operators = {
+      SOFIE::OperatorKind::RELU,
+      SOFIE::OperatorKind::SIGMOID,
+      SOFIE::OperatorKind::TANH,
+      SOFIE::OperatorKind::SOFTMAX,
+      SOFIE::OperatorKind::LEAKYRELU,
+      SOFIE::OperatorKind::EINSUM,
+      SOFIE::OperatorKind::COMPARISON,
+      SOFIE::OperatorKind::ELU,
+   };
+   bool OpNeedsBlas = false;
 
+   // single initiation operators must only be initialized only once and their count should be stored in the registered_operators set to avoid generating multiple kernels for the same operator kind
    fGC += "\n//--- ALPAKA Kernels\n";
    for (size_t id = 0; id < fOperators.size(); id++) {
-      if(registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+      if(fOperators[id]->GetKind() == OperatorKind::GEMM){
+         OpNeedsBlas = true;
+      }
+      if(single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
          
-         if (fVerbose)
+         if(registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+            
+            if (fVerbose)
             std::cout<<"Generating ALPAKA kernel for operator"<< toString(fOperators[id]->GetKind()) << std::endl;
          
+            fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
+            registered_operators.insert(fOperators[id]->GetKind());
+         }
+      } else {
+         if (fVerbose)
+         std::cout<<"Generating ALPAKA kernel for operator"<< toString(fOperators[id]->GetKind()) << std::endl;
          fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
-         registered_operators.insert(fOperators[id]->GetKind());
       }
    }
 
@@ -253,7 +290,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
     fGC += "Idx threadsPerBlock = 256;\n";
     fGC += "\nusing Ext1D = alpaka::Vec<Dim, Idx>;\n";
     fGC += "using Vec = alpaka::Vec<Dim, Idx>;\n";
-    if (registered_operators.find(SOFIE::OperatorKind::GEMM) != registered_operators.end()) {
+    if (OpNeedsBlas) {
          fGC += "\n\n// BLAS declarations\n";
          fGC += "sofieBLAS<tagAcc> blas{queue};\n";
     }
@@ -317,14 +354,23 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    }
 
    registered_operators.clear();
-      for (size_t id = 0; id < fOperators.size(); id++) {
-      if(registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+
+   for (size_t id = 0; id < fOperators.size(); id++) {
+
+      if(single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
          
+         if(registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+            
+            if (fVerbose)
+            std::cout<<"Declaring ALPAKA kernel for operator"<< toString(fOperators[id]->GetKind()) << std::endl;
+         
+            fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
+            registered_operators.insert(fOperators[id]->GetKind());
+         }
+      } else {
          if (fVerbose)
-         std::cout<<"Declaring ALPAKA kernel for operator"<< toString(fOperators[id]->GetKind())<<std::endl;
-         
+         std::cout<<"Declaring ALPAKA kernel for operator"<< toString(fOperators[id]->GetKind()) << std::endl;
          fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
-         registered_operators.insert(fOperators[id]->GetKind());
       }
    }
 

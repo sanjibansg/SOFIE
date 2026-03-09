@@ -23,6 +23,7 @@ public:
    ROperator_Sigmoid(){}
    ROperator_Sigmoid(std::string nameX, std::string nameY):
       fNX(UTILITY::Clean_name(nameX)), fNY(UTILITY::Clean_name(nameY)){
+         fKind = OperatorKind::SIGMOID;
          fInputTensorNames = { fNX };
          fOutputTensorNames = { fNY };
       }

@@ -20,7 +20,15 @@ enum class OperatorKind {
    CONSTANTOFSHAPE = 4,
    UNDEFINED = 5,
    CONV=6,
-   BATCHNORM=7
+   BATCHNORM=7,
+   CAST=8,
+   COMPARISON=9,
+   EINSUM=10,
+   ELU=11,
+   SIGMOID=12,
+   TANH=13,
+   SOFTMAX=14,
+   LEAKYRELU=15,
 };
 
 inline const char* toString(OperatorKind kind) {

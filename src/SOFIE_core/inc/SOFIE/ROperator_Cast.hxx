@@ -26,6 +26,7 @@ public:
    ROperator_Cast(std::string attr_type,std::string nameX, std::string nameY):
    fNX(UTILITY::Clean_name(nameX)), fNY(UTILITY::Clean_name(nameY)),
    fAttrType(attr_type) {
+      fKind = OperatorKind::CAST;
       fInputTensorNames = { fNX };
       fOutputTensorNames = { fNY };
    }
