@@ -40,13 +40,7 @@ void RModel::GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA()
       fGC += "// temporary initialized tensors for loading weights\n";
 
    for (auto &i : fInitializedTensors) {
-      if (!fUseWeightFile || i.second.IsConstantTensor()) {
-         if (i.second.type() == ETensorType::FLOAT)
-            fGC += GenerateConstantTensorCode<float>(i);
-         else if (i.second.type() == ETensorType::INT64)
-            fGC += GenerateConstantTensorCode<int64_t>(i);
-
-      } else {
+      if (fUseWeightFile && !i.second.IsConstantTensor()) {
          // case of tensors which are read from a file
          size_t length = ConvertShapeToLength(i.second.shape());
          if (i.second.type() == ETensorType::FLOAT) {
@@ -428,7 +422,7 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
 void RModel::MoveInitializedTensorsToBuffers_ALPAKA(){
       for (auto &i : fInitializedTensors) {
          // skip Constant and shape tensors
-         if (!i.second.IsWeightTensor()) continue;
+         if (!i.second.IsWeightTensor() || i.second.IsConstantTensor() || !fUseWeightFile) continue;
          std::string tensor_name = "tensor_" + i.first;
          auto length = ConvertShapeToLength(i.second.shape());
          std::string slength = std::to_string(length);
@@ -437,11 +431,9 @@ void RModel::MoveInitializedTensorsToBuffers_ALPAKA(){
             fGC += "     alpaka::memcpy(queue, deviceBuf_"+i.first+", hostBuf_"+i.first+");\n";
          } else if (i.second.type() == ETensorType::DOUBLE) {
             fGC += "     auto hostBuf_"+i.first+" = alpaka::createView(hostAcc, tensor_"+i.first+");\n";
-            fGC += "     std::memcpy(alpaka::getPtrNative(hostBuf_"+i.first+"), tensor_"+i.first+".data(), "+slength+"* sizeof(double));\n";
             fGC += "     alpaka::memcpy(queue, deviceBuf_"+i.first+", hostBuf_"+i.first+");\n";
          } else if (i.second.type() == ETensorType::INT64) {
-            fGC += "     auto hostBuf_"+i.first+" = alpaka::createView(hostAcc, tensor_"+i.first+");\n";
-            fGC += "     std::memcpy(alpaka::getPtrNative(hostBuf_"+i.first+"), tensor_"+i.first+".data(), "+slength+"* sizeof(int64_t));\n";
+            fGC += "     auto hostBuf_"+i.first+" = alpaka::createView(hostAcc, tensor_"+i.first+", " + slength + ");\n";
             fGC += "     alpaka::memcpy(queue, deviceBuf_"+i.first+", hostBuf_"+i.first+");\n";
          } else {
             std::runtime_error("tmva-sofie tensor " + tensor_name + " with type " + ConvertTypeToString(i.second.type()) + " cannot be read from a ROOT file");

@@ -22,6 +22,9 @@
 #include "Split_1_FromONNX_GPU_ALPAKA.hxx"
 #include "Split_2_FromONNX_GPU_ALPAKA.hxx"
 
+#include "Tile5D_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/Tile5D.ref.hxx"
+
 #include <alpaka/alpaka.hpp>
 #include <cuda_runtime.h>
 #include <nvml.h>
@@ -508,4 +511,61 @@ TEST_F(SofieAlpakaTest, Split_2)
         EXPECT_LE(std::abs(res0_ptr[j] - correct_output[0][j]), TOLERANCE);
     for (size_t j = 0; j < correct_output[1].size(); ++j)
         EXPECT_LE(std::abs(res1_ptr[j] - correct_output[1][j]), TOLERANCE);
+}
+
+TEST_F(SofieAlpakaTest, Tile5D)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+    std::vector<float> input_data({
+        0.2386120855808258,   0.5549510717391968,   -1.8190287351608276,  0.5724563598632812,   -0.6596977710723877,
+        0.17560836672782898,  0.7608169317245483,    0.08603227883577347, -0.049375515431165695,  0.2705111503601074,
+        1.42119562625885,     0.032626643776893616, -1.212586522102356,   -0.5129594802856445,   -0.43296414613723755,
+       -0.1606937050819397,   1.1884371042251587,   -0.662174642086029,   -2.291109323501587,    -0.6852569580078125,
+        2.325223922729492,   -0.19389064610004425,  -0.5784135460853577,  -0.39328137040138245,   0.2831517457962036,
+        0.4496127665042877,  -0.2029038816690445,    0.35477763414382935,  0.4266718924045563,    0.24683749675750732,
+        1.90426504611969,    -0.4861580729484558,    0.9139055013656616,  -0.5031066536903381,    0.9583520293235779,
+       -0.23210509121418,     1.3183971643447876,    1.7042455673217773,  -0.3201166093349457,   -0.14444805681705475,
+       -0.8829464912414551,   1.725736141204834,     0.45657631754875183,  0.4920198321342468,   -1.088847041130066,
+        0.49437597393989563, -0.006085286382585764,  2.475630760192871,    0.12170185893774033,  -0.8953945636749268,
+        1.1430096626281738,   1.3278610706329346,    0.3076854348182678,   0.036237504333257675,  0.05180325731635094,
+        0.2802475392818451,   0.5289335250854492,    0.9356630444526672,   0.7863689064979553,    0.4239695370197296,
+        0.8723016977310181,  -0.2248474359512329,    0.3891502320766449,   0.5463842153549194,   -0.7782878875732422,
+       -0.8570080399513245,  -2.593783378601074,    -0.11392943561077118,  0.5637082457542419,    2.075004816055298,
+       -1.0598397254943848,   1.0823975801467896
+    });
+
+    const std::size_t inputSize  = input_data.size();
+    const std::size_t outputSize = sizeof(Tile5D_ExpectedOutput::output) / sizeof(float);
+
+    // Allocate and fill host input buffer
+    auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{inputSize}));
+    float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+    for (Idx i = 0; i < inputSize; ++i)
+        input_ptr[i] = input_data[i];
+
+    // Copy to device
+    auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{inputSize}));
+    alpaka::memcpy(queue, input_d, input_h);
+    alpaka::wait(queue);
+
+    // Host result buffer
+    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
+
+    {
+        SOFIE_Tile5D::Session<alpaka::TagGpuCudaRt> session;
+        auto result = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    float* res_ptr   = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+    float* correct   = Tile5D_ExpectedOutput::output;
+
+    EXPECT_EQ(outputSize, sizeof(Tile5D_ExpectedOutput::output) / sizeof(float));
+    for (size_t i = 0; i < outputSize; ++i)
+        EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE);
 }
