@@ -22,15 +22,19 @@ void RModel::GenerateInitializedTensorInfo_GPU_ALPAKA() {
          else if (i.second.type() == ETensorType::INT64)
             fGC += GenerateConstantTensorCode<int64_t>(i);
 
-      } else {
+      }
          // case of tensors which are read from a file
          size_t length = ConvertShapeToLength(i.second.shape());
          if (i.second.type() == ETensorType::FLOAT) {
             fGC += "BufF1D deviceBuf_" + i.first +
                    " = alpaka::allocBuf<float, Idx>(devAcc, Ext1D::all(Idx{" +
                    std::to_string(length) + "}));\n";
+         } else if (i.second.type() == ETensorType::INT64) {
+            fGC += "BufI641D deviceBuf_" + i.first +
+                   " = alpaka::allocBuf<int64_t, Idx>(devAcc, Ext1D::all(Idx{" +
+                   std::to_string(length) + "}));\n";
          }
-      }
+   
    }
 }
 
@@ -421,8 +425,6 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
 
 void RModel::MoveInitializedTensorsToBuffers_ALPAKA(){
       for (auto &i : fInitializedTensors) {
-         // skip Constant and shape tensors
-         if (!i.second.IsWeightTensor() || i.second.IsConstantTensor() || !fUseWeightFile) continue;
          std::string tensor_name = "tensor_" + i.first;
          auto length = ConvertShapeToLength(i.second.shape());
          std::string slength = std::to_string(length);
