@@ -248,15 +248,13 @@ std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
 
     op += SP + SP + SP + "for (std::size_t elem_idx = global_thread_idx; elem_idx < totalElements; elem_idx += grid_thread_extent) {\n\n";
 
-    // Decompose output linear index into per-dim coords using compile-time strides
     for (std::size_t d = 0; d < D; ++d) {
         op += SP + SP + SP + SP + "std::size_t const out_" + std::to_string(d)
-            + " = (elem_idx * " + std::to_string(1/stridesY[d]) + "u) % "
+            + " = (elem_idx / " + std::to_string(stridesY[d]) + "u) % "
             + std::to_string(fShapeY[d]) + "u;\n";
     }
     op += "\n";
 
-    // Compute index into the indices tensor.
     // Output dims [axis ... axis+q) correspond to the indices tensor dims [0 ... q)
     // so i_index = sum over i in [0,q): out_{axis+i} * stridesIndices[i]
     if (q == 0) {
@@ -278,7 +276,6 @@ std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
     op += SP + SP + SP + SP + "if (k >= static_cast<int64_t>(" + std::to_string(fShapeX[fAttrAxis]) + ")) "
         + "k = static_cast<int64_t>(" + std::to_string(fShapeX[fAttrAxis]) + ") - 1;\n\n";
 
-    // Compute input index:
     // x_index = k * stridesX[axis]
     //         + sum over j in [0, axis):   out_j          * stridesX[j]
     //         + sum over j in [axis+1, r): out_{j-1+q}    * stridesX[j]

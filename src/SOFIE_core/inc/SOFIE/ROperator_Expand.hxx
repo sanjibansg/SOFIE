@@ -122,62 +122,108 @@ public:
       return out.str();
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA() {
-      std::string op;
-      op = "\n//------ Expand_KERNEL_ALPAKA\n";
-      op += SP + "struct ExpandKernel {\n";
-      op += SP + SP + "template<typename TAcc, typename T>\n";
-      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * input, T * output, const size_t * input_shape, const size_t * output_shape, const size_t * input_strides, const size_t * output_strides, const size_t ndim){\n";
-      op += SP + SP + SP + SP + "size_t input_idx = 0;\n";
-      op += SP + SP + SP + SP + "size_t output_idx = 0;\n";
-      op += SP + SP + SP + SP + "size_t coord_out;\n";
-      op += SP + SP + SP + SP + "size_t coord_in;\n";
-      op += SP + SP + SP + SP + "auto elements = alpaka::uniformElementsND(acc, alpaka::Vec<ndim, std::size_t>(output_shape));\n";
-      op += SP + SP + SP + SP + "for (auto const& elem : elements) {\n";
-      op += SP + SP + SP + SP + "input_idx = 0;\n";
-      op += SP + SP + SP + SP + "output_idx = 0;\n";
-      op += SP + SP + SP + SP + "for (int i = 0; i < ndim; ++i) {\n";
-      op += SP + SP + SP + SP + SP + "coord_out = elem[i];\n";
-      op += SP + SP + SP + SP + SP + "coord_in = (input_shape[i] == 1) ? 0 : coord_out;\n";
-      op += SP + SP + SP + SP + SP + "input_idx += coord_in * input_strides[i];\n}\n";
-      op += SP + SP + SP + SP + SP + "output_idx += coord_out * output_strides[i];\n}\n";
-      op += SP + SP + SP + SP + SP + "output[output_idx] = input[input_idx];\n";
-      op += SP + SP + SP + SP + "}\n";
-      op += SP + SP + "}\n";
-      op += SP + "};\n";
-      return op;
-   }
+std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+    if (fIsOutputConstant) return "";
+    opName = "op_" + opName;
+    if (fShapeY.empty())
+        throw std::runtime_error("TMVA SOFIE Expand Op called to Generate without being initialized first");
 
-   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) override {
-      return SP + "ExpandKernel expandKernel;\n";
-   }
+    const std::size_t D = fShapeY.size();
 
-   std::string Generate_GPU_ALPAKA(std::string OpName) override {
-      OpName = "op_" + OpName;
-      if (fShape.empty()) {
-         throw std::runtime_error("TMVA SOFIE Operator Expand called to Generate without being initialized first");
-      }
+    std::vector<size_t> shapeX_padded(D, 1);
+    size_t offset = D - fShapeX.size();
+    for (size_t i = 0; i < fShapeX.size(); ++i)
+        shapeX_padded[offset + i] = fShapeX[i];
 
-      std::stringstream out;
-      auto length = ConvertShapeToLength(fShape);
-      out << "\n//------ EXPAND_GPU_ALPAKA\n";
-      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_" << fNX
-         << "(alpaka::Vec<Dim, Idx>::all((" << length << " + 256 - 1) / 256), "
-         << "alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
+    auto stridesX = UTILITY::ComputeStrideFromShape(shapeX_padded);
+    auto stridesY = UTILITY::ComputeStrideFromShape(fShapeY);
 
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX
-         << ", expandKernel, alpaka::getPtrNative(deviceBuf_" << fNX
-         << "), alpaka::getPtrNative(deviceBuf_" << fNY
-         << "), "<< ConvertShapeToString(fShapeX) <<", "<<ConvertShapeToString(fShapeY)<<", "<<ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeX))<<", "
-         << ConvertShapeToString(UTILITY::ComputeStrideFromShape(fShapeX))<<", "<<fShapeY.size()<<");\n";
+    std::size_t totalElements = ConvertShapeToLength(fShapeY);
 
-      return out.str();
-   }
+    std::string kname = "ExpandKernel_" + opName;
 
+    std::string op;
+    op  = "\n//------ EXPAND_KERNEL_ALPAKA\n";
+    op += SP + "struct " + kname + " {\n";
+    op += SP + SP + "template<typename TAcc, typename T>\n";
+    op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
+    op += SP + SP + SP + "TAcc const& acc,\n";
+    op += SP + SP + SP + "T const* __restrict__ input,\n";
+    op += SP + SP + SP + "T* __restrict__ output,\n";
+    op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
 
+    op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+    op += SP + SP + SP + "if (global_thread_idx >= totalElements) return;\n";
+    op += SP + SP + SP + "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
 
+    op += SP + SP + SP + "for (std::size_t elem_idx = global_thread_idx; elem_idx < totalElements; elem_idx += grid_thread_extent) {\n\n";
+
+    for (std::size_t d = 0; d < D; ++d) {
+        op += SP + SP + SP + SP + "std::size_t const out_" + std::to_string(d)
+            + " = (elem_idx / " + std::to_string(stridesY[d]) + "u) % "
+            + std::to_string(fShapeY[d]) + "u;\n";
+    }
+    op += "\n";
+
+    op += SP + SP + SP + SP + "std::size_t const input_idx =\n";
+    for (std::size_t d = 0; d < D; ++d) {
+        if (shapeX_padded[d] == 1) {
+            op += SP + SP + SP + SP + SP + "0u";
+        } else {
+            op += SP + SP + SP + SP + SP
+                + "out_" + std::to_string(d)
+                + " * " + std::to_string(stridesX[d]) + "u";
+        }
+        op += (d + 1 < D) ? " +\n" : ";\n\n";
+    }
+
+    op += SP + SP + SP + SP + "output[elem_idx] = input[input_idx];\n";
+    op += SP + SP + SP + "}\n";
+    op += SP + SP + "}\n";
+    op += SP + "};\n";
+
+    return op;
+}
+
+std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
+    if (fIsOutputConstant) return "";
+    opName = "op_" + opName;
+    std::string kname = "ExpandKernel_" + opName;
+    return SP + kname + " expandKernel_" + opName + ";\n";
+}
+
+std::string Generate_GPU_ALPAKA(std::string opName) override {
+    if (fIsOutputConstant) return "";
+    opName = "op_" + opName;
+    if (fShapeY.empty())
+        throw std::runtime_error("TMVA SOFIE Operator Expand called to Generate without being initialized first");
+
+    if (fInitialized || fShapeX == fShapeY)
+        return "";
+
+    std::size_t totalElements = ConvertShapeToLength(fShapeY);
+    std::string kname = "expandKernel_" + opName;
+
+    std::stringstream out;
+    out << "\n//------ EXPAND_GPU_ALPAKA\n";
+    out << SP << "auto const elementsPerThread_" << opName << " = Vec::all(static_cast<Idx>(1));\n";
+    out << SP << "auto const elementsPerGrid_"   << opName << " = Vec::all(Idx{" << totalElements << "});\n";
+    out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << opName
+        << " = {elementsPerGrid_" << opName << ", elementsPerThread_" << opName << "};\n";
+    out << SP << "auto const workDiv_" << opName << " = alpaka::getValidWorkDiv(kernelCfg_" << opName
+        << ", devAcc, " << kname
+        << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
+        << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+        << ", static_cast<Idx>(" << totalElements << "));\n";
+    out << SP << "alpaka::exec<Acc>(queue, workDiv_" << opName
+        << ", " << kname
+        << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
+        << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+        << ", static_cast<Idx>(" << totalElements << "));\n";
+
+    return out.str();
+}
 };
-
 }//SOFIE
 
 #endif //SOFIE_ROperator_Expand
