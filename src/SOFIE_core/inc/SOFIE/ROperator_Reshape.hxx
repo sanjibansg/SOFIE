@@ -353,32 +353,35 @@ public:
       return out.str();
    }
    
-   std::string Generate_GPU_ALPAKA(std::string opName) override {
-      if (fIsOutputConstant) return "";  //no op for constant tensors
+std::string Generate_GPU_ALPAKA(std::string opName) override {
+    if (fIsOutputConstant) return "";
 
-      opName = "op_" + opName;
+    opName = "op_" + opName;
 
-      // output of reshape is same as input
-      auto length = ConvertDimShapeToLength(fShapeOutput);
-      if (length != ConvertDimShapeToLength(fShapeInput)) {
-         throw std::runtime_error("TMVA SOFIE Reshape Op : wrong output shape - is " +
-                                  ConvertDimShapeToString(fShapeOutput) + " and input is " +
-                                  ConvertDimShapeToString(fShapeInput));
-      }
-      std::stringstream out;
-      opName += "_Reshape";
-      if (fOpMode == Flatten)
-         opName += "_Flatten";
-      else if (fOpMode == Squeeze)
-         opName += "_Squeeze";
-      else if (fOpMode == Unsqueeze)
-         opName += "_Unsquueze";
-      
+    std::string opType = "Reshape";
+    if (fOpMode == Flatten)   opType = "Flatten";
+    else if (fOpMode == Squeeze)   opType = "Squeeze";
+    else if (fOpMode == Unsqueeze) opType = "Unsqueeze";
 
-      out << SP << "///-------" << opName << " operator\n" << std::endl;
-      out << SP << "alpaka::memcpy(queue, deviceBuf_" << fNOutput << ", deviceBuf_" << fNData << ");\n";
-      return out.str();
-   }
+    std::stringstream out;
+    out << SP << "///------- " << opType << " operator " << opName << "\n";
+
+    if (fDynamicShape) {
+        auto lengthOut = ConvertDimShapeToLength(fShapeOutput);
+        auto lengthIn  = ConvertDimShapeToLength(fShapeInput);
+        if (lengthOut != lengthIn) {
+            out << SP << "if (" << lengthOut << " != " << lengthIn << ")\n";
+            out << SP << SP << "throw std::runtime_error(\"TMVA SOFIE " << opType
+                << " Op : output length is different from input length\");\n";
+        }
+    }
+
+    out << SP << "alpaka::memcpy(queue, deviceBuf_" << fNOutput
+        << ", deviceBuf_" << fNData << ");\n";
+    out << SP << "alpaka::wait(queue);\n";
+
+    return out.str();
+}
 
 };
 
