@@ -273,7 +273,7 @@ std::string Generate_GPU_ALPAKA(std::string opName) override {
         << ", alpaka::getPtrNative(deviceBuf_" << fNI << ")"
         << ", alpaka::getPtrNative(deviceBuf_" << fNU << ")"
         << ", static_cast<Idx>(" << totalElements << "));\n";
-
+    out << SP <<"alpaka::wait(queue);\n";
     return out.str();
 }
 };

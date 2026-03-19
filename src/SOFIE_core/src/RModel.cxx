@@ -311,6 +311,15 @@ std::shared_ptr<void> RModel::GetInitializedTensorData(std::string tensor_name) 
     }
 }
 
+void RModel::RemoveInitializedTensor(std::string tensor_name) {
+   auto f = fInitializedTensors.find(tensor_name);
+   if (f == fInitializedTensors.end()) {
+      throw std::runtime_error("TMVA-SOFIE: tensor " + tensor_name + " not found when trying to remove it");
+   } else {
+      fInitializedTensors.erase(f);
+   }
+}
+
 void RModel::SetNotWritableInitializedTensor(const std::string & tensor_name) {
       auto t = fInitializedTensors.find(tensor_name);
       if (t == fInitializedTensors.end()) {
@@ -540,7 +549,7 @@ void RModel::Initialize(const std::map<std::string, size_t> & inputParams, bool 
       auto shape = ConvertShapeToInt(input.second.shape);
       if (verbose)
          std::cout << "converting input shape for " << input.first << " " << ConvertShapeToString(shape) << " from "
-            << ConvertShapeToString(input.second.shape) << std::endl;
+            << ConvertDimShapeToString(input.second.shape) << std::endl;
       if (!shape.empty()) {
          // case shape is defined (not parametric) we add the tensor in the fReadyInputTensorInfos map and
          // we remove the tensor from the fInputTensorInfo where th eold parametric shape was stored
@@ -643,6 +652,7 @@ void RModel::GenerateInitializedTensorInfo()
       fGC += "// initialized tensors\n";
 
    for (auto &i : fInitializedTensors) {
+      if (i.second.IsNotWritable())  continue;
       if (!fUseWeightFile || i.second.IsConstantTensor()) {
          if (i.second.type() == ETensorType::FLOAT) {
             fGC += GenerateConstantTensorCode<float>(i);
@@ -749,7 +759,7 @@ void RModel::GenerateDynamicTensorInfo()
 {
    std::stringstream out;
    for (auto &i : fDynamicTensorInfos) {
-      auto length = ConvertDynamicShapeToLength(i.second.shape);
+      auto length = ConvertDimShapeToLength(i.second.shape);
       out << SP << "if (" << length << " > 0) {\n";
       out << SP << SP << "fTensor_" << i.first << ".resize(" << length << ");\n";
       out << SP << SP << "tensor_" << i.first << " = fTensor_" << i.first << ".data();\n";
@@ -1331,7 +1341,7 @@ void RModel::PrintOutputTensors() {
         if (!IsDynamicTensor(it))
            std::cout << "shape: " << ConvertShapeToString(GetTensorShape(it)) << std::endl;
         else
-          std::cout << "shape: " << ConvertShapeToString(GetDynamicTensorShape(it)) << std::endl;
+          std::cout << "shape: " << ConvertDimShapeToString(GetDimTensorShape(it)) << std::endl;
     }
     std::cout << "\n";
 }

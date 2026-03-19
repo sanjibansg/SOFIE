@@ -76,6 +76,7 @@ protected:
       std::stringstream strs;
       std::string type = ConvertTypeToString(t.second.type());
       size_t length = ConvertShapeToLength(t.second.shape());
+      std::cout<<"Constant tensor name: "<<t.first<<", Constant tensor length: "<<length<<"\n";
       // avoid using stack sizes for constant tensors to reduce compilation time
       bool allocateOnStack = (length > 100) ? false : true;
 
@@ -86,7 +87,9 @@ protected:
       // for non stack allocation check if data are the same
       if (!allocateOnStack && length > 1) {
          size_t idx = 1;
+         std::cout<<"insider allocate on stack and length\n";
          do {
+            std::cout<<"Printing idx: "<<idx<<", data[idx] = "<<data[idx]<<", data[idx-1] = "<<data[idx-1]<<std::endl;
             sameData = (data[idx] == data[idx - 1]);
             idx++;
          } while (sameData && idx < length);

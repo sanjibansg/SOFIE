@@ -162,6 +162,14 @@ template<>
 struct TensorType<bool> {
    static const std::string Name() { return "bool"; }
 };
+template<>
+struct TensorType<int8_t> {
+   static const std::string Name() { return "int8_t"; }
+};
+template<>
+struct TensorType<uint8_t> {
+   static const std::string Name() { return "uint8_t"; }
+};
 
 struct TensorMemoryInfo {
    std::string_view tensor_name;
@@ -194,21 +202,12 @@ std::vector<Dim> ConvertShapeToDim(const std::vector<size_t> & shape);
 
 std::vector<size_t> ConvertShapeToInt(const std::vector<Dim> & shape);
 
-inline std::size_t ConvertShapeToLength(const std::vector<size_t> & shape){
-   // Empty shape represent scalar values, so we return a length=1
-   std::size_t fLength = 1;
-   for (auto& dim: shape) fLength *= dim;
-   return fLength;
-}
+std::size_t ConvertShapeToLength(const std::vector<size_t> & shape);
 
 std::string ConvertShapeToString(const std::vector<size_t> & shape);
 std::string ConvertDimShapeToString(const std::vector<Dim> & shape);
-std::string ConvertShapeToString(const std::vector<Dim> & shape);
-
-
 
 std::string ConvertDimShapeToLength(const std::vector<Dim> & shape);
-std::string ConvertDynamicShapeToLength(const std::vector<Dim> & shape);
 
 
 template<class T>
@@ -228,8 +227,11 @@ std::string ConvertValuesToString(size_t n, const T * data) {
    ret << "{ ";
    for (size_t i = 0; i < n; i++) {
       if (std::is_floating_point_v<T>)
-         ret << std::setprecision(std::numeric_limits<T>::max_digits10);
-      ret << data[i];
+         ret << std::setprecision(std::numeric_limits<T>::max_digits10) << data[i];
+      else
+         // cast in case of boolean (int8)
+         ret << (int64_t) data[i];
+
       if (i < n-1) ret << ", ";
    }
    ret << "}";
@@ -255,8 +257,14 @@ public:
    bool IsConstantTensor() const { return fConstant;}
    // query if tensor needs to be written in a weight file. Constant tensors are not written in a file
    bool IsWeightTensor() const { return !fConstant && !fIsNotWritable;}
+   // check if a Tensor is Writable (need to be written in the file or in the generated code (e.g. as a constant tensor)
+   // if an initialized tensors is used in a constant operator at compile time does not need to be written and can be omitted in
+   // the generated code
+   bool IsNotWritable() const { return fIsNotWritable; }
    // set not writable initialized tensors - i.e. tensor that must not be written in a file
    void SetNotWritable() { fIsNotWritable = true;}
+   // set as constant (needed for non-float initialized tensors)
+   void SetConstant() { fConstant = true;}
 
    template <class T = void>
    T const *data() const
@@ -279,7 +287,7 @@ public:
       case ETensorType::INT64: fSize *= sizeof(int64_t); break;
       case ETensorType::BOOL: fSize *= sizeof(bool); break;
       default:
-         throw std::runtime_error("TMVA::SOFIE doesn't yet supports serialising data-type " +
+         throw std::runtime_error("SOFIE doesn't yet supports serialising data-type " +
                                   ConvertTypeToString(fType));
       }
       fPersistentData = static_cast<char *>(fData.get());
@@ -365,7 +373,7 @@ T* BroadcastConvBias(const T* data, const size_t channel, const std::vector<size
    size_t size = targetShape.size();
    if (targetShape[1] != channel) {
       std::stringstream ss;
-      ss << "TMVA::SOFIE - Error broadcasting Conv Bias of shape {";
+      ss << "SOFIE - Error broadcasting Conv Bias of shape {";
       ss << std::to_string(channel);
       ss << "} to ";
       ss << ConvertShapeToString(targetShape);
@@ -402,14 +410,12 @@ T* BroadcastConvBias(const T* data, const size_t channel, const std::vector<size
 // Broadcast a tensor from shape to targetShape according to numpy broadcasting rules
 // See more at https://numpy.org/doc/stable/user/basics.broadcasting.html
 // and https://github.com/onnx/onnx/blob/main/docs/Broadcasting.md .
-template<typename T, class ConstContT = std::span<const T>, class ContT = std::span<T> >
-void BroadcastTensor(ConstContT data, const std::vector<size_t>& shape, const std::vector<size_t>& targetShape, ContT broadcastedData) {
+template<typename T, class ConstContT = std::span<const T>>
+void BroadcastTensor(ConstContT data, const std::vector<size_t>& shape, const std::vector<size_t>& targetShape, T *broadcastedData) {
    // Size of the shapes (tensor input here have shapes with same sizes, we have already added the needed ones )
    size_t size = shape.size();
    // Current length of the broadcasted tensor
    size_t curLength = data.size();
-   size_t targetLength = broadcastedData.size();
-   assert(ConvertShapeToLength(targetShape) == targetLength);
    // special case when broadcasting last dimensions (initial shapes must be the same)
    if (size > 1 && shape.front() == targetShape.front() && shape.back() == 1) {
       size_t bsize = targetShape.back();
@@ -419,16 +425,16 @@ void BroadcastTensor(ConstContT data, const std::vector<size_t>& shape, const st
          bsize *= targetShape[k];
       }
       for (size_t i = 0; i < curLength; i++) {
-         std::fill(broadcastedData.begin() + i*bsize, broadcastedData.begin() + (i+1)*bsize , data[i]);
+         std::fill(broadcastedData + i*bsize, broadcastedData + (i+1)*bsize , data[i]);
       }
       return;
    }
 
-   std::copy(data.begin(), data.end(), broadcastedData.begin());
+   std::copy(data.begin(), data.end(), broadcastedData);
    // Product of the previous dimensions of targetShape
    size_t arrayNum = 1;
    // New broadcasted data: is this needed?
-   std::vector<T> newData(targetLength);
+   std::vector<T> newData(ConvertShapeToLength(targetShape));
 
    for (size_t idx = 0; idx < size; idx++) {
       size_t dim = shape[idx];
@@ -444,8 +450,8 @@ void BroadcastTensor(ConstContT data, const std::vector<size_t>& shape, const st
             for (size_t arrayIdx = 0; arrayIdx < arrayNum; arrayIdx++) {
                for (size_t targetIdx = 0; targetIdx < targetDim; targetIdx++) {
                   size_t offset = arrayIdx * arrayLength * targetDim + targetIdx * arrayLength;
-                  std::copy(broadcastedData.begin() + arrayIdx * arrayLength,
-                     broadcastedData.begin() + (arrayIdx + 1) * arrayLength,
+                  std::copy(broadcastedData + arrayIdx * arrayLength,
+                     broadcastedData + (arrayIdx + 1) * arrayLength,
                      newData.begin() + offset);
                }
             }
@@ -459,12 +465,11 @@ void BroadcastTensor(ConstContT data, const std::vector<size_t>& shape, const st
          // Update current length
          curLength = newLength;
          // Update broadcasted data
-         std::copy(newData.begin(), newData.begin() + newLength, broadcastedData.begin());
+         std::copy(newData.begin(), newData.begin() + newLength, broadcastedData);
       }
       // Update the number of arrays
       arrayNum *= targetDim;
    }
-   //return broadcastedData;
 }
 
 // interface where we allocate a new array for broadcasted data
@@ -472,13 +477,10 @@ template<typename T>
 T* CreateBroadcastTensor(const T* data, const std::vector<size_t>& shape, const std::vector<size_t>& targetShape, size_t targetLength) {
    // newShape is an array of size equal to dimension along which we are broadcasting the tensor
    T* broadcastedData = new T[targetLength];
-   std::span<T> bData(broadcastedData, broadcastedData+targetLength);
    size_t curLength = ConvertShapeToLength(shape);
-   std::span<const T> inData(data, curLength);
-   BroadcastTensor<T, std::span<const T>, std::span<T>>(inData, shape, targetShape, bData);
+   BroadcastTensor<T>({data, curLength}, shape, targetShape, broadcastedData);
    return broadcastedData;
 }
-
 // Unidirectional broadcasting shape to targetShape// In unidirectional broadcast - only tensor B can have the shape changed not
 // tensor A - otherwise is a multidirectional broadcast
 template<typename T>
@@ -489,14 +491,14 @@ T* UnidirectionalBroadcast(const T* data, const std::vector<size_t>& shape, cons
       std::vector<size_t> newShape(targetSize, 1);
       size_t offset = targetSize - shape.size();
       std::copy(shape.begin(), shape.end(), newShape.begin() + offset);
-      return CreateBroadcastTensor<T>(data, newShape, targetShape, ConvertShapeToLength(targetShape));
+      return CreateBroadcastTensor(data, newShape, targetShape, ConvertShapeToLength(targetShape));
    }
-   return CreateBroadcastTensor<T>(data, shape, targetShape, ConvertShapeToLength(targetShape));
+   return CreateBroadcastTensor(data, shape, targetShape, ConvertShapeToLength(targetShape));
 }
 
 // Unidirectional broadcasting shape to targetShape using a passed vector to avoid allocations
 template<typename T>
-void UnidirectionalBroadcast(const T* data, const std::vector<size_t>& shape, const std::vector<size_t>& targetShape, std::span<T> broadcastedData) {
+void UnidirectionalBroadcast(const T* data, const std::vector<size_t>& shape, const std::vector<size_t>& targetShape, T *broadcastedData) {
    size_t curLength = ConvertShapeToLength(shape);
    std::span<T> inData(const_cast<T*>(data), curLength);
    // Prepend shape with ones
@@ -505,9 +507,9 @@ void UnidirectionalBroadcast(const T* data, const std::vector<size_t>& shape, co
       std::vector<size_t> newShape(targetSize, 1);
       size_t offset = targetSize - shape.size();
       std::copy(shape.begin(), shape.end(), newShape.begin() + offset);
-      BroadcastTensor<T>(inData, newShape, targetShape, broadcastedData);
+      BroadcastTensor(inData, newShape, targetShape, broadcastedData);
    }
-   BroadcastTensor<T, std::span<T>>(inData, shape, targetShape, broadcastedData);
+   BroadcastTensor(inData, shape, targetShape, broadcastedData);
 }
 
 /// compute stride of a tensor given its shape (assume layout is row-major)
@@ -697,20 +699,20 @@ extern "C" void sgemm_(const char * transa, const char * transb, const int * m, 
 
 
 struct GNN_Data {
-      SOFIE::RTensor<float> node_data;      // the node feature data, tensor with shape (num_nodes, num_node_features)
-      SOFIE::RTensor<float> edge_data;      // the edge feature data, tensor with shape (num_edges, num_edge_features)
-      SOFIE::RTensor<float> global_data;    // the global features, tensor with shape (1, num_global_features)
-      SOFIE::RTensor<int> edge_index;       // the edge index (receivers and senders for each edge), tensor with shape (2, num_edges)
+      RTensor<float> node_data;      // the node feature data, tensor with shape (num_nodes, num_node_features)
+      RTensor<float> edge_data;      // the edge feature data, tensor with shape (num_edges, num_edge_features)
+      RTensor<float> global_data;    // the global features, tensor with shape (1, num_global_features)
+      RTensor<int> edge_index;       // the edge index (receivers and senders for each edge), tensor with shape (2, num_edges)
                                      // edge_index[0,:] are the receivers and edge_index[1,:] are the senders
 
 
       // need to have default constructor since RTensor has not one
-      GNN_Data(): node_data(SOFIE::RTensor<float>({})), edge_data(SOFIE::RTensor<float>({})), global_data(SOFIE::RTensor<float>({})), edge_index(SOFIE::RTensor<int>({})) {}
+      GNN_Data(): node_data(RTensor<float>({})), edge_data(RTensor<float>({})), global_data(RTensor<float>({})), edge_index(RTensor<int>({})) {}
 
 };
 
 template<typename T>
-SOFIE::RTensor<T> Concatenate( SOFIE::RTensor<T> & t1,  SOFIE::RTensor<T> & t2, int axis = 0)
+RTensor<T> Concatenate( RTensor<T> & t1,  RTensor<T> & t2, int axis = 0)
 {
    // concatenate tensor along axis. Shape must be the same except in the dimension of the concatenated axis
    if (t1.GetMemoryLayout() != t2.GetMemoryLayout())
@@ -725,8 +727,8 @@ SOFIE::RTensor<T> Concatenate( SOFIE::RTensor<T> & t1,  SOFIE::RTensor<T> & t2, 
    }
    std::vector<size_t> outShape = shape1;
    outShape[axis] = shape1[axis] + shape2[axis];
-   SOFIE::RTensor<T> tout(outShape, t1.GetMemoryLayout());
-   if (t1.GetMemoryLayout() == SOFIE::MemoryLayout::ColumnMajor) {
+   RTensor<T> tout(outShape, t1.GetMemoryLayout());
+   if (t1.GetMemoryLayout() == MemoryLayout::ColumnMajor) {
       throw std::runtime_error("TMVA RTensor Concatenate is not yet supported for column major tensors");
    }
 
@@ -759,10 +761,10 @@ inline GNN_Data Concatenate(GNN_Data & data1, GNN_Data & data2, int axis = 0) {
 
 inline GNN_Data Copy(const GNN_Data & data) {
    GNN_Data out;
-   out.node_data = SOFIE::RTensor<float>(data.node_data.GetShape());
-   out.edge_data = SOFIE::RTensor<float>(data.edge_data.GetShape());
-   out.global_data = SOFIE::RTensor<float>(data.global_data.GetShape());
-   out.edge_index = SOFIE::RTensor<int>(data.edge_index.GetShape());
+   out.node_data = RTensor<float>(data.node_data.GetShape());
+   out.edge_data = RTensor<float>(data.edge_data.GetShape());
+   out.global_data = RTensor<float>(data.global_data.GetShape());
+   out.edge_index = RTensor<int>(data.edge_index.GetShape());
    std::copy(data.node_data.GetData(), data.node_data.GetData()+ data.node_data.GetSize(), out.node_data.GetData());
    std::copy(data.edge_data.GetData(), data.edge_data.GetData()+ data.edge_data.GetSize(), out.edge_data.GetData());
    std::copy(data.global_data.GetData(), data.global_data.GetData()+ data.global_data.GetSize(), out.global_data.GetData());
@@ -809,6 +811,23 @@ void ReadTensorFromStream(std::istream &is, T &target, std::string const &expect
    }
 }
 
+
+// code for the memory greeding allocations
+struct TensorLifeInfo {
+   int begin;   // start time (op index) lifetime
+   int end;     //  end time lifetime
+   size_t size; // size of tensors in bytes
+};
+
+struct MemoryResult {
+  std::size_t total_bytes = 0;  // total memory needed
+  std::vector<size_t> offsets; // resulted offsets for each tensor
+};
+
+/// Greedy best-fit planner with coalescing free list.
+MemoryResult OrganizeMemory(const std::vector<TensorLifeInfo> & tensorsInfo );
+
+
 inline std::string ConvertOutputTypeToString(ETensorType t) {
    // The std::vector<bool> is a special type that is not wrapping continuous memory.
    // We don't want to use it as a return type.
@@ -816,6 +835,7 @@ inline std::string ConvertOutputTypeToString(ETensorType t) {
    return ConvertTypeToString(t);
 }
 
+
 } // namespace SOFIE
 
-#endif //SOFIE_COMMON
+#endif //TMVA_SOFIE_COMMON

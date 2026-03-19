@@ -29,6 +29,7 @@ ParserFuncSignature ParseTile = [](RModelParser_ONNX &parser, const onnx::NodePr
 
    switch (input_type) {
    case ETensorType::FLOAT: op.reset(new ROperator_Tile<float>(repeat_name, input_name, output_name)); break;
+   case ETensorType::INT64: op.reset(new ROperator_Tile<int64_t>(repeat_name, input_name, output_name)); break;
    default:
       throw std::runtime_error("TMVA::SOFIE - Unsupported - Operator Tile does not yet support input type " +
                                std::to_string(static_cast<int>(input_type)));

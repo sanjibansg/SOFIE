@@ -58,7 +58,7 @@ public:
          throw std::runtime_error("TMVA SOFIE Operator Relu called to Generate without being initialized first");
       }
       std::stringstream out;
-      auto length = ConvertDynamicShapeToLength(fShape);
+      auto length = ConvertDimShapeToLength(fShape);
       out << "\n//------ RELU\n";
       out << SP << "for (int id = 0; id < " << length << " ; id++){\n";
       out << SP << SP << "tensor_" << fNY << "[id] = ((tensor_" << fNX << "[id] > 0 )? tensor_" << fNX << "[id] : 0);\n";
@@ -66,16 +66,20 @@ public:
       return out.str();
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA() {
+   std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) {
       std::string op;
       op = "\n//------ RELU_KERNEL_ALPAKA\n";
-      op += SP + "struct ReluKernel{\n";
-      op += SP + SP + "template<typename TAcc, typename T>\n";
-      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T* data, std::size_t numElements) const {\n";
-      op += SP + SP + SP + "for (auto i : alpaka::uniformElements(acc, numElements)) {\n";
-      op += SP + SP + SP + "data[i] = (data[i] < 0) ? 0 : data[i];\n";
+
+      op = "\n//------ RELU_KERNEL_ALPAKA\n";
+      op += "struct ReluKernel {\n";
+      op += SP + "template<typename TAcc, typename T>\n";
+      op += SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const* __restrict__ data, T* __restrict__ out, std::size_t numElements) const {\n";
+      op += SP + SP + SP + "auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (idx < numElements) {\n";
+      op += SP + SP + SP + "out[idx] = data[idx] >= T(0) ? data[idx] : 0;\n";
       op += SP + SP + "}\n";
-      op += SP + "}\n};\n";
+      op += SP + "}\n";
+      op += "};\n";
       return op;
    }
 
@@ -88,11 +92,18 @@ public:
       if (fShape.empty()) {
          throw std::runtime_error("TMVA SOFIE Operator Relu called to Generate without being initialized first");
       }
+
       std::stringstream out;
-      auto length = ConvertDynamicShapeToLength(fShape);
+      auto length = ConvertDimShapeToLength(fShape);
       out << "\n//------ RELU_GPU_ALPAKA\n";
-      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fNX<<"(alpaka::Vec<Dim, Idx>::all("<<(stoi(length)+256-1)/256<<"), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX << ", reluKernel, alpaka::getPtrNative(deviceBuf_" << fNX << "), static_cast<Idx>(" << length << ")); \n";
+      out << SP << "auto const elementsPerThread_"<<fNY<<" = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_"<<fNY<<" = Vec::all(Idx{"<< length << "});\n";
+      out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << fNY << " = {elementsPerGrid_" << fNY << ", elementsPerThread_" << fNY << "};\n";
+      out << SP << "auto const workDiv_" << fNY << " = alpaka::getValidWorkDiv(kernelCfg_" << fNY << ", devAcc, reluKernel, alpaka::getPtrNative(deviceBuf_" << fNX
+         << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), static_cast<Idx>(" << length << "));\n";
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNY
+         << ", reluKernel, alpaka::getPtrNative(deviceBuf_" << fNX
+         << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), static_cast<Idx>(" << length << "));\n";
       return out.str();
    }
 

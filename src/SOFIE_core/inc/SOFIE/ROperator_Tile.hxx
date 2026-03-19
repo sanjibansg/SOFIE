@@ -21,7 +21,7 @@ private:
    std::string fNY;
    std::vector<size_t> fShapeInput;
    std::vector<size_t> fShapeY;
-   std::vector<size_t> fRepeats;   // populated in Initialize() if repeats are known at generation time
+   std::vector<size_t> fRepeats;
 
 public:
    ROperator_Tile(){}
@@ -72,7 +72,9 @@ public:
       // which will cause the kernel to use the runtime repeats pointer path.
       fRepeats.resize(num_elements);
       std::copy(repeats_data, repeats_data + num_elements, fRepeats.begin());
-
+      if (fRepeats.size()){
+         model.RemoveInitializedTensor(fNRepeats);
+      }
       fShapeY = ShapeInference({fShapeInput, fRepeats})[0];
 
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNInput), fShapeY);
@@ -239,7 +241,7 @@ public:
           << ", devAcc, " << kname << ", " << args << ");\n";
       out << SP << "alpaka::exec<Acc>(queue, workDiv_" << opName
           << ", " << kname << ", " << args << ");\n";
-
+      out << SP <<"alpaka::wait(queue);\n";
       return out.str();
    }
 

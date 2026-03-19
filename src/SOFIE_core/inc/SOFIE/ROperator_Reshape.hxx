@@ -69,6 +69,8 @@ public:
         fAttrAxes(attrAxes)
    {
       assert(fOpMode == Squeeze || fOpMode == Unsqueeze);
+      fInputTensorNames = { fNData };
+      fOutputTensorNames = { fNOutput };
    }
 
    // output type is same as input
@@ -107,6 +109,9 @@ public:
 
                if (IsInteger(tmp_length) && IsInteger(input_length))
                   output_shape[i] = Dim{static_cast<size_t>(std::stoi(input_length) / std::stoi(tmp_length))};
+               else if (IsInteger(tmp_length) && std::stoi(tmp_length) == 1) {
+                  output_shape[i] = Dim{input_length, static_cast<size_t>(-1)};
+               }
                else {
                   //we can try simplifying expression if tmp_length is integer and part of input_length
                   // contains tmp_length
@@ -162,11 +167,11 @@ public:
          }
 
          if (fVerbose)
-            std::cout << "Reshape: correct output shape  to " << ConvertShapeToString(output_shape) << std::endl;
+            std::cout << "Reshape: correct output shape  to " << ConvertDimShapeToString(output_shape) << std::endl;
 
          if (!fDimInput && ConvertDimShapeToLength(output_shape) != ConvertDimShapeToLength(input_shape)) {
-            throw std::runtime_error("TMVA Reshape Op : Invalid  shapes : " + ConvertShapeToString(input_shape) +
-                                     ConvertShapeToString(output_shape));
+            throw std::runtime_error("TMVA Reshape Op : Invalid  shapes : " + ConvertDimShapeToString(input_shape) +
+                                     ConvertDimShapeToString(output_shape));
          }
          ret.push_back(output_shape);
 
@@ -194,14 +199,23 @@ public:
                }
             }
          } else {
-            auto &axes = fAttrAxes;
+            std::cout << "getting shape for Squeeze...from attribute\n";
+            auto axes = fAttrAxes;
             for (size_t i = 0; i < axes.size(); i++) {
+               std::cout << i << "  " << axes[i] << std::endl;
                if (axes[i] < 0)
                   axes[i] += input_shape.size();
                if (!(output_shape[axes[i]] == Dim{1}))
                   throw std::runtime_error("TMVA Squeeze Op : Invalid  axis value " + std::to_string(axes[i]) +
-                                           " for " + ConvertShapeToString(output_shape));
-               output_shape.erase(output_shape.begin() + axes[i]);
+                                           " for " + ConvertDimShapeToString(output_shape));
+            }
+            // for calling vector::erase we must sort axes in decreasing order to avoid
+            std::sort(axes.begin(), axes.end(), std::greater<int>());
+            for (auto & axis : axes) {
+               std::cout << "erase give axis " << axis << "  -> ";
+               for (auto & o : output_shape) std::cout << o << " , ";
+               std::cout << std::endl;
+               output_shape.erase(output_shape.begin() + axis);
             }
          }
          ret.push_back(output_shape);
@@ -231,8 +245,10 @@ public:
 
    void Initialize(RModel& model) override {
 
-      std::cout << "initialize reshape op type " << fOpMode << " - " << fNInput2 << " " << fNData << std::endl;
       fVerbose = model.Verbose();
+      if (fVerbose)
+         std::cout << "initialize reshape op type " << fOpMode << " - " << fNInput2 << " " << fNData << std::endl;
+
       if (model.CheckIfTensorAlreadyExist(fNData) == false) {
           // input must be a graph input, or already initialized intermediate tensor
          throw std::runtime_error("TMVA Reshape Op Input Tensor " + fNData + "  is not found in model");
@@ -242,7 +258,7 @@ public:
       // check if optional tensor exists defining shape or axes
       if (!fNInput2.empty()) {
          if (model.CheckIfTensorAlreadyExist(fNInput2)) {
-            if (model.IsConstantTensor(fNInput2) || model.IsInitializedTensor(fNInput2)) {
+            if (model.IsInitializedTensor(fNInput2)) {
                // assume input shape is an initialized tensor
                auto dptr = model.GetInitializedTensorData(fNInput2);
                auto values = static_cast<int64_t *>(dptr.get());
@@ -259,6 +275,9 @@ public:
                fShapeOutput = ShapeInference({fShapeInput})[0];
                // set flag to not write tensor in weight file. Its data will be hard-coded in way model is constructed
                model.SetNotWritableInitializedTensor(fNInput2);
+            } else if (model.IsShapeTensor(fNInput2)) {
+               auto shapeData = model.GetShapeTensorValues(fNInput2);
+               fShapeOutput = shapeData;
             } else {
                // we cannot get shape at initialization time but at run-time
                fDynamicShape = true;
@@ -290,7 +309,7 @@ public:
             throw std::runtime_error("TMVA Reshape Op : Invalid Input/Output lengths");
          model.AddConstantTensor<int64_t>(fNOutput, o_shape, inputData);
          if (model.Verbose()) {
-            std::cout << Name() << " : " << fNData << " " << ConvertShapeToString(fShapeInput) << " -->  " << fNOutput << " (constant) " << ConvertShapeToString(fShapeOutput)  << " : " <<
+            std::cout << Name() << " : " << fNData << " " << ConvertDimShapeToString(fShapeInput) << " -->  " << fNOutput << " (constant) " << ConvertDimShapeToString(fShapeOutput)  << " : " <<
             ConvertValuesToString(ConvertShapeToLength(o_shape), inputData) << std::endl;
          }
       }
@@ -300,15 +319,15 @@ public:
          auto inputData = model.GetShapeTensorValues(fNData);
          model.AddShapeTensor(fNOutput, inputData);
          if (model.Verbose()) {
-            std::cout << Name() << " : " << fNData << " " << ConvertShapeToString(fShapeInput) << " -->  " << fNOutput << " (shape) " << ConvertShapeToString(fShapeOutput)  << " : " <<
-            ConvertShapeToString(inputData) << std::endl;
+            std::cout << Name() << " : " << fNData << " " << ConvertDimShapeToString(fShapeInput) << " -->  " << fNOutput << " (shape) " << ConvertDimShapeToString(fShapeOutput)  << " : " <<
+            ConvertDimShapeToString(inputData) << std::endl;
          }
       }
       else {
          // non-constant case
          model.AddIntermediateTensor(fNOutput, model.GetTensorType(fNData), fShapeOutput);
          if (model.Verbose())
-            std::cout << Name() << " : " << fNData << " " << ConvertShapeToString(fShapeInput) << " -->  "<< fNOutput << "  " << ConvertShapeToString(fShapeOutput)  << std::endl;
+            std::cout << Name() << " : " << fNData << " " << ConvertDimShapeToString(fShapeInput) << " -->  "<< fNOutput << "  " << ConvertDimShapeToString(fShapeOutput)  << std::endl;
       }
    }
 
@@ -324,7 +343,7 @@ public:
       else if (fOpMode == Unsqueeze)
          opType = "Unsquueze";
 
-      out << SP << "///--------" << opType << " operator " << opName << " --> " << ConvertShapeToString(fShapeOutput) << "\n";
+      out << SP << "///--------" << opType << " operator " << opName << " --> " << ConvertDimShapeToString(fShapeOutput) << "\n";
 
       // in case of dynamic output shape we need to set the shape value from input shape tensor
       // and take case of the zero values
@@ -352,7 +371,6 @@ public:
           << ");\n";
       return out.str();
    }
-   
 std::string Generate_GPU_ALPAKA(std::string opName) override {
     if (fIsOutputConstant) return "";
 

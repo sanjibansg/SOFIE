@@ -135,6 +135,7 @@ struct ExtractDataFromTP<int64_t> {
 };
 template<typename T>
 std::shared_ptr<void> GetInitializedTensorData(onnx::TensorProto * tensorproto, size_t length) {
+   std::cout<<"Getting Initialized Tensor data for tensor " << tensorproto->name() << " of type " << tensorproto->data_type() << " and length " << length << std::endl;
    std::shared_ptr<void> data(malloc(length * sizeof(T)), free);
 
    if (!tensorproto->raw_data().empty()) {
@@ -586,6 +587,13 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
          if (verbose) std::cout << "add INT64 initialized tensor " << input_name << " shape " << ConvertShapeToString(shape) << std::endl;
          rmodel.AddInitializedTensor(input_name, ETensorType::INT64, shape, data);
          allInitializedTensors[input_name] = i;
+         std::cout<<"Printing initialized values for tensor: "<<input_name;
+         int64_t* rawData = static_cast<int64_t*>(data.get());
+
+         for (size_t i = 0; i < fLength; ++i) {
+            std::cout << rawData[i] << " ";
+         }
+         std::cout << std::endl;
          break;
       }
       default:

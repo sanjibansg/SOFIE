@@ -99,6 +99,7 @@ public:
       out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX
          << ", sigmoidKernel, alpaka::getPtrNative(deviceBuf_" << fNX
          << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), static_cast<Idx>(" << length << "));\n";
+      out << SP <<"alpaka::wait(queue);\n";
       return out.str();
    }
 

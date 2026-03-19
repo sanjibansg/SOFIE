@@ -27,7 +27,8 @@ public:
    ROperator_LeakyRelu(){}
    ROperator_LeakyRelu(float alpha,std::string nameX, std::string nameY):
    falpha(alpha),fNX(UTILITY::Clean_name(nameX)), fNY(UTILITY::Clean_name(nameY))
-   {
+   {  
+      fKind = OperatorKind::LEAKYRELU;
       if(std::is_same<T, float>::value){
          fType = "float";
       }
@@ -112,6 +113,7 @@ public:
       out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX
          << ", leakyReluKernel, alpaka::getPtrNative(deviceBuf_" << fNX
          << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), static_cast<Idx>(" << length << "), " << OpName << "_alpha);\n";
+      out << SP <<"alpaka::wait(queue);\n";
       return out.str();
    }
 

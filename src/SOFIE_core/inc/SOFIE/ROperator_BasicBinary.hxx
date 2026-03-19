@@ -251,8 +251,8 @@ public:
 
          model.AddIntermediateTensor(fNY, model.GetTensorType(fNA), fDimShapeY);
          if (model.Verbose()) {
-            std::cout << BinaryOperatorTrait<T, Op>::Name() << " : " << ConvertShapeToString(fDimShapeA) << " , "
-                      << ConvertShapeToString(fDimShapeB) << " --> " << ConvertShapeToString(fDimShapeY) << std::endl;
+            std::cout << BinaryOperatorTrait<T, Op>::Name() << " : " << ConvertDimShapeToString(fDimShapeA) << " , "
+                      << ConvertDimShapeToString(fDimShapeB) << " --> " << ConvertDimShapeToString(fDimShapeY) << std::endl;
          }
       }
    }
@@ -392,7 +392,7 @@ public:
 
       std::string op;
       op = "\n//------ "+opName+"_"+BinaryOperatorTrait<T, Op>::Name()+"_KERNEL_ALPAKA\n";
-      op += SP + "struct Binary"+BinaryOperatorTrait<T, Op>::Name()+"Kernel {\n";
+      op += SP + "struct Binary"+opName+BinaryOperatorTrait<T, Op>::Name()+"Kernel {\n";
       op += SP + SP + "template<typename TAcc, typename T>\n";
       op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * A, T const * B, T * C) const {\n";
       op += SP + SP + SP + "auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
@@ -470,7 +470,7 @@ public:
       if (fIsOutputConstant)
          return "";
 
-      return SP + "Binary"+BinaryOperatorTrait<T, Op>::Name()+"Kernel binary" + OpName + "Kernel;\n";
+      return SP + "Binary"+OpName+BinaryOperatorTrait<T, Op>::Name()+"Kernel binary" + OpName + "Kernel;\n";
    }
 
    std::string Generate_GPU_ALPAKA(std::string OpName) {
@@ -491,6 +491,7 @@ public:
       out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNY
          << ", binary" << OpName << "Kernel, alpaka::getPtrNative(deviceBuf_" << fNA
          << "), alpaka::getPtrNative(deviceBuf_" << fNB << "), alpaka::getPtrNative(deviceBuf_" << fNY << "));\n";
+      out << SP <<"alpaka::wait(queue);\n";
       return out.str();
    }
 

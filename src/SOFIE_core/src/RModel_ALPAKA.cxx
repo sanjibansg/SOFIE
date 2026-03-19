@@ -113,7 +113,7 @@ void RModel::GenerateDynamicTensorInfo_GPU_ALPAKA() {
    std::stringstream out;
 
    for (auto &i : fDynamicTensorInfos) {
-      auto length = ConvertDynamicShapeToLength(i.second.shape);
+      auto length = ConvertDimShapeToLength(i.second.shape);
       out << SP << "if (" << length << " > 0) {\n";
       out << "auto bufDev_" + i.first +
                  " = alpaka::allocBuf<float, size_t>(devAcc, Ext1D::all(Idx{" << length << "}));\n";
@@ -207,7 +207,7 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
       fGC += (fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx)));
    }
 
-   fGC += "\n\n   alpaka::wait(queue);\n";
+   // fGC += "\n\n   alpaka::wait(queue);\n";
    fGC += SP + "return ";
    if (outputSize>1) fGC += " {";
    for (size_t i = 0; i < outputSize; i++) {
@@ -336,7 +336,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          ReadInitializedTensorsFromFile(0);
          fGC += "\n";
       }
-
+      
       MoveInitializedTensorsToBuffers_ALPAKA();
       GenerateDynamicTensorInfo_GPU_ALPAKA();
 
@@ -380,7 +380,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 }
 
 void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int batchSize, bool verbose) {
-   fVerbose = verbose;
+   fVerbose = true;
    fBatchSize = batchSize;
 
    if (static_cast<std::underlying_type_t<Options>>(Options::kNoSession) & options) {
@@ -425,6 +425,7 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
 
 void RModel::MoveInitializedTensorsToBuffers_ALPAKA(){
       for (auto &i : fInitializedTensors) {
+         if (i.second.IsNotWritable())  continue;
          std::string tensor_name = "tensor_" + i.first;
          auto length = ConvertShapeToLength(i.second.shape());
          std::string slength = std::to_string(length);

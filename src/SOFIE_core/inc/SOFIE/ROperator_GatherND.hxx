@@ -294,7 +294,7 @@ public:
           << ", alpaka::getPtrNative(deviceBuf_" << fNIndices << ")"
           << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
           << ", static_cast<Idx>(" << totalElements << "));\n";
-
+      out << SP <<"alpaka::wait(queue);\n";
       return out.str();
    }
 };

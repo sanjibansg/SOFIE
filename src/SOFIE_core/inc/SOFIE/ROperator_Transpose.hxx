@@ -172,21 +172,27 @@ public:
       op += SP + "struct TransposeKernel_" + OpName + " {\n";
       op += SP + SP + "template<typename TAcc, typename T>\n";
       op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc, T const* input, T* output,";
-      op +=  "const std::size_t totalElements) const {\n";
+      op += "const std::size_t totalElements) const {\n";
       op += SP + SP + SP + SP + "auto const idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
       op += SP + SP + SP + SP + "if(idx >= totalElements) return;\n";
       op += SP + SP + SP + SP + "std::size_t input_idx = 0;\n";
       op += SP + SP + SP + SP + "std::size_t remaining = idx;\n";
       op += SP + SP + SP + SP + "std::size_t coord;\n";
-      auto inputStrides = UTILITY::ComputeStrideFromShape(fShapeData);
+
+      auto inputStrides  = UTILITY::ComputeStrideFromShape(fShapeData);
       auto outputStrides = UTILITY::ComputeStrideFromShape(fShapeOutput);
-      for (size_t k = 0; k < fShapeData.size(); k++) {   
-         op += SP + SP + SP + SP + "coord = remaining * " + std::to_string(1/outputStrides[k]) + ";\n";
-         op += SP + SP + SP + SP + "remaining = remaining - coord * " + std::to_string(outputStrides[k]) + ";\n";
-         op += SP + SP + SP + SP + "input_idx += coord * " + std::to_string(inputStrides[fAttrPerm[k]]) + ";\n";
+
+      for (size_t k = 0; k < fShapeData.size(); k++) {
+         op += SP + SP + SP + SP + "coord = remaining / "
+               + std::to_string(outputStrides[k]) + "u;\n";
+         op += SP + SP + SP + SP + "remaining = remaining - coord * "
+               + std::to_string(outputStrides[k]) + "u;\n";
+         op += SP + SP + SP + SP + "input_idx += coord * "
+               + std::to_string(inputStrides[fAttrPerm[k]]) + "u;\n";
       }
-      op += SP + SP + SP + SP + SP + "output[idx] = input[input_idx];\n";
-      op += SP + SP + SP + SP + "}\n";
+
+      op += SP + SP + SP + SP + "output[idx] = input[input_idx];\n";
+      op += SP + SP + SP + "}\n";
       op += SP + SP + SP + "};\n";
 
       return op;
@@ -204,15 +210,15 @@ public:
       auto length = ConvertShapeToLength(fShapeOutput);
 
       out << "\n//------ TRANSPOSE_GPU_ALPAKA\n";
-      out << SP << "auto const elementsPerThread_"<<fNData<<" = Vec::all(static_cast<Idx>(1));\n";
-      out << SP << "auto const elementsPerGrid_"<<fNData<<" = Vec::all(Idx{"<< length << "});\n";
-      out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << fNData << " = {elementsPerGrid_" << fNData << ", elementsPerThread_" << fNData << "};\n";
-      out << SP << "auto const workDiv_" << fNData << " = alpaka::getValidWorkDiv(kernelCfg_" << fNData << ", devAcc, transposeKernel_" << OpName << ", alpaka::getPtrNative(deviceBuf_" << fNData
+      out << SP << "auto const elementsPerThread_"<<fNOutput<<" = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_"<<fNOutput<<" = Vec::all(Idx{"<< length << "});\n";
+      out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << fNOutput << " = {elementsPerGrid_" << fNOutput << ", elementsPerThread_" << fNOutput << "};\n";
+      out << SP << "auto const workDiv_" << fNOutput << " = alpaka::getValidWorkDiv(kernelCfg_" << fNOutput << ", devAcc, transposeKernel_" << OpName << ", alpaka::getPtrNative(deviceBuf_" << fNData
          << "), alpaka::getPtrNative(deviceBuf_" << fNOutput << "), static_cast<Idx>(" << length << "));\n";
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNData
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNOutput
          << ", transposeKernel_" << OpName << ", alpaka::getPtrNative(deviceBuf_" << fNData
          << "), alpaka::getPtrNative(deviceBuf_" << fNOutput << "), static_cast<Idx>(" << length << "));\n";
-
+      out << SP <<"alpaka::wait(queue);\n";
       return out.str();
    }
 

@@ -93,6 +93,7 @@ public:
       size_t length = ConvertShapeToLength(shape);
       std::shared_ptr<void> data_ptr(malloc(length * sizeof(T)), free);
       std::memcpy(data_ptr.get(), (void*) data, length * sizeof(T));
+      std::cout<<"Length of constant tensor "<<name<<" added: "<<length<<std::endl;
       AddConstantTensor(name, GetTemplatedType<T>(T()), shape, data_ptr);
    }
    // for boolean can be more convenient passing an std::vector
@@ -148,6 +149,7 @@ public:
    void UpdateInitializedTensor(std::string tensor_name, ETensorType type, std::vector<std::size_t> shape,
                                 std::shared_ptr<void> data);
    std::shared_ptr<void> GetInitializedTensorData(std::string tensor_name);
+   void RemoveInitializedTensor(std::string tensor_name);
    template<class T>
    std::vector<T> GetTensorData(const std::string & name);
 
