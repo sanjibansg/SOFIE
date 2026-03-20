@@ -52,6 +52,9 @@
 #include "GatherND_NegativeIndices_FromONNX_GPU_ALPAKA.hxx"
 #include "GatherND_Batch_FromONNX_GPU_ALPAKA.hxx"
 
+#include "BatchNorm_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/BatchNorm.ref.hxx"
+
 #include <alpaka/alpaka.hpp>
 #include <cuda_runtime.h>
 #include <nvml.h>
@@ -1093,4 +1096,42 @@ TEST_F(SofieAlpakaTest, GatherND_Batch)
     ASSERT_EQ(expected.size(), 8u);
     for (size_t i = 0; i < expected.size(); ++i)
         EXPECT_LE(std::abs(res[i] - expected[i]), TOLERANCE) << "i=" << i;
+}
+
+TEST_F(SofieAlpakaTest, BatchNorm)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+   constexpr size_t INPUT_SIZE  = 8;  // (1, 2, 2, 2)
+   constexpr size_t OUTPUT_SIZE = 8;
+
+   // scale=[1,2], bias=[0,0.5], mean=[0.5,3], var=[1,4]
+   std::vector<float> input({ 1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f, 8.f });
+
+   auto A = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{INPUT_SIZE}));
+   float *A_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(A));
+   for (Idx i = 0; i < INPUT_SIZE; ++i) A_ptr[i] = input[i];
+
+   auto A_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{INPUT_SIZE}));
+   alpaka::memcpy(queue, A_d, A);
+   alpaka::wait(queue);
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{OUTPUT_SIZE}));
+
+   {
+      SOFIE_BatchNorm::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(A_d);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   float *res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float *correct = BatchNorm_ExpectedOutput::outputs;
+
+   for (size_t i = 0; i < OUTPUT_SIZE; ++i) {
+      EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE)
+         << "Mismatch at index " << i
+         << ": got " << res_ptr[i] << ", expected " << correct[i];
+   }
 }

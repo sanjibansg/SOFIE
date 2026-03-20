@@ -228,6 +228,63 @@ public:
    }
 
    std::vector<std::string> GetBlasRoutines() override { return { std::string("Copy"), std::string("Axpy") }; }
+
+   std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) override {
+      std::string op;
+      op  = "\n//------ BATCHNORM_KERNEL_ALPAKA\n";
+      op += "struct BatchNormKernel {\n";
+      op += SP + "template<typename TAcc, typename T>\n";
+      op += SP + "ALPAKA_FN_ACC void operator()(\n";
+      op += SP + "    TAcc const& acc,\n";
+      op += SP + "    T const* __restrict__ x, T* __restrict__ y,\n";
+      op += SP + "    T const* __restrict__ mean, T const* __restrict__ scale,\n";
+      op += SP + "    T const* __restrict__ bias, std::size_t n) const {\n";
+      op += SP + SP + "const auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + "if (idx < n) {\n";
+      op += SP + SP + SP + "y[idx] = (x[idx] - mean[idx]) * scale[idx] + bias[idx];\n";
+      op += SP + SP + "}\n";
+      op += SP + "}\n";
+      op += "};\n";
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) override {
+      return "BatchNormKernel batchNormKernel;\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string OpName) override {
+      OpName = "op_" + OpName;
+      if (fShapeX.empty()) {
+         throw std::runtime_error(
+            "TMVA SOFIE BatchNormalization called to Generate_GPU_ALPAKA without being initialized first");
+      }
+
+      std::stringstream out;
+      size_t n = ConvertShapeToLength(fShapeX);
+
+      out << "\n//------ BATCHNORM_GPU_ALPAKA\n";
+      out << SP << "auto const elementsPerThread_" << fNX << " = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_"   << fNX << " = Vec::all(Idx{" << n << "});\n";
+      out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << fNX
+                << " = {elementsPerGrid_" << fNX << ", elementsPerThread_" << fNX << "};\n";
+      out << SP << "auto const workDiv_" << fNX
+                << " = alpaka::getValidWorkDiv(kernelCfg_" << fNX
+                << ", devAcc, batchNormKernel,"
+                << " alpaka::getPtrNative(deviceBuf_" << fNX << "),"
+                << " alpaka::getPtrNative(deviceBuf_" << fNY << "),"
+                << " alpaka::getPtrNative(deviceBuf_" << fNMean << "),"
+                << " alpaka::getPtrNative(deviceBuf_" << fNScale << "),"
+                << " alpaka::getPtrNative(deviceBuf_" << fNB << "),"
+                << " static_cast<Idx>(" << n << "));\n";
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX << ", batchNormKernel,"
+                << " alpaka::getPtrNative(deviceBuf_" << fNX << "),"
+                << " alpaka::getPtrNative(deviceBuf_" << fNY << "),"
+                << " alpaka::getPtrNative(deviceBuf_" << fNMean << "),"
+                << " alpaka::getPtrNative(deviceBuf_" << fNScale << "),"
+                << " alpaka::getPtrNative(deviceBuf_" << fNB << "),"
+                << " static_cast<Idx>(" << n << "));\n";
+      return out.str();
+   }
 };
 
 }//SOFIE
