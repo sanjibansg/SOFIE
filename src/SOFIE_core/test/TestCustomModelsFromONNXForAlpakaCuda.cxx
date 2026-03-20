@@ -1118,7 +1118,7 @@ TEST_F(SofieAlpakaTest, BatchNorm)
    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{OUTPUT_SIZE}));
 
    {
-      SOFIE_BatchNorm::Session<alpaka::TagGpuCudaRt> session;
+      SOFIE_BatchNorm::Session<alpaka::TagGpuCudaRt> session("BatchNorm_FromONNX_GPU_ALPAKA.dat");
       auto result = session.infer(A_d);
       alpaka::wait(queue);
       cudaDeviceSynchronize();
