@@ -440,9 +440,9 @@
       out << SP << "auto const elementsPerGrid_"<<OpName<<" = Vec::all(Idx{"<< length << "});\n";
       out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << OpName << " = {elementsPerGrid_" << OpName << ", elementsPerThread_" << OpName << "};\n";
       out << SP << "auto const workDiv_" << OpName << " = alpaka::getValidWorkDiv(kernelCfg_" << OpName << ", devAcc, concatKernel_" << OpName << ", input_ptrs_" << OpName << ", alpaka::getPtrNative(deviceBuf_" << fOutput << "), static_cast<Idx>(" << length << "));\n";
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << OpName
+      out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << OpName
          << ", concatKernel_" << OpName << ", input_ptrs_" << OpName << ", alpaka::getPtrNative(deviceBuf_" << fOutput << "), static_cast<Idx>(" << length << "));\n";
-      out << SP <<"alpaka::wait(queue);\n";
+      out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";
       return out.str();
    }
 

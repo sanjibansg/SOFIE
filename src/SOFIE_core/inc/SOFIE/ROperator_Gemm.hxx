@@ -434,6 +434,7 @@ namespace SOFIE{
          }
          std::stringstream out;
          out << "\n//--------- Gemm_GPU_ALPAKA\n";
+         out << SP << "alpaka::wait(queue);\n";
          out << SP << "char " << opName << "_transA = " << (fAttrTransA ? "\'t\'" : "\'n\'") << ";\n";
          out << SP << "char " << opName << "_transB = " << (fAttrTransB ? "\'t\'" : "\'n\'") << ";\n";
          // need to consider case A and B have dim > 2 (for MatMul)

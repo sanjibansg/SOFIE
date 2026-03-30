@@ -239,9 +239,9 @@ public:
           << " = {elementsPerGrid_" << opName << ", elementsPerThread_" << opName << "};\n";
       out << SP << "auto const workDiv_" << opName << " = alpaka::getValidWorkDiv(kernelCfg_" << opName
           << ", devAcc, " << kname << ", " << args << ");\n";
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << opName
+      out << SP << "auto task_" << opName << " = alpaka::createTaskKernel<Acc>(workDiv_" << opName
           << ", " << kname << ", " << args << ");\n";
-      out << SP <<"alpaka::wait(queue);\n";
+      out << SP <<"alpaka::enqueue(queue, task_" << opName << ");\n";
       return out.str();
    }
 

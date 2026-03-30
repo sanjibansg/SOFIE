@@ -215,10 +215,10 @@ public:
       out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << fNOutput << " = {elementsPerGrid_" << fNOutput << ", elementsPerThread_" << fNOutput << "};\n";
       out << SP << "auto const workDiv_" << fNOutput << " = alpaka::getValidWorkDiv(kernelCfg_" << fNOutput << ", devAcc, transposeKernel_" << OpName << ", alpaka::getPtrNative(deviceBuf_" << fNData
          << "), alpaka::getPtrNative(deviceBuf_" << fNOutput << "), static_cast<Idx>(" << length << "));\n";
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNOutput
+      out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNOutput
          << ", transposeKernel_" << OpName << ", alpaka::getPtrNative(deviceBuf_" << fNData
          << "), alpaka::getPtrNative(deviceBuf_" << fNOutput << "), static_cast<Idx>(" << length << "));\n";
-      out << SP <<"alpaka::wait(queue);\n";
+      out << SP <<"alpaka::enqueue(queue, task_" << OpName << ");\n";
       return out.str();
    }
 

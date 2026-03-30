@@ -247,12 +247,12 @@ std::string Generate_GPU_ALPAKA(std::string opName) override {
             << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
             << ", alpaka::getPtrNative(deviceBuf_" << fNYs[i] << ")"
             << ", static_cast<Idx>(" << length << "));\n";
-        out << SP << SP << "alpaka::exec<Acc>(queue, workDiv_" << i
+        out << SP << SP << "auto task_" << opName << "_" << i << " = alpaka::createTaskKernel<Acc>(workDiv_" << i
             << ", " << kname
             << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
             << ", alpaka::getPtrNative(deviceBuf_" << fNYs[i] << ")"
             << ", static_cast<Idx>(" << length << "));\n";
-        out << SP <<"alpaka::wait(queue);\n";
+        out << SP << "alpaka::enqueue(queue, task_" << opName << "_" << i << ");\n";
         out << SP << "}\n";
     }
     return out.str();

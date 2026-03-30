@@ -89,7 +89,6 @@ protected:
          size_t idx = 1;
          std::cout<<"insider allocate on stack and length\n";
          do {
-            std::cout<<"Printing idx: "<<idx<<", data[idx] = "<<data[idx]<<", data[idx-1] = "<<data[idx-1]<<std::endl;
             sameData = (data[idx] == data[idx - 1]);
             idx++;
          } while (sameData && idx < length);

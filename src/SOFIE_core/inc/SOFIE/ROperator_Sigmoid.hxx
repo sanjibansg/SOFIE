@@ -96,10 +96,10 @@ public:
       out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << fNX << " = {elementsPerGrid_" << fNX << ", elementsPerThread_" << fNX << "};\n";
       out << SP << "auto const workDiv_" << fNX << " = alpaka::getValidWorkDiv(kernelCfg_" << fNX << ", devAcc, sigmoidKernel, alpaka::getPtrNative(deviceBuf_" << fNX
          << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), static_cast<Idx>(" << length << "));\n";
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX
+      out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNX
          << ", sigmoidKernel, alpaka::getPtrNative(deviceBuf_" << fNX
          << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), static_cast<Idx>(" << length << "));\n";
-      out << SP <<"alpaka::wait(queue);\n";
+      out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";
       return out.str();
    }
 

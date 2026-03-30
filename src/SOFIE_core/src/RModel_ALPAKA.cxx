@@ -207,7 +207,7 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
       fGC += (fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx)));
    }
 
-   // fGC += "\n\n   alpaka::wait(queue);\n";
+   fGC += "\n\n   alpaka::wait(queue);\n";
    fGC += SP + "return ";
    if (outputSize>1) fGC += " {";
    for (size_t i = 0; i < outputSize; i++) {

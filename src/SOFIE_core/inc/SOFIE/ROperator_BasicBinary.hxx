@@ -416,10 +416,6 @@ public:
       std::string flattened_index_B = "";
       std::string temp = "idx";
 
-      op += "// stridesY " + ConvertShapeToString(stridesY) + "\n";
-      op += "// stridesA " + ConvertShapeToString(stridesA) + "\n";
-      op += "// stridesB " + ConvertShapeToString(stridesB) + "\n";
-
       for (size_t id_s = 0; id_s < fShapeA.size(); ++id_s) {
 
          auto strideY = stridesY[id_s];
@@ -488,10 +484,10 @@ public:
       out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << fNY << " = {elementsPerGrid_" << fNY << ", elementsPerThread_" << fNY << "};\n";
       out << SP << "auto const workDiv_" << fNY << " = alpaka::getValidWorkDiv(kernelCfg_" << fNY << ", devAcc, binary" << OpName << "Kernel, alpaka::getPtrNative(deviceBuf_" << fNA
          << "), alpaka::getPtrNative(deviceBuf_" << fNB << "), alpaka::getPtrNative(deviceBuf_" << fNY << "));\n";
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNY
+      out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNY
          << ", binary" << OpName << "Kernel, alpaka::getPtrNative(deviceBuf_" << fNA
          << "), alpaka::getPtrNative(deviceBuf_" << fNB << "), alpaka::getPtrNative(deviceBuf_" << fNY << "));\n";
-      out << SP <<"alpaka::wait(queue);\n";
+      out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";
       return out.str();
    }
 

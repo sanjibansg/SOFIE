@@ -189,8 +189,8 @@ public:
       out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << fNY << " = {elementsPerGrid_" << fNY << ", elementsPerThread_" << fNY << "};\n";
       out << SP << "auto const workDiv_" << fNY << " = alpaka::getValidWorkDiv(kernelCfg_" << fNY << ", devAcc, castKernel, alpaka::getPtrNative(deviceBuf_" << fNX
          << "), alpaka::getPtrNative(deviceBuf_" << fNY << "));\n";
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNY << ", castKernel, alpaka::getPtrNative(deviceBuf_" << fNX << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), static_cast<Idx>(" << length << ")); \n";
-      out << SP <<"alpaka::wait(queue);\n";
+      out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNY << ", castKernel, alpaka::getPtrNative(deviceBuf_" << fNX << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), static_cast<Idx>(" << length << ")); \n";
+      out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";
       return out.str();
    }
 
