@@ -77,6 +77,33 @@ public:
    ROperator_BasicUnary(std::string nameX, std::string nameY)
       : fNX(UTILITY::Clean_name(nameX)), fNY(UTILITY::Clean_name(nameY))
    {
+
+         switch(Op) {
+            case EBasicUnaryOperator::kReciprocal:
+               fKind = OperatorKind::UNARY_RECIPROCAL;
+               break;
+            case EBasicUnaryOperator::kSqrt:
+               fKind = OperatorKind::UNARY_SQRT;
+               break;
+            case EBasicUnaryOperator::kNeg:
+               fKind = OperatorKind::UNARY_NEG;
+               break;
+            case EBasicUnaryOperator::kExp:
+               fKind = OperatorKind::UNARY_EXP;
+               break;
+            case EBasicUnaryOperator::kLog:
+               fKind = OperatorKind::UNARY_LOG;
+               break;
+            case EBasicUnaryOperator::kSin:
+               fKind = OperatorKind::UNARY_SIN;
+               break;
+            case EBasicUnaryOperator::kCos:
+               fKind = OperatorKind::UNARY_COS;
+               break;
+            case EBasicUnaryOperator::kAbs:
+               fKind = OperatorKind::UNARY_ABS;
+               break;
+         }
          fInputTensorNames =  { fNX };
          fOutputTensorNames = { fNY };
    }
@@ -107,20 +134,24 @@ public:
       return out.str();
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA() {
+   std::string Generate_GPU_Kernel_ALPAKA(std::string /*OpName*/) override {
+      if (fIsOutputConstant)
+         return "";
+
       std::string op;
       op = "\n//------ " + UnaryOpTraits<T, Op>::Name() + "_KERNEL_ALPAKA\n";
       op += SP + "struct Unary" + UnaryOpTraits<T, Op>::Name() + "Kernel{\n";
       op += SP + SP + "template<typename TAcc, typename T>\n";
-      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T* data, std::size_t numElements) const {\n";
-      op += SP + SP + SP + "for (auto i : alpaka::uniformElements(acc, numElements)) {\n";
-      op += SP + SP + SP + "data[i] = " << UnaryOpTraits<T, Op>::Op("data[i]") << ";\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * data, T * output, std::size_t const length) const {\n";
+      op += SP + SP + SP + "auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (idx < length) {\n";
+      op += SP + SP + SP + "output[idx] = " +UnaryOpTraits<T, Op>::Op("data[idx]") + ";\n";
       op += SP + SP + "}\n";
       op += SP + "}\n};\n";
       return op;
    }
 
-   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) override {
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*OpName*/) override {
       return SP + "Unary" + UnaryOpTraits<T, Op>::Name() + "Kernel " + UnaryOpTraits<T, Op>::Name() + "Kernel;\n";
    }
 
@@ -129,8 +160,15 @@ public:
       std::stringstream out;
       auto length = ConvertShapeToLength(fShapeX);
       out << "\n//------ "+OpName+"_ALPAKA\n";
-      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_"<<fNX<<"(alpaka::Vec<Dim, Idx>::all("<<(length+255)/256<<"), alpaka::Vec<Dim, Idx>::all(256), alpaka::Vec<Dim, Idx>::all(1));\n";
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNX << ", " << UnaryOpTraits<T, Op>::Name() << "Kernel, alpaka::getPtrNative(deviceBuf_" << fNX << "), static_cast<Idx>(" << length << ")); \n";
+      out << SP << "auto const elementsPerThread_"<<fNY<<" = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_"<<fNY<<" = Vec::all(Idx{"<< length << "});\n";
+      out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << fNY << " = {elementsPerGrid_" << fNY << ", elementsPerThread_" << fNY << "};\n";
+      out << SP << "auto const workDiv_" << fNY << " = alpaka::getValidWorkDiv(kernelCfg_" << fNY << ", devAcc, " << UnaryOpTraits<T, Op>::Name() << "Kernel, alpaka::getPtrNative(deviceBuf_" << fNX
+         << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), " << length << ");\n";
+      out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNY
+         << ", " << UnaryOpTraits<T, Op>::Name() << "Kernel, alpaka::getPtrNative(deviceBuf_" << fNX
+         << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), " << length << ");\n";
+      out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";
       return out.str();
    }
 

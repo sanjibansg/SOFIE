@@ -231,7 +231,16 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       SOFIE::OperatorKind::EINSUM,
       SOFIE::OperatorKind::COMPARISON,
       SOFIE::OperatorKind::ELU,
+      SOFIE::OperatorKind::UNARY_RECIPROCAL,
+      SOFIE::OperatorKind::UNARY_SQRT,
+      SOFIE::OperatorKind::UNARY_NEG,
+      SOFIE::OperatorKind::UNARY_EXP,
+      SOFIE::OperatorKind::UNARY_LOG,
+      SOFIE::OperatorKind::UNARY_SIN,
+      SOFIE::OperatorKind::UNARY_COS,
+      SOFIE::OperatorKind::UNARY_ABS
    };
+
    bool OpNeedsBlas = false;
 
    // single initiation operators must only be initialized only once and their count should be stored in the registered_operators set to avoid generating multiple kernels for the same operator kind
@@ -241,14 +250,12 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          OpNeedsBlas = true;
       }
       if(single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
-         
          if(registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+               if (fVerbose)
+               std::cout<<"Generating ALPAKA kernel for operator"<< toString(fOperators[id]->GetKind()) << std::endl;
             
-            if (fVerbose)
-            std::cout<<"Generating ALPAKA kernel for operator"<< toString(fOperators[id]->GetKind()) << std::endl;
-         
-            fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
-            registered_operators.insert(fOperators[id]->GetKind());
+               fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
+               registered_operators.insert(fOperators[id]->GetKind());
          }
       } else {
          if (fVerbose)
@@ -275,7 +282,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
     fGC += "using QueueAcc = alpaka::Queue<Acc, QueueProperty>;\n\n";
     fGC += "using BufF1D = alpaka::Buf<Acc, float, Dim, Idx>;\n";
     fGC += "using BufD1D = alpaka::Buf<Acc, double, Dim, Idx>;\n";
-    fGC += "using BufI641D = alpaka::Buf<Acc, int64_t, Dim, Idx>;\n\n";
+    fGC += "using BufI641D = alpaka::Buf<Acc, int64_t, Dim, Idx>;\n";
     fGC += "using BufUI81D = alpaka::Buf<Acc, uint8_t, Dim, Idx>;\n\n";
 
     fGC += "\nalpaka::Platform<Acc> const platform{};\n";

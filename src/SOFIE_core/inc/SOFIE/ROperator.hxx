@@ -29,6 +29,14 @@ enum class OperatorKind {
    TANH=13,
    SOFTMAX=14,
    LEAKYRELU=15,
+   UNARY_RECIPROCAL=16,
+   UNARY_SQRT=17,
+   UNARY_NEG=18,
+   UNARY_EXP=19,
+   UNARY_LOG=20,
+   UNARY_SIN=21,
+   UNARY_COS=22,
+   UNARY_ABS=23
 };
 
 inline const char* toString(OperatorKind kind) {

@@ -2849,6 +2849,7 @@ TEST(ONNX, Slice_Neg) {
    }
 
 }
+
 TEST(ONNX, RangeFloat) {
    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
 
