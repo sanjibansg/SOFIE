@@ -261,6 +261,129 @@ public:
       return out.str();
    }
 
+   std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) override {
+      if (fShapeX.empty() || fShapeY.empty())
+         throw std::runtime_error("TMVA SOFIE Reduce Op called to Generate without being initialized first");
+
+      const std::size_t Dx = fShapeX.size();
+
+      auto inputStrides  = UTILITY::ComputeStrideFromShape(fShapeX);
+      auto outputStrides = UTILITY::ComputeStrideFromShape(fShapeYNotPruned);
+
+      std::size_t inputLength  = ConvertShapeToLength(fShapeX);
+      std::size_t outputLength = ConvertShapeToLength(fShapeY);
+      std::size_t reducedLength = inputLength / outputLength;
+
+      std::string kname = "ReduceKernel_" + Name();
+
+      std::string op;
+      op  = "\n//------ " + Name() + "_KERNEL_ALPAKA\n";
+      op += SP + "struct " + kname + " {\n";
+      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
+      op += SP + SP + SP + "TAcc const& acc,\n";
+      op += SP + SP + SP + "T const* __restrict__ input,\n";
+      op += SP + SP + SP + "T* __restrict__ output,\n";
+      op += SP + SP + SP + "std::size_t const outputLength) const {\n\n";
+
+      op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (global_thread_idx >= outputLength) return;\n";
+      op += SP + SP + SP + "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+
+      op += SP + SP + SP + "for (std::size_t out_idx = global_thread_idx; out_idx < outputLength; out_idx += grid_thread_extent) {\n\n";
+
+      for (std::size_t d = 0; d < Dx; ++d) {
+         op += SP + SP + SP + SP + "std::size_t const oy_" + std::to_string(d)
+               + " = (out_idx / " + std::to_string(outputStrides[d]) + "u) % "
+               + std::to_string(fShapeYNotPruned[d]) + "u;\n";
+      }
+      op += "\n";
+
+      std::string startVal = (Op == ReduceProd) ? "static_cast<T>(1)" : "static_cast<T>(0)";
+      op += SP + SP + SP + SP + "T acc_val = " + startVal + ";\n\n";
+
+      std::vector<std::size_t> redAxes;
+      std::vector<std::size_t> keepAxes;
+      for (std::size_t d = 0; d < Dx; ++d) {
+         if (std::find(fAttrAxes.begin(), fAttrAxes.end(), (int64_t)d) != fAttrAxes.end())
+               redAxes.push_back(d);
+         else
+               keepAxes.push_back(d);
+      }
+
+      std::string indent = SP + SP + SP + SP;
+      for (std::size_t rd : redAxes) {
+         op += indent + "for (std::size_t r_" + std::to_string(rd)
+               + " = 0; r_" + std::to_string(rd)
+               + " < " + std::to_string(fShapeX[rd]) + "u; r_"
+               + std::to_string(rd) + "++) {\n";
+         indent += SP;
+      }
+
+      op += indent + "std::size_t const in_idx =\n";
+      for (std::size_t d = 0; d < Dx; ++d) {
+         std::string coord = (std::find(redAxes.begin(), redAxes.end(), d) != redAxes.end())
+               ? "r_" + std::to_string(d)
+               : "oy_" + std::to_string(d);
+         op += indent + SP + coord + " * " + std::to_string(inputStrides[d]) + "u";
+         op += (d + 1 < Dx) ? " +\n" : ";\n";
+      }
+
+      if (Op == ReduceProd)
+         op += indent + "acc_val *= input[in_idx];\n";
+      else if (Op == ReduceSum || Op == ReduceMean)
+         op += indent + "acc_val += input[in_idx];\n";
+      else if (Op == ReduceSumSquare)
+         op += indent + "acc_val += input[in_idx] * input[in_idx];\n";
+
+      for (std::size_t i = 0; i < redAxes.size(); ++i) {
+         indent = indent.substr(SP.length());
+         op += indent + "}\n";
+      }
+
+      if (Op == ReduceMean)
+         op += SP + SP + SP + SP + "acc_val /= static_cast<T>(" + std::to_string(reducedLength) + "u);\n";
+
+      op += SP + SP + SP + SP + "output[out_idx] = acc_val;\n";
+      op += SP + SP + SP + "}\n";
+      op += SP + SP + "}\n";
+      op += SP + "};\n";
+
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) override {
+      std::string kname = "ReduceKernel_" + Name();
+      return SP + kname + " reduceKernel_" + Name() + ";\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string /*opName*/) override {
+      if (fShapeX.empty() || fShapeY.empty())
+         throw std::runtime_error("TMVA SOFIE Reduce Op called to Generate without being initialized first");
+
+      std::size_t outputLength = ConvertShapeToLength(fShapeY);
+      std::string kname = "reduceKernel_" + Name();
+
+      std::stringstream out;
+      out << "\n//------ " << Name() << "_GPU_ALPAKA\n";
+      out << SP << "auto const elementsPerThread_" << fNY << " = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_"   << fNY << " = Vec::all(Idx{" << outputLength << "});\n";
+      out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << fNY
+         << " = {elementsPerGrid_" << fNY << ", elementsPerThread_" << fNY << "};\n";
+      out << SP << "auto const workDiv_" << fNY << " = alpaka::getValidWorkDiv(kernelCfg_" << fNY
+         << ", devAcc, " << kname
+         << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+         << ", static_cast<Idx>(" << outputLength << "));\n";
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNY
+         << ", " << kname
+         << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+         << ", static_cast<Idx>(" << outputLength << "));\n";
+
+      return out.str();
+   }
+
 };
 
 }//SOFIE

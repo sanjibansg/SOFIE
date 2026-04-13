@@ -8,7 +8,7 @@
 
 namespace SOFIE {
 
-enum class EBasicUnaryOperator { kReciprocal, kSqrt , kNeg, kExp, kLog, kSin, kCos, kAbs };
+enum class EBasicUnaryOperator { kReciprocal, kSqrt , kNeg, kExp, kLog, kSin, kCos, kAbs, kSoftplus, kAtan, kFloor };
 
 template <typename T, EBasicUnaryOperator Op>
 struct UnaryOpTraits {
@@ -60,6 +60,24 @@ template <typename T>
 struct UnaryOpTraits<T, EBasicUnaryOperator::kAbs> {
    static std::string Name() { return "Abs"; }
    static std::string Op(const std::string &X) { return "std::abs(" + X + ")"; }
+};
+
+template <typename T>
+struct UnaryOpTraits<T, EBasicUnaryOperator::kSoftplus> {
+   static std::string Name() { return "Softplus"; }
+   static std::string Op(const std::string &X) { return "std::log(std::exp(" + X + ") + 1)"; }
+};
+
+template <typename T>
+struct UnaryOpTraits<T, EBasicUnaryOperator::kAtan> {
+   static std::string Name() { return "Atan"; }
+   static std::string Op(const std::string &X) { return "std::atan(" + X + ")"; }
+};
+
+template <typename T>
+struct UnaryOpTraits<T, EBasicUnaryOperator::kFloor> {
+   static std::string Name() { return "Floor"; }
+   static std::string Op(const std::string &X) { return "std::floor(" + X + ")"; }
 };
 
 template <typename T, EBasicUnaryOperator Op>
