@@ -128,6 +128,7 @@ std::string RModel::GenerateInferSignature_GPU_ALPAKA(bool isdecl) {
       if (type == ETensorType::FLOAT)  return "BufF1D";
       if (type == ETensorType::DOUBLE) return "BufD1D";
       if (type == ETensorType::INT64)  return "BufI641D";
+      if (type == ETensorType::BOOL)  return "BufUI81D";
       throw std::runtime_error("TMVA-SOFIE: input tensor " + name +
                                " is of a data type which is not yet supported.");
    };

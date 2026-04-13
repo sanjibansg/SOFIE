@@ -285,6 +285,142 @@ public:
       return out.str();
    }
 
+
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+      if (fIsOutputConstant) return "";
+      opName = "op_" + opName;
+      if (fShapeY.empty())
+         throw std::runtime_error("TMVA SOFIE Where Op called to Generate without being initialized first");
+
+      const std::size_t D = fShapeY.size();
+      std::size_t totalElements = ConvertShapeToLength(fShapeY);
+
+      std::vector<size_t> shapeA_padded(D, 1);
+      std::vector<size_t> shapeB_padded(D, 1);
+      std::vector<size_t> shapeC_padded(D, 1);
+      {
+         size_t offA = D - fShapeA.size();
+         for (size_t i = 0; i < fShapeA.size(); ++i) shapeA_padded[offA + i] = fShapeA[i];
+         size_t offB = D - fShapeB.size();
+         for (size_t i = 0; i < fShapeB.size(); ++i) shapeB_padded[offB + i] = fShapeB[i];
+         size_t offC = D - fShapeC.size();
+         for (size_t i = 0; i < fShapeC.size(); ++i) shapeC_padded[offC + i] = fShapeC[i];
+      }
+
+      auto stridesA = UTILITY::ComputeStrideFromShape(shapeA_padded);
+      auto stridesB = UTILITY::ComputeStrideFromShape(shapeB_padded);
+      auto stridesC = UTILITY::ComputeStrideFromShape(shapeC_padded);
+      auto stridesY = UTILITY::ComputeStrideFromShape(fShapeY);
+
+      std::string typeName = TensorType<T>::Name();
+      std::string kname    = "WhereKernel_" + opName;
+
+      std::string op;
+      op  = "\n//------ WHERE_KERNEL_ALPAKA\n";
+      op += SP + "struct " + kname + " {\n";
+      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
+      op += SP + SP + SP + "TAcc const& acc,\n";
+      op += SP + SP + SP + "uint8_t const* __restrict__ cond,\n";
+      op += SP + SP + SP + "T const* __restrict__ x,\n";
+      op += SP + SP + SP + "T const* __restrict__ y,\n";
+      op += SP + SP + SP + "T* __restrict__ output,\n";
+      op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
+
+      op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (global_thread_idx >= totalElements) return;\n";
+      op += SP + SP + SP + "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+
+      op += SP + SP + SP + "for (std::size_t elem_idx = global_thread_idx; elem_idx < totalElements; elem_idx += grid_thread_extent) {\n\n";
+
+      for (std::size_t d = 0; d < D; ++d) {
+         op += SP + SP + SP + SP + "std::size_t const out_" + std::to_string(d)
+               + " = (elem_idx / " + std::to_string(stridesY[d]) + "u) % "
+               + std::to_string(fShapeY[d]) + "u;\n";
+      }
+      op += "\n";
+
+      op += SP + SP + SP + SP + "std::size_t const c_idx =\n";
+      for (std::size_t d = 0; d < D; ++d) {
+         if (shapeC_padded[d] == 1)
+               op += SP + SP + SP + SP + SP + "0u";
+         else
+               op += SP + SP + SP + SP + SP
+                  + "out_" + std::to_string(d)
+                  + " * " + std::to_string(stridesC[d]) + "u";
+         op += (d + 1 < D) ? " +\n" : ";\n\n";
+      }
+
+      op += SP + SP + SP + SP + "std::size_t const x_idx =\n";
+      for (std::size_t d = 0; d < D; ++d) {
+         if (shapeA_padded[d] == 1)
+               op += SP + SP + SP + SP + SP + "0u";
+         else
+               op += SP + SP + SP + SP + SP
+                  + "out_" + std::to_string(d)
+                  + " * " + std::to_string(stridesA[d]) + "u";
+         op += (d + 1 < D) ? " +\n" : ";\n\n";
+      }
+
+      op += SP + SP + SP + SP + "std::size_t const y_idx =\n";
+      for (std::size_t d = 0; d < D; ++d) {
+         if (shapeB_padded[d] == 1)
+               op += SP + SP + SP + SP + SP + "0u";
+         else
+               op += SP + SP + SP + SP + SP
+                  + "out_" + std::to_string(d)
+                  + " * " + std::to_string(stridesB[d]) + "u";
+         op += (d + 1 < D) ? " +\n" : ";\n\n";
+      }
+
+      op += SP + SP + SP + SP + "output[elem_idx] = cond[c_idx] ? x[x_idx] : y[y_idx];\n";
+      op += SP + SP + SP + "}\n";
+      op += SP + SP + "}\n";
+      op += SP + "};\n";
+
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
+      if (fIsOutputConstant) return "";
+      opName = "op_" + opName;
+      std::string kname = "WhereKernel_" + opName;
+      return SP + kname + " whereKernel_" + opName + ";\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string opName) override {
+      if (fIsOutputConstant) return "";
+      opName = "op_" + opName;
+      if (fShapeY.empty())
+         throw std::runtime_error("TMVA SOFIE Where Op called to Generate without being initialized first");
+
+      std::size_t totalElements = ConvertShapeToLength(fShapeY);
+      std::string kname = "whereKernel_" + opName;
+
+      std::stringstream out;
+      out << "\n//------ WHERE_GPU_ALPAKA\n";
+      out << SP << "auto const elementsPerThread_" << opName << " = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_"   << opName << " = Vec::all(Idx{" << totalElements << "});\n";
+      out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << opName
+         << " = {elementsPerGrid_" << opName << ", elementsPerThread_" << opName << "};\n";
+      out << SP << "auto const workDiv_" << opName << " = alpaka::getValidWorkDiv(kernelCfg_" << opName
+         << ", devAcc, " << kname
+         << ", alpaka::getPtrNative(deviceBuf_" << fNC << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << fNA << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << fNB << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+         << ", static_cast<Idx>(" << totalElements << "));\n";
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << opName
+         << ", " << kname
+         << ", alpaka::getPtrNative(deviceBuf_" << fNC << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << fNA << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << fNB << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+         << ", static_cast<Idx>(" << totalElements << "));\n";
+
+      return out.str();
+   }
+
 };
 
 }//SOFIE
