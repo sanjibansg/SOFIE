@@ -52,6 +52,17 @@
 #include "GatherND_NegativeIndices_FromONNX_GPU_ALPAKA.hxx"
 #include "GatherND_Batch_FromONNX_GPU_ALPAKA.hxx"
 
+#include "Equal_FromONNX_GPU_ALPAKA.hxx"
+#include "LessOrEqual_FromONNX_GPU_ALPAKA.hxx"
+#include "GreaterOrEqual_FromONNX_GPU_ALPAKA.hxx"
+#include "Greater_FromONNX_GPU_ALPAKA.hxx"
+#include "Less_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/Equal.ref.hxx"
+#include "input_models/references/LessOrEqual.ref.hxx"
+#include "input_models/references/GreaterOrEqual.ref.hxx"
+#include "input_models/references/Greater.ref.hxx"
+#include "input_models/references/Less.ref.hxx"
+
 #include <alpaka/alpaka.hpp>
 #include <cuda_runtime.h>
 #include <nvml.h>
@@ -1093,4 +1104,190 @@ TEST_F(SofieAlpakaTest, GatherND_Batch)
     ASSERT_EQ(expected.size(), 8u);
     for (size_t i = 0; i < expected.size(); ++i)
         EXPECT_LE(std::abs(res[i] - expected[i]), TOLERANCE) << "i=" << i;
+}
+
+TEST_F(SofieAlpakaTest, Equal)
+{
+    std::vector<float> input1 = {1.0f, 2.0f, 3.0f};
+    std::vector<float> input2 = {4.0f, 2.0f, 6.0f};
+    const std::size_t outputSize = sizeof(Equal_ExpectedOutput::outputs) / sizeof(bool);
+
+    auto input1_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input1.size()}));
+    auto input2_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input2.size()}));
+    float* in1_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input1_h));
+    float* in2_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input2_h));
+    for (Idx i = 0; i < input1.size(); ++i) in1_ptr[i] = input1[i];
+    for (Idx i = 0; i < input2.size(); ++i) in2_ptr[i] = input2[i];
+
+    auto input1_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input1.size()}));
+    auto input2_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input2.size()}));
+    alpaka::memcpy(queue, input1_d, input1_h);
+    alpaka::memcpy(queue, input2_d, input2_h);
+    alpaka::wait(queue);
+
+    // Output is bool — allocate as bool buffer
+    auto result_h = alpaka::allocBuf<uint8_t, Idx>(host, Ext1D::all(Idx{outputSize}));
+
+    {
+        SOFIE_Equal::Session<alpaka::TagGpuCudaRt> session("Equal_FromONNX_GPU_ALPAKA.dat");
+        auto result = session.infer(input1_d, input2_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    uint8_t* res_ptr     = reinterpret_cast<uint8_t*>(alpaka::getPtrNative(result_h));
+    bool* correct     = Equal_ExpectedOutput::outputs;
+    EXPECT_EQ(outputSize, sizeof(Equal_ExpectedOutput::outputs) / sizeof(bool));
+    for (size_t i = 0; i < outputSize; ++i)
+        EXPECT_EQ(res_ptr[i], correct[i]) << "i=" << i;
+}
+
+TEST_F(SofieAlpakaTest, LessOrEqual)
+{
+    std::vector<float> input1 = {1.0f, 2.0f, 3.0f};
+    std::vector<float> input2 = {4.0f, 2.0f, 6.0f};
+    const std::size_t outputSize = sizeof(LessOrEqual_ExpectedOutput::outputs) / sizeof(bool);
+
+    auto input1_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input1.size()}));
+    auto input2_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input2.size()}));
+    float* in1_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input1_h));
+    float* in2_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input2_h));
+    for (Idx i = 0; i < input1.size(); ++i) in1_ptr[i] = input1[i];
+    for (Idx i = 0; i < input2.size(); ++i) in2_ptr[i] = input2[i];
+
+    auto input1_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input1.size()}));
+    auto input2_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input2.size()}));
+    alpaka::memcpy(queue, input1_d, input1_h);
+    alpaka::memcpy(queue, input2_d, input2_h);
+    alpaka::wait(queue);
+
+    auto result_h = alpaka::allocBuf<uint8_t, Idx>(host, Ext1D::all(Idx{outputSize}));
+
+    {
+        SOFIE_LessOrEqual::Session<alpaka::TagGpuCudaRt> session("LessOrEqual_FromONNX_GPU_ALPAKA.dat");
+        auto result = session.infer(input1_d, input2_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    uint8_t* res_ptr = reinterpret_cast<uint8_t*>(alpaka::getPtrNative(result_h));
+    bool* correct = LessOrEqual_ExpectedOutput::outputs;
+    EXPECT_EQ(outputSize, sizeof(LessOrEqual_ExpectedOutput::outputs) / sizeof(bool));
+    for (size_t i = 0; i < outputSize; ++i)
+        EXPECT_EQ(res_ptr[i], correct[i]) << "i=" << i;
+}
+
+TEST_F(SofieAlpakaTest, GreaterOrEqual)
+{
+    std::vector<float> input1 = {1.0f, 2.0f, 3.0f};
+    std::vector<float> input2 = {4.0f, 2.0f, 6.0f};
+    const std::size_t outputSize = sizeof(GreaterOrEqual_ExpectedOutput::outputs) / sizeof(bool);
+
+    auto input1_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input1.size()}));
+    auto input2_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input2.size()}));
+    float* in1_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input1_h));
+    float* in2_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input2_h));
+    for (Idx i = 0; i < input1.size(); ++i) in1_ptr[i] = input1[i];
+    for (Idx i = 0; i < input2.size(); ++i) in2_ptr[i] = input2[i];
+
+    auto input1_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input1.size()}));
+    auto input2_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input2.size()}));
+    alpaka::memcpy(queue, input1_d, input1_h);
+    alpaka::memcpy(queue, input2_d, input2_h);
+    alpaka::wait(queue);
+
+    auto result_h = alpaka::allocBuf<uint8_t, Idx>(host, Ext1D::all(Idx{outputSize}));
+
+    {
+        SOFIE_GreaterOrEqual::Session<alpaka::TagGpuCudaRt> session("GreaterOrEqual_FromONNX_GPU_ALPAKA.dat");
+        auto result = session.infer(input1_d, input2_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    uint8_t* res_ptr = reinterpret_cast<uint8_t*>(alpaka::getPtrNative(result_h));
+    bool* correct = GreaterOrEqual_ExpectedOutput::outputs;
+    EXPECT_EQ(outputSize, sizeof(GreaterOrEqual_ExpectedOutput::outputs) / sizeof(bool));
+    for (size_t i = 0; i < outputSize; ++i)
+        EXPECT_EQ(res_ptr[i], correct[i]) << "i=" << i;
+}
+
+TEST_F(SofieAlpakaTest, Greater)
+{
+    std::vector<float> input1 = {1.0f, 2.0f, 3.0f};
+    std::vector<float> input2 = {4.0f, 2.0f, 6.0f};
+    const std::size_t outputSize = sizeof(Greater_ExpectedOutput::outputs) / sizeof(bool);
+
+    auto input1_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input1.size()}));
+    auto input2_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input2.size()}));
+    float* in1_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input1_h));
+    float* in2_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input2_h));
+    for (Idx i = 0; i < input1.size(); ++i) in1_ptr[i] = input1[i];
+    for (Idx i = 0; i < input2.size(); ++i) in2_ptr[i] = input2[i];
+
+    auto input1_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input1.size()}));
+    auto input2_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input2.size()}));
+    alpaka::memcpy(queue, input1_d, input1_h);
+    alpaka::memcpy(queue, input2_d, input2_h);
+    alpaka::wait(queue);
+
+    auto result_h = alpaka::allocBuf<uint8_t, Idx>(host, Ext1D::all(Idx{outputSize}));
+
+    {
+        SOFIE_Greater::Session<alpaka::TagGpuCudaRt> session("Greater_FromONNX_GPU_ALPAKA.dat");
+        auto result = session.infer(input1_d, input2_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    uint8_t* res_ptr = reinterpret_cast<uint8_t*>(alpaka::getPtrNative(result_h));
+    bool* correct = Greater_ExpectedOutput::outputs;
+    EXPECT_EQ(outputSize, sizeof(Greater_ExpectedOutput::outputs) / sizeof(bool));
+    for (size_t i = 0; i < outputSize; ++i)
+        EXPECT_EQ(res_ptr[i], correct[i]) << "i=" << i;
+}
+
+TEST_F(SofieAlpakaTest, Less)
+{
+    std::vector<float> input1 = {1.0f, 2.0f, 3.0f};
+    std::vector<float> input2 = {4.0f, 2.0f, 6.0f};
+    const std::size_t outputSize = sizeof(Less_ExpectedOutput::outputs) / sizeof(bool);
+
+    auto input1_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input1.size()}));
+    auto input2_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input2.size()}));
+    float* in1_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input1_h));
+    float* in2_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input2_h));
+    for (Idx i = 0; i < input1.size(); ++i) in1_ptr[i] = input1[i];
+    for (Idx i = 0; i < input2.size(); ++i) in2_ptr[i] = input2[i];
+
+    auto input1_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input1.size()}));
+    auto input2_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input2.size()}));
+    alpaka::memcpy(queue, input1_d, input1_h);
+    alpaka::memcpy(queue, input2_d, input2_h);
+    alpaka::wait(queue);
+
+    auto result_h = alpaka::allocBuf<uint8_t, Idx>(host, Ext1D::all(Idx{outputSize}));
+
+    {
+        SOFIE_Less::Session<alpaka::TagGpuCudaRt> session("Less_FromONNX_GPU_ALPAKA.dat");
+        auto result = session.infer(input1_d, input2_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    uint8_t* res_ptr = reinterpret_cast<uint8_t*>(alpaka::getPtrNative(result_h));
+    bool* correct = Less_ExpectedOutput::outputs;
+    EXPECT_EQ(outputSize, sizeof(Less_ExpectedOutput::outputs) / sizeof(bool));
+    for (size_t i = 0; i < outputSize; ++i)
+        EXPECT_EQ(res_ptr[i], correct[i]) << "i=" << i;
 }

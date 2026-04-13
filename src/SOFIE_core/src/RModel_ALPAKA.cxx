@@ -59,13 +59,6 @@ void RModel::GenerateGPU_ALPAKA_Buffers() {
       std::string tensor_declaration_block = "";
 
       for (auto &i : fIntermediateTensorInfos) {
-         if (i.second.type == ETensorType::BOOL) {
-            tensor_declaration_block += "std::vector<bool> fTensor_" + i.first +
-                                        " = std::vector<bool>(" +
-                                        std::to_string(ConvertShapeToLength(i.second.shape)) +
-                                        ");\n";
-            // No pointer allocation needed for BOOL
-         }
 
          size_t length = ConvertShapeToLength(i.second.shape);
 
@@ -80,6 +73,10 @@ void RModel::GenerateGPU_ALPAKA_Buffers() {
          } else if (i.second.type == ETensorType::INT64) {
             tensor_declaration_block += "BufI641D deviceBuf_" + i.first +
                                           " = alpaka::allocBuf<int64_t, size_t>(devAcc, Ext1D::all(Idx{" +
+                                          std::to_string(length) + "}));\n";
+         } else if (i.second.type == ETensorType::BOOL) {
+            tensor_declaration_block += "BufUI81D deviceBuf_" + i.first +
+                                          " = alpaka::allocBuf<std::uint8_t, size_t>(devAcc, Ext1D::all(Idx{" +
                                           std::to_string(length) + "}));\n";
          }
       }
@@ -279,6 +276,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
     fGC += "using BufF1D = alpaka::Buf<Acc, float, Dim, Idx>;\n";
     fGC += "using BufD1D = alpaka::Buf<Acc, double, Dim, Idx>;\n";
     fGC += "using BufI641D = alpaka::Buf<Acc, int64_t, Dim, Idx>;\n\n";
+    fGC += "using BufUI81D = alpaka::Buf<Acc, uint8_t, Dim, Idx>;\n\n";
 
     fGC += "\nalpaka::Platform<Acc> const platform{};\n";
     fGC += "DevAcc devAcc = alpaka::getDevByIdx(platform, 0);\n";
