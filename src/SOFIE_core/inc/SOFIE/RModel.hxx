@@ -249,8 +249,11 @@ public:
 
    bool UseSession() const { return fUseSession; }
 
+#ifdef SOFIE_SUPPORT_ROOT_BINARY
    // Use the ClassDef macro to allow definition of custom streaming
    ClassDefNV(RModel, 3);
+#endif
+
 };
 
 template<class T>

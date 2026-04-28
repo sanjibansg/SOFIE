@@ -3,7 +3,7 @@
 
 #include "SOFIE/RTensor.hxx"
 
-#include "ROOT/RSpan.hxx"
+#include <span>
 
 #include <stdexcept>
 #include <type_traits>

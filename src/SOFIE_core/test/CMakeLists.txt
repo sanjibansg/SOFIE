@@ -121,7 +121,7 @@ if (ENABLE_ALPAKA_TESTS)
     ROOTTEST_GENERATE_EXECUTABLE(
       TestCustomModelsFromONNXForAlpakaCuda
       TestCustomModelsFromONNXForAlpakaCuda.cxx
-      LIBRARIES MathCore SOFIE_core GTest::gtest GTest::gtest_main
+      LIBRARIES SOFIE_core GTest::gtest GTest::gtest_main
       FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka
       FIXTURES_SETUP sofie-test-models-onnx-alpaka-build
     )
@@ -131,7 +131,6 @@ if (ENABLE_ALPAKA_TESTS)
       ${CMAKE_CURRENT_BINARY_DIR}
       ${alpaka_SOURCE_DIR}/include
       ${sofieblas_SOURCE_DIR}/include
-      ${ROOT_INCLUDE_DIRS}
       ${CUDAToolkit_INCLUDE_DIRS}
       ${CMAKE_CURRENT_SOURCE_DIR}
     )
@@ -140,7 +139,9 @@ if (ENABLE_ALPAKA_TESTS)
       TestCustomModelsFromONNXForAlpakaCuda
       PROPERTIES
         CUDA_SEPARABLE_COMPILATION OFF
-        CUDA_ARCHITECTURES 70 80 86 
+        CUDA_ARCHITECTURES 70 80 86
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
     )
 
     target_compile_definitions(
@@ -178,7 +179,6 @@ if (ENABLE_ALPAKA_TESTS)
       CUDA::cudart
       CUDA::cublas
       CUDA::cublasLt
-      ${ROOT_LIBRARIES}
     )
 
     ROOTTEST_ADD_TEST(

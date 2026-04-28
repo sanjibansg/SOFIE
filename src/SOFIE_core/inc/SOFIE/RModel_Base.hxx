@@ -12,7 +12,10 @@
 #include <fstream>
 #include <sstream>
 #include "SOFIE/SOFIE_common.hxx"
+
+#ifdef SOFIE_SUPPORT_ROOT_BINARY
 #include "TBuffer.h"
+#endif
 
 
 namespace SOFIE {

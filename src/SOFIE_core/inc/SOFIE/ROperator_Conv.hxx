@@ -43,6 +43,7 @@ private:
    std::string fType;
 
    size_t fDim;   // dimension of the convolution
+   size_t gemm_n, gemm_m, gemm_k; // dimensions of the equivalent gemm operation after im2col transformation
 
 
 public:
@@ -66,6 +67,7 @@ public:
       }
       fInputTensorNames = { fNX, fNB };
       fOutputTensorNames = { fNY };
+      fKind = OperatorKind::CONV;
    }
 
    ROperator_Conv(std::string autopad, std::vector<size_t> dilations,
@@ -202,83 +204,86 @@ public:
 
    void Initialize(RModel& model) override {
       fUseSession = model.UseSession();
-      if (!model.CheckIfTensorAlreadyExist(fNX)) {
-         throw
-            std::runtime_error("TMVA SOFIE Conv op Input Tensor " + fNX + " is not found in model");
-      }
+      if (!model.CheckIfTensorAlreadyExist(fNX))
+         throw std::runtime_error("TMVA SOFIE Conv op Input Tensor " + fNX + " is not found in model");
+
       fShapeX = model.GetTensorShape(fNX);
-      if (fShapeX.size() < 3 || fShapeX.size()  > 5) {
-         std::cout << fNX << " : " << ConvertShapeToString(fShapeX) << std::endl;
-         throw
-            std::runtime_error("TMVA SOFIE Conv Op input data tensor" + fNX + " is not of 3,4 or 5 dimensions");
-      }
+      if (fShapeX.size() < 3 || fShapeX.size() > 5)
+         throw std::runtime_error("TMVA SOFIE Conv Op input data tensor" + fNX + " is not of 3,4 or 5 dimensions");
+
       fDim = fShapeX.size() - 2;
-      if (!model.CheckIfTensorAlreadyExist(fNW)) {
-         throw
-            std::runtime_error("TMVA SOFIE Conv op Input weight Tensor " + fNW + " is not found in model");
-      }
+
+      if (!model.CheckIfTensorAlreadyExist(fNW))
+         throw std::runtime_error("TMVA SOFIE Conv op Input weight Tensor " + fNW + " is not found in model");
+
       fShapeW = model.GetTensorShape(fNW);
-      if (fShapeW.size() < 3 || fShapeW.size()  > 5) {
-         std::cout << fNW << " : " << ConvertShapeToString(fShapeW) << std::endl;
+      if (fShapeW.size() < 3 || fShapeW.size() > 5)
          throw std::runtime_error("TMVA SOFIE Conv Op input weight tensor" + fNW + " is not of 3,4 or 5 dimensions");
-      }
+
       fShapeY = ShapeInference({fShapeX, fShapeW})[0];
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShapeY);
+
       if (fNB != "") {
-         if (!model.CheckIfTensorAlreadyExist(fNB)) {
-            throw
-               std::runtime_error("TMVA SOFIE Conv op Input Tensor " + fNB + " is not found in model");
-         }
+         if (!model.CheckIfTensorAlreadyExist(fNB))
+               throw std::runtime_error("TMVA SOFIE Conv op Input Tensor " + fNB + " is not found in model");
+
          fShapeB = model.GetTensorShape(fNB);
          std::vector<size_t> targetShape(fShapeY.begin() + 1, fShapeY.end());
          bool broadcast_needed = !UTILITY::AreSameShape(fShapeB, targetShape);
          if (broadcast_needed) {
-            auto original_data = model.GetInitializedTensorData(fNB);
-            // make bias shape equal to Y shape by adding 1
-            if (fShapeB.size() < 1)
-               throw std::runtime_error("TMVA SOFIE Conv op: Bias Tensor has empty shape");
-            // we assume bias tensor dimension is equal to number of filters that is the second dimension in
-            // the output tensor
-            if (fShapeB[0] != fShapeY[1])
-               throw std::runtime_error("TMVA SOFIE Conv op: Bias Tensor has wrong shape: " +
-                                           ConvertShapeToString(fShapeB));
-            if (fType != "float")
-               throw std::runtime_error("TMVA SOFIE Conv op: Broadcasting for non-float type tensors is not supported");
-            // here is the actual broadcasting
-            if (!fUseSession) {
-               std::vector<size_t> shape(fDim + 1, 1);
-               shape[0] = fShapeB[0];
-               std::shared_ptr<void> new_data_ptr(
-                  UTILITY::UnidirectionalBroadcast<float>(static_cast<float *>(original_data.get()), shape, targetShape),
-                  std::default_delete<float[]>());
-               model.UpdateInitializedTensor(fNB, model.GetTensorType(fNB), targetShape, new_data_ptr);
-               fShapeB = model.GetTensorShape(fNB);
-               fNB2 = fNB;   // use same name
-            }
-            else {
-               // In case of session add broadcasting code in Session constructor and in GenerateInitCode
-               // we need to add a new intermediate tensor for broadcasted bias tensor
-               fNB2 = fNB + "bcast";
-               model.AddIntermediateTensor(fNB2, model.GetTensorType(fNB), targetShape);
-            }
+               auto original_data = model.GetInitializedTensorData(fNB);
+               if (fShapeB.size() < 1)
+                  throw std::runtime_error("TMVA SOFIE Conv op: Bias Tensor has empty shape");
+               if (fShapeB[0] != fShapeY[1])
+                  throw std::runtime_error("TMVA SOFIE Conv op: Bias Tensor has wrong shape: " +
+                                          ConvertShapeToString(fShapeB));
+               if (fType != "float")
+                  throw std::runtime_error("TMVA SOFIE Conv op: Broadcasting for non-float type tensors is not supported");
+               if (!fUseSession) {
+                  std::vector<size_t> shape(fDim + 1, 1);
+                  shape[0] = fShapeB[0];
+                  std::shared_ptr<void> new_data_ptr(
+                     UTILITY::UnidirectionalBroadcast<float>(static_cast<float *>(original_data.get()), shape, targetShape),
+                     std::default_delete<float[]>());
+                  model.UpdateInitializedTensor(fNB, model.GetTensorType(fNB), targetShape, new_data_ptr);
+                  fShapeB = model.GetTensorShape(fNB);
+                  fNB2 = fNB;
+               } else {
+                  fNB2 = fNB + "bcast";
+                  model.AddIntermediateTensor(fNB2, model.GetTensorType(fNB), targetShape);
+               }
          }
       }
 
-      size_t outputChannelSize = fShapeY[2];  // size/channel = D * H * W
+      // Compute kernel size once — product of all spatial kernel dimensions
       size_t kernelSize = fAttrKernelShape[0];
-      for (size_t i = 1; i < fDim; i++) {
-         outputChannelSize *= fShapeY[2 + i];
+      for (size_t i = 1; i < fDim; i++)
          kernelSize *= fAttrKernelShape[i];
-      }
+
+      // Spatial output size: OH * OW (* OD for 3D)
+      size_t spatialSize = fShapeY[2];
+      for (size_t i = 1; i < fDim; i++)
+         spatialSize *= fShapeY[2 + i];
 
       std::vector<size_t> shape1 = {fShapeW[0], fShapeW[1], kernelSize};
-      std::vector<size_t> shape2 = {fShapeW[1], kernelSize, outputChannelSize};
-      model.AddIntermediateTensor(fNX +"_f", ConvertStringToType(fType), shape1 );
-      model.AddIntermediateTensor(fNX +"_xcol", ConvertStringToType(fType), shape2 );
-      convK = fNX +"_f";
-      imcol = fNX +"_xcol";
+      std::vector<size_t> shape2 = {fShapeW[1], kernelSize, spatialSize};
+      model.AddIntermediateTensor(fNX + "_f",    ConvertStringToType(fType), shape1);
+      model.AddIntermediateTensor(fNX + "_xcol", ConvertStringToType(fType), shape2);
+      convK = fNX + "_f";
+      imcol = fNX + "_xcol";
       fOutputTensorNames.emplace_back(convK);
       fOutputTensorNames.emplace_back(imcol);
+
+      // GEMM dimensions — set once here, reused in Generate() and Generate_GPU_ALPAKA()
+      // gemm_n = output channels (total, not per group — group case divides at launch time)
+      // gemm_m = spatial output size (OH * OW * OD)
+      // gemm_k = input channels per group * kernel spatial size
+      gemm_n = fShapeW[0];                   // total output channels
+      gemm_m = spatialSize;                  // OH * OW (* OD)
+      gemm_k = fShapeW[1] * kernelSize;      // IC_per_group * KH * KW (* KD)
+      if(fAttrGroup > 1) {
+         gemm_n /= fAttrGroup;
+      }
    }
 
    std::string GenerateInitCode() override {
@@ -519,11 +524,396 @@ public:
       out << SP << "}\n"; // end of batch size loop
 
       return out.str();
+   }
+
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      if (fShapeX.empty() || fShapeW.empty() || fShapeY.empty())
+         throw std::runtime_error("TMVA SOFIE Conv Op called to Generate without being initialized first");
+
+      size_t oDepth  = (fDim > 2) ? fShapeY[2]      : 1;
+      size_t oHeight = (fDim > 1) ? fShapeY[fDim]   : 1;
+      size_t oWidth  = fShapeY[fDim + 1];
+      size_t iDepth  = (fDim > 2) ? fShapeX[2]      : 1;
+      size_t iHeight = (fDim > 1) ? fShapeX[fDim]   : 1;
+      size_t iWidth  = fShapeX[fDim + 1];
+      size_t kHeight = (fDim > 1) ? fShapeW[fDim]   : 1;
+      size_t kWidth  = fShapeW[fDim + 1];
+      size_t kDepth  = (fDim > 2) ? fShapeW[2]      : 1;
+
+      size_t kernelSize  = fAttrKernelShape[0] * fAttrKernelShape[1] * fAttrKernelShape[2];
+      size_t colRows     = fShapeW[1] * kernelSize;
+      size_t colCols     = oDepth * oHeight * oWidth;
+      size_t colElements = colRows * colCols;
+      size_t outChannels = fShapeW[0];
+      size_t spatialSize = oDepth * oHeight * oWidth;
+
+      // Strides for weight vectorisation
+      size_t id = (fDim > 2) ? fDim - 3 : 2;
+      size_t ih = (fDim > 1) ? fDim - 2 : 1;
+      size_t iw = fDim - 1;
+      size_t wstrideDil  = fAttrDilations[iw];
+      size_t hstrideDil  = fAttrDilations[ih]  * fAttrKernelShape[iw];
+      size_t dstrideDil  = fAttrDilations[id]  * fAttrKernelShape[ih] * fAttrKernelShape[iw];
+      size_t icstrideDil = fAttrKernelShape[id] * fAttrKernelShape[ih] * fAttrKernelShape[iw];
+      size_t ocstrideDil = fShapeW[1] * icstrideDil;
+      size_t hstride     = kWidth;
+      size_t dstride     = kHeight * kWidth;
+      size_t icstride    = kHeight * kWidth * kDepth;
+      size_t ocstride    = fShapeW[1] * icstride;
+      size_t wTotalElements = ConvertShapeToLength(fShapeW);
+
+      std::string op;
+
+      // -----------------------------------------------------------------------
+      // Kernel 1: Weight vectorisation — reorder W into _f with dilation layout
+      // Each thread handles one output element of _f
+      // -----------------------------------------------------------------------
+      std::string wKname = "WeightVecKernel_" + opName;
+      op  = "\n//------ WEIGHT_VEC_KERNEL_ALPAKA (Conv " + opName + ")\n";
+      op += SP + "struct " + wKname + " {\n";
+      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
+      op += SP + SP + SP + "TAcc const& acc,\n";
+      op += SP + SP + SP + "T const* __restrict__ W,\n";
+      op += SP + SP + SP + "T* __restrict__ f,\n";
+      op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
+
+      op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (global_thread_idx >= totalElements) return;\n";
+      op += SP + SP + SP + "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+
+      op += SP + SP + SP + "for (std::size_t elem_idx = global_thread_idx; elem_idx < totalElements; elem_idx += grid_thread_extent) {\n\n";
+
+      // Decompose elem_idx into (oc, ic, kd, kh, kw) using compile-time strides
+      op += SP + SP + SP + SP + "std::size_t const oc    = elem_idx / " + std::to_string(ocstride) + "u;\n";
+      op += SP + SP + SP + SP + "std::size_t const oc_rem = elem_idx % " + std::to_string(ocstride) + "u;\n";
+      op += SP + SP + SP + SP + "std::size_t const ic    = oc_rem / " + std::to_string(icstride) + "u;\n";
+      op += SP + SP + SP + SP + "std::size_t const ic_rem = oc_rem % " + std::to_string(icstride) + "u;\n";
+      if (fDim > 2) {
+         op += SP + SP + SP + SP + "std::size_t const kd = ic_rem / " + std::to_string(kHeight * kWidth) + "u;\n";
+         op += SP + SP + SP + SP + "std::size_t const kh = (ic_rem / " + std::to_string(kWidth) + "u) % " + std::to_string(kHeight) + "u;\n";
+         op += SP + SP + SP + SP + "std::size_t const kw = ic_rem % " + std::to_string(kWidth) + "u;\n\n";
+      } else if (fDim > 1) {
+         op += SP + SP + SP + SP + "std::size_t const kd = 0u;\n";
+         op += SP + SP + SP + SP + "std::size_t const kh = ic_rem / " + std::to_string(kWidth) + "u;\n";
+         op += SP + SP + SP + SP + "std::size_t const kw = ic_rem % " + std::to_string(kWidth) + "u;\n\n";
+      } else {
+         op += SP + SP + SP + SP + "std::size_t const kd = 0u;\n";
+         op += SP + SP + SP + SP + "std::size_t const kh = 0u;\n";
+         op += SP + SP + SP + SP + "std::size_t const kw = ic_rem;\n\n";
       }
+
+      // Compute destination index in _f (dilated layout)
+      op += SP + SP + SP + SP + "std::size_t const f_idx =\n";
+      op += SP + SP + SP + SP + SP + "oc * " + std::to_string(ocstrideDil) + "u +\n";
+      op += SP + SP + SP + SP + SP + "ic * " + std::to_string(icstrideDil) + "u";
+      if (fDim > 2) op += " +\n" + SP + SP + SP + SP + SP + "kd * " + std::to_string(dstrideDil) + "u";
+      if (fDim > 1) op += " +\n" + SP + SP + SP + SP + SP + "kh * " + std::to_string(hstrideDil) + "u";
+      op += " +\n" + SP + SP + SP + SP + SP + "kw * " + std::to_string(wstrideDil) + "u;\n\n";
+
+      op += SP + SP + SP + SP + "f[f_idx] = W[elem_idx];\n";
+      op += SP + SP + SP + "}\n";   // end grid-stride loop
+      op += SP + SP + "}\n";        // end operator()
+      op += SP + "};\n\n";          // end struct
+
+      // -----------------------------------------------------------------------
+      // Kernel 2: Im2Col
+      // -----------------------------------------------------------------------
+      std::string im2colKname = "Im2ColKernel_" + opName;
+      op += SP + "//------ IM2COL_KERNEL_ALPAKA (Conv " + opName + ")\n";
+      op += SP + "struct " + im2colKname + " {\n";
+      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
+      op += SP + SP + SP + "TAcc const& acc,\n";
+      op += SP + SP + SP + "T const* __restrict__ input,\n";
+      op += SP + SP + SP + "T* __restrict__ col,\n";
+      op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
+
+      op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (global_thread_idx >= totalElements) return;\n";
+      op += SP + SP + SP + "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+
+      op += SP + SP + SP + "for (std::size_t elem_idx = global_thread_idx; elem_idx < totalElements; elem_idx += grid_thread_extent) {\n\n";
+
+      op += SP + SP + SP + SP + "std::size_t const col_row = elem_idx / " + std::to_string(colCols) + "u;\n";
+      op += SP + SP + SP + SP + "std::size_t const col_col = elem_idx % " + std::to_string(colCols) + "u;\n\n";
+
+      op += SP + SP + SP + SP + "std::size_t const ic    = col_row / " + std::to_string(kernelSize) + "u;\n";
+      op += SP + SP + SP + SP + "std::size_t const k_rem = col_row % " + std::to_string(kernelSize) + "u;\n";
+      if (fDim > 2) {
+         op += SP + SP + SP + SP + "std::size_t const kd = k_rem / " + std::to_string(kHeight * kWidth) + "u;\n";
+         op += SP + SP + SP + SP + "std::size_t const kh = (k_rem / " + std::to_string(kWidth) + "u) % " + std::to_string(kHeight) + "u;\n";
+         op += SP + SP + SP + SP + "std::size_t const kw = k_rem % " + std::to_string(kWidth) + "u;\n\n";
+      } else if (fDim > 1) {
+         op += SP + SP + SP + SP + "std::size_t const kd = 0u;\n";
+         op += SP + SP + SP + SP + "std::size_t const kh = k_rem / " + std::to_string(kWidth) + "u;\n";
+         op += SP + SP + SP + SP + "std::size_t const kw = k_rem % " + std::to_string(kWidth) + "u;\n\n";
+      } else {
+         op += SP + SP + SP + SP + "std::size_t const kd = 0u;\n";
+         op += SP + SP + SP + SP + "std::size_t const kh = 0u;\n";
+         op += SP + SP + SP + SP + "std::size_t const kw = k_rem;\n\n";
+      }
+
+      if (fDim > 2) {
+         op += SP + SP + SP + SP + "std::size_t const od = col_col / " + std::to_string(oHeight * oWidth) + "u;\n";
+         op += SP + SP + SP + SP + "std::size_t const oh = (col_col / " + std::to_string(oWidth) + "u) % " + std::to_string(oHeight) + "u;\n";
+         op += SP + SP + SP + SP + "std::size_t const ow = col_col % " + std::to_string(oWidth) + "u;\n\n";
+      } else if (fDim > 1) {
+         op += SP + SP + SP + SP + "std::size_t const od = 0u;\n";
+         op += SP + SP + SP + SP + "std::size_t const oh = col_col / " + std::to_string(oWidth) + "u;\n";
+         op += SP + SP + SP + SP + "std::size_t const ow = col_col % " + std::to_string(oWidth) + "u;\n\n";
+      } else {
+         op += SP + SP + SP + SP + "std::size_t const od = 0u;\n";
+         op += SP + SP + SP + SP + "std::size_t const oh = 0u;\n";
+         op += SP + SP + SP + SP + "std::size_t const ow = col_col;\n\n";
+      }
+
+      op += SP + SP + SP + SP + "int64_t const id_in = static_cast<int64_t>(od * " + std::to_string(fAttrStrides[0])
+         + "u + kd * " + std::to_string(fAttrDilations[0]) + "u) - " + std::to_string(fAttrPads[0]) + ";\n";
+      op += SP + SP + SP + SP + "int64_t const ih_in = static_cast<int64_t>(oh * " + std::to_string(fAttrStrides[1])
+         + "u + kh * " + std::to_string(fAttrDilations[1]) + "u) - " + std::to_string(fAttrPads[1]) + ";\n";
+      op += SP + SP + SP + SP + "int64_t const iw_in = static_cast<int64_t>(ow * " + std::to_string(fAttrStrides[2])
+         + "u + kw * " + std::to_string(fAttrDilations[2]) + "u) - " + std::to_string(fAttrPads[2]) + ";\n\n";
+
+      op += SP + SP + SP + SP + "bool const in_bounds =\n";
+      op += SP + SP + SP + SP + SP + "id_in >= 0 && id_in < " + std::to_string(iDepth)  + " &&\n";
+      op += SP + SP + SP + SP + SP + "ih_in >= 0 && ih_in < " + std::to_string(iHeight) + " &&\n";
+      op += SP + SP + SP + SP + SP + "iw_in >= 0 && iw_in < " + std::to_string(iWidth)  + ";\n\n";
+
+      op += SP + SP + SP + SP + "if (in_bounds) {\n";
+      op += SP + SP + SP + SP + SP + "std::size_t const in_idx =\n";
+      op += SP + SP + SP + SP + SP + SP + "ic * " + std::to_string(iDepth * iHeight * iWidth) + "u +\n";
+      op += SP + SP + SP + SP + SP + SP + "static_cast<std::size_t>(id_in) * " + std::to_string(iHeight * iWidth) + "u +\n";
+      op += SP + SP + SP + SP + SP + SP + "static_cast<std::size_t>(ih_in) * " + std::to_string(iWidth) + "u +\n";
+      op += SP + SP + SP + SP + SP + SP + "static_cast<std::size_t>(iw_in);\n";
+      op += SP + SP + SP + SP + SP + "col[elem_idx] = input[in_idx];\n";
+      op += SP + SP + SP + SP + "} else {\n";
+      op += SP + SP + SP + SP + SP + "col[elem_idx] = static_cast<T>(0);\n";
+      op += SP + SP + SP + SP + "}\n";
+      op += SP + SP + SP + "}\n";
+      op += SP + SP + "}\n";
+      op += SP + "};\n\n";
+
+      // -----------------------------------------------------------------------
+      // Kernel 3: Bias broadcast (only if bias present)
+      // -----------------------------------------------------------------------
+      if (!fNB2.empty()) {
+         std::string biasKname = "BiasBroadcastKernel_" + opName;
+         op += SP + "//------ BIAS_BROADCAST_KERNEL_ALPAKA (Conv " + opName + ")\n";
+         op += SP + "struct " + biasKname + " {\n";
+         op += SP + SP + "template<typename TAcc, typename T>\n";
+         op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
+         op += SP + SP + SP + "TAcc const& acc,\n";
+         op += SP + SP + SP + "T const* __restrict__ bias,\n";
+         op += SP + SP + SP + "T* __restrict__ output,\n";
+         op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
+
+         op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+         op += SP + SP + SP + "if (global_thread_idx >= totalElements) return;\n";
+         op += SP + SP + SP + "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+
+         op += SP + SP + SP + "for (std::size_t elem_idx = global_thread_idx; elem_idx < totalElements; elem_idx += grid_thread_extent) {\n";
+         op += SP + SP + SP + SP + "std::size_t const channel = elem_idx / " + std::to_string(spatialSize) + "u;\n";
+         op += SP + SP + SP + SP + "output[elem_idx] = bias[channel];\n";
+         op += SP + SP + SP + "}\n";
+         op += SP + SP + "}\n";
+         op += SP + "};\n\n";
+      }
+
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      std::string op;
+      op  = SP + "WeightVecKernel_"  + opName + " weightVecKernel_"  + opName + ";\n";
+      op += SP + "Im2ColKernel_"     + opName + " im2colKernel_"     + opName + ";\n";
+      if (!fNB2.empty())
+         op += SP + "BiasBroadcastKernel_" + opName + " biasBroadcastKernel_" + opName + ";\n";
+      return op;
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      if (fShapeX.empty() || fShapeW.empty() || fShapeY.empty())
+         throw std::runtime_error("TMVA SOFIE Conv Op called to Generate without being initialized first");
+
+      size_t bsize       = fShapeX[0];
+      size_t oDepth      = (fDim > 2) ? fShapeY[2]    : 1;
+      size_t oHeight     = (fDim > 1) ? fShapeY[fDim] : 1;
+      size_t oWidth      = fShapeY[fDim + 1];
+      size_t iDepth      = (fDim > 2) ? fShapeX[2]    : 1;
+      size_t iHeight     = (fDim > 1) ? fShapeX[fDim] : 1;
+      size_t iWidth      = fShapeX[fDim + 1];
+      size_t outChannels = fShapeW[0];
+      size_t kernelSize  = fAttrKernelShape[0] * fAttrKernelShape[1] * fAttrKernelShape[2];
+      size_t colElements = gemm_k * gemm_m;   // colRows * colCols
+      size_t wTotal      = ConvertShapeToLength(fShapeW);
+
+      // For group conv: per-group output channels and _f offset
+      // gemm_n stays as total output channels — we divide per group at launch
+      size_t groupFOffset     = gemm_n * gemm_k;  // elements of _f per group
+
+      std::stringstream out;
+      out << "\n//------ CONV_GPU_ALPAKA\n";
+
+      // -----------------------------------------------------------------------
+      // Step 1: Weight vectorisation kernel — runs once, fully on GPU
+      // -----------------------------------------------------------------------
+      out << SP << "// Step 1: vectorise W -> _f on GPU (once per infer call)\n";
+      out << SP << "{\n";
+      out << SP << SP << "auto const elementsPerThread_wv = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << SP << "auto const elementsPerGrid_wv   = Vec::all(Idx{" << wTotal << "});\n";
+      out << SP << SP << "alpaka::KernelCfg<Acc> const cfg_wv = {elementsPerGrid_wv, elementsPerThread_wv};\n";
+      out << SP << SP << "auto const workDiv_wv = alpaka::getValidWorkDiv(cfg_wv, devAcc, weightVecKernel_" << opName
+         << ", alpaka::getPtrNative(deviceBuf_" << fNW << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << convK << ")"
+         << ", static_cast<Idx>(" << wTotal << "));\n";
+      out << SP << SP << "alpaka::exec<Acc>(queue, workDiv_wv, weightVecKernel_" << opName
+         << ", alpaka::getPtrNative(deviceBuf_" << fNW << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << convK << ")"
+         << ", static_cast<Idx>(" << wTotal << "));\n";
+      out << SP << SP << "alpaka::wait(queue);\n";
+      out << SP << "}\n\n";
+
+      // -----------------------------------------------------------------------
+      // Step 2: Batch loop
+      // -----------------------------------------------------------------------
+      out << SP << "for (std::size_t n = 0; n < " << bsize << "; n++) {\n\n";
+      out << SP << SP << "std::size_t const x_offset   = n * "
+         << fShapeX[1] * iDepth * iHeight * iWidth << "u;\n";
+      out << SP << SP << "std::size_t const out_offset = n * "
+         << fShapeY[1] * gemm_m << "u;\n\n";
+
+      // -----------------------------------------------------------------------
+      // Step 3: Im2Col
+      // -----------------------------------------------------------------------
+      out << SP << SP << "// Step 3: im2col\n";
+      out << SP << SP << "{\n";
+      out << SP << SP << SP << "auto const elementsPerThread_im2col = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << SP << SP << "auto const elementsPerGrid_im2col   = Vec::all(Idx{" << colElements << "});\n";
+      out << SP << SP << SP << "alpaka::KernelCfg<Acc> const cfg_im2col = {elementsPerGrid_im2col, elementsPerThread_im2col};\n";
+      out << SP << SP << SP << "auto const workDiv_im2col = alpaka::getValidWorkDiv(cfg_im2col, devAcc, im2colKernel_" << opName
+         << ", alpaka::getPtrNative(deviceBuf_" << fNX << ") + x_offset"
+         << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+         << ", static_cast<Idx>(" << colElements << "));\n";
+      out << SP << SP << SP << "alpaka::exec<Acc>(queue, workDiv_im2col, im2colKernel_" << opName
+         << ", alpaka::getPtrNative(deviceBuf_" << fNX << ") + x_offset"
+         << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+         << ", static_cast<Idx>(" << colElements << "));\n";
+      out << SP << SP << SP << "alpaka::wait(queue);\n";
+      out << SP << SP << "}\n\n";
+
+      // -----------------------------------------------------------------------
+      // Step 4: GEMM (+ optional bias) — group or non-group
+      // gemm_n/gemm_m/gemm_k are member variables set in Initialize()
+      // For grouped conv we use gemm_n/fAttrGroup per group, keeping gemm_n as total
+      // -----------------------------------------------------------------------
+      if (fAttrGroup == 1) {
+         if (!fNB2.empty()) {
+               size_t biasElements = gemm_n * gemm_m;
+               out << SP << SP << "// Step 4a: broadcast bias into output slice\n";
+               out << SP << SP << "{\n";
+               out << SP << SP << SP << "auto const elementsPerThread_bias = Vec::all(static_cast<Idx>(1));\n";
+               out << SP << SP << SP << "auto const elementsPerGrid_bias   = Vec::all(Idx{" << biasElements << "});\n";
+               out << SP << SP << SP << "alpaka::KernelCfg<Acc> const cfg_bias = {elementsPerGrid_bias, elementsPerThread_bias};\n";
+               out << SP << SP << SP << "auto const workDiv_bias = alpaka::getValidWorkDiv(cfg_bias, devAcc, biasBroadcastKernel_" << opName
+                  << ", alpaka::getPtrNative(deviceBuf_" << fNB2 << ")"
+                  << ", alpaka::getPtrNative(deviceBuf_" << fNY << ") + out_offset"
+                  << ", static_cast<Idx>(" << biasElements << "));\n";
+               out << SP << SP << SP << "alpaka::exec<Acc>(queue, workDiv_bias, biasBroadcastKernel_" << opName
+                  << ", alpaka::getPtrNative(deviceBuf_" << fNB2 << ")"
+                  << ", alpaka::getPtrNative(deviceBuf_" << fNY << ") + out_offset"
+                  << ", static_cast<Idx>(" << biasElements << "));\n";
+               out << SP << SP << SP << "alpaka::wait(queue);\n";
+               out << SP << SP << "}\n\n";
+               out << SP << SP << "// Step 4b: GEMM beta=1 fuses bias\n";
+               out << SP << SP << "blas.matmul('n', 'n', "
+                  << gemm_n << ", " << gemm_m << ", " << gemm_k
+                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << convK << ")"
+                  << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << fNY << ") + out_offset);\n\n";
+         } else {
+               out << SP << SP << "// Step 4: GEMM beta=0 (no bias)\n";
+               out << SP << SP << "blas.matmul('n', 'n', "
+                  << gemm_n << ", " << gemm_m << ", " << gemm_k
+                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << convK << ")"
+                  << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+                  << ", 0.0f, alpaka::getPtrNative(deviceBuf_" << fNY << ") + out_offset);\n\n";
+         }
+      } else {
+         // Group convolution — gemm_n stays as total, divide per group at launch
+         out << SP << SP << "for (std::size_t g = 0; g < " << fAttrGroup << "; g++) {\n\n";
+         out << SP << SP << SP << "std::size_t const g_out_offset = out_offset + g * "
+               << gemm_n * gemm_m << "u;\n";
+         out << SP << SP << SP << "std::size_t const f_offset = g * " << groupFOffset << "u;\n\n";
+
+         if (!fNB2.empty()) {
+               size_t groupBiasElements = gemm_n * gemm_m;
+               out << SP << SP << SP << "// Broadcast group bias\n";
+               out << SP << SP << SP << "{\n";
+               out << SP << SP << SP << SP << "auto const elementsPerThread_bias = Vec::all(static_cast<Idx>(1));\n";
+               out << SP << SP << SP << SP << "auto const elementsPerGrid_bias   = Vec::all(Idx{" << groupBiasElements << "});\n";
+               out << SP << SP << SP << SP << "alpaka::KernelCfg<Acc> const cfg_bias = {elementsPerGrid_bias, elementsPerThread_bias};\n";
+               out << SP << SP << SP << SP << "auto const workDiv_bias = alpaka::getValidWorkDiv(cfg_bias, devAcc, biasBroadcastKernel_" << opName
+                  << ", alpaka::getPtrNative(deviceBuf_" << fNB2 << ") + g * " << gemm_n
+                  << ", alpaka::getPtrNative(deviceBuf_" << fNY << ") + g_out_offset"
+                  << ", static_cast<Idx>(" << groupBiasElements << "));\n";
+               out << SP << SP << SP << SP << "alpaka::exec<Acc>(queue, workDiv_bias, biasBroadcastKernel_" << opName
+                  << ", alpaka::getPtrNative(deviceBuf_" << fNB2 << ") + g * " << gemm_n
+                  << ", alpaka::getPtrNative(deviceBuf_" << fNY << ") + g_out_offset"
+                  << ", static_cast<Idx>(" << groupBiasElements << "));\n";
+               out << SP << SP << SP << SP << "alpaka::wait(queue);\n";
+               out << SP << SP << SP << "}\n\n";
+               out << SP << SP << SP << "blas.matmul('n', 'n', "
+                  << gemm_n << ", " << gemm_m << ", " << gemm_k
+                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << convK << ") + f_offset"
+                  << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << fNY << ") + g_out_offset);\n\n";
+         } else {
+               out << SP << SP << SP << "blas.matmul('n', 'n', "
+                  << gemm_n << ", " << gemm_m << ", " << gemm_k
+                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << convK << ") + f_offset"
+                  << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+                  << ", 0.0f, alpaka::getPtrNative(deviceBuf_" << fNY << ") + g_out_offset);\n\n";
+         }
+         out << SP << SP << "}\n"; // end group loop
+      }
+      
+      // print the contents of deviceBuf_W, deviceBuf_x_f and deviceBuf_x_xcol for debugging
+      out << SP << SP << "}\n";
+      out << SP << SP << "// Debug: print _W, _f and _xcol\n";
+      out << SP << SP << "std::cout << \"_W: \";\n";
+      out << SP << SP << "for (std::size_t i = 0; i < " << wTotal << "; i++) {\n";
+      out << SP << SP << SP << "printf(\"%f \", alpaka::getPtrNative(deviceBuf_" << fNW << ")  + i);\n";
+      out << SP << SP << "std::cout << std::endl;}\n";
+      out << SP << SP << "for (std::size_t i = 0; i < " << wTotal << "; i++) {\n";
+      out << SP << SP << SP << "printf(\"%f \", alpaka::getPtrNative(deviceBuf_" << convK << ")  + i);\n";
+      out << SP << SP << "}\n";
+      out << SP << SP << "std::cout << std::endl;\n";
+      out << SP << SP << "std::cout << \"_xcol: \";\n";
+      out << SP << SP << "for (std::size_t i = 0; i < " << colElements << "; i++) {\n";
+      out << SP << SP << SP << "printf(\"%f \", alpaka::getPtrNative(deviceBuf_" << imcol << ")  + i);\n";
+      out << SP << SP << "std::cout << std::endl;\n"; 
+
+
+      out << SP << "}\n"; // end batch loop
+      return out.str();
+   }
 
    /*! \brief Returns the blas routines needed to compile the generated code
     */
    std::vector<std::string> GetBlasRoutines() override { return { std::string("Gemm"), std::string("Axpy") }; }
+
+
+   std::string GetBlasConfig(){
+      auto lda = std::to_string(gemm_k);
+      auto ldb = std::to_string(gemm_n);
+      auto ldc = std::to_string(gemm_n);
+      return std::to_string(gemm_n) + ", " + std::to_string(gemm_m) + ", " + std::to_string(gemm_k) + ", " + ldb + ", " + lda + ", " + ldc;
+   }
+
 };
 
 } // namespace SOFIE

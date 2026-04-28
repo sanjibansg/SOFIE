@@ -396,7 +396,7 @@ public:
       op += SP + SP + "template<typename TAcc, typename T>\n";
       op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * A, T const * B, T * C) const {\n";
       op += SP + SP + SP + "auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
-      op += SP + SP + SP + "if (idx < " + ConvertShapeToLength(fShapeY) + ") {\n";
+      op += SP + SP + SP + "if (idx < " + std::to_string(ConvertShapeToLength(fShapeY)) + ") {\n";
       auto stridesA = UTILITY::ComputeStrideFromShape(fShapeA);
       auto stridesB = UTILITY::ComputeStrideFromShape(fShapeB);
 

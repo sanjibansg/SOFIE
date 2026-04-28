@@ -1,4 +1,3 @@
-#include "Byteswap.h"
 #include "SOFIE/RModelParser_ONNX.hxx"
 #include "onnx_proto3.pb.h"
 
@@ -9,6 +8,10 @@
 #include <iostream>
 #include <unordered_map>
 #include <functional>
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstring>
 #include "SOFIE/SOFIE_common.hxx"
 
 
@@ -137,19 +140,31 @@ struct ExtractDataFromTP<int64_t> {
                                                             static_cast<int64_t *>(data));
    }
 };
+// Reverse the bytes of a trivially-copyable value (used on big-endian hosts).
+// ONNX raw_data is always stored in little-endian order.
+template <typename T>
+static T bswap_value(T value) noexcept {
+   static_assert(std::is_trivially_copyable_v<T>);
+   std::array<char, sizeof(T)> bytes;
+   std::memcpy(bytes.data(), &value, sizeof(T));
+   std::reverse(bytes.begin(), bytes.end());
+   T result;
+   std::memcpy(&result, bytes.data(), sizeof(T));
+   return result;
+}
+
 template<typename T>
 std::shared_ptr<void> GetInitializedTensorData(onnx::TensorProto * tensorproto, size_t length) {
    std::cout<<"Getting Initialized Tensor data for tensor " << tensorproto->name() << " of type " << tensorproto->data_type() << " and length " << length << std::endl;
    std::shared_ptr<void> data(malloc(length * sizeof(T)), free);
 
    if (!tensorproto->raw_data().empty()) {
-#ifdef R__BYTESWAP
       std::memcpy(data.get(), tensorproto->raw_data().c_str(), length * sizeof(T));
-#else
-      for (std::size_t k = 0; k < length; ++k)
-         (reinterpret_cast<typename RByteSwap<sizeof(T)>::value_type *>(data.get()))[k] =
-            RByteSwap<sizeof(T)>::bswap((reinterpret_cast<const typename RByteSwap<sizeof(T)>::value_type *>(tensorproto->raw_data().c_str()))[k]);
-#endif
+      if constexpr (std::endian::native != std::endian::little) {
+         T *ptr = static_cast<T *>(data.get());
+         for (std::size_t k = 0; k < length; ++k)
+            ptr[k] = bswap_value(ptr[k]);
+      }
    } else {
       ExtractDataFromTP<T>::Copy(tensorproto, data.get());
    }

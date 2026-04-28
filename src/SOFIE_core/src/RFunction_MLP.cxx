@@ -10,7 +10,7 @@
 
 namespace SOFIE {
 
-RFunction_MLP::RFunction_MLP(FunctionTarget target, Int_t numLayers, Activation activation_function, bool activate_final, GraphType gType):
+RFunction_MLP::RFunction_MLP(FunctionTarget target, int_t numLayers, Activation activation_function, bool activate_final, GraphType gType):
     RFunction_Update(target, gType), fNumLayers(numLayers), fActivationFunction(activation_function), fActivateFinal(activate_final)
 {
    // assuming all the linear layers has a kernel and a bias initialized tensors
@@ -43,12 +43,12 @@ void RFunction_MLP::Initialize() {
         double beta = (fBiasTensors[i].empty()) ? 0. : 1.;
         op_gemm.reset(new ROperator_Gemm<float>(1.0,beta,0,0,fGemmInput,UTILITY::Clean_name(fKernelTensors[i]),UTILITY::Clean_name(fBiasTensors[i]),fFuncName+"Gemm"+std::to_string(i)));
         function_block->AddOperator(std::move(op_gemm));
-        fGemmInput = fFuncName+"Gemm"+i;
+        fGemmInput = fFuncName+"Gemm"+std::to_string(i);
         if (fActivationFunction == Activation::RELU) {
             std::unique_ptr<ROperator> op_relu;
             op_relu.reset(new ROperator_Relu<float>(fFuncName+"Gemm"+std::to_string(i), fFuncName+"Relu"+std::to_string(i)));
             function_block->AddOperator(std::move(op_relu));
-            fGemmInput = fFuncName+"Relu"+i;
+            fGemmInput = fFuncName+"Relu"+std::to_string(i);
 
         }
     }

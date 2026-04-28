@@ -89,22 +89,22 @@ set(sources_cxx
 target_sources(SOFIE_core PRIVATE ${sources_headers} ${sources_cxx})
 target_include_directories(SOFIE_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/inc)
 target_link_libraries(SOFIE_core PUBLIC utils)
-target_link_libraries(SOFIE_core PUBLIC
-    Tree
-    Core
-    RIO
-)
 
-ROOT_GENERATE_DICTIONARY(G__SOFIE_core ${sources_headers}
-    LINKDEF inc/LinkDef.h
-    MODULE SOFIE_core
-    OPTIONS --deep
-)
+if(SOFIE_WITH_ROOT AND ROOT_FOUND)
+  target_compile_definitions(SOFIE_core PUBLIC SOFIE_SUPPORT_ROOT_BINARY)
+  target_link_libraries(SOFIE_core PUBLIC Tree Core RIO)
 
-# Install the dictionaries.
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libSOFIE_core_rdict.pcm
-              ${CMAKE_CURRENT_BINARY_DIR}/libSOFIE_core.rootmap
-        DESTINATION lib)
+  ROOT_GENERATE_DICTIONARY(G__SOFIE_core ${sources_headers}
+      LINKDEF inc/LinkDef.h
+      MODULE SOFIE_core
+      OPTIONS --deep
+  )
+
+  # Install the dictionaries.
+  install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libSOFIE_core_rdict.pcm
+                ${CMAKE_CURRENT_BINARY_DIR}/libSOFIE_core.rootmap
+          DESTINATION lib)
+endif()
 
 install(TARGETS SOFIE_core
         LIBRARY DESTINATION lib

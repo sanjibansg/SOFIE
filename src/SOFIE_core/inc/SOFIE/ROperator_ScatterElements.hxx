@@ -203,9 +203,9 @@ public:
       op += SP + SP + SP + SP + "std::size_t remaining = elem_idx;\n";
       for (std::size_t d = 0; d < D; ++d) {
          op += SP + SP + SP + SP + "std::size_t const idx_" + std::to_string(d)
-               + " = remaining / " + strideI[d] + ";\n";
+               + " = remaining / " + std::to_string(strideI[d]) + ";\n";
          op += SP + SP + SP + SP + "remaining -= idx_" + std::to_string(d)
-               + " * " + strideI[d] + ";\n";
+               + " * " + std::to_string(strideI[d]) + ";\n";
       }
       op += "\n";
 

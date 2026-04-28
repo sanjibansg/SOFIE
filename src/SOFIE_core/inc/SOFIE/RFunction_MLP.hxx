@@ -15,7 +15,7 @@ enum class Activation {
 
 class RFunction_MLP: public RFunction_Update {
 private:
-    Int_t fNumLayers;           // Number of Layers in MLP
+    int_t fNumLayers;           // Number of Layers in MLP
     Activation fActivationFunction;
     bool  fActivateFinal;       // if True, fActivationFunction is applied as the activation for the last layer
     std::vector<std::string> fKernelTensors;
@@ -23,7 +23,7 @@ private:
 
 public:
     virtual ~RFunction_MLP() {}
-    RFunction_MLP(FunctionTarget target, Int_t numLayers, Activation activation_function=Activation::RELU, bool activate_final=false, GraphType gType=GraphType::GNN);
+    RFunction_MLP(FunctionTarget target, int_t numLayers, Activation activation_function=Activation::RELU, bool activate_final=false, GraphType gType=GraphType::GNN);
 
     void Initialize();
 

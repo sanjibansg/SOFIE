@@ -6,8 +6,13 @@ Since SOFIE is a part of ROOT and therefore needs to be built altogether, it tak
 
 ## Installation
 
-1. Getting a ROOT binary.  
-Download a pre-built binary of ROOT based on your architecture from [here](https://root.cern/install/).
+1. SOFIE requires ROOT by default. To explore SOFIE APIs within ROOT, follow the mentioned steps:      
+    1. Getting a ROOT binary. Download a pre-built binary of ROOT based on your architecture from [here](https://root.cern/install/).
+    2. Source it so that SOFIE is able to include its code. For example:
+    ```
+        source root_v6.36.02.Linux-ubuntu24.04-x86_64-gcc13.3/root/bin/thisroot.sh
+    ```
+    To disable ROOT, simply disable the `-DSOFIE_WITH_ROOT=OFF` cmake flag in the build command.
 
 2. Build standalone SOFIE
 ```bash
@@ -23,7 +28,7 @@ The commands above should build the SOFIE standalone. To include it within the R
 source setup.sh
 
 ```
-Now ROOT should also access the SOFIE libraries while it runs. This helps to accelerate development. Submit your developments here and we will proceed with the developments in ROOT carefull.
+Now ROOT should also access the SOFIE libraries while it runs. This helps to accelerate development. Submit your developments here and we will proceed with the developments in ROOT carefully. This step is not required if SOFIE is built for usage without ROOT (`-DSOFIE_WITH_ROOT=OFF`).
 
 3. To enable testing generated code with alpaka implementations, build using the following command:
 ```bash

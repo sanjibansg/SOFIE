@@ -103,14 +103,16 @@ target_include_directories(SOFIE_parsers PUBLIC
   set_target_properties(SOFIE_parsers PROPERTIES
   POSITION_INDEPENDENT_CODE TRUE)
 
+if(SOFIE_WITH_ROOT AND ROOT_FOUND)
   ROOT_GENERATE_DICTIONARY(G__SOFIE_parsers ${sources_headers}
     LINKDEF inc/LinkDef.h
     MODULE SOFIE_parsers
     OPTIONS --deep
-)
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libSOFIE_parsers_rdict.pcm
-              ${CMAKE_CURRENT_BINARY_DIR}/libSOFIE_parsers.rootmap
-        DESTINATION lib)
+  )
+  install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libSOFIE_parsers_rdict.pcm
+                ${CMAKE_CURRENT_BINARY_DIR}/libSOFIE_parsers.rootmap
+          DESTINATION lib)
+endif()
 
 install(TARGETS SOFIE_parsers
         LIBRARY DESTINATION lib

@@ -4,7 +4,10 @@
 #include <memory>
 #include <string>
 
+#ifdef SOFIE_SUPPORT_ROOT_BINARY
 #include "TFile.h"
+#endif
+
 #include "SOFIE/RModel.hxx"
 #include "SOFIE/SOFIE_common.hxx"
 
@@ -247,7 +250,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    // single initiation operators must only be initialized only once and their count should be stored in the registered_operators set to avoid generating multiple kernels for the same operator kind
    fGC += "\n//--- ALPAKA Kernels\n";
    for (size_t id = 0; id < fOperators.size(); id++) {
-      if(fOperators[id]->GetKind() == OperatorKind::GEMM){
+      if(fOperators[id]->GetKind() == OperatorKind::GEMM || fOperators[id]->GetKind() == OperatorKind::CONV) {
          OpNeedsBlas = true;
       }
       if(single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
@@ -348,7 +351,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
       for (size_t id = 0; id < fOperators.size(); id++) {
          fGC += fOperators[id]->GenerateInitCode_GPU_ALPAKA();
-         if (fOperators[id]->GetKind() == OperatorKind::GEMM){
+         if (fOperators[id]->GetKind() == OperatorKind::GEMM || fOperators[id]->GetKind() == OperatorKind::CONV) {
             fGC += "\nblas.AddLayoutConfig("+fOperators[id]->GetBlasConfig()+");\n";
          }
       }

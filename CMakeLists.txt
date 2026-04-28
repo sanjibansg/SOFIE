@@ -4,6 +4,10 @@ project(Sofie
     DESCRIPTION "SOFIE"
     LANGUAGES CXX)
 
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 find_package(BLAS)
 if(NOT BLAS_FOUND)
   message(WARNING "BLAS not found: TMVA-SOFIE will not be fully tested")
@@ -42,8 +46,19 @@ else()
   endif()
 endif()
 
-find_package(ROOT REQUIRED COMPONENTS Core TMVA Tree)
-include(${ROOT_USE_FILE})
+option(SOFIE_WITH_ROOT "Enable ROOT support (required for .root weight files and ROOT serialization)" OFF)
+
+if(SOFIE_WITH_ROOT)
+  find_package(ROOT REQUIRED COMPONENTS Core TMVA Tree)
+  if(ROOT_FOUND)
+    include(${ROOT_USE_FILE})
+    message(STATUS "ROOT found: enabling ROOT support in SOFIE")
+  else()
+    message(FATAL_ERROR "SOFIE_WITH_ROOT is ON but ROOT was not found")
+  endif()
+else()
+  message(STATUS "Building SOFIE without ROOT support (SOFIE_WITH_ROOT=OFF)")
+endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_INSTALL_BINDIR "bin" CACHE PATH "user executables (bin)")
@@ -60,6 +75,16 @@ if(testing)
   enable_testing()
 endif()
 
-include(cmake/modules/RoottestMacros.cmake)
+if(SOFIE_WITH_ROOT AND ROOT_FOUND)
+  include(cmake/modules/RoottestMacros.cmake)
+else()
+  include(cmake/modules/SofieTestMacros.cmake)
+endif()
 
 add_subdirectory(src)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+add_compile_options(-std=c++20)

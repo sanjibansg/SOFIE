@@ -32,9 +32,16 @@ void RModel_Base::GenerateHeaderInfo(std::string& hgname) {
     fGC += "#include \"SOFIE/SOFIE_common.hxx\"\n";
     if (fUseWeightFile)
         fGC += "#include <fstream>\n";
-    // Include TFile when saving the weights in a binary ROOT file
-    if (fWeightFile == WeightFileType::RootBinary)
-        fGC += "#include \"TFile.h\"\n";
+
+    if (fWeightFile == WeightFileType::RootBinary){
+    #ifdef SOFIE_SUPPORT_ROOT_BINARY
+        // Include TFile when saving the weights in a binary ROOT file
+            fGC += "#include \"TFile.h\"\n";
+    #else
+        throw std::runtime_error("TMVA-SOFIE: ROOT binary weight file option is enabled but the code is not compiled with ROOT support");
+    #endif
+    
+    }
 
     fGC += "\nnamespace SOFIE_" + fName + "{\n";
     if (!fNeededBlasRoutines.empty()) {
@@ -82,9 +89,15 @@ void RModel_Base::GenerateHeaderInfo_GPU_ALPAKA(std::string& hgname) {
     fGC += "#include \"SOFIE/SOFIE_common.hxx\"\n";
     if (fUseWeightFile)
         fGC += "#include <fstream>\n";
-    // Include TFile when saving the weights in a binary ROOT file
-    if (fWeightFile == WeightFileType::RootBinary)
-        fGC += "#include \"TFile.h\"\n";
+
+    if (fWeightFile == WeightFileType::RootBinary){
+        #ifdef SOFIE_SUPPORT_ROOT_BINARY
+            // Include TFile when saving the weights in a binary ROOT file
+                fGC += "#include \"TFile.h\"\n";
+        #else 
+            throw std::runtime_error("TMVA-SOFIE: ROOT binary weight file option is enabled but the code is not compiled with ROOT support");
+        #endif
+    }
 
     fGC += "\nusing Dim1D = alpaka::DimInt<1>;\n";
     fGC += "\nnamespace SOFIE_" + fName + "{\n";
