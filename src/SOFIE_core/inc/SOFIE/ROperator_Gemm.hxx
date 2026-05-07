@@ -527,7 +527,7 @@ namespace SOFIE{
          auto lda = (fAttrTransA ? m : k);
          auto ldb = (fAttrTransB ? k : n);
          auto ldc = n;
-         return n+", "+m+", "+k+", "+ldb+", "+lda+", "+ldc;
+         return n+", "+m+", "+k+", "+ldb+", "+lda+", "+ldc+", "+(fAttrTransB ? "'t'" : "'n'")+", "+(fAttrTransA ? "'t'" : "'n'");
       }
    };
 

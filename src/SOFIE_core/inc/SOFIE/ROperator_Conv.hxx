@@ -86,6 +86,7 @@ public:
       }
       fInputTensorNames = { fNX };
       fOutputTensorNames = { fNY };
+      fKind = OperatorKind::CONV;
    }
 
    std::vector<ETensorType> TypeInference(std::vector<ETensorType> input) override {
@@ -565,10 +566,8 @@ public:
 
       std::string op;
 
-      // -----------------------------------------------------------------------
       // Kernel 1: Weight vectorisation — reorder W into _f with dilation layout
       // Each thread handles one output element of _f
-      // -----------------------------------------------------------------------
       std::string wKname = "WeightVecKernel_" + opName;
       op  = "\n//------ WEIGHT_VEC_KERNEL_ALPAKA (Conv " + opName + ")\n";
       op += SP + "struct " + wKname + " {\n";
@@ -613,13 +612,11 @@ public:
       op += " +\n" + SP + SP + SP + SP + SP + "kw * " + std::to_string(wstrideDil) + "u;\n\n";
 
       op += SP + SP + SP + SP + "f[f_idx] = W[elem_idx];\n";
-      op += SP + SP + SP + "}\n";   // end grid-stride loop
-      op += SP + SP + "}\n";        // end operator()
-      op += SP + "};\n\n";          // end struct
+      op += SP + SP + SP + "}\n";
+      op += SP + SP + "}\n";
+      op += SP + "};\n\n";
 
-      // -----------------------------------------------------------------------
       // Kernel 2: Im2Col
-      // -----------------------------------------------------------------------
       std::string im2colKname = "Im2ColKernel_" + opName;
       op += SP + "//------ IM2COL_KERNEL_ALPAKA (Conv " + opName + ")\n";
       op += SP + "struct " + im2colKname + " {\n";
@@ -669,12 +666,31 @@ public:
          op += SP + SP + SP + SP + "std::size_t const ow = col_col;\n\n";
       }
 
-      op += SP + SP + SP + SP + "int64_t const id_in = static_cast<int64_t>(od * " + std::to_string(fAttrStrides[0])
-         + "u + kd * " + std::to_string(fAttrDilations[0]) + "u) - " + std::to_string(fAttrPads[0]) + ";\n";
-      op += SP + SP + SP + SP + "int64_t const ih_in = static_cast<int64_t>(oh * " + std::to_string(fAttrStrides[1])
-         + "u + kh * " + std::to_string(fAttrDilations[1]) + "u) - " + std::to_string(fAttrPads[1]) + ";\n";
-      op += SP + SP + SP + SP + "int64_t const iw_in = static_cast<int64_t>(ow * " + std::to_string(fAttrStrides[2])
-         + "u + kw * " + std::to_string(fAttrDilations[2]) + "u) - " + std::to_string(fAttrPads[2]) + ";\n\n";
+      // Depth: trivially 0 for fDim < 3 (od=kd=0 always); pads[0] is height-begin for 2D, so
+      // applying it here would make id_in negative and zero the whole output.
+      if (fDim >= 3) {
+         op += SP + SP + SP + SP + "int64_t const id_in = static_cast<int64_t>(od * " + std::to_string(fAttrStrides[0])
+            + "u + kd * " + std::to_string(fAttrDilations[0]) + "u) - " + std::to_string(fAttrPads[0]) + ";\n";
+      } else {
+         op += SP + SP + SP + SP + "int64_t const id_in = 0;\n";
+      }
+      // Height: for fDim==3 the height dim is at strides/pads index 1; for fDim==2 it is at index 0.
+      // For fDim==1 oh=kh=0 so ih_in=0.
+      {
+         size_t const hIdx = (fDim > 2) ? 1 : 0;
+         if (fDim >= 2) {
+            op += SP + SP + SP + SP + "int64_t const ih_in = static_cast<int64_t>(oh * " + std::to_string(fAttrStrides[hIdx])
+               + "u + kh * " + std::to_string(fAttrDilations[hIdx]) + "u) - " + std::to_string(fAttrPads[hIdx]) + ";\n";
+         } else {
+            op += SP + SP + SP + SP + "int64_t const ih_in = 0;\n";
+         }
+      }
+      // Width: fAttrStrides/Dilations/Pads are ordered [d,h,w] so width is at index fDim-1.
+      {
+         size_t const wIdx = fDim - 1;
+         op += SP + SP + SP + SP + "int64_t const iw_in = static_cast<int64_t>(ow * " + std::to_string(fAttrStrides[wIdx])
+            + "u + kw * " + std::to_string(fAttrDilations[wIdx]) + "u) - " + std::to_string(fAttrPads[wIdx]) + ";\n\n";
+      }
 
       op += SP + SP + SP + SP + "bool const in_bounds =\n";
       op += SP + SP + SP + SP + SP + "id_in >= 0 && id_in < " + std::to_string(iDepth)  + " &&\n";
@@ -695,9 +711,7 @@ public:
       op += SP + SP + "}\n";
       op += SP + "};\n\n";
 
-      // -----------------------------------------------------------------------
       // Kernel 3: Bias broadcast (only if bias present)
-      // -----------------------------------------------------------------------
       if (!fNB2.empty()) {
          std::string biasKname = "BiasBroadcastKernel_" + opName;
          op += SP + "//------ BIAS_BROADCAST_KERNEL_ALPAKA (Conv " + opName + ")\n";
@@ -787,30 +801,26 @@ public:
          << fShapeY[1] * gemm_m << "u;\n\n";
 
       // -----------------------------------------------------------------------
-      // Step 3: Im2Col
-      // -----------------------------------------------------------------------
-      out << SP << SP << "// Step 3: im2col\n";
-      out << SP << SP << "{\n";
-      out << SP << SP << SP << "auto const elementsPerThread_im2col = Vec::all(static_cast<Idx>(1));\n";
-      out << SP << SP << SP << "auto const elementsPerGrid_im2col   = Vec::all(Idx{" << colElements << "});\n";
-      out << SP << SP << SP << "alpaka::KernelCfg<Acc> const cfg_im2col = {elementsPerGrid_im2col, elementsPerThread_im2col};\n";
-      out << SP << SP << SP << "auto const workDiv_im2col = alpaka::getValidWorkDiv(cfg_im2col, devAcc, im2colKernel_" << opName
-         << ", alpaka::getPtrNative(deviceBuf_" << fNX << ") + x_offset"
-         << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
-         << ", static_cast<Idx>(" << colElements << "));\n";
-      out << SP << SP << SP << "alpaka::exec<Acc>(queue, workDiv_im2col, im2colKernel_" << opName
-         << ", alpaka::getPtrNative(deviceBuf_" << fNX << ") + x_offset"
-         << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
-         << ", static_cast<Idx>(" << colElements << "));\n";
-      out << SP << SP << SP << "alpaka::wait(queue);\n";
-      out << SP << SP << "}\n\n";
-
-      // -----------------------------------------------------------------------
-      // Step 4: GEMM (+ optional bias) — group or non-group
-      // gemm_n/gemm_m/gemm_k are member variables set in Initialize()
-      // For grouped conv we use gemm_n/fAttrGroup per group, keeping gemm_n as total
+      // Step 3 + 4: Im2Col then GEMM — structure differs for grouped vs non-grouped
       // -----------------------------------------------------------------------
       if (fAttrGroup == 1) {
+         // Non-grouped: single im2col per batch, then GEMM
+         out << SP << SP << "// Step 3: im2col\n";
+         out << SP << SP << "{\n";
+         out << SP << SP << SP << "auto const elementsPerThread_im2col = Vec::all(static_cast<Idx>(1));\n";
+         out << SP << SP << SP << "auto const elementsPerGrid_im2col   = Vec::all(Idx{" << colElements << "});\n";
+         out << SP << SP << SP << "alpaka::KernelCfg<Acc> const cfg_im2col = {elementsPerGrid_im2col, elementsPerThread_im2col};\n";
+         out << SP << SP << SP << "auto const workDiv_im2col = alpaka::getValidWorkDiv(cfg_im2col, devAcc, im2colKernel_" << opName
+            << ", alpaka::getPtrNative(deviceBuf_" << fNX << ") + x_offset"
+            << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+            << ", static_cast<Idx>(" << colElements << "));\n";
+         out << SP << SP << SP << "alpaka::exec<Acc>(queue, workDiv_im2col, im2colKernel_" << opName
+            << ", alpaka::getPtrNative(deviceBuf_" << fNX << ") + x_offset"
+            << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+            << ", static_cast<Idx>(" << colElements << "));\n";
+         out << SP << SP << SP << "alpaka::wait(queue);\n";
+         out << SP << SP << "}\n\n";
+
          if (!fNB2.empty()) {
                size_t biasElements = gemm_n * gemm_m;
                out << SP << SP << "// Step 4a: broadcast bias into output slice\n";
@@ -828,26 +838,48 @@ public:
                   << ", static_cast<Idx>(" << biasElements << "));\n";
                out << SP << SP << SP << "alpaka::wait(queue);\n";
                out << SP << SP << "}\n\n";
-               out << SP << SP << "// Step 4b: GEMM beta=1 fuses bias\n";
+               out << SP << SP << "// Step 4b: GEMM beta=1 accumulates onto bias-initialised output\n";
                out << SP << SP << "blas.matmul('n', 'n', "
-                  << gemm_n << ", " << gemm_m << ", " << gemm_k
-                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << convK << ")"
-                  << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+                  << gemm_m << ", " << gemm_n << ", " << gemm_k
+                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+                  << ", alpaka::getPtrNative(deviceBuf_" << convK << ")"
                   << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << fNY << ") + out_offset);\n\n";
          } else {
                out << SP << SP << "// Step 4: GEMM beta=0 (no bias)\n";
                out << SP << SP << "blas.matmul('n', 'n', "
-                  << gemm_n << ", " << gemm_m << ", " << gemm_k
-                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << convK << ")"
-                  << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+                  << gemm_m << ", " << gemm_n << ", " << gemm_k
+                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+                  << ", alpaka::getPtrNative(deviceBuf_" << convK << ")"
                   << ", 0.0f, alpaka::getPtrNative(deviceBuf_" << fNY << ") + out_offset);\n\n";
          }
+         // Wait for GEMM to finish before next batch overwrites the shared _xcol buffer.
+         out << SP << SP << "alpaka::wait(queue);\n\n";
+
       } else {
-         // Group convolution — gemm_n stays as total, divide per group at launch
+         // Grouped convolution: im2col and GEMM per group with group-adjusted input pointer.
+         // Each group processes fShapeW[1] input channels starting at g * fShapeW[1].
          out << SP << SP << "for (std::size_t g = 0; g < " << fAttrGroup << "; g++) {\n\n";
+         out << SP << SP << SP << "std::size_t const g_in_offset  = x_offset   + g * "
+               << fShapeW[1] * iDepth * iHeight * iWidth << "u;\n";
          out << SP << SP << SP << "std::size_t const g_out_offset = out_offset + g * "
                << gemm_n * gemm_m << "u;\n";
-         out << SP << SP << SP << "std::size_t const f_offset = g * " << groupFOffset << "u;\n\n";
+         out << SP << SP << SP << "std::size_t const f_offset     = g * " << groupFOffset << "u;\n\n";
+
+         out << SP << SP << SP << "// im2col for group g (reads only this group's input channels)\n";
+         out << SP << SP << SP << "{\n";
+         out << SP << SP << SP << SP << "auto const elementsPerThread_im2col = Vec::all(static_cast<Idx>(1));\n";
+         out << SP << SP << SP << SP << "auto const elementsPerGrid_im2col   = Vec::all(Idx{" << colElements << "});\n";
+         out << SP << SP << SP << SP << "alpaka::KernelCfg<Acc> const cfg_im2col = {elementsPerGrid_im2col, elementsPerThread_im2col};\n";
+         out << SP << SP << SP << SP << "auto const workDiv_im2col = alpaka::getValidWorkDiv(cfg_im2col, devAcc, im2colKernel_" << opName
+            << ", alpaka::getPtrNative(deviceBuf_" << fNX << ") + g_in_offset"
+            << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+            << ", static_cast<Idx>(" << colElements << "));\n";
+         out << SP << SP << SP << SP << "alpaka::exec<Acc>(queue, workDiv_im2col, im2colKernel_" << opName
+            << ", alpaka::getPtrNative(deviceBuf_" << fNX << ") + g_in_offset"
+            << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+            << ", static_cast<Idx>(" << colElements << "));\n";
+         out << SP << SP << SP << SP << "alpaka::wait(queue);\n";
+         out << SP << SP << SP << "}\n\n";
 
          if (!fNB2.empty()) {
                size_t groupBiasElements = gemm_n * gemm_m;
@@ -867,36 +899,21 @@ public:
                out << SP << SP << SP << SP << "alpaka::wait(queue);\n";
                out << SP << SP << SP << "}\n\n";
                out << SP << SP << SP << "blas.matmul('n', 'n', "
-                  << gemm_n << ", " << gemm_m << ", " << gemm_k
-                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << convK << ") + f_offset"
-                  << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+                  << gemm_m << ", " << gemm_n << ", " << gemm_k
+                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+                  << ", alpaka::getPtrNative(deviceBuf_" << convK << ") + f_offset"
                   << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << fNY << ") + g_out_offset);\n\n";
          } else {
                out << SP << SP << SP << "blas.matmul('n', 'n', "
-                  << gemm_n << ", " << gemm_m << ", " << gemm_k
-                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << convK << ") + f_offset"
-                  << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+                  << gemm_m << ", " << gemm_n << ", " << gemm_k
+                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+                  << ", alpaka::getPtrNative(deviceBuf_" << convK << ") + f_offset"
                   << ", 0.0f, alpaka::getPtrNative(deviceBuf_" << fNY << ") + g_out_offset);\n\n";
          }
+         // Wait for GEMM to finish before next group's im2col overwrites the shared _xcol buffer.
+         out << SP << SP << SP << "alpaka::wait(queue);\n\n";
          out << SP << SP << "}\n"; // end group loop
       }
-      
-      // print the contents of deviceBuf_W, deviceBuf_x_f and deviceBuf_x_xcol for debugging
-      out << SP << SP << "}\n";
-      out << SP << SP << "// Debug: print _W, _f and _xcol\n";
-      out << SP << SP << "std::cout << \"_W: \";\n";
-      out << SP << SP << "for (std::size_t i = 0; i < " << wTotal << "; i++) {\n";
-      out << SP << SP << SP << "printf(\"%f \", alpaka::getPtrNative(deviceBuf_" << fNW << ")  + i);\n";
-      out << SP << SP << "std::cout << std::endl;}\n";
-      out << SP << SP << "for (std::size_t i = 0; i < " << wTotal << "; i++) {\n";
-      out << SP << SP << SP << "printf(\"%f \", alpaka::getPtrNative(deviceBuf_" << convK << ")  + i);\n";
-      out << SP << SP << "}\n";
-      out << SP << SP << "std::cout << std::endl;\n";
-      out << SP << SP << "std::cout << \"_xcol: \";\n";
-      out << SP << SP << "for (std::size_t i = 0; i < " << colElements << "; i++) {\n";
-      out << SP << SP << SP << "printf(\"%f \", alpaka::getPtrNative(deviceBuf_" << imcol << ")  + i);\n";
-      out << SP << SP << "std::cout << std::endl;\n"; 
-
 
       out << SP << "}\n"; // end batch loop
       return out.str();
@@ -908,10 +925,10 @@ public:
 
 
    std::string GetBlasConfig(){
-      auto lda = std::to_string(gemm_k);
-      auto ldb = std::to_string(gemm_n);
-      auto ldc = std::to_string(gemm_n);
-      return std::to_string(gemm_n) + ", " + std::to_string(gemm_m) + ", " + std::to_string(gemm_k) + ", " + ldb + ", " + lda + ", " + ldc;
+      auto lda = std::to_string(gemm_m);  // ld for xcol^T (gemm_m×gemm_k col-major)
+      auto ldb = std::to_string(gemm_k);  // ld for xf^T   (gemm_k×gemm_n col-major)
+      auto ldc = std::to_string(gemm_m);  // ld for y^T    (gemm_m×gemm_n col-major)
+      return std::to_string(gemm_m) + ", " + std::to_string(gemm_n) + ", " + std::to_string(gemm_k) + ", " + lda + ", " + ldb + ", " + ldc + ", 'n', 'n'";
    }
 
 };

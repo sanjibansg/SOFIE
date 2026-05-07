@@ -1958,150 +1958,230 @@ TEST_F(SofieAlpakaTest, ReduceSumSquare)
         EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
 }
 
-// TEST_F(SofieAlpakaTest, ConvWithPadding)
-// {
-//    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+TEST_F(SofieAlpakaTest, ConvWithPadding)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
 
-//    // Preparing the standard all-ones input
-//    std::vector<float> input(25);
-//    std::iota(input.begin(), input.end(), 0.0f);
+   // Preparing the standard all-ones input
+   std::vector<float> input(25);
+   std::iota(input.begin(), input.end(), 0.0f);
 
-//    auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
-//    float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
-//    for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
 
-//    auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
-//    alpaka::memcpy(queue, input_d, input_h);
-//    alpaka::wait(queue);
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
    
-//    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(ConvWithPadding_ExpectedOutput::all_ones) / sizeof(float)}));
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(ConvWithPadding_ExpectedOutput::all_ones) / sizeof(float)}));
 
-//    {
-//         SOFIE_ConvWithPadding::Session<alpaka::TagGpuCudaRt> session("ConvWithPadding_FromONNX_GPU_ALPAKA.dat");
-//         auto result = session.infer(input_d);
-//         alpaka::wait(queue);
-//         cudaDeviceSynchronize();
-//         alpaka::memcpy(queue, result_h, result);
-//         alpaka::wait(queue);
+   {
+        SOFIE_ConvWithPadding::Session<alpaka::TagGpuCudaRt> session("ConvWithPadding_FromONNX_GPU_ALPAKA.dat");
+        auto result = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
 
-//    }
+   }
    
-//    float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
-//    float *correct = ConvWithPadding_ExpectedOutput::all_ones;
+   float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float *correct = ConvWithPadding_ExpectedOutput::all_ones;
 
-//    for (size_t i = 0; i < 25; ++i) {
-//     std::cout<<"res: "<<res_ptr[i]<<" correct: "<<correct[i]<<std::endl;
-//       EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
-//    }
-// }
-
-
-// TEST(ONNX, ConvWithoutPadding)
-// {
-//    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
-
-//    // Preparing the standard all-ones input
-//    std::vector<float> input(25);
-//    std::iota(input.begin(), input.end(), 0.0f);
-//    SOFIE_ConvWithoutPadding::Session s("ConvWithoutPadding_FromONNX.dat");
-//    std::vector<float> output = s.infer(input.data());
-
-//    // Checking output size
-//    EXPECT_EQ(output.size(), sizeof(ConvWithoutPadding_ExpectedOutput::all_ones) / sizeof(float));
-
-//    float *correct = ConvWithoutPadding_ExpectedOutput::all_ones;
-
-//    // Checking every output value, one by one
-//    for (size_t i = 0; i < output.size(); ++i) {
-//       EXPECT_LE(std::abs(output[i] - correct[i]), TOLERANCE);
-//    }
-// }
+   for (size_t i = 0; i < 25; ++i) {
+      EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
+   }
+}
 
 
-// TEST(ONNX, ConvWithAutopadSameLower)
-// {
-//    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+TEST_F(SofieAlpakaTest, ConvWithoutPadding)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
 
-//    // Preparing the standard all-ones input
-//    std::vector<float> input(25);
-//    std::iota(input.begin(), input.end(), 0.0f);
-//    SOFIE_ConvWithAutopadSameLower::Session s("ConvWithAutopadSameLower_FromONNX.dat");
-//    std::vector<float> output = s.infer(input.data());
+   // Preparing the standard all-ones input
+   std::vector<float> input(25);
+   std::iota(input.begin(), input.end(), 0.0f);
 
-//    // Checking output size
-//    EXPECT_EQ(output.size(), sizeof(ConvWithAutopadSameLower_ExpectedOutput::all_ones) / sizeof(float));
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
 
-//    float *correct = ConvWithAutopadSameLower_ExpectedOutput::all_ones;
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+   
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(ConvWithoutPadding_ExpectedOutput::all_ones) / sizeof(float)}));
 
-//    // Checking every output value, one by one
-//    for (size_t i = 0; i < output.size(); ++i) {
-//       EXPECT_LE(std::abs(output[i] - correct[i]), TOLERANCE);
-//    }
-// }
+   {
+        SOFIE_ConvWithoutPadding::Session<alpaka::TagGpuCudaRt> session("ConvWithoutPadding_FromONNX_GPU_ALPAKA.dat");
+        auto result = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
 
+   }
 
-// TEST(ONNX, ConvWithStridesPadding)
-// {
-//    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+      
+   float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float *correct = ConvWithoutPadding_ExpectedOutput::all_ones;
+   constexpr size_t nOut_convNoPad = sizeof(ConvWithoutPadding_ExpectedOutput::all_ones) / sizeof(float);
 
-//    // Preparing the standard all-ones input
-//    std::vector<float> input(35);
-//    std::iota(input.begin(), input.end(), 0.0f);
-//    SOFIE_ConvWithStridesPadding::Session s("ConvWithStridesPadding_FromONNX.dat");
-//    std::vector<float> output = s.infer(input.data());
+   for (size_t i = 0; i < nOut_convNoPad; ++i) {
+      EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
+   }
 
-//    // Checking output size
-//    EXPECT_EQ(output.size(), sizeof(ConvWithStridesPadding_ExpectedOutput::all_ones) / sizeof(float));
-
-//    float *correct = ConvWithStridesPadding_ExpectedOutput::all_ones;
-
-//    // Checking every output value, one by one
-//    for (size_t i = 0; i < output.size(); ++i) {
-//       EXPECT_LE(std::abs(output[i] - correct[i]), TOLERANCE);
-//    }
-// }
+}
 
 
-// TEST(ONNX, ConvWithStridesNoPadding)
-// {
-//    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+TEST_F(SofieAlpakaTest, ConvWithAutopadSameLower)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
 
-//    // Preparing the standard all-ones input
-//    std::vector<float> input(35);
-//    std::iota(input.begin(), input.end(), 0.0f);
-//    SOFIE_ConvWithStridesNoPadding::Session s("ConvWithStridesNoPadding_FromONNX.dat");
-//    std::vector<float> output = s.infer(input.data());
+   // Preparing the standard all-ones input
+   std::vector<float> input(25);
+   std::iota(input.begin(), input.end(), 0.0f);
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
 
-//    // Checking output size
-//    EXPECT_EQ(output.size(), sizeof(ConvWithStridesNoPadding_ExpectedOutput::all_ones) / sizeof(float));
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+   
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(ConvWithAutopadSameLower_ExpectedOutput::all_ones) / sizeof(float)}));
 
-//    float *correct = ConvWithStridesNoPadding_ExpectedOutput::all_ones;
+   {
+        SOFIE_ConvWithAutopadSameLower::Session<alpaka::TagGpuCudaRt> session("ConvWithAutopadSameLower_FromONNX_GPU_ALPAKA.dat");
+        auto result = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
 
-//    // Checking every output value, one by one
-//    for (size_t i = 0; i < output.size(); ++i) {
-//       EXPECT_LE(std::abs(output[i] - correct[i]), TOLERANCE);
-//    }
-// }
+   }
+   
+   float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float *correct = ConvWithAutopadSameLower_ExpectedOutput::all_ones;
+
+   for (size_t i = 0; i < 9; ++i) {
+      std::cout << "res: " << res_ptr[i] << ", correct: " << correct[i] << std::endl;
+      EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
+   }
+}
 
 
-// // Disables test (asymmetric padding not supported)
-// TEST(DISABLED_ONNX, ConvWithAsymmetricPadding)
-// {
-//    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+TEST_F(SofieAlpakaTest, ConvWithStridesPadding)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
 
-//    // Preparing the standard all-ones input
-//    std::vector<float> input(35);
-//    std::iota(input.begin(), input.end(), 0.0f);
-//    SOFIE_ConvWithAsymmetricPadding::Session s("ConvWithAsymmetricPadding_FromONNX.dat");
-//    std::vector<float> output = s.infer(input.data());
+   // Preparing the standard all-ones input
+   std::vector<float> input(35);
+   std::iota(input.begin(), input.end(), 0.0f);
 
-//    // Checking output size
-//    EXPECT_EQ(output.size(), sizeof(ConvWithAsymmetricPadding_ExpectedOutput::all_ones) / sizeof(float));
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
 
-//    float *correct = ConvWithAsymmetricPadding_ExpectedOutput::all_ones;
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+   
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(ConvWithStridesPadding_ExpectedOutput::all_ones) / sizeof(float)}));
 
-//    // Checking every output value, one by one
-//    for (size_t i = 0; i < output.size(); ++i) {
-//       EXPECT_LE(std::abs(output[i] - correct[i]), TOLERANCE);
-//    }
-// }
+   {
+        SOFIE_ConvWithStridesPadding::Session<alpaka::TagGpuCudaRt> session("ConvWithStridesPadding_FromONNX_GPU_ALPAKA.dat");
+        auto result = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+
+   }
+   
+   float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float *correct = ConvWithStridesPadding_ExpectedOutput::all_ones;
+   constexpr size_t nOut_stridesPad = sizeof(ConvWithStridesPadding_ExpectedOutput::all_ones) / sizeof(float);
+
+   for (size_t i = 0; i < nOut_stridesPad; ++i) {
+      EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
+   }
+}
+
+
+TEST_F(SofieAlpakaTest, ConvWithStridesNoPadding)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+   // Preparing the standard all-ones input
+   std::vector<float> input(35);
+   std::iota(input.begin(), input.end(), 0.0f);
+
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
+
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+   
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(ConvWithStridesNoPadding_ExpectedOutput::all_ones) / sizeof(float)}));
+
+   {
+        SOFIE_ConvWithStridesNoPadding::Session<alpaka::TagGpuCudaRt> session("ConvWithStridesNoPadding_FromONNX_GPU_ALPAKA.dat");
+        auto result = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+
+   }
+   
+   float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float *correct = ConvWithStridesNoPadding_ExpectedOutput::all_ones;
+   constexpr size_t nOut_stridesNoPad = sizeof(ConvWithStridesNoPadding_ExpectedOutput::all_ones) / sizeof(float);
+
+   for (size_t i = 0; i < nOut_stridesNoPad; ++i) {
+      EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
+   }
+}
+
+
+// Disables test (asymmetric padding not supported)
+TEST_F(SofieAlpakaTest, ConvWithAsymmetricPadding)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+   // Preparing the standard all-ones input
+   std::vector<float> input(35);
+   std::iota(input.begin(), input.end(), 0.0f);
+
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
+
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+   
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(ConvWithAsymmetricPadding_ExpectedOutput::all_ones) / sizeof(float)}));
+
+   {
+        SOFIE_ConvWithAsymmetricPadding::Session<alpaka::TagGpuCudaRt> session("ConvWithAsymmetricPadding_FromONNX_GPU_ALPAKA.dat");
+        auto result = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+
+   }
+   
+   float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float *correct = ConvWithAsymmetricPadding_ExpectedOutput::all_ones;
+   constexpr size_t nOut_asymPad = sizeof(ConvWithAsymmetricPadding_ExpectedOutput::all_ones) / sizeof(float);
+
+   for (size_t i = 0; i < nOut_asymPad; ++i) {
+      EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
+   }
+}
