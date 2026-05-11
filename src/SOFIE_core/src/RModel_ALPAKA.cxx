@@ -163,6 +163,47 @@ std::string RModel::GenerateInferSignature_GPU_ALPAKA(bool isdecl) {
    return rGC;
 }
 
+std::string RModel::GenerateImplSignature_GPU_ALPAKA(bool isdecl) {
+   // Like GenerateInferSignature_GPU_ALPAKA but uses ViewPlainPtr const& instead of Buf const.
+   // This lets _infer_impl accept non-owning views so both the typed and span-based infer
+   // wrappers can call it without duplication of operator code.
+
+   auto GetViewConstType = [this](const std::string& name) -> std::string {
+      ETensorType type = GetTensorType(name);
+      if (type == ETensorType::FLOAT)  return "ViewConstF1D";
+      if (type == ETensorType::DOUBLE) return "ViewConstD1D";
+      if (type == ETensorType::INT64)  return "ViewConstI641D";
+      if (type == ETensorType::BOOL)   return "ViewConstUI81D";
+      throw std::runtime_error("TMVA-SOFIE: input tensor " + name +
+                               " is of a data type which is not yet supported.");
+   };
+
+   std::string rGC;
+   std::unordered_map<std::string, int> inputParams;
+   int i_input = 0;
+   for (auto &name : fInputTensorNames) {
+      if (IsDimInputTensor(name)) {
+         auto shape = GetDynamicTensorShape(name);
+         for (auto &d : shape) {
+            std::string pName = d.param;
+            if (d.isParam && inputParams.count(pName) == 0) {
+               if (isdecl) rGC += "size_t ";
+               rGC += d.param + ",";
+               inputParams[pName] = i_input;
+            }
+         }
+      }
+      if (isdecl) {
+         rGC += GetViewConstType(name) + " const& ";
+      }
+      rGC += "deviceBuf_" + name + ",";
+      i_input++;
+   }
+
+   if (fInputTensorNames.size() > 0) rGC.pop_back();
+   return rGC;
+}
+
 void RModel::GenerateOutput_GPU_ALPAKA() {
    if (fVerbose)
       std::cout << "Generating main inference code for " << fName << std::endl;
@@ -171,56 +212,138 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    if (outputSize == 0)
       throw std::runtime_error("TMVA-SOFIE: output size=0 are not supported");
 
-   bool sameOutputTypes = true;
-   std::string inferReturnType;
    ETensorType eFirstOutputType = GetTensorType(*fOutputTensorNames.begin());
+   bool sameOutputTypes = true;
+   for (std::string const &name : fOutputTensorNames) {
+      if (GetTensorType(name) != eFirstOutputType)
+         sameOutputTypes = false;
+   }
 
-   fGC += "\n\n";
-   if (outputSize == 1) {
-      fGC += "alpaka::Buf<Acc, " + ConvertOutputTypeToString(eFirstOutputType) + ", Dim, Idx>";
-   } else {
-      // if all output types are the same we return an std::vector - otherwise a tuple
-      for (std::string const &name : fOutputTensorNames) {
-         if (GetTensorType(name) != eFirstOutputType)
-            sameOutputTypes = false;
-      }
-      if (sameOutputTypes)
-         fGC += "std::array<alpaka::Buf<Acc, " + ConvertOutputTypeToString(eFirstOutputType) + ", Dim, Idx>, " + std::to_string(outputSize) + ">";
-      else {
-         inferReturnType = "std::tuple<";
-         for (size_t i = 0; i < outputSize; i++) {
-            inferReturnType += "alpaka::Buf<Acc, " + ConvertOutputTypeToString(eFirstOutputType) + ", Dim, Idx>";
-            if (i < outputSize - 1)
-               inferReturnType += ",";
+   auto GetViewConstType = [this](const std::string &name) -> std::string {
+      ETensorType type = GetTensorType(name);
+      if (type == ETensorType::FLOAT)  return "ViewConstF1D";
+      if (type == ETensorType::DOUBLE) return "ViewConstD1D";
+      if (type == ETensorType::INT64)  return "ViewConstI641D";
+      if (type == ETensorType::BOOL)   return "ViewConstUI81D";
+      throw std::runtime_error("TMVA-SOFIE: input tensor " + name + " is of an unsupported data type.");
+   };
+
+   // Collect deduplicated dynamic dimension parameter names in declaration order
+   std::vector<std::string> dynParamNames;
+   {
+      std::unordered_map<std::string, int> seen;
+      for (auto &name : fInputTensorNames) {
+         if (IsDimInputTensor(name)) {
+            auto shape = GetDynamicTensorShape(name);
+            for (auto &d : shape) {
+               if (d.isParam && seen.count(d.param) == 0) {
+                  dynParamNames.push_back(d.param);
+                  seen[d.param] = 1;
+               }
+            }
          }
-         inferReturnType += ">";
-         fGC += inferReturnType;
       }
    }
 
-   fGC += " infer(";
-   fGC += GenerateInferSignature_GPU_ALPAKA();
+   fGC += "\n\n";
+
+   // === 1. _infer_impl: all operator code, takes ViewPlainPtr const& for inputs ===
+   fGC += "void _infer_impl(";
+   fGC += GenerateImplSignature_GPU_ALPAKA();
    fGC += "){\n";
 
    for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
       if (fVerbose)
          std::cout << "Generating code for operator .... " << op_idx << std::endl;
-      fGC += (fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx)));
+      fGC += fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx));
+   }
+   fGC += "\n\n   alpaka::wait(queue);\n";
+   fGC += "}\n\n";
+
+   // === 2. Span-based infer: generic entry point ===
+   // Dynamic params are forwarded explicitly; non-float inputs not yet supported here.
+   std::string spanDynDecl;
+   for (auto &p : dynParamNames)
+      spanDynDecl += ", size_t " + p;
+
+   fGC += "void infer(std::span<ViewConstF1D const> inputs, std::span<ViewF1D> outputs" + spanDynDecl + "){\n";
+
+   // Build _infer_impl call: dyn params first, then inputs[i]
+   {
+      fGC += SP + "_infer_impl(";
+      bool first = true;
+      for (auto &p : dynParamNames) {
+         if (!first) fGC += ", ";
+         fGC += p;
+         first = false;
+      }
+      for (size_t i = 0; i < fInputTensorNames.size(); i++) {
+         if (!first) fGC += ", ";
+         fGC += "inputs[" + std::to_string(i) + "]";
+         first = false;
+      }
+      fGC += ");\n";
    }
 
-   fGC += "\n\n   alpaka::wait(queue);\n";
-   fGC += SP + "return ";
-   if (outputSize>1) fGC += " {";
+   // Copy member output buffers into caller-provided output views
    for (size_t i = 0; i < outputSize; i++) {
       std::string tensorName = *(fOutputTensorNames.begin() + i);
-      bool isIntermediate = fIntermediateTensorInfos.count(tensorName) > 0;
-      fGC += "deviceBuf_"+tensorName;
-      if (i < outputSize - 1)
-         fGC += ",";
+      fGC += SP + "alpaka::memcpy(queue, outputs[" + std::to_string(i) + "], deviceBuf_" + tensorName + ");\n";
    }
-   if (outputSize>1) fGC += " };\n";
-   else fGC += ";\n";
-   fGC += "}\n"; // end of infer function scope
+   fGC += SP + "alpaka::wait(queue);\n";
+   fGC += "}\n\n";
+
+   // === 3. Typed infer: backward-compatible wrapper that delegates to _infer_impl ===
+   // Build return type
+   std::string returnType;
+   if (outputSize == 1) {
+      returnType = "alpaka::Buf<Acc, " + ConvertOutputTypeToString(eFirstOutputType) + ", Dim, Idx>";
+   } else if (sameOutputTypes) {
+      returnType = "std::array<alpaka::Buf<Acc, " + ConvertOutputTypeToString(eFirstOutputType) +
+                   ", Dim, Idx>, " + std::to_string(outputSize) + ">";
+   } else {
+      returnType = "std::tuple<";
+      for (size_t i = 0; i < outputSize; i++) {
+         std::string tname = *(fOutputTensorNames.begin() + i);
+         returnType += "alpaka::Buf<Acc, " + ConvertOutputTypeToString(GetTensorType(tname)) + ", Dim, Idx>";
+         if (i < outputSize - 1) returnType += ",";
+      }
+      returnType += ">";
+   }
+
+   fGC += returnType + " infer(";
+   fGC += GenerateInferSignature_GPU_ALPAKA();
+   fGC += "){\n";
+
+   // Wrap each typed input buffer in a ViewConstXX, then call _infer_impl
+   std::vector<std::string> typedImplArgs;
+   for (auto &p : dynParamNames)
+      typedImplArgs.push_back(p);
+   for (auto &name : fInputTensorNames) {
+      std::string viewType = GetViewConstType(name);
+      fGC += SP + viewType + " const view_" + name +
+             "{alpaka::getPtrNative(deviceBuf_" + name + "), devAcc, alpaka::getExtents(deviceBuf_" + name + ")};\n";
+      typedImplArgs.push_back("view_" + name);
+   }
+
+   fGC += SP + "_infer_impl(";
+   for (size_t i = 0; i < typedImplArgs.size(); i++) {
+      if (i > 0) fGC += ", ";
+      fGC += typedImplArgs[i];
+   }
+   fGC += ");\n";
+
+   // Return the member output buffer(s)
+   fGC += SP + "return ";
+   if (outputSize > 1) fGC += "{";
+   for (size_t i = 0; i < outputSize; i++) {
+      std::string tensorName = *(fOutputTensorNames.begin() + i);
+      fGC += "deviceBuf_" + tensorName;
+      if (i < outputSize - 1) fGC += ",";
+   }
+   if (outputSize > 1) fGC += "}";
+   fGC += ";\n";
+   fGC += "}\n";
 }
 
 void RModel::GenerateSessionCode_GPU_ALPAKA() {
@@ -288,6 +411,15 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
     fGC += "using BufD1D = alpaka::Buf<Acc, double, Dim, Idx>;\n";
     fGC += "using BufI641D = alpaka::Buf<Acc, int64_t, Dim, Idx>;\n";
     fGC += "using BufUI81D = alpaka::Buf<Acc, uint8_t, Dim, Idx>;\n\n";
+    fGC += "// Non-owning device view types (ViewPlainPtr) for the span-based infer interface\n";
+    fGC += "using ViewF1D = alpaka::ViewPlainPtr<DevAcc, float, Dim, Idx>;\n";
+    fGC += "using ViewConstF1D = alpaka::ViewPlainPtr<DevAcc, const float, Dim, Idx>;\n";
+    fGC += "using ViewD1D = alpaka::ViewPlainPtr<DevAcc, double, Dim, Idx>;\n";
+    fGC += "using ViewConstD1D = alpaka::ViewPlainPtr<DevAcc, const double, Dim, Idx>;\n";
+    fGC += "using ViewI641D = alpaka::ViewPlainPtr<DevAcc, int64_t, Dim, Idx>;\n";
+    fGC += "using ViewConstI641D = alpaka::ViewPlainPtr<DevAcc, const int64_t, Dim, Idx>;\n";
+    fGC += "using ViewUI81D = alpaka::ViewPlainPtr<DevAcc, uint8_t, Dim, Idx>;\n";
+    fGC += "using ViewConstUI81D = alpaka::ViewPlainPtr<DevAcc, const uint8_t, Dim, Idx>;\n\n";
 
     fGC += "\nalpaka::Platform<Acc> const platform{};\n";
     fGC += "DevAcc devAcc = alpaka::getDevByIdx(platform, 0);\n";

@@ -174,6 +174,9 @@ public:
    // used to infer the sub-graphs
    std::string GenerateInferSignature_GPU_ALPAKA(bool isdecl = true);
 
+   // generate the _infer_impl signature using ViewPlainPtr types instead of Buf types
+   std::string GenerateImplSignature_GPU_ALPAKA(bool isdecl = true);
+
    void RemoveIntermediateTensor(const std::string& tensor_name){
       fIntermediateTensorInfos.erase(tensor_name);
    }

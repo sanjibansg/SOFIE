@@ -83,6 +83,7 @@ void RModel_Base::GenerateHeaderInfo_GPU_ALPAKA(std::string& hgname) {
     }
     fGC += "#include <alpaka/alpaka.hpp>\n";
     fGC += "#include <sofieBLAS/sofieBLAS.hpp>\n";
+    fGC += "#include <span>\n";
 
     // for the session we need to include SOFIE_Common functions
     //needed for convolution operator (need to add a flag)

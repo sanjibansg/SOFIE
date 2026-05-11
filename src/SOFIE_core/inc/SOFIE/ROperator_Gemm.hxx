@@ -496,10 +496,12 @@ namespace SOFIE{
          }
          // in the case of bias
          if (!fNC.empty()){
+            // Use getPtrNative() for all args so the raw-pointer overload is selected regardless
+            // of whether each buffer is a BufXxx (member weight/bias/output) or ViewPlainPtr (input view).
             if (fActivation == EActivationType::RELU){
-               out << SP << "blas.gemmrelu("<<opName<<"_transB, "<<opName<<"_transA, "<<opName<<"_n, "<<opName<<"_m, "<<opName<<"_k, "<< opName << "_alpha, deviceBuf_"<<fNB<<",  "<<"deviceBuf_"<<fNA<<", "<<opName << "_beta, deviceBuf_"<<fNC<<", deviceBuf_"<<fNY<<");\n";
+               out << SP << "blas.gemmrelu("<<opName<<"_transB, "<<opName<<"_transA, "<<opName<<"_n, "<<opName<<"_m, "<<opName<<"_k, "<< opName << "_alpha, alpaka::getPtrNative(deviceBuf_"<<fNB<<"), alpaka::getPtrNative(deviceBuf_"<<fNA<<"), "<<opName << "_beta, alpaka::getPtrNative(deviceBuf_"<<fNC<<"), alpaka::getPtrNative(deviceBuf_"<<fNY<<"));\n";
             } else {
-               out << SP << "blas.gemm("<<opName<<"_transB, "<<opName<<"_transA, "<<opName<<"_n, "<<opName<<"_m, "<<opName<<"_k, "<< opName << "_alpha, deviceBuf_"<<fNB<<",  "<<"deviceBuf_"<<fNA<<", "<<opName << "_beta, deviceBuf_"<<fNC<<", deviceBuf_"<<fNY<<");\n";
+               out << SP << "blas.gemm("<<opName<<"_transB, "<<opName<<"_transA, "<<opName<<"_n, "<<opName<<"_m, "<<opName<<"_k, "<< opName << "_alpha, alpaka::getPtrNative(deviceBuf_"<<fNB<<"), alpaka::getPtrNative(deviceBuf_"<<fNA<<"), "<<opName << "_beta, alpaka::getPtrNative(deviceBuf_"<<fNC<<"), alpaka::getPtrNative(deviceBuf_"<<fNY<<"));\n";
             }
          }
          // need to implement for matmul case without bias
