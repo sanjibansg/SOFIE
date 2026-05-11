@@ -227,6 +227,89 @@ public:
       return out.str();
    }
 
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      if (fShapeX.empty())
+         throw std::runtime_error("TMVA SOFIE BatchNormalization called to Generate without being initialized first");
+
+      std::size_t totalElements = ConvertShapeToLength(fShapeY);
+
+      std::string kname = "BatchNormKernel_" + opName;
+      std::string op;
+      op  = "\n//------ BATCHNORM_KERNEL_ALPAKA\n";
+      op += SP + "struct " + kname + " {\n";
+      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
+      op += SP + SP + SP + "TAcc const& acc,\n";
+      op += SP + SP + SP + "T const* __restrict__ X,\n";
+      op += SP + SP + SP + "T const* __restrict__ scale,\n";
+      op += SP + SP + SP + "T const* __restrict__ bias,\n";
+      op += SP + SP + SP + "T const* __restrict__ mean,\n";
+      op += SP + SP + SP + "T* __restrict__ Y,\n";
+      op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
+
+      op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (global_thread_idx >= totalElements) return;\n";
+      op += SP + SP + SP + "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+
+      op += SP + SP + SP + "for (std::size_t i = global_thread_idx; i < totalElements; i += grid_thread_extent) {\n";
+
+      op += SP + SP + SP + SP + "T val = (X[i] - mean[i]) * scale[i] + bias[i];\n";
+
+      if (fActivation == EActivationType::RELU)
+         op += SP + SP + SP + SP + "Y[i] = val > static_cast<T>(0) ? val : static_cast<T>(0);\n";
+      else
+         op += SP + SP + SP + SP + "Y[i] = val;\n";
+
+      op += SP + SP + SP + "}\n";
+      op += SP + SP + "}\n";
+      op += SP + "};\n";
+
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      std::string kname = "BatchNormKernel_" + opName;
+      return SP + kname + " batchNormKernel_" + opName + ";\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      if (fShapeX.empty())
+         throw std::runtime_error("TMVA SOFIE BatchNormalization called to Generate without being initialized first");
+
+      std::size_t totalElements = ConvertShapeToLength(fShapeY);
+      std::string kname = "batchNormKernel_" + opName;
+
+      std::stringstream out;
+      out << "\n//------ BATCHNORM_GPU_ALPAKA\n";
+      out << SP << "auto const elementsPerThread_" << fNY << " = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_"   << fNY << " = Vec::all(Idx{" << totalElements << "});\n";
+      out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << fNY
+         << " = {elementsPerGrid_" << fNY << ", elementsPerThread_" << fNY << "};\n";
+      out << SP << "auto const workDiv_" << fNY << " = alpaka::getValidWorkDiv(kernelCfg_" << fNY
+         << ", devAcc, " << kname
+         << ", alpaka::getPtrNative(deviceBuf_" << fNX     << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << fNScale << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << fNB     << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << fNMean  << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << fNY     << ")"
+         << ", static_cast<Idx>(" << totalElements << "));\n";
+      
+      out << SP << "auto task_" << fNY << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNY
+         << ", " << kname
+         << ", alpaka::getPtrNative(deviceBuf_" << fNX     << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << fNScale << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << fNB     << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << fNMean  << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << fNY     << ")"
+         << ", static_cast<Idx>(" << totalElements << "));\n";
+      out << SP <<"alpaka::enqueue(queue, task_" << fNY << ");\n";
+      
+      return out.str();
+   }
+
    std::vector<std::string> GetBlasRoutines() override { return { std::string("Copy"), std::string("Axpy") }; }
 };
 
