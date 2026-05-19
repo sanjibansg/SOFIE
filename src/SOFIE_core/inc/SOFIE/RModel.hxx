@@ -45,6 +45,24 @@ private:
    MemoryPoolInfo fIntermediateMemoryInfo;    ///<!  intermediate memory info (transient)
    std::unordered_map<std::string_view, size_t> fIntermediateTensorFrequencyLookup;    ///<!  lookup table for intermediate tensor frequency (transient)
 
+   // GPU ALPAKA elementwise kernel fusion state (transient, computed in GenerateGPU_ALPAKA)
+   struct EltwiseFusionGroup {
+      std::vector<size_t> opIndices; ///< consecutive op indices forming this group
+      std::string inputTensor;       ///< input tensor name of the first op
+      std::string outputTensor;      ///< output tensor name of the last op
+      size_t numElements = 0;
+      bool isFused() const { return opIndices.size() > 1; }
+      std::string suffix() const {
+         std::string s;
+         for (auto i : opIndices) s += "_" + std::to_string(i);
+         return s;
+      }
+   };
+   std::vector<EltwiseFusionGroup> fEltwiseFusionGroups; ///<!
+   std::unordered_map<size_t, size_t> fOpToFusionGroupIdx; ///<!  op_idx -> fusion group index
+   std::set<std::string> fFusionIntermediateTensors;        ///<!  intermediate tensors whose alloc is skipped
+   void ComputeEltwiseFusionGroups();
+
 public:
    // Rule of five: explicitly define move semantics, disallow copy
    RModel(RModel &&other);

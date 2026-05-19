@@ -80,6 +80,11 @@ public:
    virtual std::string GetBlasConfig() { return ""; }
    virtual void UpdateFusableTensorName(std::string, const std::function<void(const std::string&)>& removal_func){ return;};
 
+   // Elementwise kernel fusion interface
+   virtual bool IsElementwise() const { return false; }
+   // Returns the C++ expression applying this op to inputVar (a local T variable) for fused kernel generation
+   virtual std::string GetElementwiseExpr(const std::string& /*inputVar*/) const { return ""; }
+
    //virtual void Forward_reference() = 0;
    //virtual void Forward_blas() = 0;
    virtual ~ROperator(){}

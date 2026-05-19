@@ -316,6 +316,249 @@ public:
       return out.str();
    }
 
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      if (fShapeX.empty())
+         throw std::runtime_error("TMVA::SOFIE LayerNormalization called to Generate without being initialized first");
+
+      // Each thread handles one "row" — one element of the axes dims [0..axis)
+      // and iterates over all normalized dims [axis..size)
+      // axesLength = product of fShapeX[0..axis)
+      // normalizedLength = product of fShapeX[axis..size)
+      // totalElements = axesLength (one thread per row)
+
+      std::vector<std::string> inputShape(fSize);
+      for (size_t i = 0; i < fSize; i++)
+         inputShape[i] = fShapeX[i].GetVal();
+
+      auto strides      = UTILITY::ComputeStrideFromShape(fShapeX);
+      auto scaleStrides = UTILITY::ComputeStrideFromShape(fShapeScale);
+      auto biasStrides  = (!fNB.empty()) ? UTILITY::ComputeStrideFromShape(fShapeB)
+                                          : std::vector<Dim>{};
+      auto axesStrides  = UTILITY::ComputeStrideFromShape(fAxesShape);
+
+      // Build index expressions reusing the same logic as Generate()
+      // input index: axis_0*stride0 + axis_1*stride1 + ... + norm_0*stride_axis + ...
+      // For the kernel we decompose the linear thread index into axis coords,
+      // then loop over normalized dims inside the kernel.
+
+      std::string kname = "LayerNormKernel_" + opName;
+      std::string op;
+      op  = "\n//------ LAYERNORM_KERNEL_ALPAKA\n";
+      op += SP + "struct " + kname + " {\n";
+      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
+      op += SP + SP + SP + "TAcc const& acc,\n";
+      op += SP + SP + SP + "T const* __restrict__ X,\n";
+      op += SP + SP + SP + "T const* __restrict__ scale,\n";
+      if (!fNB.empty())
+         op += SP + SP + SP + "T const* __restrict__ bias,\n";
+      if (!fNMean.empty())
+         op += SP + SP + SP + "T* __restrict__ out_mean,\n";
+      if (!fNInvStdDev.empty())
+         op += SP + SP + SP + "T* __restrict__ out_invstd,\n";
+      op += SP + SP + SP + "T* __restrict__ Y,\n";
+      op += SP + SP + SP + "std::size_t const axesLength) const {\n\n";
+
+      op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (global_thread_idx >= axesLength) return;\n";
+      op += SP + SP + SP + "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+
+      op += SP + SP + SP + "for (std::size_t row = global_thread_idx; row < axesLength; row += grid_thread_extent) {\n\n";
+
+      // Decompose row into per-axes-dim coords using compile-time strides
+      if (fAxis > 0) {
+         for (size_t i = 0; i < fAxis; ++i) {
+               op += SP + SP + SP + SP + "std::size_t const axis_" + std::to_string(i)
+                  + " = (row / " + axesStrides[i].GetVal() + "u) % "
+                  + inputShape[i] + "u;\n";
+         }
+         op += "\n";
+      }
+
+      // Base input offset for this row (contribution from axes dims only)
+      op += SP + SP + SP + SP + "std::size_t const row_base =\n";
+      if (fAxis == 0) {
+         op += SP + SP + SP + SP + SP + "0u;\n\n";
+      } else {
+         for (size_t i = 0; i < fAxis; ++i) {
+               op += SP + SP + SP + SP + SP + "axis_" + std::to_string(i)
+                  + " * " + strides[i].GetVal() + "u";
+               op += (i + 1 < fAxis) ? " +\n" : ";\n\n";
+         }
+      }
+
+      // Scale index base (from axes dims)
+      op += SP + SP + SP + SP + "std::size_t const scale_base =\n";
+      {
+         bool any = false;
+         for (size_t i = 0; i < fAxis; ++i) {
+               if (fShapeScale[i].dim != 1) {
+                  op += SP + SP + SP + SP + SP + "axis_" + std::to_string(i)
+                     + " * " + scaleStrides[i].GetVal() + "u";
+                  if (any) op = " +\n" + op;
+                  any = true;
+               }
+         }
+         if (!any) op += SP + SP + SP + SP + SP + "0u";
+         op += ";\n\n";
+      }
+
+      if (!fNB.empty()) {
+         op += SP + SP + SP + SP + "std::size_t const bias_base =\n";
+         bool any = false;
+         for (size_t i = 0; i < fAxis; ++i) {
+               if (fShapeB[i].dim != 1) {
+                  op += SP + SP + SP + SP + SP + "axis_" + std::to_string(i)
+                     + " * " + biasStrides[i].GetVal() + "u";
+                  if (any) op = " +\n" + op;
+                  any = true;
+               }
+         }
+         if (!any) op += SP + SP + SP + SP + SP + "0u";
+         op += ";\n\n";
+      }
+
+      // ---- Pass 1: compute mean ----
+      op += SP + SP + SP + SP + "T mean = static_cast<T>(0);\n";
+
+      // Unroll normalized dims loop for mean
+      for (size_t j = fAxis; j < fSize; ++j)
+         op += SP + SP + SP + SP + "for (std::size_t n_" + std::to_string(j)
+               + " = 0; n_" + std::to_string(j) + " < " + inputShape[j]
+               + "u; n_" + std::to_string(j) + "++) {\n";
+
+      // Normalized dim index
+      op += SP + SP + SP + SP + SP + "std::size_t const norm_idx = row_base";
+      for (size_t j = fAxis; j < fSize; ++j)
+         op += " + n_" + std::to_string(j) + " * " + strides[j].GetVal() + "u";
+      op += ";\n";
+      op += SP + SP + SP + SP + SP + "mean += X[norm_idx];\n";
+
+      for (size_t j = fAxis; j < fSize; ++j)
+         op += SP + SP + SP + SP + "}\n";
+
+      op += SP + SP + SP + SP + "mean /= static_cast<T>(" + fNormalizedLength + ");\n\n";
+
+      // ---- Pass 2: compute variance ----
+      op += SP + SP + SP + SP + "T sum = static_cast<T>(0);\n";
+
+      for (size_t j = fAxis; j < fSize; ++j)
+         op += SP + SP + SP + SP + "for (std::size_t n_" + std::to_string(j)
+               + " = 0; n_" + std::to_string(j) + " < " + inputShape[j]
+               + "u; n_" + std::to_string(j) + "++) {\n";
+
+      op += SP + SP + SP + SP + SP + "std::size_t const norm_idx = row_base";
+      for (size_t j = fAxis; j < fSize; ++j)
+         op += " + n_" + std::to_string(j) + " * " + strides[j].GetVal() + "u";
+      op += ";\n";
+      op += SP + SP + SP + SP + SP + "T tmp = X[norm_idx] - mean;\n";
+      op += SP + SP + SP + SP + SP + "sum += tmp * tmp;\n";
+
+      for (size_t j = fAxis; j < fSize; ++j)
+         op += SP + SP + SP + SP + "}\n";
+
+      op += SP + SP + SP + SP + "T const invStdDev = static_cast<T>(1) / "
+         "alpaka::math::sqrt(acc, sum / static_cast<T>("
+         + fNormalizedLength + ") + static_cast<T>(" + std::to_string(fAttrEpsilon) + "));\n\n";
+
+      // Save mean and invstd if requested
+      if (!fNMean.empty())
+         op += SP + SP + SP + SP + "out_mean[row]   = mean;\n";
+      if (!fNInvStdDev.empty())
+         op += SP + SP + SP + SP + "out_invstd[row] = invStdDev;\n";
+      op += "\n";
+
+      // ---- Pass 3: normalize, scale, bias ----
+      for (size_t j = fAxis; j < fSize; ++j)
+         op += SP + SP + SP + SP + "for (std::size_t n_" + std::to_string(j)
+               + " = 0; n_" + std::to_string(j) + " < " + inputShape[j]
+               + "u; n_" + std::to_string(j) + "++) {\n";
+
+      op += SP + SP + SP + SP + SP + "std::size_t const norm_idx = row_base";
+      for (size_t j = fAxis; j < fSize; ++j)
+         op += " + n_" + std::to_string(j) + " * " + strides[j].GetVal() + "u";
+      op += ";\n";
+
+      // Scale index (normalized dims contribution)
+      op += SP + SP + SP + SP + SP + "std::size_t const s_idx = scale_base";
+      for (size_t j = fAxis; j < fSize; ++j) {
+         if (fShapeScale[j].dim != 1)
+               op += " + n_" + std::to_string(j) + " * " + scaleStrides[j].GetVal() + "u";
+      }
+      op += ";\n";
+
+      op += SP + SP + SP + SP + SP + "T val = scale[s_idx] * invStdDev * (X[norm_idx] - mean);\n";
+
+      if (!fNB.empty()) {
+         op += SP + SP + SP + SP + SP + "std::size_t const b_idx = bias_base";
+         for (size_t j = fAxis; j < fSize; ++j) {
+               if (fShapeB[j].dim != 1)
+                  op += " + n_" + std::to_string(j) + " * " + biasStrides[j].GetVal() + "u";
+         }
+         op += ";\n";
+         op += SP + SP + SP + SP + SP + "val += bias[b_idx];\n";
+      }
+
+      op += SP + SP + SP + SP + SP + "Y[norm_idx] = val;\n";
+
+      for (size_t j = fAxis; j < fSize; ++j)
+         op += SP + SP + SP + SP + "}\n";
+
+      op += SP + SP + SP + "}\n";   // end row loop
+      op += SP + SP + "}\n";        // end operator()
+      op += SP + "};\n";            // end struct
+
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      std::string kname = "LayerNormKernel_" + opName;
+      return SP + kname + " layerNormKernel_" + opName + ";\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      if (fShapeX.empty())
+         throw std::runtime_error("TMVA::SOFIE LayerNormalization called to Generate without being initialized first");
+
+      // One thread per row (per axes element)
+      // axesLength is known at generation time for static shapes
+      std::string axesLengthStr = fAxesLength;
+      // For static models fAxesLength is a number string; use it directly
+      // For dynamic models it may be a param expression — still valid in generated code
+
+      std::string kname = "layerNormKernel_" + opName;
+
+      std::stringstream out;
+      out << "\n//------ LAYERNORM_GPU_ALPAKA\n";
+      out << SP << "auto const elementsPerThread_" << opName << " = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_"   << opName << " = Vec::all(Idx{" << axesLengthStr << "});\n";
+      out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << opName
+         << " = {elementsPerGrid_" << opName << ", elementsPerThread_" << opName << "};\n";
+
+      // Build argument list
+      std::string args =
+         "alpaka::getPtrNative(deviceBuf_" + fNX + "), "
+         + "alpaka::getPtrNative(deviceBuf_" + fNScale + ")";
+      if (!fNB.empty())
+         args += ", alpaka::getPtrNative(deviceBuf_" + fNB + ")";
+      if (!fNMean.empty())
+         args += ", alpaka::getPtrNative(deviceBuf_" + fNMean + ")";
+      if (!fNInvStdDev.empty())
+         args += ", alpaka::getPtrNative(deviceBuf_" + fNInvStdDev + ")";
+      args += ", alpaka::getPtrNative(deviceBuf_" + fNY + ")";
+      args += ", static_cast<Idx>(" + axesLengthStr + ")";
+
+      out << SP << "auto const workDiv_" << opName << " = alpaka::getValidWorkDiv(kernelCfg_" << opName
+         << ", devAcc, " << kname << ", " << args << ");\n";
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << opName
+         << ", " << kname << ", " << args << ");\n";
+
+      return out.str();
+   }
+
    std::vector<std::string> GetBlasRoutines() override { return { std::string("Axpy") }; }
 
    std::vector<std::string> GetStdLibs() override { return { std::string("cmath") }; }

@@ -1,8 +1,10 @@
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <limits>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 #ifdef SOFIE_SUPPORT_ROOT_BINARY
 #include "TFile.h"
@@ -12,6 +14,88 @@
 #include "SOFIE/SOFIE_common.hxx"
 
 namespace SOFIE {
+
+void RModel::ComputeEltwiseFusionGroups() {
+   fEltwiseFusionGroups.clear();
+   fOpToFusionGroupIdx.clear();
+   fFusionIntermediateTensors.clear();
+
+   // Build tensor -> consumer op indices map
+   std::unordered_map<std::string, std::vector<size_t>> tensorConsumers;
+   for (size_t i = 0; i < fOperators.size(); i++) {
+      for (const auto& name : fOperators[i]->GetOpInputTensors())
+         tensorConsumers[std::string(name)].push_back(i);
+   }
+
+   // Returns true if tensorName is safe to treat as a fusion intermediate:
+   // consumed by exactly one op AND not a model output.
+   auto isFuseSafe = [&](const std::string& tensorName) -> bool {
+      for (const auto& outName : fOutputTensorNames)
+         if (outName == tensorName) return false;
+      auto it = tensorConsumers.find(tensorName);
+      return it != tensorConsumers.end() && it->second.size() == 1;
+   };
+
+   std::vector<bool> opAssigned(fOperators.size(), false);
+
+   for (size_t i = 0; i < fOperators.size(); i++) {
+      if (opAssigned[i]) continue;
+      opAssigned[i] = true;
+
+      EltwiseFusionGroup group;
+      group.opIndices.push_back(i);
+
+      auto firstInputs = fOperators[i]->GetOpInputTensors();
+      group.inputTensor = firstInputs.empty() ? "" : std::string(firstInputs[0]);
+
+      // Extend chain: only if CURRENT op is elementwise and its single output can be fused
+      size_t current = i;
+      while (fOperators[current]->IsElementwise()) {
+         auto curOutputs = fOperators[current]->GetOpOutputTensors();
+         if (curOutputs.size() != 1) break;
+         std::string curOut = std::string(curOutputs[0]);
+         if (!isFuseSafe(curOut)) break;
+
+         size_t nextIdx = tensorConsumers.find(curOut)->second[0];
+         // Must be strictly the next op in sequence and itself elementwise with single input
+         if (nextIdx != current + 1) break;
+         if (opAssigned[nextIdx]) break;
+         if (!fOperators[nextIdx]->IsElementwise()) break;
+         auto nextInputs = fOperators[nextIdx]->GetOpInputTensors();
+         if (nextInputs.size() != 1) break;
+
+         opAssigned[nextIdx] = true;
+         group.opIndices.push_back(nextIdx);
+         current = nextIdx;
+      }
+
+      // Output tensor is the last op's output
+      auto lastOutputs = fOperators[current]->GetOpOutputTensors();
+      group.outputTensor = lastOutputs.empty() ? "" : std::string(lastOutputs[0]);
+
+      // Element count from intermediate tensor info (all op outputs are intermediates)
+      if (!group.outputTensor.empty()) {
+         auto it = fIntermediateTensorInfos.find(group.outputTensor);
+         if (it != fIntermediateTensorInfos.end())
+            group.numElements = ConvertShapeToLength(it->second.shape);
+      }
+
+      size_t gIdx = fEltwiseFusionGroups.size();
+      for (auto opIdx : group.opIndices)
+         fOpToFusionGroupIdx[opIdx] = gIdx;
+
+      // Mark all-but-last outputs as fusion intermediates (skip allocation)
+      if (group.isFused()) {
+         for (size_t k = 0; k + 1 < group.opIndices.size(); k++) {
+            auto midOuts = fOperators[group.opIndices[k]]->GetOpOutputTensors();
+            if (!midOuts.empty())
+               fFusionIntermediateTensors.insert(std::string(midOuts[0]));
+         }
+      }
+
+      fEltwiseFusionGroups.push_back(std::move(group));
+   }
+}
 
 void RModel::GenerateInitializedTensorInfo_GPU_ALPAKA() {
    if (!fInitializedTensors.empty()){
@@ -62,6 +146,8 @@ void RModel::GenerateGPU_ALPAKA_Buffers() {
       std::string tensor_declaration_block = "";
 
       for (auto &i : fIntermediateTensorInfos) {
+         // Skip tensors that are purely intermediate within a fused kernel chain
+         if (fFusionIntermediateTensors.count(i.first)) continue;
 
          size_t length = ConvertShapeToLength(i.second.shape);
 
@@ -252,10 +338,40 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    fGC += GenerateImplSignature_GPU_ALPAKA();
    fGC += "){\n";
 
+   std::set<size_t> fusedGroupsLaunched;
    for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
       if (fVerbose)
          std::cout << "Generating code for operator .... " << op_idx << std::endl;
-      fGC += fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx));
+
+      auto gIt = fOpToFusionGroupIdx.find(op_idx);
+      size_t gIdx = (gIt != fOpToFusionGroupIdx.end()) ? gIt->second : SIZE_MAX;
+      bool inFusedGroup = (gIdx != SIZE_MAX) && fEltwiseFusionGroups[gIdx].isFused();
+
+      if (inFusedGroup) {
+         // Only emit the fused kernel launch once, at the chain leader
+         if (fEltwiseFusionGroups[gIdx].opIndices[0] == op_idx && !fusedGroupsLaunched.count(gIdx)) {
+            const auto& grp = fEltwiseFusionGroups[gIdx];
+            std::string sfx = grp.suffix();
+            std::string kname = "fusedEltwiseKernel" + sfx;
+            fGC += "\n//------ FUSED_ELTWISE_GPU_ALPAKA" + sfx + "\n";
+            fGC += SP + "{\n";
+            fGC += SP + SP + "auto const elementsPerThread_fused" + sfx + " = Vec::all(static_cast<Idx>(1));\n";
+            fGC += SP + SP + "auto const elementsPerGrid_fused" + sfx + " = Vec::all(Idx{" + std::to_string(grp.numElements) + "});\n";
+            fGC += SP + SP + "alpaka::KernelCfg<Acc> const cfg_fused" + sfx + " = {elementsPerGrid_fused" + sfx + ", elementsPerThread_fused" + sfx + "};\n";
+            fGC += SP + SP + "auto const workDiv_fused" + sfx + " = alpaka::getValidWorkDiv(cfg_fused" + sfx + ", devAcc, " + kname +
+                   ", alpaka::getPtrNative(deviceBuf_" + grp.inputTensor + "), alpaka::getPtrNative(deviceBuf_" + grp.outputTensor +
+                   "), static_cast<Idx>(" + std::to_string(grp.numElements) + "));\n";
+            fGC += SP + SP + "auto task_fused" + sfx + " = alpaka::createTaskKernel<Acc>(workDiv_fused" + sfx + ", " + kname +
+                   ", alpaka::getPtrNative(deviceBuf_" + grp.inputTensor + "), alpaka::getPtrNative(deviceBuf_" + grp.outputTensor +
+                   "), static_cast<Idx>(" + std::to_string(grp.numElements) + "));\n";
+            fGC += SP + SP + "alpaka::enqueue(queue, task_fused" + sfx + ");\n";
+            fGC += SP + "}\n";
+            fusedGroupsLaunched.insert(gIdx);
+         }
+         // Chain followers: skip — their logic is inside the fused kernel
+      } else {
+         fGC += fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx));
+      }
    }
    fGC += "\n\n   alpaka::wait(queue);\n";
    fGC += "}\n\n";
@@ -347,8 +463,9 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
 }
 
 void RModel::GenerateSessionCode_GPU_ALPAKA() {
-   
+
    std::set<SOFIE::OperatorKind> registered_operators;
+   std::set<size_t> fusedGroupsEmitted; // tracks which fusion groups have had their struct/decl emitted
    std::set<SOFIE::OperatorKind> single_initialized_operators = {
       SOFIE::OperatorKind::RELU,
       SOFIE::OperatorKind::SIGMOID,
@@ -370,24 +487,54 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
    bool OpNeedsBlas = false;
 
-   // single initiation operators must only be initialized only once and their count should be stored in the registered_operators set to avoid generating multiple kernels for the same operator kind
+   // Generate kernel struct declarations, accounting for elementwise fusion groups.
+   // For fused chains (≥2 elementwise ops), a single FusedEltwiseKernel is generated
+   // instead of individual kernel structs for the participating ops.
    fGC += "\n//--- ALPAKA Kernels\n";
    for (size_t id = 0; id < fOperators.size(); id++) {
       if(fOperators[id]->GetKind() == OperatorKind::GEMM || fOperators[id]->GetKind() == OperatorKind::CONV) {
          OpNeedsBlas = true;
       }
-      if(single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
-         if(registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+
+      auto gIt = fOpToFusionGroupIdx.find(id);
+      size_t gIdx = (gIt != fOpToFusionGroupIdx.end()) ? gIt->second : SIZE_MAX;
+      bool inFusedGroup = (gIdx != SIZE_MAX) && fEltwiseFusionGroups[gIdx].isFused();
+
+      if (inFusedGroup) {
+         // Only emit the fused kernel struct once, at the chain leader
+         if (fEltwiseFusionGroups[gIdx].opIndices[0] == id && !fusedGroupsEmitted.count(gIdx)) {
+            const auto& grp = fEltwiseFusionGroups[gIdx];
+            std::string sfx = grp.suffix();
+            fGC += "\n//------ FUSED_ELTWISE_KERNEL" + sfx + "\n";
+            fGC += "struct FusedEltwiseKernel" + sfx + " {\n";
+            fGC += SP + "template<typename TAcc, typename T>\n";
+            fGC += SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc, T const* __restrict__ data, T* __restrict__ out, std::size_t n) const {\n";
+            fGC += SP + SP + "const auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+            fGC += SP + SP + "if (idx < n) {\n";
+            fGC += SP + SP + SP + "T v = data[idx];\n";
+            for (size_t opIdx : grp.opIndices)
+               fGC += SP + SP + SP + "v = " + fOperators[opIdx]->GetElementwiseExpr("v") + ";\n";
+            fGC += SP + SP + SP + "out[idx] = v;\n";
+            fGC += SP + SP + "}\n";
+            fGC += SP + "}\n";
+            fGC += "};\n";
+            fusedGroupsEmitted.insert(gIdx);
+         }
+         // Chain followers: skip (their logic is inside the fused kernel)
+      } else {
+         // Unfused op: generate individual kernel struct (with dedup for single_initialized_operators)
+         if (single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
+            if (registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
                if (fVerbose)
-               std::cout<<"Generating ALPAKA kernel for operator"<< toString(fOperators[id]->GetKind()) << std::endl;
-            
+                  std::cout << "Generating ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
                fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
                registered_operators.insert(fOperators[id]->GetKind());
+            }
+         } else {
+            if (fVerbose)
+               std::cout << "Generating ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
+            fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
          }
-      } else {
-         if (fVerbose)
-         std::cout<<"Generating ALPAKA kernel for operator"<< toString(fOperators[id]->GetKind()) << std::endl;
-         fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
       }
    }
 
@@ -493,23 +640,32 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    }
 
    registered_operators.clear();
+   fusedGroupsEmitted.clear();
 
    for (size_t id = 0; id < fOperators.size(); id++) {
+      auto gIt = fOpToFusionGroupIdx.find(id);
+      size_t gIdx = (gIt != fOpToFusionGroupIdx.end()) ? gIt->second : SIZE_MAX;
+      bool inFusedGroup = (gIdx != SIZE_MAX) && fEltwiseFusionGroups[gIdx].isFused();
 
-      if(single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
-         
-         if(registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
-            
-            if (fVerbose)
-            std::cout<<"Declaring ALPAKA kernel for operator"<< toString(fOperators[id]->GetKind()) << std::endl;
-         
-            fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
-            registered_operators.insert(fOperators[id]->GetKind());
+      if (inFusedGroup) {
+         if (fEltwiseFusionGroups[gIdx].opIndices[0] == id && !fusedGroupsEmitted.count(gIdx)) {
+            std::string sfx = fEltwiseFusionGroups[gIdx].suffix();
+            fGC += SP + "FusedEltwiseKernel" + sfx + " fusedEltwiseKernel" + sfx + ";\n";
+            fusedGroupsEmitted.insert(gIdx);
          }
       } else {
-         if (fVerbose)
-         std::cout<<"Declaring ALPAKA kernel for operator"<< toString(fOperators[id]->GetKind()) << std::endl;
-         fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
+         if (single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
+            if (registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+               if (fVerbose)
+                  std::cout << "Declaring ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
+               fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
+               registered_operators.insert(fOperators[id]->GetKind());
+            }
+         } else {
+            if (fVerbose)
+               std::cout << "Declaring ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
+            fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
+         }
       }
    }
 
@@ -546,6 +702,7 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
       throw std::runtime_error("SOFIE GPU does not yet supports GNN Inference.");
 
    Initialize(batchSize, verbose);
+   ComputeEltwiseFusionGroups();
 
    std::string hgname;
    if (!fIsSubGraph) {

@@ -197,6 +197,11 @@ public:
          return {};
       }
    }
+
+   bool IsElementwise() const override { return !fIsOutputConstant; }
+   std::string GetElementwiseExpr(const std::string& v) const override {
+      return UnaryOpTraits<T, Op>::Op(v);
+   }
 };
 
 } // namespace SOFIE

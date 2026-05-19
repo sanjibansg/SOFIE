@@ -107,6 +107,11 @@ public:
       return fNY;
    }
 
+   bool IsElementwise() const override { return true; }
+   std::string GetElementwiseExpr(const std::string& v) const override {
+      return "static_cast<T>(1) / (static_cast<T>(1) + exp(-(" + v + ")))";
+   }
+
    void UpdateFusableTensorName(std::string fusable_tensor_name, const std::function<void(const std::string&)>& removal_func){
       removal_func(fNX);
       removal_func(fNY);
