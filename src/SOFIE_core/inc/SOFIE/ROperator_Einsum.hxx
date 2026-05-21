@@ -47,7 +47,7 @@ public:
 
       // parse teh equations to find labels
       if (!ParseEquation(equation))
-         throw std::runtime_error("TMVA SOFIE Einsum Op: Error parsing the equation " + equation);
+         throw std::runtime_error("SOFIE Einsum Op: Error parsing the equation " + equation);
 
       fInputTensorNames.resize(fNInputs.size());
       std::transform(fNInputs.begin(), fNInputs.end(), fInputTensorNames.begin(),
@@ -129,7 +129,7 @@ public:
       std::map<char, int> labelsMap;
       for ( auto & name : fNInputs) {
          if (!model.CheckIfTensorAlreadyExist(name))
-            throw std::runtime_error(std::string("TMVA SOFIE Einsum Op Input Tensor ") + name + "is not found in model");
+            throw std::runtime_error(std::string("SOFIE Einsum Op Input Tensor ") + name + "is not found in model");
 
          // if (model.IsDynamicTensor(name) || model.IsDimInputTensor(name) ) {
          //    // not yet supported
@@ -141,7 +141,7 @@ public:
          std::string labels = fInputLabels[i];
          for (size_t j = 0; j < shape.size(); j++) {
             if (j >= labels.length()) {
-               throw std::runtime_error(std::string("TMVA SOFIE Einsum Op Input Tensor has invalid label or shape ") + labels + " " + ConvertShapeToString(shape));
+               throw std::runtime_error(std::string("SOFIE Einsum Op Input Tensor has invalid label or shape ") + labels + " " + ConvertShapeToString(shape));
             }
             labelsMap[labels[j]] = shape[j];
          }
@@ -150,7 +150,7 @@ public:
       // get output shape from label maps
       for (char l : fOutputLabels) {
          if (labelsMap.count(l) == 0)
-            throw std::runtime_error(std::string("TMVA SOFIE Einsum Op : output label ") + std::string(&l) + " is not present in inputs");
+            throw std::runtime_error(std::string("SOFIE Einsum Op : output label ") + std::string(&l) + " is not present in inputs");
          fShapeY.push_back(labelsMap[l]);
       }
       // we need to get the labels we are going to sum
@@ -210,7 +210,7 @@ public:
       opName = "op_" + opName;
 
       if (fShapeY.size() != fOutputLabels.length()) {
-         throw std::runtime_error("TMVA SOFIE Einsum Op called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Einsum Op called to Generate without being initialized first");
       }
 
       // function to write compute expression index from strides

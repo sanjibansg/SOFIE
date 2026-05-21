@@ -46,23 +46,23 @@ public:
 
    void Initialize(RModel& model) override {
       if (model.CheckIfTensorAlreadyExist(fNInput) == false)
-         throw std::runtime_error("TMVA SOFIE Tile Op Input Tensor is not found in model");
+         throw std::runtime_error("SOFIE Tile Op Input Tensor is not found in model");
       if (model.CheckIfTensorAlreadyExist(fNRepeats) == false)
-         throw std::runtime_error("TMVA SOFIE Tile Op Repeats Tensor is not found in model");
+         throw std::runtime_error("SOFIE Tile Op Repeats Tensor is not found in model");
 
       fShapeInput = model.GetTensorShape(fNInput);
 
       if (!model.IsInitializedTensor(fNRepeats))
-         throw std::runtime_error("TMVA SOFIE Tile Op: non-initialized repeats input is not supported");
+         throw std::runtime_error("SOFIE Tile Op: non-initialized repeats input is not supported");
 
       auto repptr       = model.GetInitializedTensorData(fNRepeats);
       auto repeats_data = static_cast<int64_t*>(repptr.get());
       if (repeats_data == nullptr)
-         throw std::runtime_error("TMVA SOFIE Tile Op: failed to retrieve repeats tensor data");
+         throw std::runtime_error("SOFIE Tile Op: failed to retrieve repeats tensor data");
 
       auto repeats_shape = model.GetTensorShape(fNRepeats);
       if (repeats_shape.size() != 1)
-         throw std::runtime_error("TMVA SOFIE Tile Op: repeats tensor must be 1D");
+         throw std::runtime_error("SOFIE Tile Op: repeats tensor must be 1D");
 
       size_t num_elements = repeats_shape[0];
 
@@ -88,7 +88,7 @@ public:
    std::string Generate(std::string OpName) override {
       OpName = "op_" + OpName;
       if (fShapeInput.empty() || fShapeY.empty())
-         throw std::runtime_error("TMVA SOFIE Tile Op called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Tile Op called to Generate without being initialized first");
 
       std::stringstream out;
       std::string input   = "tensor_" + fNInput;
@@ -146,7 +146,7 @@ public:
    std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
       opName = "op_" + opName;
       if (fShapeInput.empty() || fShapeY.empty())
-         throw std::runtime_error("TMVA SOFIE Operator Tile called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Operator Tile called to Generate without being initialized first");
 
       const std::size_t D = fShapeInput.size();
 
@@ -217,7 +217,7 @@ public:
    std::string Generate_GPU_ALPAKA(std::string opName) override {
       opName = "op_" + opName;
       if (fShapeInput.empty() || fShapeY.empty())
-         throw std::runtime_error("TMVA SOFIE Operator Tile called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Operator Tile called to Generate without being initialized first");
 
       bool repeatsKnown = !fRepeats.empty();
       std::size_t totalElements = ConvertShapeToLength(fShapeY);

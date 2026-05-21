@@ -68,7 +68,7 @@ public:
       for (size_t j = 0; j < fAttrAxes.size(); j++) {
          if (fAttrAxes[j] < 0) fAttrAxes[j] += outputShape.size();
          if (fAttrAxes[j] < 0 || (size_t) fAttrAxes[j] >= outputShape.size() )
-            throw std::runtime_error("TMVA SOFIE Reduce Op - invalid axes values " + std::to_string(fAttrAxes[j]));
+            throw std::runtime_error("SOFIE Reduce Op - invalid axes values " + std::to_string(fAttrAxes[j]));
          // set to 1 the reduced dims
          outputShape[fAttrAxes[j]] = 1;
       }
@@ -94,7 +94,7 @@ public:
 
       if (!model.CheckIfTensorAlreadyExist(fNX)) {
          // input must be a graph input, or already initialized intermediate tensor
-         throw std::runtime_error("TMVA SOFIE Reduce Op Input Tensor " + fNX + " is not found in model");
+         throw std::runtime_error("SOFIE Reduce Op Input Tensor " + fNX + " is not found in model");
       }
       fShapeX = model.GetTensorShape(fNX);
       // check if tensor with axes is provided
@@ -122,7 +122,7 @@ public:
    std::string Generate(std::string opName) override {
       opName = "op_" + opName;
       if (fShapeX.empty() || fShapeY.empty()) {
-         throw std::runtime_error("TMVA SOFIE Reduce Op called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Reduce Op called to Generate without being initialized first");
       }
 
       size_t inputLength = SOFIE::ConvertShapeToLength(fShapeX);
@@ -263,7 +263,7 @@ public:
 
    std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) override {
       if (fShapeX.empty() || fShapeY.empty())
-         throw std::runtime_error("TMVA SOFIE Reduce Op called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Reduce Op called to Generate without being initialized first");
 
       const std::size_t Dx = fShapeX.size();
 
@@ -359,7 +359,7 @@ public:
 
    std::string Generate_GPU_ALPAKA(std::string /*opName*/) override {
       if (fShapeX.empty() || fShapeY.empty())
-         throw std::runtime_error("TMVA SOFIE Reduce Op called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Reduce Op called to Generate without being initialized first");
 
       std::size_t outputLength = ConvertShapeToLength(fShapeY);
       std::string kname = "reduceKernel_" + Name();

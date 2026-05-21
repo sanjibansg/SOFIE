@@ -38,7 +38,7 @@ public:
 
    void Initialize(RModel& model) override {
       if (model.CheckIfTensorAlreadyExist(fNX) == false){   //input must be a graph input, or already initialized intermediate tensor
-         throw std::runtime_error("TMVA SOFIE Selu Op Input Tensor is not found in model");
+         throw std::runtime_error("SOFIE Selu Op Input Tensor is not found in model");
       }
       fShape = model.GetTensorShape(fNX);
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShape);
@@ -48,7 +48,7 @@ public:
    std::string Generate(std::string OpName) override {
       OpName = "op_" + OpName;
       if (fShape.empty()){
-         throw std::runtime_error("TMVA SOFIE Operator Selu called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Operator Selu called to Generate without being initialized first");
       }
       std::stringstream out;
       int length = 1;

@@ -121,13 +121,13 @@ public:
       if (fUseROOT) {
          if (fMode == kNormal) {
             if (fParams.count("mean") == 0 || fParams.count("scale") == 0)
-               throw std::runtime_error("TMVA SOFIE RandomNormal op : no mean or scale are defined");
+               throw std::runtime_error("SOFIE RandomNormal op : no mean or scale are defined");
             float mean = fParams["mean"];
             float scale = fParams["scale"];
             out << SP << SP << "tensor_" << fNY << "[i] = fRndmEngine->Gaus(" << mean << "," << scale << ");\n";
          } else if (fMode == kUniform) {
             if (fParams.count("high") == 0 || fParams.count("low") == 0)
-              throw std::runtime_error("TMVA SOFIE RandomUniform op : no low or high are defined");
+              throw std::runtime_error("SOFIE RandomUniform op : no low or high are defined");
             float high = fParams["high"];
             float low = fParams["low"];
             out << SP << SP << "tensor_" << fNY << "[i] = fRndmEngine->Uniform(" << low << "," << high << ");\n";

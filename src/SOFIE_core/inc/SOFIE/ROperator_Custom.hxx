@@ -48,13 +48,13 @@ public:
 
       for(auto& it:fInputNames){
         if (model.CheckIfTensorAlreadyExist(it) == false){
-         throw std::runtime_error("TMVA SOFIE Custom " + fOpName + " Op Input Tensor " + it + " is not found in model");
+         throw std::runtime_error("SOFIE Custom " + fOpName + " Op Input Tensor " + it + " is not found in model");
         }
         fInputSizes.push_back(ConvertShapeToLength(model.GetTensorShape(it)));
       }
 
       if(fOutputNames.size() != fOutputShapes.size()){
-        throw std::runtime_error("TMVA SOFIE Custom "+ fOpName + " Op was not intialized with the names/shapes of all the output tensors");
+        throw std::runtime_error("SOFIE Custom "+ fOpName + " Op was not intialized with the names/shapes of all the output tensors");
       }
 
       for(long unsigned int i=0; i<fOutputNames.size(); ++i){

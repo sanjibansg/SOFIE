@@ -5,7 +5,7 @@
 # For the list of contributors see $ROOTSYS/README/CREDITS.
 
 ############################################################################
-# CMakeLists.txt file for building TMVA SOFIE package
+# CMakeLists.txt file for building SOFIE package
 ############################################################################
 #Author: Sitong An, Lorenzo Moneta 10/03/2021
 
@@ -33,6 +33,7 @@ set(sources_cxx
     src/RModelParser_ONNX.cxx
     src/ParseBasicUnary.cxx
     src/ParseBasicBinary.cxx
+    src/ParseBasicIs.cxx
     src/ParseBatchNormalization.cxx
     src/ParseCast.cxx
     src/ParseConcat.cxx
@@ -80,6 +81,8 @@ set(sources_cxx
     src/ParseWhere.cxx
     src/ParseEinsum.cxx
     src/ParseRandom.cxx
+    src/ParseNot.cxx
+    src/ParseClip.cxx
     src/ParseScatterElements.cxx
     ${PROTO_SRCS}
   ${DEPENDENCIES}

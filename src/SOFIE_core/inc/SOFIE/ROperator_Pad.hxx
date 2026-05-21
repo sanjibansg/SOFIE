@@ -61,13 +61,13 @@ public:
 
    void Initialize(RModel& model) override {
       if (model.CheckIfTensorAlreadyExist(fNX) == false){   //input must be a graph input, or already initialized intermediate tensor
-         throw std::runtime_error("TMVA SOFIE Pad Op Input Tensor is not found in model");
+         throw std::runtime_error("SOFIE Pad Op Input Tensor is not found in model");
       }
 
       fInputShape = model.GetTensorShape(fNX);
 
       if (fMode != EMode::kConstant) {
-         throw std::runtime_error("TMVA SOFIE Pad Op supports now only Constant mode");
+         throw std::runtime_error("SOFIE Pad Op supports now only Constant mode");
       }
 
       // get pads data
@@ -75,7 +75,7 @@ public:
       if (model.IsInitializedTensor(fNP)) {
          padsData = static_cast<int64_t*>(model.GetInitializedTensorData(fNP).get());
       } else {
-         throw std::runtime_error("TMVA SOFIE Pad Op supports now only initialized Pads data");
+         throw std::runtime_error("SOFIE Pad Op supports now only initialized Pads data");
       }
       // get constant value
       fConstantValue = 0;
@@ -84,7 +84,7 @@ public:
             T * cData = static_cast<T*>(model.GetInitializedTensorData(fNCV).get());
             fConstantValue = cData[0];
          } else {
-            throw std::runtime_error("TMVA SOFIE Pad Op supports now only initialized Constant Value  data");
+            throw std::runtime_error("SOFIE Pad Op supports now only initialized Constant Value  data");
          }
       }
       std::vector<int64_t> axes;
@@ -103,10 +103,10 @@ public:
                for (size_t i = 0; i < nax; i++)
                   axes[i] = data[i];
             }  else {
-               throw std::runtime_error("TMVA SOFIE Pad Op invalid input Axes type");
+               throw std::runtime_error("SOFIE Pad Op invalid input Axes type");
             }
          } else {
-            throw std::runtime_error("TMVA SOFIE Pad Op supports now only initialized Axes data");
+            throw std::runtime_error("SOFIE Pad Op supports now only initialized Axes data");
          }
       }
 
@@ -127,7 +127,7 @@ public:
             fPads[i].second = padsData[axesSize + i];
             int64_t outDim = static_cast<int64_t>(fOutputShape[i]) + fPads[i].first + fPads[i].second;
             if (outDim < 0)
-               throw std::runtime_error("TMVA SOFIE Pad Op : invalid Pads values");
+               throw std::runtime_error("SOFIE Pad Op : invalid Pads values");
             fOutputShape[i] = outDim;
          }
       }
@@ -149,7 +149,7 @@ public:
    std::string Generate(std::string OpName) override {
       OpName = "op_" + OpName;
       if (fOutputShape.empty()){
-         throw std::runtime_error("TMVA SOFIE Operator Pad called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Operator Pad called to Generate without being initialized first");
       }
       std::stringstream out;
       auto inputStride = UTILITY::ComputeStrideFromShape(fInputShape);

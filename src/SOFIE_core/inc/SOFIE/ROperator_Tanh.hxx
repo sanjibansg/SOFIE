@@ -41,7 +41,7 @@ public:
    void Initialize(RModel& model) override {
        //input must be a graph input, or already initialized intermediate tensor
       if (model.CheckIfTensorAlreadyExist(fNX) == false){
-        throw std::runtime_error("TMVA SOFIE Tanh Op Input Tensor is not found in model");
+        throw std::runtime_error("SOFIE Tanh Op Input Tensor is not found in model");
       }
       fShape = model.GetTensorShape(fNX);
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShape);
@@ -52,7 +52,7 @@ public:
    std::string Generate(std::string OpName) override {
       OpName = "op_" + OpName;
       if (fShape.empty()) {
-         throw std::runtime_error("TMVA SOFIE Tanh operator called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Tanh operator called to Generate without being initialized first");
       }
       std::stringstream out;
       size_t length = ConvertShapeToLength(fShape);
@@ -90,7 +90,7 @@ public:
    std::string Generate_GPU_ALPAKA(std::string OpName) override {
       OpName = "op_" + OpName;
       if (fShape.empty()) {
-         throw std::runtime_error("TMVA SOFIE Tanh called to Generate_GPU_ALPAKA without being initialized");
+         throw std::runtime_error("SOFIE Tanh called to Generate_GPU_ALPAKA without being initialized");
       }
       std::stringstream out;
       size_t length = ConvertShapeToLength(fShape);

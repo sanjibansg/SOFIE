@@ -45,6 +45,8 @@ private:
    MemoryPoolInfo fIntermediateMemoryInfo;    ///<!  intermediate memory info (transient)
    std::unordered_map<std::string_view, size_t> fIntermediateTensorFrequencyLookup;    ///<!  lookup table for intermediate tensor frequency (transient)
 
+   std::string fExtraCodeForDimShapes; // extra code needed for initialization of dynamic parameters (e.g. number of non zero elements in NonZero operator)
+
    // GPU ALPAKA elementwise kernel fusion state (transient, computed in GenerateGPU_ALPAKA)
    struct EltwiseFusionGroup {
       std::vector<size_t> opIndices; ///< consecutive op indices forming this group
@@ -134,6 +136,8 @@ public:
    }
 
    void AddShapeTensor(const std::string & name, const std::vector<Dim> & shapeValues, bool scalar = false);
+
+   void AddExtraCodeForDimShapes(const std::string & code) { fExtraCodeForDimShapes += code; }
 
    // add and initialize subgraph to the model
    void InitializeSubGraph(std::shared_ptr<RModel>  graph);

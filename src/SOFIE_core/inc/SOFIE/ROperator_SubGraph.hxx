@@ -50,7 +50,7 @@ public:
    void Initialize(RModel& model) override {
        //input must be a graph input, or already initialized intermediate tensor
       if (model.CheckIfTensorAlreadyExist(fNX) == false){
-        throw std::runtime_error("TMVA SOFIE If Op Input Tensor is not found in model");
+        throw std::runtime_error("SOFIE If Op Input Tensor is not found in model");
       }
       //add the subgraph model to parent RModel and initialize them
       model.InitializeSubGraph(fModel_then);
@@ -71,7 +71,7 @@ public:
             fType = type;
          else {
             if (type != fType)
-               throw std::runtime_error("TMVA SOFIE If Op supports only all outputs of the same type");
+               throw std::runtime_error("SOFIE If Op supports only all outputs of the same type");
          }
          model.AddIntermediateTensor(fNYs[i], fType, shape );
       }

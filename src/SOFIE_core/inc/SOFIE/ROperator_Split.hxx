@@ -51,14 +51,14 @@ public:
 
    void Initialize(RModel& model) override {
       if (model.CheckIfTensorAlreadyExist(fNX) == false){   //input must be a graph input, or already initialized intermediate tensor
-         throw std::runtime_error("TMVA SOFIE Split Op Input Tensor is not found in model");
+         throw std::runtime_error("SOFIE Split Op Input Tensor is not found in model");
       }
       fInputShape = model.GetTensorShape(fNX);
 
       // correct for negative axis
       if (fAxis < 0) fAxis += fInputShape.size();
       if (fAxis < 0 || fAxis >= static_cast<int>(fInputShape.size()) )
-         throw std::runtime_error("TMVA SOFIE Split - invalid axis " + std::to_string(fAxis));
+         throw std::runtime_error("SOFIE Split - invalid axis " + std::to_string(fAxis));
 
       // compute output shapes
       size_t nsplit = fNYs.size();
@@ -77,10 +77,10 @@ public:
       } else {
          // get split tensor values
          if (!model.IsInitializedTensor(fNSplit))
-            throw std::runtime_error("TMVA SOFIE Split - non-initialized split tensors are not supported");
+            throw std::runtime_error("SOFIE Split - non-initialized split tensors are not supported");
          auto splitShape =  model.GetTensorShape(fNSplit);
          if (splitShape.size() != 1 || splitShape[0] != nsplit)
-            throw std::runtime_error("TMVA SOFIE Split - split input tensor has invalid shape");
+            throw std::runtime_error("SOFIE Split - split input tensor has invalid shape");
          auto split_data = static_cast<int64_t *>(model.GetInitializedTensorData(fNSplit).get());
          fSplit = std::vector<int64_t>(split_data, split_data + nsplit);
       }
@@ -94,7 +94,7 @@ public:
          fOutputShapes.push_back(outputShape);
       }
       if (tot_split != fInputShape[fAxis])
-         throw std::runtime_error("TMVA SOFIE Split - Sum of split sizes must match the input dimension along the axis");
+         throw std::runtime_error("SOFIE Split - Sum of split sizes must match the input dimension along the axis");
 
 
       if (model.Verbose()) {
@@ -109,7 +109,7 @@ public:
    std::string Generate(std::string OpName) override {
       OpName = "op_" + OpName;
       if (fOutputShapes.empty()){
-         throw std::runtime_error("TMVA SOFIE Operator Split called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Operator Split called to Generate without being initialized first");
       }
 
       auto input_strides =  UTILITY::ComputeStrideFromShape(fInputShape);
@@ -156,7 +156,7 @@ public:
 std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
     opName = "op_" + opName;
     if (fOutputShapes.empty())
-        throw std::runtime_error("TMVA SOFIE Operator Split called to Generate without being initialized first");
+        throw std::runtime_error("SOFIE Operator Split called to Generate without being initialized first");
 
     const std::size_t D   = fInputShape.size();
     const std::size_t Nin = fNYs.size();
@@ -228,7 +228,7 @@ std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override 
 std::string Generate_GPU_ALPAKA(std::string opName) override {
     opName = "op_" + opName;
     if (fOutputShapes.empty())
-        throw std::runtime_error("TMVA SOFIE Operator Split called to Generate without being initialized first");
+        throw std::runtime_error("SOFIE Operator Split called to Generate without being initialized first");
 
     std::stringstream out;
     out << "\n//------ SPLIT_GPU_ALPAKA\n";

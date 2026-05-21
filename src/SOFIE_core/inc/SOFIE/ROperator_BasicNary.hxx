@@ -119,7 +119,7 @@ public:
    void Initialize(RModel& model) override {
       for (auto &it : fNInputs) {
          if (!model.CheckIfTensorAlreadyExist(it)) {
-            throw std::runtime_error("TMVA SOFIE BasicNary Op Input Tensor " + it + " is not found in model");
+            throw std::runtime_error("SOFIE BasicNary Op Input Tensor " + it + " is not found in model");
          }
          fShapeInputs.push_back(model.GetTensorShape(it));
       }
@@ -145,7 +145,7 @@ public:
    std::string Generate(std::string OpName) override {
       OpName = "op_" + OpName;
       if (fShapeY.empty()) {
-         throw std::runtime_error("TMVA SOFIE BasicNary called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE BasicNary called to Generate without being initialized first");
       }
       std::stringstream out;
       size_t length = ConvertShapeToLength(fShapeY);

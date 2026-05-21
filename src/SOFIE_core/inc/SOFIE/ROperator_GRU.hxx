@@ -114,7 +114,7 @@ template <typename T> class ROperator_GRU final : public ROperator {
          fType = "float";
       } else {
          throw std::runtime_error(
-             "TMVA SOFIE Encountered unsupported type parsing a GRU operator");
+             "SOFIE Encountered unsupported type parsing a GRU operator");
       }
    }
 

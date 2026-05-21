@@ -91,7 +91,7 @@ template <typename T> class ROperator_RNN final : public ROperator {
          fType = "float";
       } else {
          throw std::runtime_error(
-             "TMVA SOFIE Encountered unsupported type parsing a RNN operator");
+             "SOFIE Encountered unsupported type parsing a RNN operator");
       }
 
       fInputTensorNames = { fNX, fNW, fNR };

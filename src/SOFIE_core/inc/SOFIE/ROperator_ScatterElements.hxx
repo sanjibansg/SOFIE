@@ -41,7 +41,7 @@ private:
       else if (name == "min")
          return "std::min(" + t1 + "," + t2 + ")";
       else
-         throw std::runtime_error("TMVA SOFIE ScatterElements : invalid reduction attribute");
+         throw std::runtime_error("SOFIE ScatterElements : invalid reduction attribute");
 
       return std::string();
    }
@@ -73,24 +73,24 @@ public:
    void Initialize(RModel& model) override {
       // input must be a graph input, or already initialized intermediate tensor
       if (!model.CheckIfTensorAlreadyExist(fNX)){
-         throw std::runtime_error(std::string("TMVA SOFIE ScatterElements Op Input Tensor ") + fNX + "is not found in model");
+         throw std::runtime_error(std::string("SOFIE ScatterElements Op Input Tensor ") + fNX + "is not found in model");
       }
       if (!model.CheckIfTensorAlreadyExist(fNI)) {
-         throw std::runtime_error(std::string("TMVA SOFIE ScatterElements Op Input Tensor ") + fNI + "is not found in model");
+         throw std::runtime_error(std::string("SOFIE ScatterElements Op Input Tensor ") + fNI + "is not found in model");
       }
       if (!model.CheckIfTensorAlreadyExist(fNU)) {
-         throw std::runtime_error(std::string("TMVA SOFIE ScatterElements Op Input Tensor ") + fNU + "is not found in model");
+         throw std::runtime_error(std::string("SOFIE ScatterElements Op Input Tensor ") + fNU + "is not found in model");
       }
       //tbd check for constant tensors
 
       fShapeX = model.GetTensorShape(fNX);
       fShapeI = model.GetTensorShape(fNI);
       if (model.GetTensorShape(fNU) != fShapeI)
-         throw std::runtime_error(std::string("TMVA SOFIE ScatterElements - update tensor has invalid shape ")) ;
+         throw std::runtime_error(std::string("SOFIE ScatterElements - update tensor has invalid shape ")) ;
       if (fShapeX.size() == 0)
-         throw std::runtime_error(std::string("TMVA SOFIE ScatterElements - input tensor has zero rank  ")) ;
+         throw std::runtime_error(std::string("SOFIE ScatterElements - input tensor has zero rank  ")) ;
       if (fShapeX.size() != fShapeI.size())
-         throw std::runtime_error(std::string("TMVA SOFIE ScatterElements - index tensor has invalid rank  ")) ;
+         throw std::runtime_error(std::string("SOFIE ScatterElements - index tensor has invalid rank  ")) ;
 
       if (fAxis < 0) fAxis += fShapeX.size();
 
@@ -109,7 +109,7 @@ public:
       if (fIsOutputConstant) return "";
 
       if (fShapeY.empty()) {
-         throw std::runtime_error("TMVA SOFIE ScatterElements Op called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE ScatterElements Op called to Generate without being initialized first");
       }
       std::stringstream out;
       out << SP << "\n//-------- ScatterElements  --- " << opName << "\n";
@@ -171,7 +171,7 @@ public:
    std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
       opName = "op_" + opName;
       if (fShapeY.empty()) {
-         throw std::runtime_error("TMVA SOFIE ScatterElements Op called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE ScatterElements Op called to Generate without being initialized first");
       }
 
       const std::size_t D = fShapeI.size();
@@ -248,7 +248,7 @@ std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override 
 std::string Generate_GPU_ALPAKA(std::string opName) override {
     opName = "op_" + opName;
     if (fShapeY.empty()) {
-        throw std::runtime_error("TMVA SOFIE ScatterElements Op called to Generate without being initialized first");
+        throw std::runtime_error("SOFIE ScatterElements Op called to Generate without being initialized first");
     }
 
     std::size_t totalElements = ConvertShapeToLength(fShapeI);

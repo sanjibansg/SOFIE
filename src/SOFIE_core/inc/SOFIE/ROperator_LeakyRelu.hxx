@@ -34,7 +34,7 @@ public:
       }
 		else{
 			throw
-				std::runtime_error("TMVA SOFIE Encountered unsupported type parsing a Leaky Relu operator");
+				std::runtime_error("SOFIE Encountered unsupported type parsing a Leaky Relu operator");
 		}
 
       fInputTensorNames = { fNX };
@@ -52,7 +52,7 @@ public:
 
    void Initialize(RModel& model) override {
       if (model.CheckIfTensorAlreadyExist(fNX) == false){   //input must be a graph input, or already initialized intermediate tensor
-         throw std::runtime_error("TMVA SOFIE Leaky Relu Op Input Tensor is not found in model");
+         throw std::runtime_error("SOFIE Leaky Relu Op Input Tensor is not found in model");
       }
       fShape = model.GetTensorShape(fNX);
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShape);
@@ -62,7 +62,7 @@ public:
    std::string Generate(std::string OpName) override {
       OpName = "op_" + OpName;
       if (fShape.empty()) {
-         throw std::runtime_error("TMVA SOFIE Operator Leaky Relu called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Operator Leaky Relu called to Generate without being initialized first");
       }
       std::stringstream out;
       size_t length = ConvertShapeToLength(fShape);
@@ -98,7 +98,7 @@ public:
    std::string Generate_GPU_ALPAKA(std::string OpName) override {
       OpName = "op_" + OpName;
       if (fShape.empty()) {
-         throw std::runtime_error("TMVA SOFIE Operator LeakyRelu called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Operator LeakyRelu called to Generate without being initialized first");
       }
 
       std::stringstream out;
@@ -115,6 +115,11 @@ public:
          << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), static_cast<Idx>(" << length << "), " << OpName << "_alpha);\n";
       out << SP <<"alpaka::enqueue(queue, task_" << OpName << ");\n";
       return out.str();
+   }
+
+   bool IsElementwise() const override { return true; }
+   std::string GetElementwiseExpr(const std::string& v) const override {
+      return "((" + v + " >= 0) ? " + v + " : " + std::to_string(falpha) + " * " + v + ")";
    }
 
 

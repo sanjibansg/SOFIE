@@ -40,7 +40,7 @@ public:
 
    void Initialize(RModel& model) override {
       if (model.CheckIfTensorAlreadyExist(fNX) == false){   //input must be a graph input, or already initialized intermediate tensor
-         throw std::runtime_error("TMVA SOFIE Relu Op Input Tensor " + fNX + " is not found in model");
+         throw std::runtime_error("SOFIE Relu Op Input Tensor " + fNX + " is not found in model");
       }
 
       fShape = model.GetDimTensorShape(fNX);
@@ -55,7 +55,7 @@ public:
    std::string Generate(std::string OpName) override {
       OpName = "op_" + OpName;
       if (fShape.empty()) {
-         throw std::runtime_error("TMVA SOFIE Operator Relu called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Operator Relu called to Generate without being initialized first");
       }
       std::stringstream out;
       auto length = ConvertDimShapeToLength(fShape);
@@ -90,7 +90,7 @@ public:
    std::string Generate_GPU_ALPAKA(std::string OpName) override {
       OpName = "op_" + OpName;
       if (fShape.empty()) {
-         throw std::runtime_error("TMVA SOFIE Operator Relu called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Operator Relu called to Generate without being initialized first");
       }
 
       std::stringstream out;

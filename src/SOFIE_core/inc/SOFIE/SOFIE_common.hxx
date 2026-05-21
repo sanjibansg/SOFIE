@@ -213,33 +213,69 @@ std::string ConvertDimShapeToLength(const std::vector<Dim> & shape);
 template<class T>
 std::string ConvertValToString(T value) {
    std::stringstream ret;
-   if (std::is_floating_point_v<T>)
-      ret << std::setprecision(std::numeric_limits<T>::max_digits10);
-   ret << value;
+   ret << std::to_string(value);
+   return ret.str();
+}
+// float specialization
+template<>
+inline std::string ConvertValToString<float>(float value) {
+   std::stringstream ret;
+   // special case for infinity and Nan
+   if (std::isinf(value))
+         ret << (value > 0 ? "std::numeric_limits<float>::infinity()" :
+                                  "-std::numeric_limits<float>::infinity()");
+   else if (std::isnan(value))
+         ret << "std::numeric_limits<float>::quiet_NaN()";
+   else {
+      ret << std::setprecision(std::numeric_limits<float>::max_digits10);
+      ret << value;
+   }
+   return ret.str();
+}
+// double specialization
+template<>
+inline std::string ConvertValToString<double>(double value) {
+   std::stringstream ret;
+   // special case for infinity and Nan
+   if (std::isinf(value))
+         ret << (value > 0 ? "std::numeric_limits<double>::infinity()" :
+                                  "-std::numeric_limits<double>::infinity()");
+   else if (std::isnan(value))
+         ret << "std::numeric_limits<double>::quiet_NaN()";
+   else {
+      ret << std::setprecision(std::numeric_limits<double>::max_digits10);
+      ret << value;
+   }
+   return ret.str();
+}
+// int64_t specialization for INT64_MIN
+template<>
+inline std::string ConvertValToString<int64_t>(int64_t value) {
+   std::stringstream ret;
+   if (value == INT64_MIN)
+      ret << "INT64_MIN";
+   else
+      ret << std::to_string(value);
    return ret.str();
 }
 
 
 // convert list of values in a string taking into account the precision
 template<class T>
-std::string ConvertValuesToString(size_t n, const T * data) {
+std::string ConvertValuesToString(size_t n, const T * data, size_t maxprint = -1) {
    std::stringstream ret;
    ret << "{ ";
-   for (size_t i = 0; i < n; i++) {
-      if (std::is_floating_point_v<T>)
-         ret << std::setprecision(std::numeric_limits<T>::max_digits10) << data[i];
-      else
-         // cast in case of boolean (int8)
-         ret << (int64_t) data[i];
-
+   for (size_t i = 0; i < std::min(n,maxprint); i++) {
+      ret << ConvertValToString(data[i]);
       if (i < n-1) ret << ", ";
+      if (i < n-1 && i == maxprint-1) ret << "..... ";
    }
    ret << "}";
    return ret.str();
 }
 template<class T>
-std::string ConvertValuesToString(const std::vector<T> & data) {
-  return ConvertValuesToString(data.size(), data.data());
+std::string ConvertValuesToString(const std::vector<T> & data, size_t maxprint = 5) {
+  return ConvertValuesToString(data.size(), data.data(), maxprint);
 }
 
 class InitializedTensor {
@@ -255,7 +291,7 @@ public:
    std::shared_ptr<void> const &sharedptr() const { return fData; }
    // query if tensor comes from a Constant operator
    bool IsConstantTensor() const { return fConstant;}
-   // query if tensor needs to be written in a weight file. Constant tensors are not written in a file
+   // query if tensor needs to be written in a weight file. Constant tensors are not written in a separate file
    bool IsWeightTensor() const { return !fConstant && !fIsNotWritable;}
    // check if a Tensor is Writable (need to be written in the file or in the generated code (e.g. as a constant tensor)
    // if an initialized tensors is used in a constant operator at compile time does not need to be written and can be omitted in
@@ -263,6 +299,8 @@ public:
    bool IsNotWritable() const { return fIsNotWritable; }
    // set not writable initialized tensors - i.e. tensor that must not be written in a file
    void SetNotWritable() { fIsNotWritable = true;}
+   // set writable initialized tensors - i.e. tensor that must be written in a file
+   void SetWritable() { fIsNotWritable = false;}
    // set as constant (needed for non-float initialized tensors)
    void SetConstant() { fConstant = true;}
 
@@ -280,16 +318,8 @@ public:
       for (std::size_t item : fShape) {
          fSize *= static_cast<int>(item);
       }
-      switch (fType) {
-      case ETensorType::FLOAT: fSize *= sizeof(float); break;
-      case ETensorType::DOUBLE: fSize *= sizeof(double); break;
-      case ETensorType::INT32: fSize *= sizeof(int32_t); break;
-      case ETensorType::INT64: fSize *= sizeof(int64_t); break;
-      case ETensorType::BOOL: fSize *= sizeof(bool); break;
-      default:
-         throw std::runtime_error("SOFIE doesn't yet supports serialising data-type " +
-                                  ConvertTypeToString(fType));
-      }
+      // get size in bytes
+      fSize *= GetTypeSize(fType);
       fPersistentData = static_cast<char *>(fData.get());
    }
    void CastPersistentToShared()
@@ -373,7 +403,7 @@ T* BroadcastConvBias(const T* data, const size_t channel, const std::vector<size
    size_t size = targetShape.size();
    if (targetShape[1] != channel) {
       std::stringstream ss;
-      ss << "SOFIE - Error broadcasting Conv Bias of shape {";
+      ss << "TMVA::SOFIE - Error broadcasting Conv Bias of shape {";
       ss << std::to_string(channel);
       ss << "} to ";
       ss << ConvertShapeToString(targetShape);
@@ -679,16 +709,6 @@ void col2im(const Dtype* data_col, const int channels,
   //std::cout << "finishing col2imp" << std::endl;
 }
 
-// Used at the end of infer() to fill the return object.
-template <class T>
-void FillOutput(T const *arr, std::vector<T> &out, std::size_t n)
-{
-   out.resize(n);
-   for (std::size_t i = 0; i < n; ++i) {
-      out[i] = arr[i];
-   }
-}
-
 }  // end namespace UTILITY
 
 namespace BLAS{
@@ -712,7 +732,7 @@ struct GNN_Data {
 };
 
 template<typename T>
-RTensor<T> Concatenate( RTensor<T> & t1,  RTensor<T> & t2, int axis = 0)
+TMVA::Experimental::RTensor<T> Concatenate( TMVA::Experimental::RTensor<T> & t1,  TMVA::Experimental::RTensor<T> & t2, int axis = 0)
 {
    // concatenate tensor along axis. Shape must be the same except in the dimension of the concatenated axis
    if (t1.GetMemoryLayout() != t2.GetMemoryLayout())
@@ -727,8 +747,8 @@ RTensor<T> Concatenate( RTensor<T> & t1,  RTensor<T> & t2, int axis = 0)
    }
    std::vector<size_t> outShape = shape1;
    outShape[axis] = shape1[axis] + shape2[axis];
-   RTensor<T> tout(outShape, t1.GetMemoryLayout());
-   if (t1.GetMemoryLayout() == MemoryLayout::ColumnMajor) {
+   TMVA::Experimental::RTensor<T> tout(outShape, t1.GetMemoryLayout());
+   if (t1.GetMemoryLayout() == TMVA::Experimental::MemoryLayout::ColumnMajor) {
       throw std::runtime_error("TMVA RTensor Concatenate is not yet supported for column major tensors");
    }
 
@@ -783,8 +803,33 @@ inline void Gemm_Call(float *output, bool transa, bool transb, int m, int n, int
    if (C != nullptr) {
       std::copy(C, C + m * n, output);
    }
-   SOFIE::BLAS::sgemm_(transa ? &ct : &cn, transb ? &ct : &cn, &m, &n, &k, &alpha, A, lda, B, ldb,
+   TMVA::Experimental::SOFIE::BLAS::sgemm_(transa ? &ct : &cn, transb ? &ct : &cn, &m, &n, &k, &alpha, A, lda, B, ldb,
                                            &beta, output, ldc);
+}
+
+inline void Fill(float *output, float value, int size)
+{
+   std::fill(output, output + size, value);
+}
+
+template <class T>
+inline void Copy(T *output, T const *input, int size)
+{
+   std::copy(input, input + size, output);
+}
+
+inline void Relu(float *output, float const *input, int size)
+{
+   for (int i = 0; i < size; i++) {
+      output[i] = (input[i] > 0.0f) ? input[i] : 0.0f;
+   }
+}
+// function to read float from the file dealing with inf and nan values
+inline float ParseFloatToken (const std::string & s)  {
+   if (s == "inf")  return  std::numeric_limits<float>::infinity();
+   if (s == "-inf") return -std::numeric_limits<float>::infinity();
+   if (s == "nan")  return  std::numeric_limits<float>::quiet_NaN();
+   return std::stof(s);
 }
 
 template <class T>
@@ -803,13 +848,19 @@ void ReadTensorFromStream(std::istream &is, T &target, std::string const &expect
                             std::to_string(expectedLength) + " , read " + std::to_string(length);
       throw std::runtime_error(err_msg);
    }
+   std::string token;
    for (size_t i = 0; i < length; ++i) {
-      is >> target[i];
+      is >> token;
+      target[i] = ParseFloatToken(token);
    }
    if (is.fail()) {
       throw std::runtime_error("TMVA-SOFIE failed to read the values for tensor " + expectedName);
    }
 }
+
+//Utility functions to generate code
+void EmitNestedLoops(std::stringstream &out, size_t loopRank, const std::vector<Dim> shape);
+void CloseNestedLoops(std::stringstream &out, size_t loopRank);
 
 
 // code for the memory greeding allocations
@@ -827,6 +878,41 @@ struct MemoryResult {
 /// Greedy best-fit planner with coalescing free list.
 MemoryResult OrganizeMemory(const std::vector<TensorLifeInfo> & tensorsInfo );
 
+// Simple Dimension classes ans helpers to add constexpr meta info on input
+// tensors to the emitted code.
+struct SingleDim {
+   enum class Kind {
+      Static,
+      Symbolic
+   };
+
+   Kind kind;
+   std::size_t dim;
+   std::string_view name;
+
+   constexpr SingleDim(std::size_t v) : kind(Kind::Static), dim(v), name() {}
+   constexpr SingleDim(const char *v) : kind(Kind::Symbolic), dim(0), name(v) {}
+};
+
+struct TensorDims {
+   const SingleDim *data;
+   std::size_t size;
+
+   constexpr std::size_t total_size() const
+   {
+      std::size_t result = 1;
+      for (std::size_t i = 0; i < size; ++i) {
+         result *= data[i].dim;
+      }
+      return result;
+   }
+};
+
+template<class Arr>
+constexpr TensorDims makeDims(Arr const &arr)
+{
+   return TensorDims{arr.data(), arr.size()};
+}
 
 inline std::string ConvertOutputTypeToString(ETensorType t) {
    // The std::vector<bool> is a special type that is not wrapping continuous memory.

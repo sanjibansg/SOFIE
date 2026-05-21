@@ -46,10 +46,10 @@ public:
    }
 
    std::vector<std::vector<size_t>> ShapeInference(std::vector<std::vector<size_t>> input) override {
-      if (input.size() > 1) throw std::runtime_error("TMVA SOFIE Tranpose Op Shape Inference only need 1 input tensor");
+      if (input.size() > 1) throw std::runtime_error("SOFIE Tranpose Op Shape Inference only need 1 input tensor");
       auto& data = input[0];
       if (fAttrPerm.size() != data.size() )
-         throw std::runtime_error("TMVA SOFIE Tranpose Op - Invalid axes attributes");
+         throw std::runtime_error("SOFIE Tranpose Op - Invalid axes attributes");
 
       std::vector<size_t> output_shape(fAttrPerm.size());
       for (size_t i = 0; i < fAttrPerm.size(); i++){
@@ -64,7 +64,7 @@ public:
    void Initialize(RModel& model) override {
       if (model.CheckIfTensorAlreadyExist(fNData) == false){   //input must be a graph input, or already initialized intermediate tensor
          std::cout<<"Input tensor for transpose: "<<fNData<<'\n';
-         throw std::runtime_error("TMVA SOFIE Tranpose Op Input Tensor is not found in model");
+         throw std::runtime_error("SOFIE Tranpose Op Input Tensor is not found in model");
       }
       fShapeData = model.GetTensorShape(fNData);
       if (fAttrPerm.empty()){
@@ -116,7 +116,7 @@ public:
       if (fIsOutputConstant) return "";  //no op for constant tensors
       OpName = "op_" + OpName;
       if (fShapeData.empty() || fShapeOutput.empty()){
-         throw std::runtime_error("TMVA SOFIE Transpose Op called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Transpose Op called to Generate without being initialized first");
       }
       int dim = fShapeData.size();
       auto inStrides = UTILITY::ComputeStrideFromShape(fShapeData);
@@ -204,7 +204,7 @@ public:
 
    std::string Generate_GPU_ALPAKA(std::string OpName) override {
       if (fShapeOutput.empty()) {
-         throw std::runtime_error("TMVA SOFIE Operator Transpose called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Operator Transpose called to Generate without being initialized first");
       }
       std::stringstream out;
       auto length = ConvertShapeToLength(fShapeOutput);

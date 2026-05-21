@@ -106,7 +106,7 @@ template <typename T> class ROperator_LSTM final : public ROperator {
          fType = "float";
       } else {
          throw std::runtime_error(
-             "TMVA SOFIE Encountered unsupported type parsing a LSTM operator");
+             "SOFIE Encountered unsupported type parsing a LSTM operator");
       }
       
       fInputTensorNames = { fNX, fNW, fNR };

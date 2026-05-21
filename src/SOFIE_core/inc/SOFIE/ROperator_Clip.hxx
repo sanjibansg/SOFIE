@@ -5,6 +5,7 @@
 #include "ROperator.hxx"
 #include "RModel.hxx"
 
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -165,6 +166,126 @@ public:
       model.AddNeededStdLib("limits");
    }
 
+
+   // -----------------------------------------------------------------------
+   // GPU ALPAKA
+   // -----------------------------------------------------------------------
+
+   std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) override
+   {
+      std::string op;
+      op  = "\n//------ CLIP_KERNEL_ALPAKA\n";
+      op += "struct ClipKernel {\n";
+      op += SP + "template<typename TAcc, typename T>\n";
+      op += SP + "ALPAKA_FN_ACC void operator()(\n";
+      op += SP + SP + "TAcc const & acc,\n";
+      op += SP + SP + "T const * __restrict__ data,\n";
+      op += SP + SP + "T * __restrict__ out,\n";
+      op += SP + SP + "std::size_t numElements,\n";
+      op += SP + SP + "T minVal,\n";
+      op += SP + SP + "T maxVal) const\n";
+      op += SP + "{\n";
+      op += SP + SP + "auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + "if (idx < numElements) {\n";
+      op += SP + SP + SP + "T val = data[idx];\n";
+      op += SP + SP + SP + "val = val < minVal ? minVal : val;\n";
+      op += SP + SP + SP + "out[idx] = val > maxVal ? maxVal : val;\n";
+      op += SP + SP + "}\n";
+      op += SP + "}\n";
+      op += "};\n";
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) override
+   {
+      return "ClipKernel clipKernel;\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string OpName) override
+   {
+      OpName = "op_" + OpName;
+      if (fShape.empty() && fDimShape.empty())
+         throw std::runtime_error(
+            "SOFIE Operator Clip called to Generate_GPU_ALPAKA without being initialized first");
+
+      std::stringstream out;
+      out << "\n//------ CLIP_GPU_ALPAKA " << OpName << "\n";
+
+      std::string length = ConvertDimShapeToLength(fDimShape);
+
+      std::string minExpr, maxExpr;
+      if (fMinIsConstant) {
+         minExpr = ToStringHighPrec(fMin);
+      } else if (fHasMin) {
+         throw std::runtime_error(
+            "SOFIE Clip GPU ALPAKA: runtime (non-constant) min bound is not supported in GPU path");
+      } else {
+         minExpr = "std::numeric_limits<" + TensorType<T>::Name() + ">::lowest()";
+      }
+
+      if (fMaxIsConstant) {
+         maxExpr = ToStringHighPrec(fMax);
+      } else if (fHasMax) {
+         throw std::runtime_error(
+            "SOFIE Clip GPU ALPAKA: runtime (non-constant) max bound is not supported in GPU path");
+      } else {
+         maxExpr = "std::numeric_limits<" + TensorType<T>::Name() + ">::max()";
+      }
+
+      std::string castMin = "static_cast<" + TensorType<T>::Name() + ">(" + minExpr + ")";
+      std::string castMax = "static_cast<" + TensorType<T>::Name() + ">(" + maxExpr + ")";
+
+      out << SP << "auto const elementsPerThread_" << fNX << " = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_"   << fNX << " = Vec::all(Idx{" << length << "});\n";
+      out << SP << "alpaka::KernelCfg<Acc> const kernelCfg_" << fNX
+          << " = {elementsPerGrid_" << fNX << ", elementsPerThread_" << fNX << "};\n";
+      out << SP << "auto const workDiv_" << fNX
+          << " = alpaka::getValidWorkDiv(kernelCfg_" << fNX << ", devAcc, clipKernel"
+          << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
+          << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+          << ", static_cast<std::size_t>(" << length << ")"
+          << ", " << castMin << ", " << castMax << ");\n";
+      out << SP << "auto task_" << OpName
+          << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNX << ", clipKernel"
+          << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
+          << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+          << ", static_cast<std::size_t>(" << length << ")"
+          << ", " << castMin << ", " << castMax << ");\n";
+      out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";
+      return out.str();
+   }
+
+   bool IsElementwise() const override { return true; }
+
+   std::string GetElementwiseExpr(const std::string& v) const override
+   {
+      std::string minExpr, maxExpr;
+      if (fMinIsConstant)       minExpr = ToStringHighPrec(fMin);
+      else if (fHasMin)         minExpr = "tensor_" + fNMin + "[0]";
+      else                      minExpr = "std::numeric_limits<" + TensorType<T>::Name() + ">::lowest()";
+
+      if (fMaxIsConstant)       maxExpr = ToStringHighPrec(fMax);
+      else if (fHasMax)         maxExpr = "tensor_" + fNMax + "[0]";
+      else                      maxExpr = "std::numeric_limits<" + TensorType<T>::Name() + ">::max()";
+
+      std::string expr = fHasMax || fMaxIsConstant ? "std::min(" + maxExpr + ", " + v + ")" : v;
+      if (fHasMin || fMinIsConstant)
+         expr = "std::max(" + minExpr + ", " + expr + ")";
+      return expr;
+   }
+
+   std::string GetFusableOutputTensorName() override { return fNY; }
+
+   void UpdateFusableTensorName(std::string fusable_tensor_name,
+                                 const std::function<void(const std::string&)>& removal_func) override
+   {
+      removal_func(fNX);
+      removal_func(fNY);
+      fNX = fusable_tensor_name;
+      fNY = fusable_tensor_name;
+      fInputTensorNames[0]  = fNX;
+      fOutputTensorNames[0] = fNY;
+   }
 
    // -----------------------------------------------------------------------
    // Generate

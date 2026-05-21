@@ -47,7 +47,7 @@ public:
 
    void Initialize(RModel& model) override {
       if (model.CheckIfTensorAlreadyExist(fNX) == false){   //input must be a graph input, or already initialized intermediate tensor
-         throw std::runtime_error("TMVA SOFIE Shape Op Input Tensor " + fNX + " is not found in model");
+         throw std::runtime_error("SOFIE Shape Op Input Tensor " + fNX + " is not found in model");
       }
       fShape = model.GetTensorShape(fNX);
       size_t length = fShape.size();  // this the size of shape not length of tensor
@@ -87,7 +87,7 @@ public:
 
       OpName = "op_" + OpName;
       if (fShape.empty()) {
-         throw std::runtime_error("TMVA SOFIE Shape op called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Shape op called to Generate without being initialized first");
       }
       std::stringstream out;
 
@@ -107,7 +107,7 @@ public:
 
       OpName = "op_" + OpName;
       if (fShape.empty()) {
-         throw std::runtime_error("TMVA SOFIE Shape op called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Shape op called to Generate without being initialized first");
       }
       std::stringstream out;
 

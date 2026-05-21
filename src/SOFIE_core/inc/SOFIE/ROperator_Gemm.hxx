@@ -24,6 +24,7 @@ namespace SOFIE{
    private:
       bool fIsDynamic = false;
       bool fBroadcastBias = false;
+      bool fCheckBiasShapeAtRuntime = false; // flag to identify the need to do a run time check of bias shape compatibility in case of dynamic shapes and uni-directional broadcasting
 
       float fAttrAlpha = 1.0;
       float fAttrBeta = 1.0;
@@ -39,6 +40,7 @@ namespace SOFIE{
       std::vector<Dim> fShapeA;
       std::vector<Dim> fShapeB;
       std::vector<size_t> fShapeC;
+      std::vector<Dim> fDimShapeC;
       std::vector<Dim> fShapeY;
       RModel * fModel = nullptr;
 
@@ -49,7 +51,6 @@ namespace SOFIE{
          fAttrAlpha(alpha), fAttrBeta(beta), fAttrTransA(transA), fAttrTransB(transB), fNA(UTILITY::Clean_name(nameA)),
          fNB(UTILITY::Clean_name(nameB)), fNY(UTILITY::Clean_name(nameY))
       {
-         fKind = OperatorKind::GEMM;
          fActivation = activation;
          fType = "float";
          static_assert(std::is_same_v<T, float>,
@@ -62,7 +63,6 @@ namespace SOFIE{
          fAttrAlpha(alpha), fAttrBeta(beta), fAttrTransA(transA), fAttrTransB(transB), fNA(UTILITY::Clean_name(nameA)),
          fNB(UTILITY::Clean_name(nameB)), fNC(UTILITY::Clean_name(nameC)), fNY(UTILITY::Clean_name(nameY)), fActivation(activation)
       {
-         fKind = OperatorKind::GEMM;
          fActivation = activation;
          fType = "float";
 
@@ -77,12 +77,12 @@ namespace SOFIE{
 
       template <typename U>
       std::vector<U> DoShapeInference(const std::vector<std::vector<U>> & input){
-         if (input.size() > 3) throw std::runtime_error("TMVA SOFIE Gemm Op Shape Inference only need 2 or 3 input tensor");
+         if (input.size() > 3) throw std::runtime_error("SOFIE Gemm Op Shape Inference only need 2 or 3 input tensor");
          // accept tensor with input dimensions > 2
          // example: A = (d1,d2,...,N1,N2)  B = (d1,d2,...,N2,N3)    --> Y = (d1,d2,..,N1,N3)
          for (auto& i: input){
             if (i.size() < 2){
-               throw std::runtime_error("TMVA SOFIE Gemm Op Shape Inference only accept input tensor with >=2 dimensions");
+               throw std::runtime_error("SOFIE Gemm Op Shape Inference only accept input tensor with >=2 dimensions");
             }
          }
 
@@ -118,7 +118,7 @@ namespace SOFIE{
                   else if (valueA.GetVal() == "1")
                      s_y.push_back(input[1][i]);
                   else if (!valueA.isParam && !valueB.isParam)
-                     throw std::runtime_error("TMVA SOFIE Gemm Op - invalid input shapes " + valueA.GetVal() + " and "
+                     throw std::runtime_error("SOFIE Gemm Op - invalid input shapes " + valueA.GetVal() + " and "
                         + valueB.GetVal());
                   else if (valueA.isParam && valueB.isParam){
                       // check which parameter is first in RModel list
@@ -133,7 +133,7 @@ namespace SOFIE{
                   else if (!valueB.isParam)
                      s_y.push_back(input[1][i]);
                   else
-                     throw std::runtime_error("TMVA SOFIE Gemm Op - invalid input shapes " + valueA.GetVal() + " and "
+                     throw std::runtime_error("SOFIE Gemm Op - invalid input shapes " + valueA.GetVal() + " and "
                         + valueB.GetVal());
                }
                else
@@ -162,11 +162,11 @@ namespace SOFIE{
          fModel = &model;
 
          if ((model.CheckIfTensorAlreadyExist(fNA) == false) || (model.CheckIfTensorAlreadyExist(fNB) == false) ){   //input must be a graph input, or already initialized intermediate tensor
-            throw std::runtime_error("TMVA SOFIE Gemm Op Input Tensor " + fNA + " or " + fNB + " is not found in model");
+            throw std::runtime_error("SOFIE Gemm Op Input Tensor " + fNA + " or " + fNB + " is not found in model");
          }
          if (fNC != ""){
             if (model.CheckIfTensorAlreadyExist(fNC) == false){   //input must be a graph input, or already initialized intermediate tensor
-               throw std::runtime_error("TMVA SOFIE Gemm Op Input Tensor" + fNC + " is not found in model");
+               throw std::runtime_error("SOFIE Gemm Op Input Tensor " + fNC + " is not found in model");
             }
          }
          if (model.IsDynamicTensor(fNA) || model.IsDimInputTensor(fNA) ) {
@@ -213,37 +213,38 @@ namespace SOFIE{
 
          // bias is normally not dynamic (not support it for time being)
          if (fNC != ""){
-            // normally bias is fixed and not dynamic
-            if (model.IsDynamicTensor(fNC)) {
-               throw std::runtime_error("TMVA SOFIE Gemm Op Input Tensor" + fNC + " is dynamic and is not supported");
+            if (model.IsDynamicTensor(fNC))
+               fDimShapeC = model.GetDynamicTensorShape(fNC);
+            else {
+               fShapeC = model.GetTensorShape(fNC);
+               fDimShapeC = ConvertShapeToDim(fShapeC);
             }
-            fShapeC = model.GetTensorShape(fNC);
             // for dynamic outputs broadcasting is always needed
             bool broadcast_needed = false;
             if (fIsDynamic && shapeY.empty())
                broadcast_needed = true;
             else
-               // consider broadcasting also if same length
+               // consider broadcasting also if they have different length
                broadcast_needed = (fShapeC != shapeY);
 
 
             if (broadcast_needed) {
                fBroadcastBias = true;
                // check if broadcasting is compatible and note that prepend 1 to shapeC
-               auto shapeDimC = ConvertShapeToDim(fShapeC);
-               auto r = UTILITY::MultidirectionalBroadcastShape(fShapeY, shapeDimC);
-               // return flag must be equal to 1 since this is a unidirectional broadcast of C->Y
-               if (r.first > 1) {
-                  throw std::runtime_error("TMVA SOFIE Gemm Op - bias tensor of shape " + ConvertShapeToString(fShapeC) + " cannot be uni-directional broadcasted to " + ConvertDimShapeToString(fShapeY));
+               auto r = UTILITY::MultidirectionalBroadcastShape(fShapeY, fDimShapeC);
+               // return flag must not have bit equal to 2 since this is a unidirectional broadcast of C->Y
+               //
+               if ((r.first & 2) == 2) {
+                  throw std::runtime_error("SOFIE Gemm Op - bias tensor of shape " + ConvertDimShapeToString(fDimShapeC) + " cannot be uni-directional broadcasted to " + ConvertDimShapeToString(fShapeY));
+               } else if (r.first  == 4) {
+                  // we need to do a run time check of bias shape if it is compatible
+                  fCheckBiasShapeAtRuntime = true;
                }
-               fShapeC = ConvertShapeToInt(shapeDimC);
-               if (fShapeC.empty()) {
-                  throw std::runtime_error("TMVA SOFIE Gemm Op - Error in bias tensor " + ConvertDimShapeToString(shapeDimC) );
-               }
+               fShapeC = ConvertShapeToInt(fDimShapeC);
             }
          }
 
-         // remove appended or prepended value of 1
+         // remove appended or prepended value of 1 in Y
          if (prependOne) {
             if (fIsDynamic)
                fShapeY.erase(fShapeY.begin());
@@ -276,9 +277,9 @@ namespace SOFIE{
       std::string Generate(std::string opName) override {
          opName = "op_" + opName;
 
-         if (fShapeA.empty() || fShapeB.empty() || fShapeY.empty() || (fNC != "" && fShapeC.empty())) {
-            throw std::runtime_error("TMVA SOFIE Gemm Op called to Generate without being initialized first");
-         }
+         // if (fShapeA.empty() || fShapeB.empty() || fShapeY.empty() || (fNC != "" && fShapeC.empty())) {
+         //    throw std::runtime_error("SOFIE Gemm Op called to Generate without being initialized first");
+         // }
          std::stringstream out;
          out << "\n//--------- Gemm " << opName << " " << ConvertDimShapeToString(fShapeA) << " * " << ConvertDimShapeToString(fShapeB)
              << " -> " << ConvertDimShapeToString(fShapeY) << "\n";
@@ -286,8 +287,13 @@ namespace SOFIE{
          int64_t dimA = fShapeA.size();
          int64_t dimB = fShapeB.size();
          int64_t dimY = fShapeY.size();
-         if (dimA != dimB || dimA != dimY) {
-             throw std::runtime_error("TMVA SOFIE Gemm(MatMul) has invalid shape for inputs or output");
+         int64_t dimC = fDimShapeC.size();
+         if (dimA != dimB || dimA != dimY || (fBroadcastBias && dimC != dimY)) {
+             std::cout << " shape A " << ConvertDimShapeToString(fShapeA)
+                       << " shape B " << ConvertDimShapeToString(fShapeB)
+                       << " shape C " << ConvertDimShapeToString(fDimShapeC)
+                       << " shape Y " << ConvertDimShapeToString(fShapeY) << std::endl;
+             throw std::runtime_error("SOFIE Gemm(MatMul) has invalid shape for inputs or output");
          }
          auto m = (fAttrTransA ? fShapeA[dimA-1].GetVal() : fShapeA[dimA-2].GetVal());
          auto n = (fAttrTransB ? fShapeB[dimB-2].GetVal() : fShapeB[dimB-1].GetVal());
@@ -302,26 +308,49 @@ namespace SOFIE{
          }
          auto lengthGemm = ConvertDimShapeToLength(sY); // size of the Gemm operation
          auto lengthExtra_Y = ConvertDimShapeToLength(sExtraY); // extra length in case input tensors are of dim>2 (MatMul)
+         std::string lengthExtra_C;
+         std::vector<Dim> sExtraC;
+         std::vector<Dim> sC;
+         bool haveExtraC = false;
+         if (dimC > 2) {
+            sC = {fDimShapeC[dimC-2], fDimShapeC[dimC-1]};
+            for (int64_t i = 0; i < dimC-2; i++) {
+               sExtraC.push_back(fDimShapeC[i]);
+            }
+            lengthExtra_C = ConvertDimShapeToLength(sExtraC);
+            if (lengthExtra_C != "1") haveExtraC = true;
+         } else if (dimC > 0) {
+            for (int64_t i = 0; i < dimC; i++) {
+               sC.push_back(fDimShapeC[i]);
+            }
+         }
 
          // case bias is present
          if (!fNC.empty()){
+             // when the 2 last dims of bias and Y are not compatible we need to perform a run time broadcast
+            if (sC != sY) fBroadcastBias = true;
             if (!fBroadcastBias) {
                // add a check in case broadcasting was not needed or done outside of session
                // C should have smaller dimension of Y
                if (!fIsDynamic) {
-                  if (std::stoi(lengthGemm) != static_cast<int>(ConvertShapeToLength(fShapeC)))
-                     throw std::runtime_error("TMVA SOFIE Gemm Op " + opName + " Bias tensor has not correct size "
+                  if ((std::stoi(lengthGemm) != std::stoi(ConvertDimShapeToLength(sC))) ||
+                      ( haveExtraC &&  std::stoi(lengthExtra_Y) != std::stoi(lengthExtra_C)))
+                     throw std::runtime_error("SOFIE Gemm Op " + opName + " Bias tensor " + fNC + " has not correct size "
                             + ConvertShapeToString(fShapeC) + " output length " + lengthGemm);
                } else {
                   // add a dynamic check (C should not be a dynamic tensor)
-                  out << SP << "assert(" << lengthGemm << " == " <<  ConvertShapeToLength(fShapeC) << ");\n";
+                  out << SP << "assert(" << lengthGemm << " == " <<  ConvertDimShapeToLength(sC) << ");\n";
+                  if (haveExtraC) out << SP << "assert(" << lengthExtra_Y << " == " <<  lengthExtra_C << ");\n";
                }
             }
          } else {
+            fBroadcastBias = false;
             //in this case fAttrBeta needs to be equal to zero otherwise second time we run we will use
             // the previous result
             if (fAttrBeta != 0) {
-               throw std::runtime_error("TMVA SOFIE Gemm Op " + opName + " Bias tensor is not present but beta value in Gemm is not zero");
+               // some model don't have bias but Beta is not zero - force it to zero
+               fAttrBeta = 0;
+               std::cout << "WARNING: SOFIE Gemm Op " + opName + " Bias tensor is not present but beta value in Gemm is not zero - force it to zero\n";
             }
          }
 
@@ -338,57 +367,116 @@ namespace SOFIE{
             std::vector<Dim> sA(fShapeA.begin(), fShapeA.begin()+dimA-2);
             std::vector<Dim> sB(fShapeB.begin(), fShapeB.begin()+dimB-2);
             std::vector<Dim> mA = {fShapeA[dimA-2], fShapeA[dimA-1]};
-            std::vector<Dim> mB = {fShapeA[dimB-2], fShapeB[dimB-1]};
+            std::vector<Dim> mB = {fShapeB[dimB-2], fShapeB[dimB-1]};
             lengthExtra_A = ConvertDimShapeToLength(sA);
             lengthExtra_B = ConvertDimShapeToLength(sB);
-            // size of A performing matmul is m*k and n*k for B
+            // if A ( b, m, k) and B (b, k, n) these are the strides of A and B ( m*k for A and n*k for B )
             increment_A = ConvertDimShapeToLength(mA);
             increment_B = ConvertDimShapeToLength(mB);
          }
          bool extraA = (doStackMul && lengthExtra_A != "1");
          bool extraB = (doStackMul && lengthExtra_B != "1");
+         bool extraC = (doStackMul && haveExtraC && !fBroadcastBias);
+         // run time check for bias broadcasting
+         std::string biasShapeType = opName + "_biasShapeType";
+         if (fBroadcastBias && fCheckBiasShapeAtRuntime) {
+            // create a flag according to bias shape:
+            // = 1 for (1,Y2)
+            // = 2 for (Y1,1)
+            // = 3 for a scalar
+            out << SP << "int " << biasShapeType << " = 0;\n";
+            // case vector of columns
+            if (sC[0].GetVal() != "1" && sC[1].GetVal() != sY[1].GetVal())
+               out << SP << "if (" << sC[0] << " == 1 && " << sC[1] << " == " << sY[1] << ")\n";
+            else if (sC[0].GetVal() == "1")
+               out << SP << "if (" << sC[1] << " == " << sY[1] << ")\n";
+            else if (sC[1].GetVal() == sY[1].GetVal())
+               out << SP << "if (" << sC[0] << " == 1)\n";
+
+            out << SP << SP << biasShapeType << " = 1;\n";
+
+            // case vector of rows
+            if (sC[1].GetVal() != "1" && sC[0].GetVal() != sY[0].GetVal())
+               out << SP << "else if (" << sC[1] << " == 1 && " << sC[0] << " == " << sY[0] << ")\n";
+            else if (sC[1].GetVal() == "1")
+                out << SP << "else if (" << sC[0] << " == " << sY[0] << ")\n";
+            else if (sC[0].GetVal() == sY[0].GetVal())
+               out << SP << "else if (" << sC[1] << " == 1)\n";
+
+            out << SP << SP << biasShapeType << " = 2;\n";
+
+            // case scalar
+            if (sC[0].GetVal() != "1" && sC[1].GetVal() != "1")
+               out << SP << "else if (" << sC[0] << " == 1 && " << sC[1] << " == 1 )\n";
+            else if (sC[0].GetVal() == "1")
+               out << SP << "else if (" << sC[1] << " == 1)\n";
+            else if (sC[1].GetVal() == "1")
+               out << SP << "else if (" << sC[0] << " == 1)\n";
+            out << SP << SP << biasShapeType << " = 3;\n";
+            out << SP << "else\n";
+            out << SP << SP << "throw std::runtime_error(\"SOFIE Gemm Op - bias tensor "
+                                 << ConvertDimShapeToString(fDimShapeC) << " cannot be broadcasted to "
+                                 << ConvertDimShapeToString(fShapeY) << "\");\n";
+         }
+         auto SP2 = SP;
          if (doStackMul) {
             out << SP << "size_t " << opName << "_y_offset = 0;\n"; // needed if we stack the gemm operations
             if (extraA)
                out << SP << "size_t " << opName << "_A_offset = 0;\n";
             if (extraB)
                out << SP << "size_t " << opName << "_B_offset = 0;\n";
+            if (extraC)
+               out << SP << "size_t " << opName << "_C_offset = 0;\n";
             out << SP << "for (size_t i = 0; i < " << lengthExtra_Y << "; i++){\n";
-            out << SP;
+            SP2 += SP;
          }
-         // do the bias broadcasting
+         // do the bias broadcasting at run time by
+         // initializing output Y vector with bias values
          if (fBroadcastBias) {
+
             fAttrBeta = 1.;
-            out << SP << "for (size_t j = 0; j < " << sY[0] << "; j++) { \n";
-            out << SP << SP << "size_t y_index = ";
-            if (doStackMul) // add offset in caseof stack multiplications (not sure if bias is present in these cases)
+
+            // loop on first output dimension
+            out << SP2 << "for (size_t j = 0; j < " << sY[0] << "; j++) { \n";
+            out << SP2 << SP << "size_t y_index = ";
+            if (doStackMul) // add offset in case of stack multiplications (not sure if bias is present in these cases)
                out <<  opName << "_y_offset + ";
             if (sY[1].GetVal() != "1")
                out << sY[1] << " * j;\n";
             else
                out << "j;\n";
 
-            out << SP << SP << "for (size_t k = 0; k < " << sY[1] << "; k++) { \n";
-            std::string bias_index;
-            if (fShapeC[0] == 1 && fShapeC[1] == sY[1].dim)
-               bias_index = "k";
-            else if (fShapeC[1] == 1 && fShapeC[0] == sY[0].dim)
-               bias_index = "j";
-            else if (fShapeC[0] == 1 && fShapeC[1] == 1)   // scalar case
-               bias_index = "0";
-            else {
-               throw std::runtime_error("TMVA SOFIE Gemm Op - invalid shape for bias tensor " + ConvertShapeToString(fShapeC));
+            std::string prefix = SP2 + SP + "TMVA::Experimental::SOFIE::";
+            std::string target = "tensor_" + fNY;
+            if (sC.size() != 2) {
+               throw std::runtime_error("SOFIE Gemm Op - invalid rank for bias tensor " + ConvertDimShapeToString(fDimShapeC) + ConvertDimShapeToString(sC));
+            } if (sC[0].GetVal() == "1" && sC[1].GetVal() == sY[1].GetVal()) {
+               out << prefix << "Copy(" << target << " + y_index, tensor_" << fNC << ", " << sY[1] << ");\n";
+            } else if (sC[1].GetVal() == "1" && sC[0].GetVal() == sY[0].GetVal()) {
+               out << prefix << "Fill(" << target << " + y_index, tensor_" << fNC << "[j], " << sY[1] << ");\n";
+            } else if (sC[0].GetVal() == "1" && sC[1].GetVal() == "1") {
+               // scalar case
+               out << prefix << "Fill(" << target << " + y_index, tensor_" << fNC << "[0], " << sY[1] << ");\n";
+            } else if (fCheckBiasShapeAtRuntime) {
+               // in the generic dynamic case we check at run time that bias is compatible
+               // we check that bias[0] = 1 or equal to SY[0] and that bias[1] = 1 or equal to SY[1]
+               // tbd: this run-time check coul;d be moved outside the loop for better run time efficiency
+               out << SP2 << SP << "if (" << biasShapeType << " == 1)\n";   // case vector of columns
+               out << SP << prefix << "Copy(" << target << " + y_index, tensor_" << fNC << ", " << sY[1] << ");\n";
+               out << SP2 << SP << "else if (" << biasShapeType << " == 2)\n";  // case vector of rows
+               out << SP << prefix << "Fill(" << target << " + y_index, tensor_" << fNC << "[j], " << sY[1] << ");\n";
+               out << SP2 << SP << "else \n";  // scalar case
+               out << SP << prefix << "Fill(" << target << " + y_index, tensor_" << fNC << "[0], " << sY[1] << ");\n";
+            } else {
+               throw std::runtime_error("SOFIE Gemm Op - invalid shape for bias tensor " + ConvertDimShapeToString(fDimShapeC));
             }
 
-            out << SP << SP << SP << "tensor_" << fNY << "[y_index + k] = " <<  "tensor_" << fNC << "[" << bias_index << "];\n";
-            out << SP << SP << "}\n";
-            out << SP << "}\n";
+            out << SP2 << "}\n";
          }
 
          if (fType == "float"){
 
-            out << SP << "TMVA::Experimental::SOFIE::Gemm_Call("
-             << "tensor_" << fNY;
+            out << SP2 << "TMVA::Experimental::SOFIE::Gemm_Call(" << "tensor_" << fNY;
              if (doStackMul) out << " + " << opName << "_y_offset";
             out <<   ", "
              << (fAttrTransB ? "true, " : "false, ")
@@ -399,18 +487,17 @@ namespace SOFIE{
             out << ", tensor_" << fNA;
             if (extraA) out << " + " << opName << "_A_offset";
             out << ", " << std::setprecision(std::numeric_limits<float>::max_digits10) << fAttrBeta << ",";
-            // in the case of bias and no broadcasting needed
-            if (!fNC.empty() && !fBroadcastBias)
+            // in the case of bias and no broadcasting needed - I need to add bias as an extra tensor in Gemm call
+            if (!fNC.empty() && !fBroadcastBias) {
                out << "tensor_" << fNC;
-            else
+               if (extraC) {
+                  out << " + " << opName << "_C_offset";
+               }
+            } else {
                out << "nullptr";
+            }
             out << ");\n";
 
-            if(fActivation == EActivationType::RELU){
-               out << SP << "for (int id = 0; id < " << ConvertDimShapeToLength(fShapeY) << " ; id++){\n";
-               out << SP << SP << "tensor_" << fNY << "[id] = ((tensor_" << fNY << "[id] > 0 )? tensor_" << fNY << "[id] : 0);\n";
-               out << SP << "}\n";
-            }
          }
 
          if (doStackMul) {
@@ -419,8 +506,18 @@ namespace SOFIE{
                out << SP << SP << opName << "_A_offset += " << increment_A << ";\n";
             if (lengthExtra_B != "1")
                out << SP << SP << opName << "_B_offset += " << increment_B << ";\n";
+            if (extraC)
+               // increment_C is lengthGEmm
+               out << SP << SP << opName << "_C_offset += " << lengthGemm << ";\n";
+            out << SP << "}\n"; // end of loop on the stacked multiplication
+         }
 
-            out << "}\n"; // end of loop on the stacked multiplications
+         // fuse with Relu
+         if(fActivation == EActivationType::RELU){
+               out << SP << "//--- applying RELU to output\n";
+               std::string tnsr = "tensor_" + fNY;
+               std::string reluSize = ConvertDimShapeToLength(fShapeY);
+               out << SP << "TMVA::Experimental::SOFIE::Relu(" << tnsr << ", " << tnsr << ", " << reluSize << ");\n";
          }
 
          return out.str();
@@ -430,7 +527,7 @@ namespace SOFIE{
          opName = "op_" + opName;
 
          if (fShapeA.empty() || fShapeB.empty() || fShapeY.empty() || (fNC != "" && fShapeC.empty())) {
-            throw std::runtime_error("TMVA SOFIE Gemm Op called to Generate without being initialized first");
+            throw std::runtime_error("SOFIE Gemm Op called to Generate without being initialized first");
          }
          std::stringstream out;
          out << "\n//--------- Gemm_GPU_ALPAKA\n";
@@ -442,7 +539,7 @@ namespace SOFIE{
          int64_t dimB = fShapeB.size();
          int64_t dimY = fShapeY.size();
          if (dimA != dimB || dimA != dimY) {
-             throw std::runtime_error("TMVA SOFIE Gemm(MatMul) has invalid shape for inputs or output");
+             throw std::runtime_error("SOFIE Gemm(MatMul) has invalid shape for inputs or output");
          }
          auto m = (fAttrTransA ? fShapeA[dimA-1].GetVal() : fShapeA[dimA-2].GetVal());
          auto n = (fAttrTransB ? fShapeB[dimB-2].GetVal() : fShapeB[dimB-1].GetVal());
@@ -471,7 +568,7 @@ namespace SOFIE{
                // C should have smaller dimension of Y
                if (!fIsDynamic) {
                   if (std::stoi(lengthGemm) != static_cast<int>(ConvertShapeToLength(fShapeC)))
-                     throw std::runtime_error("TMVA SOFIE Gemm Op " + opName + " Bias tensor has not correct size "
+                     throw std::runtime_error("SOFIE Gemm Op " + opName + " Bias tensor has not correct size "
                             + ConvertShapeToString(fShapeC) + " output length " + lengthGemm);
                } else {
                   // add a dynamic check (C should not be a dynamic tensor)
@@ -482,7 +579,7 @@ namespace SOFIE{
             //in this case fAttrBeta needs to be equal to zero otherwise second time we run we will use
             // the previous result
             if (fAttrBeta != 0) {
-               throw std::runtime_error("TMVA SOFIE Gemm Op " + opName + " Bias tensor is not present but beta value in Gemm is not zero");
+               throw std::runtime_error("SOFIE Gemm Op " + opName + " Bias tensor is not present but beta value in Gemm is not zero");
             }
          }
 

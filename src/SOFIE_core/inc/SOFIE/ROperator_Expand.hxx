@@ -40,7 +40,7 @@ public:
    void Initialize(RModel& model) override {
       // input must be a graph input, or already initialized intermediate tensor
       if (!model.CheckIfTensorAlreadyExist(fNX)) {
-        throw std::runtime_error("TMVA SOFIE Expand Op Input Tensor " + fNX + " is not found in model");
+        throw std::runtime_error("SOFIE Expand Op Input Tensor " + fNX + " is not found in model");
       }
       fShapeX = model.GetDimTensorShape(fNX);
       if (model.IsInitializedTensor(fNShape)) {
@@ -145,7 +145,7 @@ public:
       if (fIsOutputConstant) return "";
       opName = "op_" + opName;
       if (fShapeY.empty()) {
-         throw std::runtime_error("TMVA SOFIE Expand Op called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Expand Op called to Generate without being initialized first");
       }
       std::stringstream out;
       out << SP << "\n//------ Expand " << opName << " --> " << ConvertDimShapeToString(fShapeY) << "\n";
@@ -170,7 +170,7 @@ std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
 
     opName = "op_" + opName;
     if (fShapeY.empty())
-        throw std::runtime_error("TMVA SOFIE Expand Op called to Generate without being initialized first");
+        throw std::runtime_error("SOFIE Expand Op called to Generate without being initialized first");
 
     // Can only generate a static kernel if all dimensions are concrete values
     auto isStatic = [](const std::vector<Dim>& shape) {
@@ -281,7 +281,7 @@ std::string Generate_GPU_ALPAKA(std::string opName) override {
     if (fIsOutputConstant) return "";
     opName = "op_" + opName;
     if (fShapeY.empty())
-        throw std::runtime_error("TMVA SOFIE Operator Expand called to Generate without being initialized first");
+        throw std::runtime_error("SOFIE Operator Expand called to Generate without being initialized first");
 
     std::stringstream out;
     out << "\n//------ EXPAND_GPU_ALPAKA\n";
@@ -318,7 +318,7 @@ std::string Generate_GPU_ALPAKA(std::string opName) override {
     if (!staticShapes) {
         // Dynamic shapes — not yet supported on GPU, throw a clear error
         throw std::runtime_error(
-            "TMVA SOFIE Expand GPU: dynamic shapes are not yet supported for GPU inference. "
+            "SOFIE Expand GPU: dynamic shapes are not yet supported for GPU inference. "
             "Tensor " + fNX + " has a dynamic shape.");
     }
 

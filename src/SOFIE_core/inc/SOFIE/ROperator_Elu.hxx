@@ -35,7 +35,7 @@ public:
          fType = "float";
       }
 		else{
-			throw std::runtime_error("TMVA SOFIE Encountered unsupported type parsing a Elu operator");
+			throw std::runtime_error("SOFIE Encountered unsupported type parsing a Elu operator");
 		}
    }
 
@@ -50,7 +50,7 @@ public:
 
    void Initialize(RModel& model) override {
       if (model.CheckIfTensorAlreadyExist(fNX) == false){   //input must be a graph input, or already initialized intermediate tensor
-         throw std::runtime_error("TMVA SOFIE Elu Op Input Tensor is not found in model");
+         throw std::runtime_error("SOFIE Elu Op Input Tensor is not found in model");
       }
       fShape = model.GetTensorShape(fNX);
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShape);
@@ -60,7 +60,7 @@ public:
    std::string Generate(std::string OpName) override {
       OpName = "op_" + OpName;
       if (fShape.empty()) {
-         throw std::runtime_error("TMVA SOFIE Operator Elu called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Operator Elu called to Generate without being initialized first");
       }
       std::stringstream out;
       size_t length = ConvertShapeToLength(fShape);

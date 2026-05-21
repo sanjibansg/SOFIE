@@ -38,40 +38,40 @@ auto ROperator_RNN<T>::Initialize(RModel& model)
    fUseSession = model.UseSession();
    // Check the input and output tensors
    if (!model.CheckIfTensorAlreadyExist(fNX)) {
-      throw std::runtime_error("TMVA SOFIE RNN Op input tensor " + fNX +
+      throw std::runtime_error("SOFIE RNN Op input tensor " + fNX +
                                "  is not found in model.");
    }
    fShapeX = model.GetTensorShape(fNX);
    if (fShapeX.size() != 3) {
-      throw std::runtime_error("TMVA SOFIE RNN Op input tensor " + fNX +
+      throw std::runtime_error("SOFIE RNN Op input tensor " + fNX +
                                " is not of 3 dimensions.");
    }
    if (!model.CheckIfTensorAlreadyExist(fNW)) {
-      throw std::runtime_error("TMVA SOFIE RNN Op input tensor " + fNW +
+      throw std::runtime_error("SOFIE RNN Op input tensor " + fNW +
                                "  is not found in model.");
    }
    fShapeW = model.GetTensorShape(fNW);
    if (fShapeW.size() != 3) {
-      throw std::runtime_error("TMVA SOFIE RNN Op input tensor " + fNW +
+      throw std::runtime_error("SOFIE RNN Op input tensor " + fNW +
                                " is not of 3 dimensions.");
    }
    if (!model.CheckIfTensorAlreadyExist(fNR)) {
-      throw std::runtime_error("TMVA SOFIE RNN Op input tensor " + fNR +
+      throw std::runtime_error("SOFIE RNN Op input tensor " + fNR +
                                "  is not found in model.");
    }
    fShapeR = model.GetTensorShape(fNR);
    if (fShapeR.size() != 3) {
-      throw std::runtime_error("TMVA SOFIE RNN Op input tensor " + fNR +
+      throw std::runtime_error("SOFIE RNN Op input tensor " + fNR +
                                " is not of 3 dimensions.");
    }
    if (!fNB.empty()) {
       if (!model.CheckIfTensorAlreadyExist(fNB)) {
-         throw std::runtime_error("TMVA SOFIE RNN op input tensor " + fNB +
+         throw std::runtime_error("SOFIE RNN op input tensor " + fNB +
                                   " is not  found in model.");
       }
       fShapeB = model.GetTensorShape(fNB);
       if (fShapeB.size() != 2 && fShapeB.size() != 4) {
-         throw std::runtime_error("TMVA SOFIE RNN op input tensor " + fNB +
+         throw std::runtime_error("SOFIE RNN op input tensor " + fNB +
                                   " is not of 2 or 4 dimensions.");
       }
       if (fShapeB.size() == 2) {
@@ -111,23 +111,23 @@ auto ROperator_RNN<T>::Initialize(RModel& model)
    }
    if (!fNSequence_lens.empty()) {
       if (!model.CheckIfTensorAlreadyExist(fNSequence_lens)) {
-         throw std::runtime_error("TMVA SOFIE RNN Op input tensor " +
+         throw std::runtime_error("SOFIE RNN Op input tensor " +
                                   fNSequence_lens + "is not found in model.");
       }
       fShapeSequence_lens = model.GetTensorShape(fNSequence_lens);
       if (fShapeSequence_lens.size() != 1) {
-         throw std::runtime_error("TMVA SOFIE RNN Op input tensor " +
+         throw std::runtime_error("SOFIE RNN Op input tensor " +
                                   fNSequence_lens + " is not of 1 dimension.");
       }
    }
    if (!fNInitial_h.empty()) {
       if (!model.CheckIfTensorAlreadyExist(fNInitial_h)) {
-         throw std::runtime_error("TMVA SOFIE RNN Op input tensor " +
+         throw std::runtime_error("SOFIE RNN Op input tensor " +
                                   fNInitial_h + " is not found in model.");
       }
       fShapeInitial_h = model.GetTensorShape(fNInitial_h);
       if (fShapeInitial_h.size() != 3) {
-         throw std::runtime_error("TMVA SOFIE RNN Op input tensor " +
+         throw std::runtime_error("SOFIE RNN Op input tensor " +
                                   fNInitial_h + " is not of 3 dimensions.");
       }
    }
@@ -152,24 +152,24 @@ auto ROperator_RNN<T>::Initialize(RModel& model)
           activation != "ScaledTanh" && activation != "HardSigmoid" &&
           activation != "Elu" && activation != "Softsign" &&
           activation != "Softplus") {
-         throw std::runtime_error("TMVA SOFIE - Activation function " +
+         throw std::runtime_error("SOFIE - Activation function " +
                                   activation + " not implemented");
       }
    }
    if (fAttrDirection != "forward" && fAttrDirection != "backward" &&
        fAttrDirection != "bidirectional") {
       throw std::runtime_error(
-          "TMVA SOFIE - Invalid RNN direction fAttrDirection = " +
+          "SOFIE - Invalid RNN direction fAttrDirection = " +
           fAttrDirection);
    }
    if (fAttrHiddenSize != fShapeW[1]) {
       throw std::runtime_error(
-          "TMVA SOFIE - fAttrHiddenSize must be equal to " +
+          "SOFIE - fAttrHiddenSize must be equal to " +
           std::to_string(fShapeW[1]));
    }
    if (fAttrLayout > 1) {
       throw std::runtime_error(
-          "TMVA SOFIE - Layout fAttrLayout = " + std::to_string(fAttrLayout) +
+          "SOFIE - Layout fAttrLayout = " + std::to_string(fAttrLayout) +
           " must be 0 (timewise) or 1 (batchwise)");
    }
    if (fAttrActivations.empty()) {

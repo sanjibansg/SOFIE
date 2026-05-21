@@ -88,7 +88,7 @@ public:
       if (std::is_same<T, float>::value) {
          fType = "float";
       } else {
-         throw std::runtime_error("TMVA SOFIE Encountered unsupported type parsing a Conv operator");
+         throw std::runtime_error("SOFIE Encountered unsupported type parsing a Conv operator");
       }
    }
 

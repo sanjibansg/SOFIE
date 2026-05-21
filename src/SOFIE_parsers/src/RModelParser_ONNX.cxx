@@ -48,6 +48,11 @@ extern ParserFuncSignature ParseLess;
 extern ParserFuncSignature ParseLessEq;
 extern ParserFuncSignature ParseGreater;
 extern ParserFuncSignature ParseGreaterEq;
+//Is Operators
+extern ParserFuncSignature ParseIsInf;
+extern ParserFuncSignature ParseIsNaN;
+extern ParserFuncSignature ParseNot;
+extern ParserFuncSignature ParseClip;
 // Reduce operators
 extern ParserFuncSignature ParseReduceMean;
 extern ParserFuncSignature ParseReduceSum;
@@ -204,6 +209,11 @@ RModelParser_ONNX::RModelParser_ONNX() noexcept : fOperatorsMapImpl(std::make_un
    RegisterOperator("LessOrEqual", ParseLessEq);
    RegisterOperator("Greater", ParseGreater);
    RegisterOperator("GreaterOrEqual", ParseGreaterEq);
+   // Is / Not operators
+   RegisterOperator("IsInf", ParseIsInf);
+   RegisterOperator("IsNaN", ParseIsNaN);
+   RegisterOperator("Not", ParseNot);
+   RegisterOperator("Clip", ParseClip);
    // Reduce operators
    RegisterOperator("ReduceMean", ParseReduceMean);
    RegisterOperator("ReduceSum", ParseReduceSum);
@@ -763,7 +773,7 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
          std::cout << "\t" << i << "  " << nodesOrder[i] << " parsing operator " << op_type << std::endl;
       }
 
-      std::unique_ptr<ROperator> op = ParseOperator(i, graph, nodesOrder, nodesChildren[i]);
+      std::unique_ptr<ROperator> op = ParseOperator(i, graph, nodesOrder, nodesChildren[nodesOrder[i]]);
       if (!op) {
          if (verbose) {
             std::cout << "\t\tskipping operator since it is fused with previous one" << std::endl;

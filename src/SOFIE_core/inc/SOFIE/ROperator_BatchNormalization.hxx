@@ -59,7 +59,7 @@ public:
       }
       else{
 	      throw
-		      std::runtime_error("TMVA SOFIE Encountered unsupported type parsing a BatchNormalization operator");
+		      std::runtime_error("SOFIE Encountered unsupported type parsing a BatchNormalization operator");
       }
    }
 
@@ -72,12 +72,12 @@ public:
    std::vector<std::vector<size_t>> ShapeInference(std::vector<std::vector<size_t>> input) override {
       if (input.size() != 5 ) {
          throw
-         std::runtime_error("TMVA SOFIE BatchNormalization Op Shape inference need 5 input tensors");
+         std::runtime_error("SOFIE BatchNormalization Op Shape inference need 5 input tensors");
       }
       for(size_t i = 0; i < input.size(); i++) {
          if (input[i].size() != 4) {
             throw
-            std::runtime_error("TMVA SOFIE BatchNormalization Op Shape inference only accept tensor with 4 dimensions");
+            std::runtime_error("SOFIE BatchNormalization Op Shape inference only accept tensor with 4 dimensions");
          }
       }
 
@@ -88,30 +88,30 @@ public:
    void Initialize(RModel& model) override {
       if (!model.CheckIfTensorAlreadyExist(fNX)) {
          throw
-            std::runtime_error("TMVA SOFIE BatchNormalization op Input Tensor " + fNX + " fnx is not found in model");
+            std::runtime_error("SOFIE BatchNormalization op Input Tensor " + fNX + " fnx is not found in model");
       }
       if (!model.CheckIfTensorAlreadyExist(fNScale)) {
 	     throw
-            std::runtime_error("TMVA SOFIE BatchNormalization op Input Tensor " + fNScale + " fns is not found in model");
+            std::runtime_error("SOFIE BatchNormalization op Input Tensor " + fNScale + " fns is not found in model");
       }
 	  if (!model.CheckIfTensorAlreadyExist(fNB)) {
          throw
-            std::runtime_error("TMVA SOFIE BatchNormalization op Input Tensor " + fNB + " fnb is not found in model");
+            std::runtime_error("SOFIE BatchNormalization op Input Tensor " + fNB + " fnb is not found in model");
       }
       if (!model.CheckIfTensorAlreadyExist(fNMean)) {
          throw
-            std::runtime_error("TMVA SOFIE BatchNormalization op Input Tensor " + fNMean + " fnm is not found in model");
+            std::runtime_error("SOFIE BatchNormalization op Input Tensor " + fNMean + " fnm is not found in model");
       }
       if (!model.CheckIfTensorAlreadyExist(fNVar)) {
          throw
-            std::runtime_error("TMVA SOFIE BatchNormalization op Input Tensor " + fNVar + " fnv is not found in model");
+            std::runtime_error("SOFIE BatchNormalization op Input Tensor " + fNVar + " fnv is not found in model");
       }
 
       fShapeX = model.GetTensorShape(fNX);
 
       if (fShapeX.size() <  2 || fShapeX.size() > 4) {
          throw
-            std::runtime_error("TMVA SOFIE BatchNormalization Op input tensor " + fNX + " fnx has wrong shape : " + ConvertShapeToString(fShapeX));
+            std::runtime_error("SOFIE BatchNormalization Op input tensor " + fNX + " fnx has wrong shape : " + ConvertShapeToString(fShapeX));
       }
 
       fShapeScale = model.GetTensorShape(fNScale);
@@ -185,7 +185,7 @@ public:
    std::string Generate(std::string OpName) override {
       OpName = "op_" + OpName;
       if (fShapeX.empty()){
-         throw std::runtime_error("TMVA SOFIE Batch Normalization called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Batch Normalization called to Generate without being initialized first");
       }
 
       std::stringstream out;
@@ -230,7 +230,7 @@ public:
    std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
       opName = "op_" + opName;
       if (fShapeX.empty())
-         throw std::runtime_error("TMVA SOFIE BatchNormalization called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE BatchNormalization called to Generate without being initialized first");
 
       std::size_t totalElements = ConvertShapeToLength(fShapeY);
 
@@ -277,7 +277,7 @@ public:
    std::string Generate_GPU_ALPAKA(std::string opName) override {
       opName = "op_" + opName;
       if (fShapeX.empty())
-         throw std::runtime_error("TMVA SOFIE BatchNormalization called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE BatchNormalization called to Generate without being initialized first");
 
       std::size_t totalElements = ConvertShapeToLength(fShapeY);
       std::string kname = "batchNormKernel_" + opName;

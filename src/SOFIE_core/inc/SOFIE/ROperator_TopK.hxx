@@ -48,7 +48,7 @@ public:
 
    std::vector<std::vector<size_t>> ShapeInference(std::vector<std::vector<size_t>> input) override {
       if (input.size() != 2) {
-         throw std::runtime_error("TMVA SOFIE TopK Op Shape Inference needs exactly 2 input tensors");
+         throw std::runtime_error("SOFIE TopK Op Shape Inference needs exactly 2 input tensors");
       }
 
       auto shape = input[0]; // Shape format: [ m x n x o x p ... ]
@@ -62,11 +62,11 @@ public:
    void Initialize(RModel& model) override {
       if (model.CheckIfTensorAlreadyExist(fNX) == false) {
          // input must be a graph input, or already initialized intermediate tensor
-         throw std::runtime_error("TMVA SOFIE TopK Op Input Tensor is not found in model");
+         throw std::runtime_error("SOFIE TopK Op Input Tensor is not found in model");
       }
       if (model.CheckIfTensorAlreadyExist(fNK) == false) {
          // input must be a graph input, or already initialized intermediate tensor
-         throw std::runtime_error("TMVA SOFIE TopK Op Input Tensor i.e. K is not found in model");
+         throw std::runtime_error("SOFIE TopK Op Input Tensor i.e. K is not found in model");
       }
 
       fShapeX = model.GetTensorShape(fNX);
@@ -111,7 +111,7 @@ public:
    std::string Generate(std::string OpName) override {
       OpName = "op_" + OpName;
       if (fShapeX.empty()) {
-         throw std::runtime_error("TMVA SOFIE Operator TopK called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Operator TopK called to Generate without being initialized first");
       }
       std::stringstream out;
       size_t size = fShapeX.size();

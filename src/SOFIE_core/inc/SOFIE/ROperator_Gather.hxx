@@ -49,7 +49,7 @@ public:
 
    void Initialize(RModel& model) override {
       if (!model.CheckIfTensorAlreadyExist(fNX)) {
-         throw std::runtime_error("TMVA SOFIE Gather Op Input Tensor " + fNX + " is not found in model");
+         throw std::runtime_error("SOFIE Gather Op Input Tensor " + fNX + " is not found in model");
       }
       fShapeX = model.GetDimTensorShape(fNX);
       if (model.Verbose())
@@ -280,7 +280,7 @@ std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
     if (fIsOutputConstant) return "";
     opName = "op_" + opName;
     if (fShapeY.empty())
-        throw std::runtime_error("TMVA SOFIE Gather Op called to Generate without being initialized first");
+        throw std::runtime_error("SOFIE Gather Op called to Generate without being initialized first");
 
     const std::size_t D  = fShapeY.size();   // output rank = q + r - 1
     const std::size_t r  = fShapeX.size();
@@ -373,7 +373,7 @@ std::string Generate_GPU_ALPAKA(std::string opName) override {
     if (fIsOutputConstant) return "";
     opName = "op_" + opName;
     if (fShapeY.empty())
-        throw std::runtime_error("TMVA SOFIE Gather Op called to Generate without being initialized first");
+        throw std::runtime_error("SOFIE Gather Op called to Generate without being initialized first");
 
     auto totalElements = ConvertDimShapeToLength(fShapeY);
     std::string kname = "gatherKernel_" + opName;

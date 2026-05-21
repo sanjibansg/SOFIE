@@ -16,7 +16,7 @@ RFunction_MLP::RFunction_MLP(FunctionTarget target, int_t numLayers, Activation 
    // assuming all the linear layers has a kernel and a bias initialized tensors
    if (fActivateFinal) {
       if (fActivationFunction == Activation::Invalid) {
-         throw std::runtime_error("TMVA SOFIE GNN doesn't currently supports the provided activation function for " +
+         throw std::runtime_error("SOFIE GNN doesn't currently supports the provided activation function for " +
                                   fFuncName + " update.");
       }
       function_block->AddOutputTensorNameList({fFuncName + "Relu" + std::to_string(fNumLayers)});

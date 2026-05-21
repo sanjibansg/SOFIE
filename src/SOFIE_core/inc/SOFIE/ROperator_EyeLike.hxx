@@ -40,11 +40,11 @@ public:
 
    void Initialize(RModel& model) override {
       if (model.CheckIfTensorAlreadyExist(fNX) == false){   //input must be a graph input, or already initialized intermediate tensor
-         throw std::runtime_error("TMVA SOFIE EyeLike Op Input Tensor is not found in model");
+         throw std::runtime_error("SOFIE EyeLike Op Input Tensor is not found in model");
       }
       fShape = model.GetTensorShape(fNX);
       if (fShape.size() != 2)
-         throw std::runtime_error("TMVA SOFIE EyeLike Op Input Tensor is not of rank 2");
+         throw std::runtime_error("SOFIE EyeLike Op Input Tensor is not of rank 2");
 
       if(fdtype){
         ETensorType extractedType = static_cast<ETensorType>(fdtype);
@@ -59,7 +59,7 @@ public:
    std::string Generate(std::string OpName) override {
       OpName = "op_" + OpName;
       if (fShape.empty()){
-         throw std::runtime_error("TMVA SOFIE Operator EyeLike called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Operator EyeLike called to Generate without being initialized first");
       }
       auto length = ConvertShapeToLength(fShape);
       auto stride = SOFIE::UTILITY::ComputeStrideFromShape(fShape);

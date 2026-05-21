@@ -52,7 +52,7 @@ public:
          // case of ConstantOfShape (since no inputs in case of Constant operator)
          fIsConstantOfShape  = true;
          if (model.CheckIfTensorAlreadyExist(fNX) == false){
-           throw std::runtime_error("TMVA SOFIE ConstantOfShape Op Input Tensor is not found in model");
+           throw std::runtime_error("SOFIE ConstantOfShape Op Input Tensor is not found in model");
          }
          // get output shape from input values:
          // can work only if input is a constant or initialized tensor (or dynamic one)
@@ -60,7 +60,7 @@ public:
          auto input_tensor = static_cast<int64_t *>(dptr.get());
          auto input_shape = model.GetTensorShape(fNX);
          if (input_shape.size() > 1 )
-            throw std::runtime_error("TMVA SOFIE ConstantOfShape Op Input Tensor has invalid shape");
+            throw std::runtime_error("SOFIE ConstantOfShape Op Input Tensor has invalid shape");
          if (input_tensor != nullptr && !input_shape.empty()) {
             fShape = std::vector<size_t> (input_shape[0]);
             for (size_t i = 0; i < fShape.size(); i++)
@@ -70,7 +70,7 @@ public:
 
          length = ConvertShapeToLength(fShape);
          if (fValues.size() != 1)
-            throw std::runtime_error("TMVA SOFIE ConstantOfShape Op value Tensor has invalid size " + std::to_string(fValues.size()));
+            throw std::runtime_error("SOFIE ConstantOfShape Op value Tensor has invalid size " + std::to_string(fValues.size()));
 
          T value = fValues[0];
          fValues = std::vector<T>(length, value);
@@ -80,7 +80,7 @@ public:
          // in case of standard constant the shape is provided as input
          length = ConvertShapeToLength(fShape);
          if (length != fValues.size())
-            throw std::runtime_error("TMVA SOFIE Constant Op has invalid shape : " + ConvertShapeToString(fShape) +
+            throw std::runtime_error("SOFIE Constant Op has invalid shape : " + ConvertShapeToString(fShape) +
                                  " with " + std::to_string(fValues.size()) + " values");
       }
 

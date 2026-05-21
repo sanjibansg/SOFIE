@@ -53,9 +53,9 @@ public:
 
    void Initialize(RModel& model) override {
       if (!model.CheckIfTensorAlreadyExist(fNData))
-         throw std::runtime_error("TMVA SOFIE GatherND: data tensor " + fNData + " not found in model");
+         throw std::runtime_error("SOFIE GatherND: data tensor " + fNData + " not found in model");
       if (!model.CheckIfTensorAlreadyExist(fNIndices))
-         throw std::runtime_error("TMVA SOFIE GatherND: indices tensor " + fNIndices + " not found in model");
+         throw std::runtime_error("SOFIE GatherND: indices tensor " + fNIndices + " not found in model");
 
       fShapeData    = model.GetTensorShape(fNData);
       fShapeIndices = model.GetTensorShape(fNIndices);
@@ -66,17 +66,17 @@ public:
       size_t last_idx_dim = fShapeIndices.back();
 
       if (r < 1)
-         throw std::runtime_error("TMVA SOFIE GatherND: data rank must be >= 1");
+         throw std::runtime_error("SOFIE GatherND: data rank must be >= 1");
       if (q < 1)
-         throw std::runtime_error("TMVA SOFIE GatherND: indices rank must be >= 1");
+         throw std::runtime_error("SOFIE GatherND: indices rank must be >= 1");
       if (b >= std::min(q, r))
-         throw std::runtime_error("TMVA SOFIE GatherND: batch_dims must be < min(q, r)");
+         throw std::runtime_error("SOFIE GatherND: batch_dims must be < min(q, r)");
       if (last_idx_dim > r - b)
-         throw std::runtime_error("TMVA SOFIE GatherND: indices_shape[-1] must be <= r - batch_dims");
+         throw std::runtime_error("SOFIE GatherND: indices_shape[-1] must be <= r - batch_dims");
 
       for (size_t i = 0; i < b; ++i) {
          if (fShapeData[i] != fShapeIndices[i])
-            throw std::runtime_error("TMVA SOFIE GatherND: first batch_dims dimensions of data and indices must match");
+            throw std::runtime_error("SOFIE GatherND: first batch_dims dimensions of data and indices must match");
       }
 
       // Output shape: batch_dims + indices[0..q-2] + data[b + last_idx_dim .. r-1]
@@ -103,7 +103,7 @@ public:
    std::string Generate(std::string opName) override {
       opName = "op_" + opName;
       if (fShapeY.empty())
-         throw std::runtime_error("TMVA SOFIE GatherND called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE GatherND called to Generate without being initialized first");
 
       size_t r = fShapeData.size();
       size_t q = fShapeIndices.size();
@@ -163,7 +163,7 @@ public:
    std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
       opName = "op_" + opName;
       if (fShapeY.empty())
-         throw std::runtime_error("TMVA SOFIE GatherND called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE GatherND called to Generate without being initialized first");
 
       size_t r = fShapeData.size();
       size_t q = fShapeIndices.size();
@@ -271,7 +271,7 @@ public:
    std::string Generate_GPU_ALPAKA(std::string opName) override {
       opName = "op_" + opName;
       if (fShapeY.empty())
-         throw std::runtime_error("TMVA SOFIE GatherND called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE GatherND called to Generate without being initialized first");
 
       std::size_t totalElements = ConvertShapeToLength(fShapeY);
       std::string kname = "gatherNDKernel_" + opName;

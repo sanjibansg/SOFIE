@@ -88,10 +88,10 @@ public:
 
    void Initialize(RModel& model) override {
       if (!model.CheckIfTensorAlreadyExist(fNX1)){
-         throw std::runtime_error(std::string("TMVA SOFIE Comparision Op Input Tensor ") + fNX1 + "is not found in model");
+         throw std::runtime_error(std::string("SOFIE Comparision Op Input Tensor ") + fNX1 + "is not found in model");
       }
       if (!model.CheckIfTensorAlreadyExist(fNX2)) {
-         throw std::runtime_error(std::string("TMVA SOFIE Comparision Op Input Tensor ") + fNX2 + "is not found in model");
+         throw std::runtime_error(std::string("SOFIE Comparision Op Input Tensor ") + fNX2 + "is not found in model");
       }
       fShapeX1 = model.GetTensorShape(fNX1);
       fShapeX2 = model.GetTensorShape(fNX2);
@@ -157,7 +157,7 @@ public:
       if (fIsOutputConstant) return "";
       OpName = "op_" + OpName;
       if (fShapeY.empty()) {
-         throw std::runtime_error("TMVA SOFIE Comparision Op called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Comparision Op called to Generate without being initialized first");
       }
       std::stringstream out;
       out << SP << "\n//------ " << ComparisionTrait<T,Op>::Name() << "\n";
@@ -194,7 +194,7 @@ public:
       if (fIsOutputConstant) return "";
       opName = "op_" + opName;
       if (fShapeY.empty())
-         throw std::runtime_error("TMVA SOFIE Comparision Op called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Comparision Op called to Generate without being initialized first");
 
       const std::size_t D = fShapeY.size();
       std::size_t totalElements = ConvertShapeToLength(fShapeY);
@@ -284,7 +284,7 @@ public:
       if (fIsOutputConstant) return "";
       opName = "op_" + opName;
       if (fShapeY.empty())
-         throw std::runtime_error("TMVA SOFIE Comparision Op called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Comparision Op called to Generate without being initialized first");
 
       std::size_t totalElements = ConvertShapeToLength(fShapeY);
       std::string kname = "comparisonKernel_" + opName;

@@ -122,6 +122,10 @@
 #include "LayerNormScaleBias_FromONNX_GPU_ALPAKA.hxx"
 #include "LayerNorm3D_FromONNX_GPU_ALPAKA.hxx"
 
+#include "IsInf_FromONNX_GPU_ALPAKA.hxx"
+#include "IsNaN_FromONNX_GPU_ALPAKA.hxx"
+#include "Clip_FromONNX_GPU_ALPAKA.hxx"
+#include "Not_FromONNX_GPU_ALPAKA.hxx"
 
 #include <alpaka/alpaka.hpp>
 #include <cuda_runtime.h>
@@ -2409,4 +2413,142 @@ TEST_F(SofieAlpakaTest, LayerNorm3D)
         EXPECT_LE(std::abs(res_ptr[i]      - exp0[i]), TOLERANCE) << "row0 i=" << i;
     for (size_t i = 0; i < 12; ++i)
         EXPECT_LE(std::abs(res_ptr[12 + i] - exp1[i]), TOLERANCE) << "row1 i=" << i;
+}
+
+TEST_F(SofieAlpakaTest, IsInf)
+{
+    // Input contains finite values, +inf, -inf; output is bool (uint8_t).
+    float pos_inf = std::numeric_limits<float>::infinity();
+    float neg_inf = -std::numeric_limits<float>::infinity();
+    std::vector<float> input = {1.0f, pos_inf, neg_inf, 0.0f, -1.0f, 2.0f, neg_inf, pos_inf};
+    const std::size_t N = input.size();
+
+    auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{N}));
+    float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+    for (Idx i = 0; i < N; ++i) input_ptr[i] = input[i];
+
+    auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{N}));
+    alpaka::memcpy(queue, input_d, input_h);
+    alpaka::wait(queue);
+
+    auto result_h = alpaka::allocBuf<uint8_t, Idx>(host, Ext1D::all(Idx{N}));
+
+    {
+        SOFIE_IsInf::Session<alpaka::TagGpuCudaRt> session;
+        auto result = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    uint8_t* res_ptr = reinterpret_cast<uint8_t*>(alpaka::getPtrNative(result_h));
+    ASSERT_EQ(N, 8u);
+    for (size_t i = 0; i < N; ++i)
+        EXPECT_EQ(static_cast<bool>(res_ptr[i]), std::isinf(input[i])) << "i=" << i;
+}
+
+TEST_F(SofieAlpakaTest, IsNaN)
+{
+    // Input contains finite values, +inf, and NaN; output is bool (uint8_t).
+    float nan_val = std::numeric_limits<float>::quiet_NaN();
+    float pos_inf = std::numeric_limits<float>::infinity();
+    std::vector<float> input = {1.0f, nan_val, 0.0f, pos_inf, nan_val, 2.0f, -1.0f, nan_val};
+    const std::size_t N = input.size();
+
+    auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{N}));
+    float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+    for (Idx i = 0; i < N; ++i) input_ptr[i] = input[i];
+
+    auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{N}));
+    alpaka::memcpy(queue, input_d, input_h);
+    alpaka::wait(queue);
+
+    auto result_h = alpaka::allocBuf<uint8_t, Idx>(host, Ext1D::all(Idx{N}));
+
+    {
+        SOFIE_IsNaN::Session<alpaka::TagGpuCudaRt> session;
+        auto result = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    uint8_t* res_ptr = reinterpret_cast<uint8_t*>(alpaka::getPtrNative(result_h));
+    ASSERT_EQ(N, 8u);
+    for (size_t i = 0; i < N; ++i)
+        EXPECT_EQ(static_cast<bool>(res_ptr[i]), std::isnan(input[i])) << "i=" << i;
+}
+
+TEST_F(SofieAlpakaTest, Clip)
+{
+    // Model clips to [-1.0, 1.0] (initializer constants).
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    constexpr float clip_min = -1.0f;
+    constexpr float clip_max =  1.0f;
+
+    std::vector<float> input = {
+        -2.0f, -1.5f, -1.0f, -0.5f,
+         0.0f,  0.5f,  1.0f,  1.5f,
+         2.0f, -0.3f,  0.7f,  1.2f
+    };
+    const std::size_t N = input.size();
+
+    auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{N}));
+    float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+    for (Idx i = 0; i < N; ++i) input_ptr[i] = input[i];
+
+    auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{N}));
+    alpaka::memcpy(queue, input_d, input_h);
+    alpaka::wait(queue);
+
+    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{N}));
+
+    {
+        SOFIE_Clip::Session<alpaka::TagGpuCudaRt> session;
+        auto result = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+    ASSERT_EQ(N, 12u);
+    for (size_t i = 0; i < N; ++i) {
+        float expected = std::max(clip_min, std::min(clip_max, input[i]));
+        EXPECT_LE(std::abs(res_ptr[i] - expected), TOLERANCE) << "i=" << i;
+    }
+}
+
+TEST_F(SofieAlpakaTest, Not)
+{
+    // Input and output are bool tensors (uint8_t on device).
+    std::vector<uint8_t> input = {1, 0, 1, 1, 0, 0, 1, 0};
+    const std::size_t N = input.size();
+
+    auto input_h = alpaka::allocBuf<uint8_t, Idx>(host, Ext1D::all(Idx{N}));
+    uint8_t* input_ptr = reinterpret_cast<uint8_t*>(alpaka::getPtrNative(input_h));
+    for (Idx i = 0; i < N; ++i) input_ptr[i] = input[i];
+
+    auto input_d = alpaka::allocBuf<uint8_t, Idx>(device, Ext1D::all(Idx{N}));
+    alpaka::memcpy(queue, input_d, input_h);
+    alpaka::wait(queue);
+
+    auto result_h = alpaka::allocBuf<uint8_t, Idx>(host, Ext1D::all(Idx{N}));
+
+    {
+        SOFIE_Not::Session<alpaka::TagGpuCudaRt> session;
+        auto result = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    uint8_t* res_ptr = reinterpret_cast<uint8_t*>(alpaka::getPtrNative(result_h));
+    ASSERT_EQ(N, 8u);
+    for (size_t i = 0; i < N; ++i)
+        EXPECT_EQ(static_cast<bool>(res_ptr[i]), !static_cast<bool>(input[i])) << "i=" << i;
 }

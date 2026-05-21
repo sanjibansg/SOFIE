@@ -76,7 +76,7 @@ public:
          fType = "float";
       } else {
          throw
-            std::runtime_error("TMVA SOFIE Encountered unsupported type parsing a Pool operator");
+            std::runtime_error("SOFIE Encountered unsupported type parsing a Pool operator");
       }
       fInputTensorNames = { fNX };
       fOutputTensorNames = { fNY };
@@ -94,19 +94,19 @@ public:
       // Where N is batch size, C : input  channels, H : input height, W = input width
       // or it can be [N, C, F1,F2,....FN] . Minimum dimension is 3
       if (input.size() != 1 ) {
-         throw std::runtime_error("TMVA SOFIE" + Name() + "Op Shape inference need 1 input tensor");
+         throw std::runtime_error("SOFIE" + Name() + "Op Shape inference need 1 input tensor");
       }
       if (input[0].size() < 3) {
-         throw std::runtime_error("TMVA SOFIE" + Name() + "Op Shape inference only accept tensor with at least 3 dimensions");
+         throw std::runtime_error("SOFIE" + Name() + "Op Shape inference only accept tensor with at least 3 dimensions");
       }
       // support only input tensors with dim = 3,4,5
       if (input[0].size() < 3 || input[0].size() >  5) {
-         throw std::runtime_error("TMVA SOFIE" + Name() + "Op : tensors with dimension " + std::to_string(input[0].size()) + " are not yet supported");
+         throw std::runtime_error("SOFIE" + Name() + "Op : tensors with dimension " + std::to_string(input[0].size()) + " are not yet supported");
       }
 
       if (input[0].size() -2 != fDim) {
          throw
-            std::runtime_error("TMVA SOFIE Pool Op Shape inference - invalid inputs ");
+            std::runtime_error("SOFIE Pool Op Shape inference - invalid inputs ");
       }
        // kernel shape
       size_t k1 = ((fAttrKernelShape.empty())? input[0][2] : fAttrKernelShape[0]);
@@ -156,7 +156,7 @@ public:
          }
       } else if (fAttrAutopad != "VALID") {
          throw
-            std::runtime_error("TMVA SOFIE" + Name() + "Op invalid Autopad value : " + fAttrAutopad);
+            std::runtime_error("SOFIE" + Name() + "Op invalid Autopad value : " + fAttrAutopad);
       }
       // to be sure pad is vector of size 6
       if (fDim < 3) fAttrPads.resize(6, 0);
@@ -204,13 +204,13 @@ public:
 
       if (!model.CheckIfTensorAlreadyExist(fNX)) {
          throw
-            std::runtime_error("TMVA SOFIE Pool op Input Tensor " + fNX + " is not found in model");
+            std::runtime_error("SOFIE Pool op Input Tensor " + fNX + " is not found in model");
       }
       fShapeX = model.GetTensorShape(fNX);
       if (fShapeX.size() < 3 || fShapeX.size()  > 5) {
          std::cout << fNX << " : " << ConvertShapeToString(fShapeX) << std::endl;
          throw
-            std::runtime_error("TMVA SOFIE Pool Op input data tensor" + fNX + " is not of 3,4 or 5 dimensions");
+            std::runtime_error("SOFIE Pool Op input data tensor" + fNX + " is not of 3,4 or 5 dimensions");
       }
        fDim = fShapeX.size() - 2;
       // case of GlobalAveragePool. It is a pool case with kernel shape == image shape
@@ -267,7 +267,7 @@ public:
       OpName = "op_" + OpName;
 
       if (fShapeX.empty() || fShapeY.empty()) {
-         throw std::runtime_error("TMVA SOFIE Pool Op called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Pool Op called to Generate without being initialized first");
       }
 
       std::stringstream out;

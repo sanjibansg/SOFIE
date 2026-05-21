@@ -41,7 +41,7 @@ public:
    void Initialize(RModel& model) override {
        //input must be a graph input, or already initialized intermediate tensor
       if (model.CheckIfTensorAlreadyExist(fNX) == false){
-        throw std::runtime_error("TMVA SOFIE Identity Op Input Tensor is not found in model");
+        throw std::runtime_error("SOFIE Identity Op Input Tensor is not found in model");
       }
       fShape = model.GetTensorShape(fNX);
       if (model.IsInitializedTensor(fNX)) {
@@ -77,7 +77,7 @@ public:
       if (fIsOutputConstant || fIsInputInitialized) return "";
       OpName = "op_" + OpName;
       if (fShape.empty()) {
-         throw std::runtime_error("TMVA SOFIE Operator Identity called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Operator Identity called to Generate without being initialized first");
       }
       std::stringstream out;
       out << "\n//------ IDENTITY\n";

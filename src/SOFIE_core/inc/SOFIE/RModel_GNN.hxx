@@ -66,7 +66,7 @@ struct GNN_Init {
          break;
       }
       default: {
-         throw std::runtime_error("TMVA SOFIE: Invalid Update function supplied for creating GNN function block.");
+         throw std::runtime_error("SOFIE: Invalid Update function supplied for creating GNN function block.");
       }
       }
    }
@@ -88,7 +88,7 @@ struct GNN_Init {
          break;
       }
       default: {
-         throw std::runtime_error("TMVA SOFIE: Invalid Aggregate function supplied for creating GNN function block.");
+         throw std::runtime_error("SOFIE: Invalid Aggregate function supplied for creating GNN function block.");
       }
       }
    }

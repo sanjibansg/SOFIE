@@ -49,7 +49,7 @@ struct GraphIndependent_Init {
       }
       default: {
          throw std::runtime_error(
-            "TMVA SOFIE: Invalid Update function supplied for creating GraphIndependent function block.");
+            "SOFIE: Invalid Update function supplied for creating GraphIndependent function block.");
       }
       }
    }

@@ -50,15 +50,15 @@ public:
        //input must be a graph input, or already initialized intermediate tensor
       if (!model.CheckIfTensorAlreadyExist(fNStart)) {
          throw
-            std::runtime_error("TMVA SOFIE Range Op Input Tensor " + fNStart + "is not found in model");
+            std::runtime_error("SOFIE Range Op Input Tensor " + fNStart + "is not found in model");
       }
       if (!model.CheckIfTensorAlreadyExist(fNLimit)) {
          throw
-            std::runtime_error("TMVA SOFIE Range Op Input Tensor " + fNLimit + "is not found in model");
+            std::runtime_error("SOFIE Range Op Input Tensor " + fNLimit + "is not found in model");
       }
       if (!model.CheckIfTensorAlreadyExist(fNDelta)) {
          throw
-            std::runtime_error("TMVA SOFIE Range Op Input Tensor " + fNDelta + "is not found in model");
+            std::runtime_error("SOFIE Range Op Input Tensor " + fNDelta + "is not found in model");
       }
       ETensorType type = ConvertStringToType(fType);
       if (model.IsInitializedTensor(fNStart) && model.IsInitializedTensor(fNDelta) && model.IsInitializedTensor(fNLimit)) {
@@ -66,7 +66,7 @@ public:
          T * limit = static_cast<T*>(model.GetInitializedTensorData(fNLimit).get());
          T * delta = static_cast<T*>(model.GetInitializedTensorData(fNDelta).get());
          if (!start || !delta || !limit)
-            std::runtime_error("TMVA SOFIE Range Op Input Tensor has invalid input data");
+            std::runtime_error("SOFIE Range Op Input Tensor has invalid input data");
          T a = *start;
          T b = *limit;
          T d = *delta;
@@ -102,7 +102,7 @@ public:
 
       OpName = "op_" + OpName;
       if (fShape.empty()) {
-         throw std::runtime_error("TMVA SOFIE Range operator called to Generate without being initialized first");
+         throw std::runtime_error("SOFIE Range operator called to Generate without being initialized first");
       }
 
       std::string sizeName = fShape[0].param;

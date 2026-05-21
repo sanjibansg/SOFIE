@@ -130,9 +130,8 @@ public:
    }
    void AddNeededStdLib(std::string libname)
    {
-      if (fAllowedStdLib.find(libname) != fAllowedStdLib.end()) {
-         fNeededStdLib.insert(libname);
-      }
+      // if the library is already in the set, insert does nothing
+      fNeededStdLib.insert(libname);
    }
    void AddNeededCustomHeader(std::string filename)
    {
