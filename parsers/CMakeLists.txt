@@ -85,6 +85,8 @@ set(sources_cxx
     src/ParseNot.cxx
     src/ParseClip.cxx
     src/ParseScatterElements.cxx
+    src/ParseTrilu.cxx
+    src/ParseLogic.cxx
     ${PROTO_SRCS}
   ${DEPENDENCIES}
     ${SOFIE_core}

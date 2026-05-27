@@ -429,9 +429,14 @@ std::string Generate_GPU_ALPAKA(std::string opName) override {
         }
     }
 
-    out << SP << "alpaka::memcpy(queue, deviceBuf_" << fNOutput
-        << ", deviceBuf_" << fNData << ");\n";
-    out << SP << "alpaka::wait(queue);\n";
+    // Reshape / View / Squeeze / Unsqueeze are zero-copy reinterpretations of memory.
+    // Instead of a GPU memcpy + CPU synchronisation barrier, create a local non-owning
+    // view that aliases the source buffer.  All downstream getPtrNative() calls on the
+    // local view return the same device pointer as the source — no data movement at all.
+    auto outputLength = ConvertDimShapeToLength(fShapeOutput);
+    out << SP << "auto deviceBuf_" << fNOutput
+        << " = alpaka::createView(devAcc, alpaka::getPtrNative(deviceBuf_" << fNData
+        << "), static_cast<Idx>(" << outputLength << "));\n";
 
     return out.str();
 }

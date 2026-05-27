@@ -36,6 +36,36 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 file(GLOB BENCHMARK_ONNX_MODELS
     "${CMAKE_CURRENT_SOURCE_DIR}/models/*.onnx")
 
+# Exclude the base/template models used by specialize_models.py to generate
+# fixed-size variants (e.g. gnn_h32_k2_n100_e500.onnx).  The base models
+# have symbolic dim_param input dimensions that SOFIE cannot resolve during
+# code generation:
+#   • GetTensorShape() throws "unspecified dimension parameter" for input
+#     tensors whose shapes were not concretised by ONNX shape inference.
+#   • GetTensorShape() throws "is a dynamic tensor" when an operator tries
+#     to read a concrete size from an intermediate tensor that remained
+#     dynamic because its input shapes were unknown.
+# The concrete specialised variants produced by specialize_models.py are
+# benchmarked instead.
+list(FILTER BENCHMARK_ONNX_MODELS EXCLUDE REGEX
+    "/(gnn_h32_k2|gnn_h64_k4|punet_h32_k2_heads4_layers2|punet_h64_k4_heads4_layers2|transformer_d32_h2_L6_ff32)\\.onnx$")
+
+# Exclude models that exceed GPU memory (cudaErrorMemoryAllocation) or trigger
+# a cuBLAS EXECUTION_FAILED error (status 13) on the available hardware
+# (RTX 2070 SUPER, 8 GB VRAM).  They stay on disk for reference but are not
+# included in the benchmark binary.
+list(FILTER BENCHMARK_ONNX_MODELS EXCLUDE REGEX
+    "/(punet_h32_k2_heads4_layers2_n10000_e50000\
+|punet_h32_k2_heads4_layers2_n1000_e5000\
+|punet_h32_k2_heads4_layers2_n3000_e15000\
+|punet_h64_k4_heads4_layers2_n10000_e50000\
+|punet_h64_k4_heads4_layers2_n100_e500\
+|punet_h64_k4_heads4_layers2_n300_e1500\
+|punet_h64_k4_heads4_layers2_n3000_e15000\
+|transformer_L1000_B100\
+|transformer_L100_B100\
+|transformer_L8000_B1)\\.onnx$")
+
 if(NOT BENCHMARK_ONNX_MODELS)
     message(STATUS
         "SOFIE Benchmark: No .onnx models found in benchmark/models/. "
@@ -142,21 +172,13 @@ set(_EMIT_BLOCK
 }\n\
 ")
 
-set(_RUN_BLOCK
-"    Benchmark_@3@(warmup, iterations, weightsDir);\n\
-")
-
-# ORT call: passes the full ONNX path directly (no SOFIE weights needed)
-set(_ORT_RUN_BLOCK
-"#ifdef SOFIE_BENCHMARK_ORT\n\
-    if (run_ort) BenchmarkORT_GPU(\"@1@\", \"@2@\", warmup, iterations);\n\
-#endif\n\
-")
-
-set(BENCHMARK_EMIT_CAPTURES "")
-set(BENCHMARK_BENCH_HEADERS "")
-set(BENCHMARK_RUN_CALLS     "")
-set(GENERATED_HEADERS       "")
+set(BENCHMARK_EMIT_CAPTURES        "")
+set(BENCHMARK_BENCH_HEADERS        "")
+set(BENCHMARK_FWD_DECLS            "")
+set(BENCHMARK_SINGLE_MODEL_CASES   "")
+set(BENCHMARK_SPAWN_CALLS          "")
+set(GENERATED_HEADERS              "")
+set(BENCHMARK_MODEL_CU_SRCS        "")
 
 foreach(ONNX_FILE ${BENCHMARK_ONNX_MODELS})
     get_filename_component(MODEL_NAME "${ONNX_FILE}" NAME_WE)
@@ -167,21 +189,52 @@ foreach(ONNX_FILE ${BENCHMARK_ONNX_MODELS})
     set(GEN_BENCH "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_bench.hxx")
     list(APPEND GENERATED_HEADERS "${GEN_HXX}" "${GEN_BENCH}")
 
-    string(REPLACE "@1@" "${ONNX_FILE}"     _emit_cap "${_EMIT_BLOCK}")
-    string(REPLACE "@2@" "${MODEL_NAME}"    _emit_cap "${_emit_cap}")
+    string(REPLACE "@1@" "${ONNX_FILE}"  _emit_cap "${_EMIT_BLOCK}")
+    string(REPLACE "@2@" "${MODEL_NAME}" _emit_cap "${_emit_cap}")
     string(APPEND BENCHMARK_EMIT_CAPTURES "${_emit_cap}")
-
-    # SOFIE Alpaka call
-    string(REPLACE "@3@" "${MODEL_CPPNAME}" _run_cap  "${_RUN_BLOCK}")
-    string(APPEND BENCHMARK_RUN_CALLS "${_run_cap}")
-
-    # ORT call (guarded by #ifdef at compile time + run_ort flag at runtime)
-    string(REPLACE "@1@" "${ONNX_FILE}"  _ort_cap "${_ORT_RUN_BLOCK}")
-    string(REPLACE "@2@" "${MODEL_NAME}" _ort_cap "${_ort_cap}")
-    string(APPEND BENCHMARK_RUN_CALLS "${_ort_cap}")
 
     string(APPEND BENCHMARK_BENCH_HEADERS
         "#include \"${MODEL_NAME}_bench.hxx\"\n")
+
+    # Forward declaration for the main TU (function defined in per-model .cu)
+    string(APPEND BENCHMARK_FWD_DECLS
+        "void Benchmark_${MODEL_CPPNAME}(int warmup, int iterations, const std::string& weightsDir);\n")
+
+    # Single-model dispatch: one if-branch per model (used in --single-model mode)
+    string(APPEND BENCHMARK_SINGLE_MODEL_CASES
+        "    if (model == \"${MODEL_CPPNAME}\") {\n"
+        "        Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir);\n"
+        "#ifdef SOFIE_BENCHMARK_ORT\n"
+        "        if (run_ort) BenchmarkORT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations);\n"
+        "#endif\n"
+        "        return 0;\n"
+        "    }\n"
+    )
+
+    # Subprocess spawn: run this binary as a child with --single-model <name>.
+    # Each child gets a fresh CUDA context so GPU memory from the previous
+    # model is completely freed before the next one allocates.
+    string(APPEND BENCHMARK_SPAWN_CALLS
+        "    {\n"
+        "        std::string cmd = std::string(argv[0])\n"
+        "            + \" --single-model ${MODEL_CPPNAME}\"\n"
+        "            + commonArgs;\n"
+        "        int rc = std::system(cmd.c_str());\n"
+        "        if (rc != 0) {\n"
+        "            std::fprintf(stderr, \"[ERROR] ${MODEL_NAME}: subprocess exited %d\\n\", rc);\n"
+        "            ++totalFailed;\n"
+        "        }\n"
+        "    }\n"
+    )
+
+    # Per-model compilation unit: include one bench.hxx → one .cu file
+    set(_model_cu "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_bench.cu")
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/ModelBench.cu.in"
+        "${_model_cu}"
+        @ONLY
+    )
+    list(APPEND BENCHMARK_MODEL_CU_SRCS "${_model_cu}")
 endforeach()
 
 ################################################################################
@@ -194,7 +247,9 @@ configure_file(
     @ONLY
 )
 
-set(RUNNER_SRC "${CMAKE_CURRENT_BINARY_DIR}/BenchmarkRunner_all.cu")
+# Main runner: only main() + forward declarations (no model headers).
+# Each model is compiled in its own _bench.cu TU (see BENCHMARK_MODEL_CU_SRCS).
+set(RUNNER_SRC "${CMAKE_CURRENT_BINARY_DIR}/BenchmarkRunner_main.cpp")
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/BenchmarkRunner.cxx.in"
     "${RUNNER_SRC}"
@@ -247,9 +302,13 @@ add_custom_target(sofie_benchmark_headers
 # Benchmark runner (compiled as .cu, same as the test suite)
 ################################################################################
 
-set_source_files_properties("${RUNNER_SRC}" PROPERTIES LANGUAGE CUDA)
+# Mark every per-model bench.cu as CUDA so nvcc processes the device kernels.
+set_source_files_properties(${BENCHMARK_MODEL_CU_SRCS} PROPERTIES LANGUAGE CUDA)
 
-add_executable(sofie_benchmark "${RUNNER_SRC}")
+# The main runner is plain C++ (no CUDA kernels, just calls forward-declared fns).
+set_source_files_properties("${RUNNER_SRC}" PROPERTIES LANGUAGE CXX)
+
+add_executable(sofie_benchmark "${RUNNER_SRC}" ${BENCHMARK_MODEL_CU_SRCS})
 
 add_dependencies(sofie_benchmark sofie_benchmark_headers)
 
@@ -261,9 +320,22 @@ target_include_directories(sofie_benchmark PRIVATE
     "${CUDAToolkit_INCLUDE_DIRS}"
 )
 
+# Default to the native GPU architecture so we compile only one arch (saves
+# memory and time).  The previous "70;75;80;86;89;90" multi-arch list caused
+# nvcc to OOM-kill when processing all models.  Override via
+#   cmake -DSOFIE_BENCHMARK_CUDA_ARCH="75;86" .
+if(NOT DEFINED SOFIE_BENCHMARK_CUDA_ARCH OR SOFIE_BENCHMARK_CUDA_ARCH STREQUAL "")
+    if(CMAKE_CUDA_ARCHITECTURES AND NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+        set(SOFIE_BENCHMARK_CUDA_ARCH "${CMAKE_CUDA_ARCHITECTURES}")
+    else()
+        set(SOFIE_BENCHMARK_CUDA_ARCH "75")   # RTX 2070 SUPER default
+    endif()
+endif()
+message(STATUS "SOFIE Benchmark: CUDA architectures = ${SOFIE_BENCHMARK_CUDA_ARCH}")
+
 set_target_properties(sofie_benchmark PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
-    CUDA_ARCHITECTURES          "70;75;80;86;89;90"
+    CUDA_ARCHITECTURES          "${SOFIE_BENCHMARK_CUDA_ARCH}"
     CUDA_STANDARD               20
     CUDA_STANDARD_REQUIRED      ON
     RUNTIME_OUTPUT_DIRECTORY    "${CMAKE_CURRENT_BINARY_DIR}"
@@ -280,8 +352,17 @@ target_compile_options(sofie_benchmark PRIVATE
         --extended-lambda
         --expt-relaxed-constexpr
         --use_fast_math
-        -O2
+        -O1
         -Wno-deprecated-gpu-targets
+        # Suppress "variable was declared but never referenced" (#177-D).
+        # Generated Expand/Where kernels compute per-dimension indices for
+        # broadcast dimensions; when a dimension has size 1 the index variable
+        # is always 0 and goes unused.  Without this suppress the CUDA device
+        # compiler counts them against its error-budget and stops compilation.
+        -diag-suppress 177
+        # Limit device register usage to reduce per-kernel memory footprint
+        # during compilation of the large all-models TU.
+        --maxrregcount=64
     >
     $<$<COMPILE_LANGUAGE:CXX>:
         -O2

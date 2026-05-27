@@ -17,7 +17,7 @@ private:
 
    std::string fNX;
    std::string fNY;
-   std::vector<size_t> fShape;
+   std::vector<Dim> fShape;
 
 public:
    ROperator_Swish(){}
@@ -40,7 +40,7 @@ public:
       if (model.CheckIfTensorAlreadyExist(fNX) == false){   //input must be a graph input, or already initialized intermediate tensor
          throw std::runtime_error("SOFIE Swish Op Input Tensor is not found in model");
       }
-      fShape = model.GetTensorShape(fNX);
+      fShape = model.GetDimTensorShape(fNX);
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShape);
    }
 
@@ -51,10 +51,7 @@ public:
          throw std::runtime_error("SOFIE Operator Swish called to Generate without being initialized first");
       }
       std::stringstream out;
-      int length = 1;
-      for(auto& i: fShape){
-         length *= i;
-      }
+      std::string length = ConvertDimShapeToLength(fShape);
       out << "\t" << "for (int id = 0; id < " << length << " ; id++){\n";
       out << "\t\t" << "tensor_" << fNY << "[id] = tensor_" << fNX <<"[id] / (1 + std::exp( - tensor_"  << fNX << "[id]));\n";
       out << "\t}\n";

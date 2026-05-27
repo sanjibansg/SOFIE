@@ -86,6 +86,31 @@ public:
       return out.str();
    }
 
+   std::string GenerateInitCode_GPU_ALPAKA() override {
+      // For initialized (weight) tensors: the device buffer for X is already populated by
+      // MoveInitializedTensorsToBuffers_ALPAKA(); copy it into the Y device buffer.
+      if (!fIsInputInitialized) return "";
+      std::stringstream out;
+      out << "\n//------ IDENTITY (init)\n";
+      out << SP << SP << "alpaka::memcpy(queue, deviceBuf_" << fNY << ", deviceBuf_" << fNX << ");\n";
+      return out.str();
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string OpName) override {
+      // Constant outputs and already-initialised tensors need no runtime work.
+      if (fIsOutputConstant || fIsInputInitialized) return "";
+      OpName = "op_" + OpName;
+      if (fShape.empty()) {
+         throw std::runtime_error("SOFIE Operator Identity called to Generate_GPU_ALPAKA without being initialized first");
+      }
+      std::stringstream out;
+      out << "\n//------ IDENTITY\n";
+      // Device buffers cannot simply be aliased; perform an explicit device-to-device copy.
+      out << SP << "alpaka::memcpy(queue, deviceBuf_" << fNY << ", deviceBuf_" << fNX << ");\n";
+      out << SP << "alpaka::wait(queue);\n";
+      return out.str();
+   }
+
 };
 
 }//SOFIE

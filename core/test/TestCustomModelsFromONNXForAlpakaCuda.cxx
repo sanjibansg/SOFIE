@@ -1,6 +1,46 @@
 #include <numeric>
 #include <cstddef>
 
+// ── Trilu ──────────────────────────────────────────────────────────────────
+#include "Trilu_upper_FromONNX_GPU_ALPAKA.hxx"
+#include "Trilu_lower_FromONNX_GPU_ALPAKA.hxx"
+#include "Trilu_k2_FromONNX_GPU_ALPAKA.hxx"
+#include "Trilu_kn1_FromONNX_GPU_ALPAKA.hxx"
+#include "Trilu_3D_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/Trilu_upper.ref.hxx"
+#include "input_models/references/Trilu_upper_input.ref.hxx"
+#include "input_models/references/Trilu_lower.ref.hxx"
+#include "input_models/references/Trilu_lower_input.ref.hxx"
+#include "input_models/references/Trilu_k2.ref.hxx"
+#include "input_models/references/Trilu_k2_input.ref.hxx"
+#include "input_models/references/Trilu_kn1.ref.hxx"
+#include "input_models/references/Trilu_kn1_input.ref.hxx"
+#include "input_models/references/Trilu_3D.ref.hxx"
+#include "input_models/references/Trilu_3D_input.ref.hxx"
+// ── Logic ───────────────────────────────────────────────────────────────────
+#include "Logic_And_FromONNX_GPU_ALPAKA.hxx"
+#include "Logic_Or_FromONNX_GPU_ALPAKA.hxx"
+#include "Logic_Xor_FromONNX_GPU_ALPAKA.hxx"
+#include "Logic_BitwiseAnd_FromONNX_GPU_ALPAKA.hxx"
+#include "Logic_BitwiseOr_FromONNX_GPU_ALPAKA.hxx"
+#include "Logic_BitwiseXor_FromONNX_GPU_ALPAKA.hxx"
+#include "Logic_BitwiseNot_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/Logic_And.ref.hxx"
+#include "input_models/references/Logic_And_input.ref.hxx"
+#include "input_models/references/Logic_Or.ref.hxx"
+#include "input_models/references/Logic_Or_input.ref.hxx"
+#include "input_models/references/Logic_Xor.ref.hxx"
+#include "input_models/references/Logic_Xor_input.ref.hxx"
+#include "input_models/references/Logic_BitwiseAnd.ref.hxx"
+#include "input_models/references/Logic_BitwiseAnd_input.ref.hxx"
+#include "input_models/references/Logic_BitwiseOr.ref.hxx"
+#include "input_models/references/Logic_BitwiseOr_input.ref.hxx"
+#include "input_models/references/Logic_BitwiseXor.ref.hxx"
+#include "input_models/references/Logic_BitwiseXor_input.ref.hxx"
+#include "input_models/references/Logic_BitwiseNot.ref.hxx"
+#include "input_models/references/Logic_BitwiseNot_input.ref.hxx"
+// ─────────────────────────────────────────────────────────────────────────
+
 #include "Linear_64_FromONNX_GPU_ALPAKA.hxx"
 #include "input_models/references/Linear_64.ref.hxx"
 
@@ -94,8 +134,17 @@
 #include "ReduceProd_FromONNX_GPU_ALPAKA.hxx"
 #include "ReduceSum_FromONNX_GPU_ALPAKA.hxx"
 #include "ReduceSumSquare_FromONNX_GPU_ALPAKA.hxx"
+#include "ReduceL2_FromONNX_GPU_ALPAKA.hxx"
+#include "ReduceL2Large_FromONNX_GPU_ALPAKA.hxx"
+#include "ReduceMax_FromONNX_GPU_ALPAKA.hxx"
+#include "ReduceMax_axis0_FromONNX_GPU_ALPAKA.hxx"
+#include "ReduceMax_mid_FromONNX_GPU_ALPAKA.hxx"
 #include "input_models/references/ReduceMean.ref.hxx"
 #include "input_models/references/ReduceProd.ref.hxx"
+#include "input_models/references/ReduceL2.ref.hxx"
+#include "input_models/references/ReduceMax.ref.hxx"
+#include "input_models/references/ReduceMax_axis0.ref.hxx"
+#include "input_models/references/ReduceMax_mid.ref.hxx"
 
 #include "ConvWithPadding_FromONNX_GPU_ALPAKA.hxx"
 #include "input_models/references/ConvWithPadding.ref.hxx"
@@ -1972,6 +2021,199 @@ TEST_F(SofieAlpakaTest, ReduceSumSquare)
         EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
 }
 
+// ReduceL2: input [1,2,3]={5,2,3,5,5,4}, reduce axis=1, keepdims=0 → [1,3]
+// Expected: {sqrt(50), sqrt(29), 5.0}
+TEST_F(SofieAlpakaTest, ReduceL2)
+{
+    constexpr float TOLERANCE = 1e-3f;
+
+    std::vector<float> input = {5.f, 2.f, 3.f, 5.f, 5.f, 4.f};
+    const std::size_t outputSize = sizeof(ReduceL2_ExpectedOutput::output) / sizeof(float);
+
+    auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+    float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+    for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
+
+    auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+    alpaka::memcpy(queue, input_d, input_h);
+    alpaka::wait(queue);
+
+    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
+
+    {
+        SOFIE_ReduceL2::Session<alpaka::TagGpuCudaRt> session("ReduceL2_FromONNX_GPU_ALPAKA.dat");
+        auto result = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+    float* correct = ReduceL2_ExpectedOutput::output;
+    EXPECT_EQ(outputSize, 3u);
+    for (size_t i = 0; i < outputSize; ++i)
+        EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
+}
+
+// ReduceL2Large: input [4,512], reduce axis=1, keepdims=0 → [4]
+// Row i is filled with (i+1), so L2 norm = (i+1)*sqrt(512).
+// This test exercises the 256-thread block reduction with reducedLength > BLOCK_SIZE.
+TEST_F(SofieAlpakaTest, ReduceL2Large)
+{
+    constexpr float TOLERANCE = 1e-2f;  // slightly looser: large sum, float accumulation
+
+    constexpr std::size_t nrows = 4;
+    constexpr std::size_t ncols = 512;
+    const std::size_t inputSize  = nrows * ncols;
+    const std::size_t outputSize = nrows;
+
+    // Fill row i with value (i+1)
+    std::vector<float> input(inputSize);
+    for (std::size_t r = 0; r < nrows; ++r)
+        for (std::size_t c = 0; c < ncols; ++c)
+            input[r * ncols + c] = static_cast<float>(r + 1);
+
+    // Expected L2 per row: sqrt(ncols) * (row+1)
+    const float sqrt512 = std::sqrt(static_cast<float>(ncols));
+    std::vector<float> correct(nrows);
+    for (std::size_t r = 0; r < nrows; ++r)
+        correct[r] = static_cast<float>(r + 1) * sqrt512;
+
+    auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{inputSize}));
+    float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+    for (Idx i = 0; i < inputSize; ++i) input_ptr[i] = input[i];
+
+    auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{inputSize}));
+    alpaka::memcpy(queue, input_d, input_h);
+    alpaka::wait(queue);
+
+    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
+
+    {
+        SOFIE_ReduceL2Large::Session<alpaka::TagGpuCudaRt> session;
+        auto result = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+    EXPECT_EQ(outputSize, nrows);
+    for (size_t i = 0; i < outputSize; ++i)
+        EXPECT_LE(std::abs(res_ptr[i] - correct[i]) / correct[i], TOLERANCE) << "row=" << i;
+}
+
+// ── ReduceMax: [1,2,3] axis=1 keepdims=0 (kLast path) ──────────────────────
+TEST_F(SofieAlpakaTest, ReduceMax)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+    std::vector<float> input = {5.f, 2.f, 3.f, 5.f, 5.f, 4.f};
+    const std::size_t outputSize = sizeof(ReduceMax_ExpectedOutput::output) / sizeof(float);
+
+    auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+    float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+    for (std::size_t i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
+
+    auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+    alpaka::memcpy(queue, input_d, input_h);
+    alpaka::wait(queue);
+
+    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
+    {
+        SOFIE_ReduceMax::Session<alpaka::TagGpuCudaRt> session;
+        auto result = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+    float* correct = ReduceMax_ExpectedOutput::output;
+    for (std::size_t i = 0; i < outputSize; ++i)
+        EXPECT_NEAR(res_ptr[i], correct[i], TOLERANCE) << "  i=" << i;
+}
+
+// ── ReduceMax_axis0: [3,4] axis=0 keepdims=0 (kFirst path) ─────────────────
+TEST_F(SofieAlpakaTest, ReduceMax_axis0)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+    // numpy default_rng(42).standard_normal((3,4)) — same seed/sequence as generator
+    const std::size_t inputSize  = 12;
+    const std::size_t outputSize = sizeof(ReduceMax_axis0_ExpectedOutput::output) / sizeof(float);
+    float vals[] = { 0.30471709f, -1.03998411f,  0.75045121f,  0.94056469f,
+                    -1.95103514f, -1.30217946f,  0.12784040f, -0.31624261f,
+                    -0.01680116f, -0.85304391f,  0.87939799f,  0.77779192f};
+    std::vector<float> input(vals, vals + inputSize);
+
+    auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{inputSize}));
+    float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+    for (std::size_t i = 0; i < inputSize; ++i) input_ptr[i] = input[i];
+
+    auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{inputSize}));
+    alpaka::memcpy(queue, input_d, input_h);
+    alpaka::wait(queue);
+
+    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
+    {
+        SOFIE_ReduceMax_axis0::Session<alpaka::TagGpuCudaRt> session;
+        auto result = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+    float* correct = ReduceMax_axis0_ExpectedOutput::output;
+    for (std::size_t i = 0; i < outputSize; ++i)
+        EXPECT_NEAR(res_ptr[i], correct[i], TOLERANCE) << "  i=" << i;
+}
+
+// ── ReduceMax_mid: [2,3,4] axis=1 keepdims=0 (kMiddle path) ────────────────
+TEST_F(SofieAlpakaTest, ReduceMax_mid)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+    const std::size_t inputSize  = 24;   // 2×3×4
+    const std::size_t outputSize = sizeof(ReduceMax_mid_ExpectedOutput::output) / sizeof(float);
+
+    // numpy default_rng(42).standard_normal((2,3,4)) — same seed/sequence as generator
+    float vals[] = { 0.06603070f,  1.12724125f,  0.46750933f, -0.85929245f,
+                     0.36875078f, -0.95888263f,  0.87845027f, -0.04992591f,
+                    -0.18486236f, -0.68092954f,  1.22254133f, -0.15452948f,
+                    -0.42832783f, -0.35213354f,  0.53230917f,  0.36544406f,
+                     0.41273260f,  0.43082100f,  2.14164758f, -0.40641502f,
+                    -0.51224273f, -0.81377274f,  0.61597943f,  1.12897229f};
+
+    auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{inputSize}));
+    float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+    for (std::size_t i = 0; i < inputSize; ++i) input_ptr[i] = vals[i];
+
+    auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{inputSize}));
+    alpaka::memcpy(queue, input_d, input_h);
+    alpaka::wait(queue);
+
+    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
+    {
+        SOFIE_ReduceMax_mid::Session<alpaka::TagGpuCudaRt> session;
+        auto result = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+    float* correct = ReduceMax_mid_ExpectedOutput::output;
+    for (std::size_t i = 0; i < outputSize; ++i)
+        EXPECT_NEAR(res_ptr[i], correct[i], TOLERANCE) << "  i=" << i;
+}
+
 TEST_F(SofieAlpakaTest, ConvWithPadding)
 {
    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
@@ -2605,4 +2847,317 @@ TEST_F(SofieAlpakaTest, GNN_model)
         EXPECT_GE(res_ptr[i], 0.0f) << "output[" << i << "] < 0";
         EXPECT_LE(res_ptr[i], 1.0f) << "output[" << i << "] > 1";
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Trilu operator tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Helper: copy a host C-array into an Alpaka host buffer then to device.
+template <typename T>
+static alpaka::Buf<alpaka::DevCudaRt, T, Dim, Idx>
+makeDeviceBuf(alpaka::DevCpu const& host,
+              alpaka::DevCudaRt const& device,
+              alpaka::Queue<alpaka::DevCudaRt, alpaka::NonBlocking>& queue,
+              const T* src, std::size_t n)
+{
+   auto hbuf = alpaka::allocBuf<T, Idx>(host, Ext1D::all(Idx{n}));
+   T* hp = reinterpret_cast<T*>(alpaka::getPtrNative(hbuf));
+   for (std::size_t i = 0; i < n; ++i) hp[i] = src[i];
+   auto dbuf = alpaka::allocBuf<T, Idx>(device, Ext1D::all(Idx{n}));
+   alpaka::memcpy(queue, dbuf, hbuf);
+   alpaka::wait(queue);
+   return dbuf;
+}
+
+// ── Trilu_upper: 4×4, upper=1, k=0 ─────────────────────────────────────────
+TEST_F(SofieAlpakaTest, Trilu_upper)
+{
+   constexpr std::size_t N = 16;   // 4×4
+   auto d_input = makeDeviceBuf<float>(host, device, queue,
+                                       Trilu_upper_Input::data, N);
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{N}));
+   {
+      SOFIE_Trilu_upper::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(d_input);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float* ref = Trilu_upper_ExpectedOutput::outputs;
+   for (std::size_t i = 0; i < N; ++i)
+      EXPECT_NEAR(res[i], ref[i], DEFAULT_TOLERANCE) << "  index=" << i;
+}
+
+// ── Trilu_lower: 4×4, upper=0, k=0 ─────────────────────────────────────────
+TEST_F(SofieAlpakaTest, Trilu_lower)
+{
+   constexpr std::size_t N = 16;
+   auto d_input = makeDeviceBuf<float>(host, device, queue,
+                                       Trilu_lower_Input::data, N);
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{N}));
+   {
+      SOFIE_Trilu_lower::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(d_input);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float* ref = Trilu_lower_ExpectedOutput::outputs;
+   for (std::size_t i = 0; i < N; ++i)
+      EXPECT_NEAR(res[i], ref[i], DEFAULT_TOLERANCE) << "  index=" << i;
+}
+
+// ── Trilu_k2: 3×5, upper=1, k=+2 ────────────────────────────────────────────
+TEST_F(SofieAlpakaTest, Trilu_k2)
+{
+   constexpr std::size_t N = 15;   // 3×5
+   auto d_input = makeDeviceBuf<float>(host, device, queue,
+                                       Trilu_k2_Input::data, N);
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{N}));
+   {
+      SOFIE_Trilu_k2::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(d_input);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float* ref = Trilu_k2_ExpectedOutput::outputs;
+   for (std::size_t i = 0; i < N; ++i)
+      EXPECT_NEAR(res[i], ref[i], DEFAULT_TOLERANCE) << "  index=" << i;
+}
+
+// ── Trilu_kn1: 3×5, upper=0, k=-1 ────────────────────────────────────────────
+TEST_F(SofieAlpakaTest, Trilu_kn1)
+{
+   constexpr std::size_t N = 15;
+   auto d_input = makeDeviceBuf<float>(host, device, queue,
+                                       Trilu_kn1_Input::data, N);
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{N}));
+   {
+      SOFIE_Trilu_kn1::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(d_input);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float* ref = Trilu_kn1_ExpectedOutput::outputs;
+   for (std::size_t i = 0; i < N; ++i)
+      EXPECT_NEAR(res[i], ref[i], DEFAULT_TOLERANCE) << "  index=" << i;
+}
+
+// ── Trilu_3D: 2×3×4, upper=1, k=0 (batched) ─────────────────────────────────
+TEST_F(SofieAlpakaTest, Trilu_3D)
+{
+   constexpr std::size_t N = 24;   // 2×3×4
+   auto d_input = makeDeviceBuf<float>(host, device, queue,
+                                       Trilu_3D_Input::data, N);
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{N}));
+   {
+      SOFIE_Trilu_3D::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(d_input);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float* ref = Trilu_3D_ExpectedOutput::outputs;
+   for (std::size_t i = 0; i < N; ++i)
+      EXPECT_NEAR(res[i], ref[i], DEFAULT_TOLERANCE) << "  index=" << i;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Logic / Bitwise operator tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Logic_And: 4×4 bool, And ────────────────────────────────────────────────
+TEST_F(SofieAlpakaTest, Logic_And)
+{
+   constexpr std::size_t N = 16;   // 4×4
+   auto d_a = makeDeviceBuf<uint8_t>(host, device, queue,
+                                     Logic_And_Input::data_a, N);
+   auto d_b = makeDeviceBuf<uint8_t>(host, device, queue,
+                                     Logic_And_Input::data_b, N);
+
+   auto result_h = alpaka::allocBuf<uint8_t, Idx>(host, Ext1D::all(Idx{N}));
+   {
+      SOFIE_Logic_And::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(d_a, d_b);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   uint8_t* res = reinterpret_cast<uint8_t*>(alpaka::getPtrNative(result_h));
+   uint8_t* ref = Logic_And_ExpectedOutput::outputs;
+   for (std::size_t i = 0; i < N; ++i)
+      EXPECT_EQ(res[i], ref[i]) << "  index=" << i;
+}
+
+// ── Logic_Or: 4×4 bool, Or ─────────────────────────────────────────────────
+TEST_F(SofieAlpakaTest, Logic_Or)
+{
+   constexpr std::size_t N = 16;
+   auto d_a = makeDeviceBuf<uint8_t>(host, device, queue,
+                                     Logic_Or_Input::data_a, N);
+   auto d_b = makeDeviceBuf<uint8_t>(host, device, queue,
+                                     Logic_Or_Input::data_b, N);
+
+   auto result_h = alpaka::allocBuf<uint8_t, Idx>(host, Ext1D::all(Idx{N}));
+   {
+      SOFIE_Logic_Or::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(d_a, d_b);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   uint8_t* res = reinterpret_cast<uint8_t*>(alpaka::getPtrNative(result_h));
+   uint8_t* ref = Logic_Or_ExpectedOutput::outputs;
+   for (std::size_t i = 0; i < N; ++i)
+      EXPECT_EQ(res[i], ref[i]) << "  index=" << i;
+}
+
+// ── Logic_Xor: 4×4 bool, Xor ───────────────────────────────────────────────
+TEST_F(SofieAlpakaTest, Logic_Xor)
+{
+   constexpr std::size_t N = 16;
+   auto d_a = makeDeviceBuf<uint8_t>(host, device, queue,
+                                     Logic_Xor_Input::data_a, N);
+   auto d_b = makeDeviceBuf<uint8_t>(host, device, queue,
+                                     Logic_Xor_Input::data_b, N);
+
+   auto result_h = alpaka::allocBuf<uint8_t, Idx>(host, Ext1D::all(Idx{N}));
+   {
+      SOFIE_Logic_Xor::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(d_a, d_b);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   uint8_t* res = reinterpret_cast<uint8_t*>(alpaka::getPtrNative(result_h));
+   uint8_t* ref = Logic_Xor_ExpectedOutput::outputs;
+   for (std::size_t i = 0; i < N; ++i)
+      EXPECT_EQ(res[i], ref[i]) << "  index=" << i;
+}
+
+// ── Logic_BitwiseAnd: 3×5 int32, BitwiseAnd ────────────────────────────────
+TEST_F(SofieAlpakaTest, Logic_BitwiseAnd)
+{
+   constexpr std::size_t N = 15;   // 3×5
+   auto d_a = makeDeviceBuf<int32_t>(host, device, queue,
+                                     Logic_BitwiseAnd_Input::data_a, N);
+   auto d_b = makeDeviceBuf<int32_t>(host, device, queue,
+                                     Logic_BitwiseAnd_Input::data_b, N);
+
+   auto result_h = alpaka::allocBuf<int32_t, Idx>(host, Ext1D::all(Idx{N}));
+   {
+      SOFIE_Logic_BitwiseAnd::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(d_a, d_b);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   int32_t* res = reinterpret_cast<int32_t*>(alpaka::getPtrNative(result_h));
+   int32_t* ref = Logic_BitwiseAnd_ExpectedOutput::outputs;
+   for (std::size_t i = 0; i < N; ++i)
+      EXPECT_EQ(res[i], ref[i]) << "  index=" << i;
+}
+
+// ── Logic_BitwiseOr: 3×5 int32, BitwiseOr ──────────────────────────────────
+TEST_F(SofieAlpakaTest, Logic_BitwiseOr)
+{
+   constexpr std::size_t N = 15;
+   auto d_a = makeDeviceBuf<int32_t>(host, device, queue,
+                                     Logic_BitwiseOr_Input::data_a, N);
+   auto d_b = makeDeviceBuf<int32_t>(host, device, queue,
+                                     Logic_BitwiseOr_Input::data_b, N);
+
+   auto result_h = alpaka::allocBuf<int32_t, Idx>(host, Ext1D::all(Idx{N}));
+   {
+      SOFIE_Logic_BitwiseOr::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(d_a, d_b);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   int32_t* res = reinterpret_cast<int32_t*>(alpaka::getPtrNative(result_h));
+   int32_t* ref = Logic_BitwiseOr_ExpectedOutput::outputs;
+   for (std::size_t i = 0; i < N; ++i)
+      EXPECT_EQ(res[i], ref[i]) << "  index=" << i;
+}
+
+// ── Logic_BitwiseXor: 3×5 int32, BitwiseXor ────────────────────────────────
+TEST_F(SofieAlpakaTest, Logic_BitwiseXor)
+{
+   constexpr std::size_t N = 15;
+   auto d_a = makeDeviceBuf<int32_t>(host, device, queue,
+                                     Logic_BitwiseXor_Input::data_a, N);
+   auto d_b = makeDeviceBuf<int32_t>(host, device, queue,
+                                     Logic_BitwiseXor_Input::data_b, N);
+
+   auto result_h = alpaka::allocBuf<int32_t, Idx>(host, Ext1D::all(Idx{N}));
+   {
+      SOFIE_Logic_BitwiseXor::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(d_a, d_b);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   int32_t* res = reinterpret_cast<int32_t*>(alpaka::getPtrNative(result_h));
+   int32_t* ref = Logic_BitwiseXor_ExpectedOutput::outputs;
+   for (std::size_t i = 0; i < N; ++i)
+      EXPECT_EQ(res[i], ref[i]) << "  index=" << i;
+}
+
+// ── Logic_BitwiseNot: 2×3×4 int32, BitwiseNot ──────────────────────────────
+TEST_F(SofieAlpakaTest, Logic_BitwiseNot)
+{
+   constexpr std::size_t N = 24;   // 2×3×4
+   auto d_input = makeDeviceBuf<int32_t>(host, device, queue,
+                                         Logic_BitwiseNot_Input::data_a, N);
+
+   auto result_h = alpaka::allocBuf<int32_t, Idx>(host, Ext1D::all(Idx{N}));
+   {
+      SOFIE_Logic_BitwiseNot::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(d_input);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   int32_t* res = reinterpret_cast<int32_t*>(alpaka::getPtrNative(result_h));
+   int32_t* ref = Logic_BitwiseNot_ExpectedOutput::outputs;
+   for (std::size_t i = 0; i < N; ++i)
+      EXPECT_EQ(res[i], ref[i]) << "  index=" << i;
 }

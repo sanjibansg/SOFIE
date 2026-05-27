@@ -35,6 +35,7 @@ public:
       fNX(UTILITY::Clean_name(nameX)), fNY(UTILITY::Clean_name(nameY)),
       fType(type)
    {
+      fKind = OperatorKind::CAST;
       fInputTensorNames = { fNX };
       fOutputTensorNames = { fNY };
    }
@@ -132,13 +133,19 @@ public:
       return op;
    }
 
+   // Use a per-operator variable name so that multiple Cast operators with
+   // different source/destination types in the same model each get their own
+   // distinct member variable (the struct type is already per-op: CastKernelN).
    std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
       if (fIsOutputConstant) return "";
-      return SP + "CastKernel"+opName+" castKernel;\n";
+      return SP + "CastKernel" + opName + " castKernel_" + opName + ";\n";
    }
 
    std::string Generate_GPU_ALPAKA(std::string OpName) override {
       if (fIsOutputConstant) return "";
+      // Save the raw operator index before building the "op_N" prefix so the
+      // variable name matches the one declared in Generate_GPU_Kernel_Definitions_ALPAKA.
+      std::string varName = "castKernel_" + OpName;
       OpName = "op_" + OpName;
       if (fShape.empty()) {
          throw std::runtime_error("SOFIE Operator Cast called to Generate without being initialized first");
@@ -150,15 +157,16 @@ public:
       out << SP << "auto const elementsPerThread_"<<fNY<<" = Vec::all(static_cast<Idx>(1));\n";
       out << SP << "auto const elementsPerGrid_"<<fNY<<" = Vec::all(Idx{"<< length << "});\n";
       out << SP << "auto const workDiv_" << fNY << " = sofie_workdiv(elementsPerGrid_" << fNY << ");\n";
-      out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNY << ", castKernel, alpaka::getPtrNative(deviceBuf_" << fNX << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), static_cast<Idx>(" << length << ")); \n";
+      out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNY << ", " << varName << ", alpaka::getPtrNative(deviceBuf_" << fNX << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), static_cast<Idx>(" << length << ")); \n";
       out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";
       return out.str();
    }
    
-   bool IsElementwise() const override { return true; }
-   std::string GetElementwiseExpr(const std::string& v) const override {
-      return "static_cast<" + ConvertTypeToString(fType) + ">(" + v + ")";
-   }
+   // Cast changes the data type, so it cannot participate in the single-type-T
+   // FusedEltwiseKernel (which reads input and writes output as the same T).
+   // Returning false here routes Cast through its own Generate_GPU_ALPAKA path,
+   // which correctly uses separate SrcT and DstT device buffers.
+   bool IsElementwise() const override { return false; }
 
 };
 

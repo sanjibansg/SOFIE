@@ -65,7 +65,11 @@ private:
    std::vector<EltwiseFusionGroup> fEltwiseFusionGroups; ///<!
    std::unordered_map<size_t, size_t> fOpToFusionGroupIdx; ///<!  op_idx -> fusion group index
    std::set<std::string> fFusionIntermediateTensors;        ///<!  intermediate tensors whose alloc is skipped
+   std::set<size_t>      fSkipOperators;                    ///<!  ops swallowed by a preceding fusion (e.g. GEMM+LeakyReLU)
    void ComputeEltwiseFusionGroups();
+   /// GPU-only pass: fuse GEMM→LeakyReLU (and GEMM→ReLU where not already
+   /// handled by the ONNX parser) into a single in-place kernel sequence.
+   void FuseGemmActivations_GPU();
 
 public:
    // Rule of five: explicitly define move semantics, disallow copy

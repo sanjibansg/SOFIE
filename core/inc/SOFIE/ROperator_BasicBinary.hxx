@@ -477,50 +477,68 @@ public:
 
       auto stridesY = UTILITY::ComputeStrideFromShape(fShapeY);
 
+      // --- Fast-path index simplifications ---
+      // Check whether A is broadcast (all strides zero → single element)
+      bool isAScalar = true;
+      for (const auto& s : stridesA) { if (s != 0) { isAScalar = false; break; } }
+      // Check whether B is broadcast (all strides zero → single element)
+      bool isBScalar = true;
+      for (const auto& s : stridesB) { if (s != 0) { isBScalar = false; break; } }
+      // Check whether A has the same contiguous layout as Y (no broadcasting)
+      bool isAContiguous = (fShapeA.size() == fShapeY.size());
+      if (isAContiguous) {
+         for (size_t i = 0; i < fShapeA.size(); ++i)
+            if (fShapeA[i] != fShapeY[i]) { isAContiguous = false; break; }
+      }
+      // Check whether B has the same contiguous layout as Y (no broadcasting)
+      bool isBContiguous = (fShapeB.size() == fShapeY.size());
+      if (isBContiguous) {
+         for (size_t i = 0; i < fShapeB.size(); ++i)
+            if (fShapeB[i] != fShapeY[i]) { isBContiguous = false; break; }
+      }
+
       std::string flattened_index_A = "";
       std::string flattened_index_B = "";
-      std::string temp = "idx";
 
-      for (size_t id_s = 0; id_s < fShapeA.size(); ++id_s) {
-
-         auto strideY = stridesY[id_s];
-         auto strideA = stridesA[id_s];
-
-         // coord expression
-         std::string coord = "(int)(" + temp + " / " + std::to_string(strideY) + ")";
-
-         // accumulate into final index
-         flattened_index_A += coord + " * " + std::to_string(strideA) + " + ";
-
-         // update temp correctly
-         temp = temp + " - (" + coord + " * " + std::to_string(strideY) + ")";
+      if (isAScalar) {
+         // A is a single broadcast value
+         flattened_index_A = "0";
+      } else if (isAContiguous) {
+         // A and Y have identical shapes → direct index
+         flattened_index_A = "idx";
+      } else {
+         // General broadcast case: decompose idx into per-dim coords
+         std::string temp = "idx";
+         for (size_t id_s = 0; id_s < fShapeA.size(); ++id_s) {
+            auto strideY = stridesY[id_s];
+            auto strideA = stridesA[id_s];
+            std::string coord = "(int)(" + temp + " / " + std::to_string(strideY) + ")";
+            flattened_index_A += coord + " * " + std::to_string(strideA) + " + ";
+            temp = temp + " - (" + coord + " * " + std::to_string(strideY) + ")";
+         }
+         if (!flattened_index_A.empty())
+            flattened_index_A.erase(flattened_index_A.size() - 3);
       }
 
-      // remove trailing " + "
-      if (!flattened_index_A.empty())
-         flattened_index_A.erase(flattened_index_A.size() - 3);
-
-      temp = "idx";
-
-      for (size_t id_s = 0; id_s < fShapeB.size(); ++id_s) {
-
-         auto strideY = stridesY[id_s];
-         auto strideB = stridesB[id_s];
-
-         // coord expression
-         std::string coord = "(int)(" + temp + " / " + std::to_string(strideY)  + ")";
-
-         // accumulate into final index
-         flattened_index_B += coord + " * " + std::to_string(strideB) + " + ";
-
-         // update temp correctly
-         temp = temp + " - (" + coord + " * " + std::to_string(strideY) + ")";
+      if (isBScalar) {
+         // B is a single broadcast value
+         flattened_index_B = "0";
+      } else if (isBContiguous) {
+         // B and Y have identical shapes → direct index
+         flattened_index_B = "idx";
+      } else {
+         // General broadcast case
+         std::string temp = "idx";
+         for (size_t id_s = 0; id_s < fShapeB.size(); ++id_s) {
+            auto strideY = stridesY[id_s];
+            auto strideB = stridesB[id_s];
+            std::string coord = "(int)(" + temp + " / " + std::to_string(strideY) + ")";
+            flattened_index_B += coord + " * " + std::to_string(strideB) + " + ";
+            temp = temp + " - (" + coord + " * " + std::to_string(strideY) + ")";
+         }
+         if (!flattened_index_B.empty())
+            flattened_index_B.erase(flattened_index_B.size() - 3);
       }
-
-      // remove trailing " + "
-      if (!flattened_index_B.empty())
-         flattened_index_B.erase(flattened_index_B.size() - 3);
-         
 
       op += "C[idx] = " + BinaryOperatorTrait<T, Op>::Op("A["+flattened_index_A+"]", "B["+flattened_index_B+"]") + ";\n";
       op += "}\n}\n};\n";

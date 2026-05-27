@@ -23,6 +23,7 @@ public:
    ROperator_Not(std::string nameX, std::string nameY)
       : fNX(UTILITY::Clean_name(nameX)), fNY(UTILITY::Clean_name(nameY))
    {
+         fKind = OperatorKind::NOT;
          fInputTensorNames =  { fNX };
          fOutputTensorNames = { fNY };
    }

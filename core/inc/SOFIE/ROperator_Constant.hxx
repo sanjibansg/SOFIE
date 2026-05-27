@@ -18,6 +18,7 @@ private:
    std::string fNX;
    std::string fNY;
    std::vector<size_t> fShape;
+   std::vector<Dim> fDimShape;  // used for dynamic ConstantOfShape
    std::vector<T> fValues;
    std::string fAttrType;
    bool fIsConstantOfShape = false;
@@ -54,8 +55,28 @@ public:
          if (model.CheckIfTensorAlreadyExist(fNX) == false){
            throw std::runtime_error("SOFIE ConstantOfShape Op Input Tensor is not found in model");
          }
+         if (model.IsShapeTensor(fNX)) {
+            // Input is a shape tensor (symbolic dimensions) — output will be a dynamic tensor
+            // whose shape is determined at runtime from the symbolic values.
+            const auto & dimVals = model.GetShapeTensorValues(fNX);
+            std::vector<Dim> outShape;
+            for (const auto & d : dimVals)
+               outShape.push_back(d);
+            if (fValues.size() != 1)
+               throw std::runtime_error("SOFIE ConstantOfShape Op value Tensor has invalid size " + std::to_string(fValues.size()));
+            // Register as a dynamic intermediate tensor — values will be filled at runtime
+            model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), outShape);
+            // Store shape for code generation (use fShape for rank, values = 0 for symbolic dims)
+            fShape.resize(outShape.size());
+            for (size_t i = 0; i < outShape.size(); i++)
+               fShape[i] = outShape[i].isParam ? 0 : outShape[i].dim;
+            // Store symbolic lengths/shape for Generate()
+            fDimShape = outShape;
+            fIsOutputConstant = false;  // cannot be constant since shape is dynamic
+            return;
+         }
          // get output shape from input values:
-         // can work only if input is a constant or initialized tensor (or dynamic one)
+         // can work only if input is a constant or initialized tensor
          auto dptr = model.GetInitializedTensorData(fNX);
          auto input_tensor = static_cast<int64_t *>(dptr.get());
          auto input_shape = model.GetTensorShape(fNX);

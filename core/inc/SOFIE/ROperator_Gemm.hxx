@@ -37,6 +37,7 @@ namespace SOFIE{
       std::string fNY;
       std::string fType;
       EActivationType fActivation;
+      float fLeakyReluAlpha = 0.01f;   // used when fActivation == LEAKYRELU
       std::vector<Dim> fShapeA;
       std::vector<Dim> fShapeB;
       std::vector<size_t> fShapeC;
@@ -514,12 +515,21 @@ namespace SOFIE{
             out << SP << "}\n"; // end of loop on the stacked multiplication
          }
 
-         // fuse with Relu
-         if(fActivation == EActivationType::RELU){
+         // fuse activation with GEMM output (in-place on fNY)
+         if (fActivation == EActivationType::RELU) {
                out << SP << "//--- applying RELU to output\n";
                std::string tnsr = "tensor_" + fNY;
                std::string reluSize = ConvertDimShapeToLength(fShapeY);
                out << SP << "SOFIE::Relu(" << tnsr << ", " << tnsr << ", " << reluSize << ");\n";
+         } else if (fActivation == EActivationType::LEAKYRELU) {
+               out << SP << "//--- applying LEAKYRELU to output (in-place)\n";
+               std::string tnsr = "tensor_" + fNY;
+               std::string reluSize = ConvertDimShapeToLength(fShapeY);
+               out << SP << "{\n";
+               out << SP << SP << "constexpr float lrelu_alpha = " << std::setprecision(std::numeric_limits<float>::max_digits10) << fLeakyReluAlpha << "f;\n";
+               out << SP << SP << "for (size_t _i = 0; _i < " << reluSize << "; ++_i)\n";
+               out << SP << SP << SP << tnsr << "[_i] = " << tnsr << "[_i] >= 0.f ? " << tnsr << "[_i] : lrelu_alpha * " << tnsr << "[_i];\n";
+               out << SP << "}\n";
          }
 
          return out.str();
@@ -533,7 +543,13 @@ namespace SOFIE{
          }
          std::stringstream out;
          out << "\n//--------- Gemm_GPU_ALPAKA\n";
-         out << SP << "alpaka::wait(queue);\n";
+         // Note: alpaka::wait(queue) intentionally removed here.
+         // Operations are enqueued asynchronously on the Alpaka queue's CUDA
+         // stream.  Synchronisation only happens once per inference at the
+         // alpaka::wait(queue) call in _infer_impl's tail and at the
+         // cudaDeviceSynchronize in the benchmark harness.  Adding a wait
+         // before every GEMM stalls the CPU<->GPU pipeline and is the primary
+         // cause of SOFIE being slower than ONNXRuntime.
          out << SP << "char " << opName << "_transA = " << (fAttrTransA ? "\'t\'" : "\'n\'") << ";\n";
          out << SP << "char " << opName << "_transB = " << (fAttrTransB ? "\'t\'" : "\'n\'") << ";\n";
          // need to consider case A and B have dim > 2 (for MatMul)
@@ -595,43 +611,182 @@ namespace SOFIE{
          // Compute per-iteration strides for each buffer when stacking.
          // m/n/k are std::string from Dim::GetVal(); stoi() is safe for static shapes.
          size_t strideA = 0, strideB = 0, strideY = 0, strideC = 0;
+         // GPU optimisation flags (static shapes only):
+         //   batchCollapseB  — strideB==0: B is the shared weight, so replace the N-iteration
+         //                     loop with a single cuBLASLt GEMM whose batch dimension is
+         //                     folded into the "n_sofie" parameter (n_sofie = m_onnx * N).
+         //                     This turns 30 per-token GEMM launches into one kernel call.
+         //   useSBatched     — both strides non-zero AND no bias: use cublasSgemmStridedBatched
+         //                     so the GPU driver schedules all N GEMMs in one call.
+         //                     (Bias epilogue is not available on the strided-batched path, so
+         //                      this only applies to pure MatMul ops such as softmax(QK^T)·V.)
+         bool batchCollapseB = false;
+         bool useSBatched    = false;
          if (doStackMul && !fIsDynamic) {
             strideA = static_cast<size_t>(std::stoi(m)) * static_cast<size_t>(std::stoi(k));
-            strideB = static_cast<size_t>(std::stoi(n)) * static_cast<size_t>(std::stoi(k));
+            // B is a shared weight (broadcast over the stacked/batch dimension) when all its
+            // leading dims (beyond the 2 matrix dims) are 1.  In that case strideB must be 0
+            // so every iteration reads from the same B slice — not i * n*k (which goes OOB).
+            bool bLeadingDimsAllOne = true;
+            for (int64_t i = 0; i < dimB - 2; i++) {
+               if (fShapeB[i].dim != 1) { bLeadingDimsAllOne = false; break; }
+            }
+            strideB = bLeadingDimsAllOne ? 0
+                                         : static_cast<size_t>(std::stoi(n)) * static_cast<size_t>(std::stoi(k));
             strideY = static_cast<size_t>(std::stoi(m)) * static_cast<size_t>(std::stoi(n));
             strideC = !fNC.empty() ? static_cast<size_t>(std::stoi(lengthGemm)) : 0;
-            out << SP << "size_t " << opName << "_yoffset = 0;\n";
-            out << SP << "for (int i = 0; i < " << lengthExtra << "; i++){\n";
-         } else if (doStackMul) {
-            // Dynamic case: emit symbolic stride expressions
+
+            batchCollapseB = (strideB == 0);
+            useSBatched    = !batchCollapseB && fNC.empty();
+         }
+
+         // Emit the loop only for the serial fallback path (dynamic shapes, or static
+         // shapes where both A and B vary per iteration AND a bias epilogue is needed).
+         bool useSerialLoop = doStackMul && !batchCollapseB && !useSBatched;
+         if (useSerialLoop || (doStackMul && fIsDynamic)) {
             out << SP << "size_t " << opName << "_yoffset = 0;\n";
             out << SP << "for (int i = 0; i < " << lengthExtra << "; i++){\n";
          }
 
-         // in the case of bias
-         if (!fNC.empty()){
-            // Use getPtrNative() for all args so the raw-pointer overload is selected regardless
-            // of whether each buffer is a BufXxx (member weight/bias/output) or ViewPlainPtr (input view).
-            std::string pA = "alpaka::getPtrNative(deviceBuf_" + fNA + ")";
-            std::string pB = "alpaka::getPtrNative(deviceBuf_" + fNB + ")";
+         // Use getPtrNative() for all args so the raw-pointer overload is selected
+         // regardless of whether each buffer is a BufXxx or ViewPlainPtr.
+         // For the loop path, add per-iteration offsets; for the collapsed/batched
+         // paths, use base pointers (the whole contiguous tensor is processed at once).
+         std::string pA = "alpaka::getPtrNative(deviceBuf_" + fNA + ")";
+         std::string pB = "alpaka::getPtrNative(deviceBuf_" + fNB + ")";
+         std::string pY = "alpaka::getPtrNative(deviceBuf_" + fNY + ")";
+         if (useSerialLoop && !fIsDynamic) {
+            pA += " + i * " + std::to_string(strideA);
+            if (strideB > 0) pB += " + i * " + std::to_string(strideB);
+            // strideB == 0: B is a shared weight, pointer stays at base
+            pY += " + i * " + std::to_string(strideY);
+         }
+
+         if (useSBatched) {
+            // ----------------------------------------------------------------
+            // gemmStridedBatched: both A and B vary per batch (e.g. per attention
+            // head), and there is no bias.  Uses cublasSgemmStridedBatched via
+            // the legacy cuBLAS handle so all N GEMMs are issued in one driver call.
+            //
+            // sofieBLAS convention (column-major transpose trick):
+            //   transa_sofie = transB_onnx,  transb_sofie = transA_onnx
+            //   m_sofie      = n_onnx,        n_sofie      = m_onnx
+            //   A_sofie      = fNB,           B_sofie      = fNA
+            //   lda = m_sofie  (leading dim of A when transA_sofie='n')
+            //   ldb = k        (leading dim of B when transB_sofie='n')
+            //   ldc = m_sofie  (leading dim of C)
+            // ----------------------------------------------------------------
+            size_t m_sofie    = static_cast<size_t>(std::stoi(n));   // ONNX n
+            size_t n_sofie    = static_cast<size_t>(std::stoi(m));   // ONNX m
+            size_t k_val      = static_cast<size_t>(std::stoi(k));
+            size_t lda        = m_sofie;             // transA_sofie='n'
+            size_t ldb        = k_val;               // transB_sofie='n'
+            size_t ldc        = m_sofie;
+            size_t sA         = m_sofie * k_val;     // stride per batch for fNB
+            size_t sB         = k_val  * n_sofie;    // stride per batch for fNA (= strideA_onnx)
+            size_t sC         = m_sofie * n_sofie;   // stride per batch for fNY (= strideY)
+            size_t batchCount = static_cast<size_t>(std::stoi(lengthExtra));
+            out << SP << "blas.gemmStridedBatched("
+                << opName << "_transB, " << opName << "_transA, "
+                << m_sofie << ", " << n_sofie << ", " << k_val << ", "
+                << opName << "_alpha, "
+                << "alpaka::getPtrNative(deviceBuf_" << fNB << "), "
+                << lda << ", " << sA << ", "
+                << "alpaka::getPtrNative(deviceBuf_" << fNA << "), "
+                << ldb << ", " << sB << ", "
+                << opName << "_beta, "
+                << "alpaka::getPtrNative(deviceBuf_" << fNY << "), "
+                << ldc << ", " << sC << ", "
+                << batchCount << ");\n";
+         } else if (!fNC.empty()) {
+            // ----------------------------------------------------------------
+            // GEMM with bias:  Y = alpha * op(A) * op(B) + bias
+            // cuBLAS is column-major so we swap A↔B and transA↔transB
+            // (row-major C=A*B  ↔  col-major C^T = B^T * A^T).
+            // The epilogue fuses the bias-add (and optional ReLU/GELU) in the
+            // same kernel, avoiding a separate element-wise pass.
+            //
+            // For batch-collapse (batchCollapseB), use m*batchCount so that all
+            // tokens are processed in a single cuBLASLt kernel launch instead of N.
+            // The bias vector is broadcast across all columns by the epilogue.
+            // ----------------------------------------------------------------
+            std::string call_m = batchCollapseB
+               ? std::to_string(static_cast<size_t>(std::stoi(m)) * static_cast<size_t>(std::stoi(lengthExtra)))
+               : (opName + "_m");
+
             std::string pC = "alpaka::getPtrNative(deviceBuf_" + fNC + ")";
-            std::string pY = "alpaka::getPtrNative(deviceBuf_" + fNY + ")";
-            if (doStackMul && !fIsDynamic) {
-               pA += " + i * " + std::to_string(strideA);
-               pB += " + i * " + std::to_string(strideB);
-               pY += " + i * " + std::to_string(strideY);
-               if (!fBroadcastBias && strideC > 0) pC += " + i * " + std::to_string(strideC);
+            if (useSerialLoop && !fIsDynamic) {
+               if (!fBroadcastBias && strideC > 0)
+                  pC += " + i * " + std::to_string(strideC);
             }
-            if (fActivation == EActivationType::RELU){
-               out << SP << "blas.gemmrelu("<<opName<<"_transB, "<<opName<<"_transA, "<<opName<<"_n, "<<opName<<"_m, "<<opName<<"_k, "<< opName << "_alpha, " << pB << ", " << pA << ", " <<opName << "_beta, " << pC << ", " << pY << ");\n";
+            if (fActivation == EActivationType::RELU) {
+               out << SP << "blas.gemmrelu("
+                   << opName << "_transB, " << opName << "_transA, "
+                   << opName << "_n, "      << call_m << ", "
+                   << opName << "_k, "      << opName << "_alpha, "
+                   << pB << ", " << pA << ", "
+                   << opName << "_beta, " << pC << ", " << pY << ");\n";
             } else {
-               out << SP << "blas.gemm("<<opName<<"_transB, "<<opName<<"_transA, "<<opName<<"_n, "<<opName<<"_m, "<<opName<<"_k, "<< opName << "_alpha, " << pB << ", " << pA << ", " <<opName << "_beta, " << pC << ", " << pY << ");\n";
+               out << SP << "blas.gemm("
+                   << opName << "_transB, " << opName << "_transA, "
+                   << opName << "_n, "      << call_m << ", "
+                   << opName << "_k, "      << opName << "_alpha, "
+                   << pB << ", " << pA << ", "
+                   << opName << "_beta, " << pC << ", " << pY << ");\n";
             }
-         }
-         // need to implement for matmul case without bias
+         } else {
+            // ----------------------------------------------------------------
+            // Pure MatMul (no bias):  Y = alpha * op(A) * op(B)
+            // This covers:
+            //   • Scaled Dot-Product Attention:  softmax(QK^T/√d) @ V
+            //   • Any other no-bias matrix multiplication
+            // Previously this branch emitted nothing (empty loop body), which
+            // caused the attention output to be silently uninitialized.
+            // For batch-collapse, use m*batchCount for the same reason as above.
+            // ----------------------------------------------------------------
+            std::string call_m = batchCollapseB
+               ? std::to_string(static_cast<size_t>(std::stoi(m)) * static_cast<size_t>(std::stoi(lengthExtra)))
+               : (opName + "_m");
 
-         if (doStackMul) {
+            out << SP << "blas.matmul("
+                << opName << "_transB, " << opName << "_transA, "
+                << opName << "_n, "      << call_m << ", "
+                << opName << "_k, "      << opName << "_alpha, "
+                << pB << ", " << pA << ", "
+                << opName << "_beta, "  << pY << ");\n";
+         }
+
+         if (useSerialLoop || (doStackMul && fIsDynamic)) {
             out << SP << "}\n"; // end of loop on the stacked multiplication
+         }
+
+         // GEMM+LeakyReLU fusion (GPU): cuBLASLt has no native LeakyReLU epilogue,
+         // so we emit a cheap in-place ALPAKA kernel immediately after the GEMM.
+         // This avoids allocating a separate intermediate buffer and saves one
+         // GPU kernel launch compared to a standalone LeakyReLU operator.
+         if (fActivation == EActivationType::LEAKYRELU) {
+            std::string numElem = ConvertDimShapeToLength(fShapeY);
+            out << SP << "//--- GEMM+LeakyReLU in-place fusion\n";
+            out << SP << "{\n";
+            out << SP << SP << "constexpr float " << opName << "_lrelu_alpha = "
+                << std::setprecision(std::numeric_limits<float>::max_digits10)
+                << fLeakyReluAlpha << "f;\n";
+            out << SP << SP << "auto const elementsPerThread_lrelu_" << opName
+                << " = Vec::all(static_cast<Idx>(1));\n";
+            out << SP << SP << "auto const elementsPerGrid_lrelu_" << opName
+                << " = Vec::all(Idx{" << numElem << "});\n";
+            out << SP << SP << "auto const workDiv_lrelu_" << opName
+                << " = sofie_workdiv(elementsPerGrid_lrelu_" << opName << ");\n";
+            // In-place: input and output pointer are the same device buffer.
+            out << SP << SP << "auto task_lrelu_" << opName
+                << " = alpaka::createTaskKernel<Acc>(workDiv_lrelu_" << opName
+                << ", leakyReluKernel"
+                << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+                << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+                << ", static_cast<Idx>(" << numElem << ")"
+                << ", static_cast<float>(" << opName << "_lrelu_alpha));\n";
+            out << SP << SP << "alpaka::enqueue(queue, task_lrelu_" << opName << ");\n";
+            out << SP << "}\n";
          }
 
          return out.str();
@@ -648,16 +803,54 @@ namespace SOFIE{
          fOutputTensorNames[0] = fNY;
       }
 
+      // --- Activation fusion accessors (used by FuseGemmActivations_GPU) ---
+      EActivationType GetActivationType() const { return fActivation; }
+      /// Set fused activation.  alpha is only meaningful for LEAKYRELU.
+      void SetActivation(EActivationType act, float alpha = 0.f) {
+         fActivation      = act;
+         fLeakyReluAlpha  = alpha;
+      }
+
       std::string GetBlasConfig(){
          int64_t dimA = fShapeA.size();
          int64_t dimB = fShapeB.size();
+         int64_t dimY = fShapeY.size();
          auto m = (fAttrTransA ? fShapeA[dimA-1].GetVal() : fShapeA[dimA-2].GetVal());
          auto n = (fAttrTransB ? fShapeB[dimB-2].GetVal() : fShapeB[dimB-1].GetVal());
          auto k = (fAttrTransA ? fShapeA[dimA-2].GetVal() : fShapeA[dimA-1].GetVal());
          auto lda = (fAttrTransA ? m : k);
          auto ldb = (fAttrTransB ? k : n);
          auto ldc = n;
-         return n+", "+m+", "+k+", "+ldb+", "+lda+", "+ldc+", "+(fAttrTransB ? "'t'" : "'n'")+", "+(fAttrTransA ? "'t'" : "'n'");
+         std::string transFlags = std::string(fAttrTransB ? "'t'" : "'n'") + ", " + (fAttrTransA ? "'t'" : "'n'");
+
+         // For stacked (batched) GEMMs on static shapes, return the layout that
+         // matches the actual call emitted by Generate_GPU_ALPAKA:
+         //   - batch-collapse (strideB==0): single GEMM with n_sofie = m_onnx * batchCount
+         //                                  → register the batched layout
+         //   - gemmStridedBatched (both strides non-zero, no bias): uses legacy cuBLAS,
+         //                                  no cuBLASLt layout needed → return ""
+         if (dimY > 2 && !fIsDynamic) {
+            std::vector<Dim> sExtra;
+            for (int64_t i = 0; i < dimY - 2; i++) sExtra.push_back(fShapeY[i]);
+            auto lengthExtra = ConvertDimShapeToLength(sExtra);
+            if (std::stoi(lengthExtra) > 1) {
+               bool bLeadingDimsAllOne = true;
+               for (int64_t i = 0; i < dimB - 2; i++) {
+                  if (fShapeB[i].dim != 1) { bLeadingDimsAllOne = false; break; }
+               }
+               if (bLeadingDimsAllOne) {
+                  // batch-collapse: register layout for the full-batch GEMM
+                  auto m_batched = std::to_string(std::stoi(m) * std::stoi(lengthExtra));
+                  return n+", "+m_batched+", "+k+", "+ldb+", "+lda+", "+ldc+", "+transFlags;
+               } else if (fNC.empty()) {
+                  // gemmStridedBatched: legacy cuBLAS, no cuBLASLt layout needed
+                  return "";
+               }
+               // else: serial loop with bias — fall through to per-iteration layout
+            }
+         }
+
+         return n+", "+m+", "+k+", "+ldb+", "+lda+", "+ldc+", "+transFlags;
       }
    };
 

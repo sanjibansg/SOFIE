@@ -19,7 +19,7 @@ private:
    float falpha= 1.0; //default value
    std::string fNX;
    std::string fNY;
-   std::vector<size_t> fShape;
+   std::vector<Dim> fShape;
    std::string fType;
 
 public:
@@ -52,7 +52,7 @@ public:
       if (model.CheckIfTensorAlreadyExist(fNX) == false){   //input must be a graph input, or already initialized intermediate tensor
          throw std::runtime_error("SOFIE Elu Op Input Tensor is not found in model");
       }
-      fShape = model.GetTensorShape(fNX);
+      fShape = model.GetDimTensorShape(fNX);
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShape);
    }
 
@@ -63,7 +63,7 @@ public:
          throw std::runtime_error("SOFIE Operator Elu called to Generate without being initialized first");
       }
       std::stringstream out;
-      size_t length = ConvertShapeToLength(fShape);
+      std::string length = ConvertDimShapeToLength(fShape);
 
       out << SP << "float " << OpName << "_alpha = " << std::setprecision(std::numeric_limits<float>::max_digits10) << falpha << ";\n";
 

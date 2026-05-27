@@ -99,7 +99,10 @@ public:
       fTensorType2 = model.GetTensorType(fNX2);
       bool broadcast = !UTILITY::AreSameShape(fShapeX1, fShapeX2);
       if (broadcast) {
-         fShapeY = UTILITY::UnidirectionalBroadcastShape(fShapeX1, fShapeX2);
+         // ONNX comparison ops support multidirectional broadcasting (numpy semantics):
+         // both inputs can be broadcast to the common output shape.
+         auto ret = UTILITY::MultidirectionalBroadcastShape(fShapeX1, fShapeX2);
+         fShapeY = ret.second;
          bool broadcastX1 = !UTILITY::AreSameShape(fShapeX1, fShapeY);
          bool broadcastX2 = !UTILITY::AreSameShape(fShapeX2, fShapeY);
          if (broadcastX1) {

@@ -80,6 +80,7 @@ public:
         fNMin(nameMin.empty() ? "" : UTILITY::Clean_name(nameMin)),
         fNMax(nameMax.empty() ? "" : UTILITY::Clean_name(nameMax))
    {
+      fKind = OperatorKind::CLIP;
       fInputTensorNames  = { fNX };
       if (!fNMin.empty()) fInputTensorNames.push_back(fNMin);
       if (!fNMax.empty()) fInputTensorNames.push_back(fNMax);
@@ -97,6 +98,7 @@ public:
         fHasMin(true), fHasMax(true),
         fMinIsConstant(true), fMaxIsConstant(true)
    {
+      fKind = OperatorKind::CLIP;
       fInputTensorNames  = { fNX };
       fOutputTensorNames = { fNY };
    }
@@ -171,11 +173,16 @@ public:
    // GPU ALPAKA
    // -----------------------------------------------------------------------
 
-   std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) override
+   // Each Clip instance carries its own min/max values (passed as kernel
+   // arguments) and may have different element types.  Use per-operator names
+   // for the kernel struct and member variable so that multiple Clip operators
+   // in the same model do not produce duplicate definitions.
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override
    {
+      std::string kname = "ClipKernel_op_" + opName;
       std::string op;
-      op  = "\n//------ CLIP_KERNEL_ALPAKA\n";
-      op += "struct ClipKernel {\n";
+      op  = "\n//------ CLIP_KERNEL_ALPAKA op_" + opName + "\n";
+      op += "struct " + kname + " {\n";
       op += SP + "template<typename TAcc, typename T>\n";
       op += SP + "ALPAKA_FN_ACC void operator()(\n";
       op += SP + SP + "TAcc const & acc,\n";
@@ -196,14 +203,20 @@ public:
       return op;
    }
 
-   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) override
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override
    {
-      return "ClipKernel clipKernel;\n";
+      std::string kname = "ClipKernel_op_" + opName;
+      std::string vname = "clipKernel_op_" + opName;
+      return kname + " " + vname + ";\n";
    }
 
    std::string Generate_GPU_ALPAKA(std::string OpName) override
    {
+      // Save the raw operator index before building the "op_N" prefix so that
+      // the variable name matches the one declared in Generate_GPU_Kernel_Definitions_ALPAKA.
+      std::string varName = "clipKernel_op_" + OpName;
       OpName = "op_" + OpName;
+
       if (fShape.empty() && fDimShape.empty())
          throw std::runtime_error(
             "SOFIE Operator Clip called to Generate_GPU_ALPAKA without being initialized first");
@@ -239,7 +252,7 @@ public:
       out << SP << "auto const elementsPerGrid_"   << fNY << " = Vec::all(Idx{" << length << "});\n";
       out << SP << "auto const workDiv_" << fNY << " = sofie_workdiv(elementsPerGrid_" << fNY << ");\n";
       out << SP << "auto task_" << OpName
-          << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNY << ", clipKernel"
+          << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNY << ", " << varName
           << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
           << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
           << ", static_cast<std::size_t>(" << length << ")"

@@ -81,10 +81,10 @@ private:
 
    std::vector<std::string> fNInputs;
    std::string fNY;
-   std::vector<std::vector<size_t>> fShapeInputs;
+   std::vector<std::vector<Dim>> fShapeInputs;
 
    std::vector<std::string> fNBroadcastedInputs;
-   std::vector<size_t> fShapeY;
+   std::vector<Dim> fShapeY;
 
    bool fBroadcast = false;
 
@@ -121,16 +121,22 @@ public:
          if (!model.CheckIfTensorAlreadyExist(it)) {
             throw std::runtime_error("SOFIE BasicNary Op Input Tensor " + it + " is not found in model");
          }
-         fShapeInputs.push_back(model.GetTensorShape(it));
+         fShapeInputs.push_back(model.GetDimTensorShape(it));
       }
-      // Find the common shape of the input tensors
-      fShapeY = UTILITY::MultidirectionalBroadcastShape(fShapeInputs);
+      // Find the common output shape by pairwise multidirectional broadcast
+      fShapeY = fShapeInputs[0];
+      for (size_t i = 1; i < fShapeInputs.size(); i++) {
+         auto shapeA = fShapeY;
+         auto shapeB = fShapeInputs[i];
+         auto ret = UTILITY::MultidirectionalBroadcastShape(shapeA, shapeB);
+         fShapeY = ret.second;
+      }
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNInputs[0]), fShapeY);
       // Broadcasting
       size_t N = fNInputs.size();
       fNBroadcastedInputs.reserve(N);
       for (size_t i = 0; i < N; i++) {
-         if (!UTILITY::AreSameShape(model.GetTensorShape(fNInputs[i]), fShapeY)) {
+         if (!UTILITY::AreSameShape(fShapeInputs[i], fShapeY)) {
             fBroadcast = true;
             std::string name = "Broadcasted"  + fNInputs[i];
             model.AddIntermediateTensor(name, model.GetTensorType(fNInputs[0]), fShapeY);
@@ -148,15 +154,15 @@ public:
          throw std::runtime_error("SOFIE BasicNary called to Generate without being initialized first");
       }
       std::stringstream out;
-      size_t length = ConvertShapeToLength(fShapeY);
+      std::string length = ConvertDimShapeToLength(fShapeY);
       out << SP << "\n//------ BasicNary operator\n";
       if (fBroadcast) {
          for (size_t i = 0; i < fNInputs.size(); i++) {
             if (fNBroadcastedInputs[i] != fNInputs[i]) {
-               out << SP << SP << "// Broadcasting " << fNInputs[i] << " to " << ConvertShapeToString(fShapeY) << "\n";
+               out << SP << SP << "// Broadcasting " << fNInputs[i] << " to " << ConvertDimShapeToString(fShapeY) << "\n";
                out << SP << SP << "{\n";
-               out << SP << SP << SP << fType << "* data = SOFIE::UTILITY::UnidirectionalBroadcast<" << fType << ">(tensor_" + fNInputs[i] << ", " << ConvertShapeToString(fShapeInputs[i]);
-               out << ", " << ConvertShapeToString(fShapeY) << ");\n";
+               out << SP << SP << SP << fType << "* data = SOFIE::UTILITY::UnidirectionalBroadcast<" << fType << ">(tensor_" + fNInputs[i] << ", " << ConvertDimShapeToString(fShapeInputs[i]);
+               out << ", " << ConvertDimShapeToString(fShapeY) << ");\n";
                out << SP << SP << SP << "std::copy(data, data + " << length << ", " << fNBroadcastedInputs[i] << ");\n";
                out << SP << SP << SP << "delete[] data;\n";
                out << SP << SP << "}\n";

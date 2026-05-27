@@ -118,7 +118,11 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         << "#include <iostream>\n"
         << "#include <random>\n"
         << "#include <string>\n\n"
-        << "inline void Benchmark_" << cppName
+        // Not inline: each model is compiled in its own _bench.cu TU and
+        // called from the main TU via a forward declaration.  Using inline
+        // here would require all 32 models to share one translation unit
+        // which OOM-kills the CUDA compiler.
+        << "void Benchmark_" << cppName
         << "(int warmup, int iterations, const std::string& weightsDir) {\n"
         << "    using Idx  = std::size_t;\n"
         << "    using Dim1 = alpaka::DimInt<1>;\n"

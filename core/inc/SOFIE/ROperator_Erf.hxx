@@ -17,7 +17,7 @@ private:
 
    std::string fNX;
    std::string fNY;
-   std::vector<size_t> fShape;
+   std::vector<Dim> fShape;
 
 public:
    ROperator_Erf(){}
@@ -41,7 +41,7 @@ public:
       if (model.CheckIfTensorAlreadyExist(fNX) == false){
         throw std::runtime_error("SOFIE SOFIE Erf Op Input Tensor is not found in model");
       }
-      fShape = model.GetTensorShape(fNX);
+      fShape = model.GetDimTensorShape(fNX);
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShape);
    }
 
@@ -52,7 +52,7 @@ public:
          throw std::runtime_error("SOFIE SOFIE Erf operator called to Generate without being initialized first");
       }
       std::stringstream out;
-      size_t length = ConvertShapeToLength(fShape);
+      std::string length = ConvertDimShapeToLength(fShape);
       out << "\n//------ ERF\n";
       out << SP << "for (int id = 0; id < " << length << " ; id++){\n";
       out << SP << SP << "tensor_" << fNY << "[id] = std::erf(tensor_" << fNX << "[id]);\n";

@@ -7,6 +7,7 @@
 #include <cassert>
 #include <iostream>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
 #include <algorithm>
 #include <array>
@@ -58,6 +59,8 @@ extern ParserFuncSignature ParseReduceMean;
 extern ParserFuncSignature ParseReduceSum;
 extern ParserFuncSignature ParseReduceSumSquare;
 extern ParserFuncSignature ParseReduceProd;
+extern ParserFuncSignature ParseReduceL2;
+extern ParserFuncSignature ParseReduceMax;
 // Others
 extern ParserFuncSignature ParseBatchNormalization;
 extern ParserFuncSignature ParseConstant;
@@ -99,6 +102,14 @@ extern ParserFuncSignature ParseWhere;
 extern ParserFuncSignature ParseEinsum;
 extern ParserFuncSignature ParseRandom;
 extern ParserFuncSignature ParseScatterElements;
+extern ParserFuncSignature ParseTrilu;
+extern ParserFuncSignature ParseAnd;
+extern ParserFuncSignature ParseOr;
+extern ParserFuncSignature ParseXor;
+extern ParserFuncSignature ParseBitwiseAnd;
+extern ParserFuncSignature ParseBitwiseOr;
+extern ParserFuncSignature ParseBitwiseXor;
+extern ParserFuncSignature ParseBitwiseNot;
 // Declaration of fused operators
 extern ParserFuseFuncSignature ParseFuseConvAdd;
 extern ParserFuseFuncSignature ParseFuseGemmRelu;
@@ -219,6 +230,8 @@ RModelParser_ONNX::RModelParser_ONNX() noexcept : fOperatorsMapImpl(std::make_un
    RegisterOperator("ReduceSum", ParseReduceSum);
    RegisterOperator("ReduceSumSquare", ParseReduceSumSquare);
    RegisterOperator("ReduceProd", ParseReduceProd);
+   RegisterOperator("ReduceL2", ParseReduceL2);
+   RegisterOperator("ReduceMax", ParseReduceMax);
    // Others
    RegisterOperator("BatchNormalization", ParseBatchNormalization);
    RegisterOperator("Constant", ParseConstant);
@@ -269,6 +282,16 @@ RModelParser_ONNX::RModelParser_ONNX() noexcept : fOperatorsMapImpl(std::make_un
    RegisterOperator("RandomUniform", ParseRandom);
    RegisterOperator("RandomUniformLike", ParseRandom);
    RegisterOperator("ScatterElements", ParseScatterElements);
+   RegisterOperator("Trilu", ParseTrilu);
+   // Logical operators
+   RegisterOperator("And", ParseAnd);
+   RegisterOperator("Or", ParseOr);
+   RegisterOperator("Xor", ParseXor);
+   // Bitwise operators
+   RegisterOperator("BitwiseAnd", ParseBitwiseAnd);
+   RegisterOperator("BitwiseOr", ParseBitwiseOr);
+   RegisterOperator("BitwiseXor", ParseBitwiseXor);
+   RegisterOperator("BitwiseNot", ParseBitwiseNot);
 }
 
 // Destructor of the parser
@@ -656,6 +679,18 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
    nodesOrder.reserve(graph.node_size());
    std::vector<bool> foundNodes(graph.node_size());
 
+   // Pre-compute the set of all tensor names that belong to THIS graph:
+   // graph inputs, initializers, and node outputs.  A tensor is an "outer-scope
+   // reference" (from an enclosing graph) only if it is NOT in this set.
+   std::unordered_set<std::string> graphLocalTensors;
+   for (int i = 0; i < graph.input_size(); i++)
+      graphLocalTensors.insert(graph.input(i).name());
+   for (int i = 0; i < graph.initializer_size(); i++)
+      graphLocalTensors.insert(graph.initializer(i).name());
+   for (int i = 0; i < graph.node_size(); i++)
+      for (int j = 0; j < graph.node(i).output_size(); j++)
+         graphLocalTensors.insert(graph.node(i).output(j));
+
    // loop at graph inputs
    std::map<std::string, int> allInputs;
    for (int i = 0; i < graph.input_size(); i++) {
@@ -676,13 +711,22 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
             std::string name = graph.node(i).input(j);
             // skip empty names
             if (!name.empty()) {
-               existInputs &= (allInputs.find(name) != allInputs.end() ||
-                               allInitializedTensors.find(name) != allInitializedTensors.end());
+               // A tensor is available if it is: a graph input/previously computed node output
+               // (allInputs), an initializer (allInitializedTensors), or an outer-scope tensor
+               // referenced from a subgraph.  Outer-scope means: registered in the parser's type
+               // map AND not produced by any node/input/initializer of the current graph.  The
+               // second condition prevents cross-model contamination from prior parsing passes.
+               bool isOuterScope = !graphLocalTensors.count(name) && IsRegisteredTensorType(name);
+               bool available = (allInputs.find(name) != allInputs.end() ||
+                                 allInitializedTensors.find(name) != allInitializedTensors.end() ||
+                                 isOuterScope);
+               existInputs &= available;
                if (fVerbose) {
                   std::cout << "\t\t input " << name << " "
                      << bool(allInputs.find(name) != allInputs.end()) << "  " <<
                      bool(allInitializedTensors.find(name) != allInitializedTensors.end()) << "  " <<
-                     existInputs << std::endl;
+                     bool(isOuterScope) << "  "
+                     << existInputs << std::endl;
                }
             }
          }
@@ -763,7 +807,11 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
    }
 
    // we have to record order of node execution separately to
-   // account for fused operators
+   // account for fused operators.
+   // Save and restore fFusedOperators around the parsing loop so that
+   // recursive ParseONNXGraph calls (for If/Loop subgraphs) do not
+   // corrupt the parent graph's fused-operator bookkeeping.
+   auto savedFusedOperators = std::move(fFusedOperators);
    size_t node_order_exec = 0;
    fFusedOperators = std::vector<bool>(graph.node_size(), false);
    for (int i = 0; i < graph.node_size(); i++) {
@@ -783,6 +831,10 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
       }
       rmodel.AddOperator(std::move(op), node_order_exec++);
    }
+
+   // Restore the parent graph's fFusedOperators (may have been saved as empty
+   // for the top-level call, which is fine — we're done with the loop).
+   fFusedOperators = std::move(savedFusedOperators);
 
    std::vector<std::string> outputnames;
    if (verbose)

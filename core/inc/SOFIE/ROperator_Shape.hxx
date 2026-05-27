@@ -49,8 +49,14 @@ public:
       if (model.CheckIfTensorAlreadyExist(fNX) == false){   //input must be a graph input, or already initialized intermediate tensor
          throw std::runtime_error("SOFIE Shape Op Input Tensor " + fNX + " is not found in model");
       }
-      fShape = model.GetTensorShape(fNX);
-      size_t length = fShape.size();  // this the size of shape not length of tensor
+      // Use Dim-aware shape query to handle dynamic (symbolic) tensors
+      auto dimShape = model.GetDimTensorShape(fNX);
+      size_t length = dimShape.size();  // rank of the input tensor
+      // Build fShape from dimShape (0 for symbolic/dynamic dims, concrete value otherwise)
+      fShape.resize(length);
+      for (size_t i = 0; i < length; i++)
+         fShape[i] = dimShape[i].isParam ? 0 : dimShape[i].dim;
+
       fStart = std::max(fStart,(int) -length);
       fStart = std::min(fStart,(int) length);
       if (fStart < 0) fStart += length;
@@ -74,6 +80,14 @@ public:
             std::cout << std::endl;
          }
          fIsOutputConstant = true;
+      } else if (model.IsDynamicTensor(fNX) && !fOutput_shape.empty()) {
+         // For dynamic tensors, register the output as a shape tensor with symbolic dimension values
+         std::vector<Dim> dimVals(dimShape.begin() + fStart, dimShape.begin() + fEnd);
+         model.AddShapeTensor(fNY, dimVals, false);
+         fIsOutputConstant = true;  // no runtime code needed
+         if (model.Verbose()) {
+            std::cout << "Output of Shape (dynamic input) is shape tensor: " << ConvertDimShapeToString(dimVals) << std::endl;
+         }
       }
       else
          model.AddIntermediateTensor(fNY, ETensorType::INT64, fOutput_shape);

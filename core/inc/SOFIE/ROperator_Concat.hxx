@@ -376,7 +376,7 @@
          }
 
    std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
-      if (fIsOutputConstant) return "";
+      if (fIsOutputConstant || fIsOutputParamShape) return "";
       opName = "op_" + opName;
       if (fOutputShape.empty())
          throw std::runtime_error("SOFIE Operator Concat called to Generate without being initialized first");
@@ -461,11 +461,13 @@
    }
 
    std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
+      if (fIsOutputConstant || fIsOutputParamShape) return "";
       opName = "op_" + opName;
       return SP + "ConcatKernel_" + opName + " concatKernel_" + opName + ";\n";
    }
 
    std::string Generate_GPU_ALPAKA(std::string OpName) override {
+      if (fIsOutputConstant || fIsOutputParamShape) return "";
       OpName = "op_" + OpName;
       if (fOutputShape.empty()) {
          throw std::runtime_error("SOFIE Operator Concat called to Generate without being initialized first");

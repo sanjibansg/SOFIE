@@ -35,8 +35,18 @@ ParserFuncSignature ParseExpand = [](RModelParser_ONNX &parser, const onnx::Node
       case ETensorType::FLOAT:
          op.reset(new ROperator_Expand<float>(input_name, shape_name, output_name));
          break;
+      case ETensorType::DOUBLE:
+         op.reset(new ROperator_Expand<double>(input_name, shape_name, output_name));
+         break;
+      case ETensorType::INT32:
+         op.reset(new ROperator_Expand<int32_t>(input_name, shape_name, output_name));
+         break;
       case ETensorType::INT64:
          op.reset(new ROperator_Expand<int64_t>(input_name, shape_name, output_name));
+         break;
+      case ETensorType::BOOL:
+      case ETensorType::UINT8:
+         op.reset(new ROperator_Expand<uint8_t>(input_name, shape_name, output_name));
          break;
       default:
          throw std::runtime_error("TMVA::SOFIE - Unsupported - Expand Operator does "

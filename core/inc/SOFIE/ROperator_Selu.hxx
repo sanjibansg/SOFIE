@@ -17,7 +17,7 @@ private:
 
    std::string fNX;
    std::string fNY;
-   std::vector<size_t> fShape;
+   std::vector<Dim> fShape;
 
 public:
    ROperator_Selu(){}
@@ -40,7 +40,7 @@ public:
       if (model.CheckIfTensorAlreadyExist(fNX) == false){   //input must be a graph input, or already initialized intermediate tensor
          throw std::runtime_error("SOFIE Selu Op Input Tensor is not found in model");
       }
-      fShape = model.GetTensorShape(fNX);
+      fShape = model.GetDimTensorShape(fNX);
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShape);
    }
 
@@ -51,10 +51,7 @@ public:
          throw std::runtime_error("SOFIE Operator Selu called to Generate without being initialized first");
       }
       std::stringstream out;
-      int length = 1;
-      for(auto& i: fShape){
-         length *= i;
-      }
+      std::string length = ConvertDimShapeToLength(fShape);
       out << "\t" << "for (int id = 0; id < " << length << " ; id++){\n";
       out << "\t\t" << "tensor_" << fNY << "[id] = 1.0507009873554804934193349852946 * (std::max(float(0.0), tensor_"  << fNX << "[id]) + std::min(0.0, 1.6732632423543772848170429916717 * (std::exp(" << "tensor_" << fNX << "[id]" <<")-1)));\n";
       out << "\t}\n";
