@@ -38,7 +38,8 @@ enum class OperatorKind {
    UNARY_COS=22,
    UNARY_ABS=23,
    CLIP=24,
-   NOT=25
+   NOT=25,
+   POOL=26
 };
 
 inline const char* toString(OperatorKind kind) {

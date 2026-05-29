@@ -80,6 +80,7 @@ public:
       }
       fInputTensorNames = { fNX };
       fOutputTensorNames = { fNY };
+      fKind = OperatorKind::POOL;
    }
 
    // return input type (defined abstract in ROperator class )
@@ -471,6 +472,101 @@ public:
       // end scope
       out << SP << "}\n";
 
+
+      return out.str();
+   }
+
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      if (fShapeX.empty() || fShapeY.empty())
+         throw std::runtime_error("SOFIE Pool called to Generate without being initialized first");
+      if (fPoolMode != MaxPool)
+         throw std::runtime_error("SOFIE Pool GPU: only MaxPool is supported so far");
+      if (fDim != 2)
+         throw std::runtime_error("SOFIE Pool GPU: only 2D is supported so far");
+
+      std::string kname = "MaxPoolKernel_" + opName;
+
+      std::stringstream op;
+      op << "\n//------ MAXPOOL_KERNEL_ALPAKA\n";
+      op << SP << "struct " << kname << " {\n";
+      op << SP << SP << "template<typename TAcc, typename T>\n";
+      op << SP << SP << "ALPAKA_FN_ACC void operator()(\n";
+      op << SP << SP << SP << "TAcc const& acc,\n";
+      op << SP << SP << SP << "T const* __restrict__ X,\n";
+      op << SP << SP << SP << "T* __restrict__ Y,\n";
+      op << SP << SP << SP << "std::size_t const totalOut) const {\n\n";
+
+      op << SP << SP << SP << "constexpr int H        = " << fShapeX[2]          << ";\n";
+      op << SP << SP << SP << "constexpr int W        = " << fShapeX[3]          << ";\n";
+      op << SP << SP << SP << "constexpr int OH       = " << fShapeY[2]          << ";\n";
+      op << SP << SP << SP << "constexpr int OW       = " << fShapeY[3]          << ";\n";
+      op << SP << SP << SP << "constexpr int kh       = " << fAttrKernelShape[0] << ";\n";
+      op << SP << SP << SP << "constexpr int kw       = " << fAttrKernelShape[1] << ";\n";
+      op << SP << SP << SP << "constexpr int sh       = " << fAttrStrides[0]     << ";\n";
+      op << SP << SP << SP << "constexpr int sw       = " << fAttrStrides[1]     << ";\n";
+      op << SP << SP << SP << "constexpr int pad_top  = " << fAttrPads[0]        << ";\n";
+      op << SP << SP << SP << "constexpr int pad_left = " << fAttrPads[2]        << ";\n\n";
+
+      op << SP << SP << SP << "auto const tid    = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op << SP << SP << SP << "auto const stride = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+
+      op << SP << SP << SP << "for (std::size_t idx = tid; idx < totalOut; idx += stride) {\n";
+      op << SP << SP << SP << SP << "int ow = idx % OW;\n";
+      op << SP << SP << SP << SP << "int oh = (idx / OW) % OH;\n";
+      op << SP << SP << SP << SP << "int nc = idx / (OH * OW);\n";
+      op << SP << SP << SP << SP << "int i  = oh * sh - pad_top;\n";
+      op << SP << SP << SP << SP << "int j  = ow * sw - pad_left;\n";
+      op << SP << SP << SP << SP << "std::size_t base = static_cast<std::size_t>(nc) * (H * W);\n\n";
+      op << SP << SP << SP << SP << "T value = static_cast<T>(-INFINITY);\n";
+      op << SP << SP << SP << SP << "for (int l = i; l < i + kh; ++l) {\n";
+      op << SP << SP << SP << SP << SP << "if (l < 0 || l >= H) continue;\n";
+      op << SP << SP << SP << SP << SP << "for (int m = j; m < j + kw; ++m) {\n";
+      op << SP << SP << SP << SP << SP << SP << "if (m < 0 || m >= W) continue;\n";
+      op << SP << SP << SP << SP << SP << SP << "T xv = X[base + l * W + m];\n";
+      op << SP << SP << SP << SP << SP << SP << "if (xv > value) value = xv;\n";
+      op << SP << SP << SP << SP << SP << "}\n";
+      op << SP << SP << SP << SP << "}\n";
+      op << SP << SP << SP << SP << "Y[idx] = value;\n";
+      op << SP << SP << SP << "}\n";
+      op << SP << SP << "}\n";
+      op << SP << "};\n";
+
+      return op.str();
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      if (fPoolMode != MaxPool || fDim != 2)
+         return "";
+      std::string kname = "MaxPoolKernel_" + opName;
+      return SP + kname + " maxPoolKernel_" + opName + ";\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      if (fShapeX.empty() || fShapeY.empty())
+         throw std::runtime_error("SOFIE Pool called to Generate without being initialized first");
+      if (fPoolMode != MaxPool)
+         throw std::runtime_error("SOFIE Pool GPU: only MaxPool is supported so far");
+      if (fDim != 2)
+         throw std::runtime_error("SOFIE Pool GPU: only 2D is supported so far");
+
+      std::size_t totalOut = ConvertShapeToLength(fShapeY);
+      std::string kname = "maxPoolKernel_" + opName;
+
+      std::stringstream out;
+      out << "\n//------ MAXPOOL_GPU_ALPAKA\n";
+      out << SP << "auto const elementsPerThread_" << fNY << " = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_"   << fNY << " = Vec::all(Idx{" << totalOut << "});\n";
+      out << SP << "auto const workDiv_" << fNY << " = sofie_workdiv(elementsPerGrid_" << fNY << ");\n";
+
+      out << SP << "auto task_" << fNY << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNY
+          << ", " << kname
+          << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
+          << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+          << ", static_cast<Idx>(" << totalOut << "));\n";
+      out << SP << "alpaka::enqueue(queue, task_" << fNY << ");\n";
 
       return out.str();
    }
