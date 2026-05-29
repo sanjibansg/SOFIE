@@ -480,10 +480,8 @@ public:
       opName = "op_" + opName;
       if (fShapeX.empty() || fShapeY.empty())
          throw std::runtime_error("SOFIE Pool called to Generate without being initialized first");
-      if (fPoolMode != MaxPool)
-         throw std::runtime_error("SOFIE Pool GPU: only MaxPool is supported so far");
-      if (fDim != 2)
-         throw std::runtime_error("SOFIE Pool GPU: only 2D is supported so far");
+      if (fPoolMode != MaxPool || fDim != 2)
+         return "";
 
       std::string kname = "MaxPoolKernel_" + opName;
 
@@ -547,10 +545,8 @@ public:
       opName = "op_" + opName;
       if (fShapeX.empty() || fShapeY.empty())
          throw std::runtime_error("SOFIE Pool called to Generate without being initialized first");
-      if (fPoolMode != MaxPool)
-         throw std::runtime_error("SOFIE Pool GPU: only MaxPool is supported so far");
-      if (fDim != 2)
-         throw std::runtime_error("SOFIE Pool GPU: only 2D is supported so far");
+      if (fPoolMode != MaxPool || fDim != 2)
+         return "";
 
       std::size_t totalOut = ConvertShapeToLength(fShapeY);
       std::string kname = "maxPoolKernel_" + opName;
