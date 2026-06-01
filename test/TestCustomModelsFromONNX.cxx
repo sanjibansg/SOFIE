@@ -86,6 +86,9 @@
 #include "MaxPool2d_FromONNX.hxx"
 #include "input_models/references/MaxPool2d.ref.hxx"
 
+#include "MaxPool2d_AsymPad_FromONNX.hxx"
+#include "input_models/references/MaxPool2d_AsymPad.ref.hxx"
+
 #include "MaxPool3d_FromONNX.hxx"
 #include "input_models/references/MaxPool3d.ref.hxx"
 
@@ -1049,6 +1052,26 @@ TEST(ONNX, MaxPool2d){
       EXPECT_LE(std::abs(output[i] - correct[i]), TOLERANCE);
    }
 
+}
+
+TEST(ONNX, MaxPool2d_AsymPad)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+   // 1x1x4x4 input with values 0..15
+   std::vector<float> input({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15});
+
+   SOFIE_MaxPool2d_AsymPad::Session s("MaxPool2d_AsymPad_FromONNX.dat");
+   std::vector<float> output = s.infer(input.data());
+
+   // pads=[0,1,0,1] (width padded, height not) gives a 1x1x3x5 output;
+   // the pre-fix code mis-read the pads and produced a 4x4 grid instead
+   EXPECT_EQ(output.size(), sizeof(MaxPool2d_AsymPad_ExpectedOutput::output) / sizeof(float));
+
+   float *correct = MaxPool2d_AsymPad_ExpectedOutput::output;
+   for (size_t i = 0; i < output.size(); ++i) {
+      EXPECT_LE(std::abs(output[i] - correct[i]), TOLERANCE);
+   }
 }
 
 TEST(ONNX, MaxPool3d){
