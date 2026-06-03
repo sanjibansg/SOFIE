@@ -317,7 +317,9 @@ public:
       }
 
       std::vector<size_t> shape1 = {fShapeW[0], fShapeW[1], kernelSize};
-      std::vector<Dim> shape2 = {Dim{fShapeW[1]}, Dim{kernelSize}, channelDim };
+      // _xcol holds the im2col of every batch sample, so the non-grouped GPU path can
+      // run a single strided-batched GEMM over all samples (each gets its own slice).
+      std::vector<Dim> shape2 = {fShapeX[0], Dim{fShapeW[1]}, Dim{kernelSize}, channelDim };
       model.AddIntermediateTensor(fNX +"_f", ConvertStringToType(fType), shape1 );
       model.AddIntermediateTensor(fNX +"_xcol", ConvertStringToType(fType), shape2 );
       convK = fNX +"_f";
@@ -874,22 +876,21 @@ public:
       // Step 3 + 4: Im2Col then GEMM — structure differs for grouped vs non-grouped
       // -----------------------------------------------------------------------
       if (fAttrGroup == 1) {
-         // Non-grouped: single im2col per batch, then GEMM
-         out << SP << SP << "// Step 3: im2col\n";
+         // Non-grouped: im2col this sample into its own _xcol slice (slice n). The
+         // single strided-batched GEMM over all samples is issued after the loop.
          out << SP << SP << "{\n";
          out << SP << SP << SP << "auto const elementsPerThread_im2col = Vec::all(static_cast<Idx>(1));\n";
          out << SP << SP << SP << "auto const elementsPerGrid_im2col   = Vec::all(Idx{" << colElements << "});\n";
          out << SP << SP << SP << "auto const workDiv_im2col = sofie_workdiv(elementsPerGrid_im2col);\n";
          out << SP << SP << SP << "alpaka::exec<Acc>(queue, workDiv_im2col, im2colKernel_" << opName
             << ", alpaka::getPtrNative(deviceBuf_" << fNX << ") + x_offset"
-            << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+            << ", alpaka::getPtrNative(deviceBuf_" << imcol << ") + n * " << colElements << "u"
             << ", static_cast<Idx>(" << colElements << "));\n";
-         out << SP << SP << SP << "alpaka::wait(queue);\n";
          out << SP << SP << "}\n\n";
 
          if (!fNB.empty()) {
                size_t biasElements = gemm_n * gemm_m;
-               out << SP << SP << "// Step 4a: broadcast bias into output slice\n";
+               out << SP << SP << "// broadcast bias into this sample's output slice\n";
                out << SP << SP << "{\n";
                out << SP << SP << SP << "auto const elementsPerThread_bias = Vec::all(static_cast<Idx>(1));\n";
                out << SP << SP << SP << "auto const elementsPerGrid_bias   = Vec::all(Idx{" << biasElements << "});\n";
@@ -898,24 +899,8 @@ public:
                   << ", alpaka::getPtrNative(deviceBuf_" << fNB << ")"
                   << ", alpaka::getPtrNative(deviceBuf_" << fNY << ") + out_offset"
                   << ", static_cast<Idx>(" << biasElements << "));\n";
-               out << SP << SP << SP << "alpaka::wait(queue);\n";
                out << SP << SP << "}\n\n";
-               out << SP << SP << "// Step 4b: GEMM beta=1 accumulates onto bias-initialised output\n";
-               out << SP << SP << "blas.matmul('n', 'n', "
-                  << gemm_m << ", " << gemm_n << ", " << gemm_k
-                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << imcol << ")"
-                  << ", alpaka::getPtrNative(deviceBuf_" << convK << ")"
-                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << fNY << ") + out_offset);\n\n";
-         } else {
-               out << SP << SP << "// Step 4: GEMM beta=0 (no bias)\n";
-               out << SP << SP << "blas.matmul('n', 'n', "
-                  << gemm_m << ", " << gemm_n << ", " << gemm_k
-                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << imcol << ")"
-                  << ", alpaka::getPtrNative(deviceBuf_" << convK << ")"
-                  << ", 0.0f, alpaka::getPtrNative(deviceBuf_" << fNY << ") + out_offset);\n\n";
          }
-         // Wait for GEMM to finish before next batch overwrites the shared _xcol buffer.
-         out << SP << SP << "alpaka::wait(queue);\n\n";
 
       } else {
          // Grouped convolution: im2col and GEMM per group with group-adjusted input pointer.
@@ -970,6 +955,21 @@ public:
       }
 
       out << SP << "}\n"; // end batch loop
+
+      // Non-grouped: replace the per-sample matmul loop with one strided-batched GEMM.
+      // Each sample reads its own _xcol slice (strideA = colElements) and writes its own
+      // output block (strideC = gemm_n*gemm_m); the weight _f is shared, so strideB = 0.
+      if (fAttrGroup == 1) {
+         std::string convBeta = fNB.empty() ? "0.0f" : "1.0f";
+         out << SP << "alpaka::wait(queue);\n";
+         out << SP << "blas.gemmStridedBatched('n', 'n', "
+            << gemm_m << ", " << gemm_n << ", " << gemm_k << ", 1.0f, "
+            << "alpaka::getPtrNative(deviceBuf_" << imcol << "), " << gemm_m << ", " << colElements << ", "
+            << "alpaka::getPtrNative(deviceBuf_" << convK << "), " << gemm_k << ", 0, "
+            << convBeta << ", alpaka::getPtrNative(deviceBuf_" << fNY << "), "
+            << gemm_m << ", " << gemm_n * gemm_m << ", " << bsize << ");\n";
+         out << SP << "alpaka::wait(queue);\n";
+      }
       return out.str();
    }
 
@@ -979,6 +979,9 @@ public:
 
 
    std::string GetBlasConfig(){
+      // Non-grouped Conv uses gemmStridedBatched (legacy cuBLAS, no cuBLASLt layout
+      // registration). Grouped Conv still uses the per-group matmul path below.
+      if (fAttrGroup == 1) return "";
       size_t oDepth_  = (fDim > 2) ? fShapeY[2].dim    : 1;
       size_t oHeight_ = (fDim > 1) ? fShapeY[fDim].dim : 1;
       size_t oWidth_  = fShapeY[fDim + 1].dim;
