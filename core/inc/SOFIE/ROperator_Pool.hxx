@@ -480,13 +480,49 @@ public:
       opName = "op_" + opName;
       if (fShapeX.empty() || fShapeY.empty())
          throw std::runtime_error("SOFIE Pool called to Generate without being initialized first");
-      if (fPoolMode != MaxPool)
+      if (fPoolMode != MaxPool && fPoolMode != AveragePool)
          return "";
 
-      std::string kname = "MaxPoolKernel_" + opName;
+      const bool isAvg = (fPoolMode == AveragePool);
+      bool doPadding = false;
+      for (auto & e : fAttrPads) doPadding |= (e > 0);
+      // count_include_pad == 0 with padding: divide by the in-bounds cells counted
+      // at run time; otherwise by the constant kernel area (CPU Generate above).
+      const bool runtimeCount = isAvg && fAttrCountIncludePad == 0 && doPadding;
+
+      const std::string kname = (isAvg ? "AvgPoolKernel_" : "MaxPoolKernel_") + opName;
+
+      // Mode dependent fragments, so the index math stays shared across 1D/2D/3D.
+      auto emitInit = [&](const std::string & ind) {
+         std::string s;
+         if (isAvg) {
+            s += ind + "T value = static_cast<T>(0);\n";
+            if (runtimeCount) s += ind + "int count = 0;\n";
+         } else {
+            s += ind + "T value = static_cast<T>(-INFINITY);\n";
+         }
+         return s;
+      };
+      auto emitAccum = [&](const std::string & ind, const std::string & xidx) {
+         std::string s;
+         if (isAvg) {
+            s += ind + "value += X[" + xidx + "];\n";
+            if (runtimeCount) s += ind + "++count;\n";
+         } else {
+            s += ind + "T xv = X[" + xidx + "];\n";
+            s += ind + "if (xv > value) value = xv;\n";
+         }
+         return s;
+      };
+      auto emitFinal = [&](const std::string & ind, const std::string & area) {
+         std::string s;
+         if (isAvg)
+            s += ind + "value /= static_cast<T>(" + (runtimeCount ? std::string("count") : area) + ");\n";
+         return s;
+      };
 
       std::stringstream op;
-      op << "\n//------ MAXPOOL_KERNEL_ALPAKA\n";
+      op << "\n//------ " << (isAvg ? "AVGPOOL" : "MAXPOOL") << "_KERNEL_ALPAKA\n";
       op << SP << "struct " << kname << " {\n";
       op << SP << SP << "template<typename TAcc, typename T>\n";
       op << SP << SP << "ALPAKA_FN_ACC void operator()(\n";
@@ -510,12 +546,12 @@ public:
          op << SP << SP << SP << SP << "int nc = idx / OH;\n";
          op << SP << SP << SP << SP << "int i  = oh * sh - pad_top;\n";
          op << SP << SP << SP << SP << "std::size_t base = static_cast<std::size_t>(nc) * H;\n\n";
-         op << SP << SP << SP << SP << "T value = static_cast<T>(-INFINITY);\n";
+         op << emitInit(SP + SP + SP + SP);
          op << SP << SP << SP << SP << "for (int l = i; l < i + kh; ++l) {\n";
          op << SP << SP << SP << SP << SP << "if (l < 0 || l >= H) continue;\n";
-         op << SP << SP << SP << SP << SP << "T xv = X[base + l];\n";
-         op << SP << SP << SP << SP << SP << "if (xv > value) value = xv;\n";
+         op << emitAccum(SP + SP + SP + SP + SP, "base + l");
          op << SP << SP << SP << SP << "}\n";
+         op << emitFinal(SP + SP + SP + SP, "kh");
          op << SP << SP << SP << SP << "Y[idx] = value;\n";
          op << SP << SP << SP << "}\n";
       }
@@ -541,15 +577,15 @@ public:
          op << SP << SP << SP << SP << "int i  = oh * sh - pad_top;\n";
          op << SP << SP << SP << SP << "int j  = ow * sw - pad_left;\n";
          op << SP << SP << SP << SP << "std::size_t base = static_cast<std::size_t>(nc) * (H * W);\n\n";
-         op << SP << SP << SP << SP << "T value = static_cast<T>(-INFINITY);\n";
+         op << emitInit(SP + SP + SP + SP);
          op << SP << SP << SP << SP << "for (int l = i; l < i + kh; ++l) {\n";
          op << SP << SP << SP << SP << SP << "if (l < 0 || l >= H) continue;\n";
          op << SP << SP << SP << SP << SP << "for (int m = j; m < j + kw; ++m) {\n";
          op << SP << SP << SP << SP << SP << SP << "if (m < 0 || m >= W) continue;\n";
-         op << SP << SP << SP << SP << SP << SP << "T xv = X[base + l * W + m];\n";
-         op << SP << SP << SP << SP << SP << SP << "if (xv > value) value = xv;\n";
+         op << emitAccum(SP + SP + SP + SP + SP + SP, "base + l * W + m");
          op << SP << SP << SP << SP << SP << "}\n";
          op << SP << SP << SP << SP << "}\n";
+         op << emitFinal(SP + SP + SP + SP, "kh * kw");
          op << SP << SP << SP << SP << "Y[idx] = value;\n";
          op << SP << SP << SP << "}\n";
       }
@@ -582,18 +618,18 @@ public:
          op << SP << SP << SP << SP << "int j  = ow * sw - pad_left;\n";
          op << SP << SP << SP << SP << "int k  = od * sd - pad_front;\n";
          op << SP << SP << SP << SP << "std::size_t base = static_cast<std::size_t>(nc) * (H * W * D);\n\n";
-         op << SP << SP << SP << SP << "T value = static_cast<T>(-INFINITY);\n";
+         op << emitInit(SP + SP + SP + SP);
          op << SP << SP << SP << SP << "for (int l = i; l < i + kh; ++l) {\n";
          op << SP << SP << SP << SP << SP << "if (l < 0 || l >= H) continue;\n";
          op << SP << SP << SP << SP << SP << "for (int m = j; m < j + kw; ++m) {\n";
          op << SP << SP << SP << SP << SP << SP << "if (m < 0 || m >= W) continue;\n";
          op << SP << SP << SP << SP << SP << SP << "for (int p = k; p < k + kd; ++p) {\n";
          op << SP << SP << SP << SP << SP << SP << SP << "if (p < 0 || p >= D) continue;\n";
-         op << SP << SP << SP << SP << SP << SP << SP << "T xv = X[base + l * (W * D) + m * D + p];\n";
-         op << SP << SP << SP << SP << SP << SP << SP << "if (xv > value) value = xv;\n";
+         op << emitAccum(SP + SP + SP + SP + SP + SP + SP, "base + l * (W * D) + m * D + p");
          op << SP << SP << SP << SP << SP << SP << "}\n";
          op << SP << SP << SP << SP << SP << "}\n";
          op << SP << SP << SP << SP << "}\n";
+         op << emitFinal(SP + SP + SP + SP, "kh * kw * kd");
          op << SP << SP << SP << SP << "Y[idx] = value;\n";
          op << SP << SP << SP << "}\n";
       }
@@ -609,24 +645,26 @@ public:
 
    std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
       opName = "op_" + opName;
-      if (fPoolMode != MaxPool)
-         return "";
-      std::string kname = "MaxPoolKernel_" + opName;
-      return SP + kname + " maxPoolKernel_" + opName + ";\n";
+      if (fPoolMode == MaxPool)
+         return SP + "MaxPoolKernel_" + opName + " maxPoolKernel_" + opName + ";\n";
+      if (fPoolMode == AveragePool)
+         return SP + "AvgPoolKernel_" + opName + " avgPoolKernel_" + opName + ";\n";
+      return "";
    }
 
    std::string Generate_GPU_ALPAKA(std::string opName) override {
       opName = "op_" + opName;
       if (fShapeX.empty() || fShapeY.empty())
          throw std::runtime_error("SOFIE Pool called to Generate without being initialized first");
-      if (fPoolMode != MaxPool)
+      if (fPoolMode != MaxPool && fPoolMode != AveragePool)
          return "";
 
+      const bool isAvg = (fPoolMode == AveragePool);
       std::size_t totalOut = ConvertShapeToLength(fShapeY);
-      std::string kname = "maxPoolKernel_" + opName;
+      std::string kname = (isAvg ? "avgPoolKernel_" : "maxPoolKernel_") + opName;
 
       std::stringstream out;
-      out << "\n//------ MAXPOOL_GPU_ALPAKA\n";
+      out << "\n//------ " << (isAvg ? "AVGPOOL" : "MAXPOOL") << "_GPU_ALPAKA\n";
       out << SP << "auto const elementsPerThread_" << fNY << " = Vec::all(static_cast<Idx>(1));\n";
       out << SP << "auto const elementsPerGrid_"   << fNY << " = Vec::all(Idx{" << totalOut << "});\n";
       out << SP << "auto const workDiv_" << fNY << " = sofie_workdiv(elementsPerGrid_" << fNY << ");\n";
