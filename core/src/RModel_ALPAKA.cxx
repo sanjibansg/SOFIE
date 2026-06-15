@@ -576,7 +576,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       SOFIE::OperatorKind::UNARY_SIN,
       SOFIE::OperatorKind::UNARY_COS,
       SOFIE::OperatorKind::UNARY_ABS,
-      SOFIE::OperatorKind::NOT
+      SOFIE::OperatorKind::NOT,
+      SOFIE::OperatorKind::SELU
    };
 
    bool OpNeedsBlas = false;
