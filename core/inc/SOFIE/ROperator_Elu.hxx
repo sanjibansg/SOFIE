@@ -69,11 +69,49 @@ public:
 
       out << "\n//------ ELU \n";
       out << SP << "for (int id = 0; id < " << length << " ; id++){\n";
-      out << SP << SP << "tensor_" << fNY << "[id] = ((tensor_" << fNX << "[id] >= 0 )? tensor_" << fNX << "[id] : "<< OpName << "_alpha * std::exp(tensor_"<< fNX<<"[id]) - 1);\n";
+      out << SP << SP << "tensor_" << fNY << "[id] = ((tensor_" << fNX << "[id] >= 0 )? tensor_" << fNX << "[id] : "<< OpName << "_alpha * (std::exp(tensor_"<< fNX<<"[id]) - 1));\n";
       out << SP << "}\n";
       return out.str();
    }
+   
+   std::vector<std::string> GetStdLibs() override { return { std::string("cmath") }; }
 
+   // elu gpu kernel
+   std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) override {
+      std::string op;
+      op = "\n//------ ELU_KERNEL_ALPAKA\n";
+      op += "struct EluKernel {\n";
+      op += SP + "template<typename TAcc, typename T>\n";
+      op += SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc, T const* __restrict__ data, T* __restrict__ out, std::size_t numElements, T alpha) const {\n";
+      op += SP + SP + "const auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + "if (idx < numElements) { out[idx] = data[idx] >= T(0) ? data[idx]:alpha * (exp(data[idx]) - T(1)); }\n";
+      op += SP + "}\n";
+      op += "};\n";
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) override {
+      return SP + "EluKernel eluKernel;\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string OpName) override {
+      OpName = "op_" + OpName;
+      if (fShape.empty()) {
+         throw std::runtime_error("SOFIE Elu called to Generate_GPU_ALPAKA without being initialized");
+      }
+      std::stringstream out;
+      std::string length = ConvertDimShapeToLength(fShape);
+      out << "\n//------ ELU_GPU_ALPAKA\n";
+      out << SP << "auto const elementsPerThread_"<<fNX<<" = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_"<<fNX<<" = Vec::all(Idx{"<< length << "});\n";
+      out << SP << "auto const workDiv_" << fNX << " = sofie_workdiv(elementsPerGrid_" << fNX << ");\n";
+      out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNX
+         << ", eluKernel, alpaka::getPtrNative(deviceBuf_" << fNX
+         << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), static_cast<Idx>(" << length << "), static_cast<float>("
+         << std::setprecision(std::numeric_limits<float>::max_digits10) << falpha << "));\n";
+      out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";
+      return out.str();
+   }
 };
 
 }//SOFIE
