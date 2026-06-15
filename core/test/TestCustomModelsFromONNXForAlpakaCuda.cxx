@@ -176,6 +176,9 @@
 #include "Clip_FromONNX_GPU_ALPAKA.hxx"
 #include "Not_FromONNX_GPU_ALPAKA.hxx"
 
+#include "Elu_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/Elu.ref.hxx"
+
 #include "GNN_model_FromONNX_GPU_ALPAKA.hxx"
 
 #include <alpaka/alpaka.hpp>
@@ -3160,4 +3163,38 @@ TEST_F(SofieAlpakaTest, Logic_BitwiseNot)
    int32_t* ref = Logic_BitwiseNot_ExpectedOutput::outputs;
    for (std::size_t i = 0; i < N; ++i)
       EXPECT_EQ(res[i], ref[i]) << "  index=" << i;
+}
+
+TEST_F(SofieAlpakaTest, Elu)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+   // same input as the CPU Elu test: spans negative + positive
+   std::vector<float> input({1.0f, -2.0f, 3.0f, 0.5f, -1.0f, 2.0f});
+
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
+
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+
+   constexpr size_t nOut = sizeof(Elu_ExpectedOutput::outputs) / sizeof(float);
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{nOut}));
+
+   {
+      SOFIE_Elu::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(input_d);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float* correct = Elu_ExpectedOutput::outputs;
+   for (size_t i = 0; i < nOut; ++i) {
+      EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
+   }
 }
