@@ -102,11 +102,14 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 #
 # Scale: 5 variants with n_edges ≈ 5 × n_nodes (realistic for tracking GNNs)
 GNN_VARIANTS = [
-    {"n_nodes": 100,   "n_edges": 500},
-    {"n_nodes": 300,   "n_edges": 1500},
-    {"n_nodes": 1000,  "n_edges": 5000},
-    {"n_nodes": 3000,  "n_edges": 15000},
-    {"n_nodes": 10000, "n_edges": 50000},
+    {"n_nodes": 100,    "n_edges": 500},
+    {"n_nodes": 300,    "n_edges": 1500},
+    {"n_nodes": 1000,   "n_edges": 5000},
+    {"n_nodes": 3000,   "n_edges": 15000},
+    {"n_nodes": 10000,  "n_edges": 50000},
+    # Large-input variants — cluster GPUs only (≥40 GB VRAM)
+    {"n_nodes": 30000,  "n_edges": 150000},
+    {"n_nodes": 100000, "n_edges": 500000},
 ]
 
 GNN_MODELS = [
@@ -149,6 +152,8 @@ TRANSFORMER_VARIANTS = [
     {"n_nodes": 30, "seq_len": 30},
     {"n_nodes": 40, "seq_len": 40},
     {"n_nodes": 50, "seq_len": 50},
+    # Maximum allowed by the positional-encoding table [1, 60, 32]
+    {"n_nodes": 60, "seq_len": 60},
 ]
 
 TRANSFORMER_MODELS = ["transformer_d32_h2_L6_ff32.onnx"]

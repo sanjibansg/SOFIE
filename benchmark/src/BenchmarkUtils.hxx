@@ -29,7 +29,7 @@ struct BenchmarkResult {
     size_t      outputElements  = 0;
     float       avgInferMs      = 0.0f;  // per-inference average (chrono)
     float       throughput      = 0.0f;  // inferences / second
-    float       weightMemMB     = 0.0f;  // device memory for model weights (if measurable)
+    float       weightMemMB     = 0.0f;  // device memory for model weights
     float       runtimeMemMB    = 0.0f;  // device memory for intermediates
     bool        ortRan          = false;
     bool        ortMatch        = false;
@@ -75,7 +75,6 @@ inline BenchmarkConfig ParseArgs(int argc, char *argv[]) {
     return cfg;
 }
 
-// Print device name (caller obtains it via alpaka::getName(dev))
 inline void PrintDeviceInfo(const std::string &deviceName) {
     std::cout << "Device: " << deviceName << "\n";
 }

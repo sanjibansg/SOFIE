@@ -21,6 +21,34 @@ option(SOFIE_BENCHMARK_ORT
     "Also benchmark ONNX Runtime GPU alongside SOFIE (requires ORT ≥ 1.18)"
     OFF)
 
+################################################################################
+# Backend / architecture selection
+#
+# Set SOFIE_BENCHMARK_BACKEND to choose the accelerator target.
+# Currently only CUDA is supported; setting any other value is a hard error.
+# When AMD GPU (HIP/ROCm) support is added, this option will accept "HIP".
+################################################################################
+
+set(SOFIE_BENCHMARK_BACKEND "CUDA" CACHE STRING
+    "Target accelerator backend for SOFIE benchmark (currently only CUDA is supported)")
+set_property(CACHE SOFIE_BENCHMARK_BACKEND PROPERTY STRINGS CUDA)
+
+string(TOUPPER "${SOFIE_BENCHMARK_BACKEND}" _bench_backend)
+
+if(NOT _bench_backend STREQUAL "CUDA")
+    message(FATAL_ERROR
+        "SOFIE Benchmark: SOFIE_BENCHMARK_BACKEND='${SOFIE_BENCHMARK_BACKEND}' is not "
+        "supported.  Only 'CUDA' is currently implemented.  "
+        "AMD GPU (HIP/ROCm) support is planned for a future release.")
+endif()
+
+# Compile-time defines propagated to every benchmark translation unit.
+# These drive BenchmarkBackend.hxx type aliases and SOFIE_BENCH_DEVICE_SYNC().
+set(_SOFIE_BENCH_ALPAKA_DEFINE ALPAKA_ACC_GPU_CUDA_ENABLED)
+set(_SOFIE_BENCH_BACKEND_DEFINE SOFIE_BACKEND_CUDA)
+
+message(STATUS "SOFIE Benchmark: backend = ${SOFIE_BENCHMARK_BACKEND}")
+
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/../core/inc
     ${CMAKE_CURRENT_SOURCE_DIR}/../parsers/inc
@@ -52,19 +80,28 @@ list(FILTER BENCHMARK_ONNX_MODELS EXCLUDE REGEX
 
 # Exclude models that exceed GPU memory (cudaErrorMemoryAllocation) or trigger
 # a cuBLAS EXECUTION_FAILED error (status 13) on the available hardware
-# (RTX 2070 SUPER, 8 GB VRAM).  They stay on disk for reference but are not
-# included in the benchmark binary.
+# (RTX 2070 SUPER, 8 GB VRAM).  They stay on disk for reference and are
+# compiled into sofie_benchmark_large (cluster target) instead.
 list(FILTER BENCHMARK_ONNX_MODELS EXCLUDE REGEX
     "/(punet_h32_k2_heads4_layers2_n10000_e50000\
 |punet_h32_k2_heads4_layers2_n1000_e5000\
 |punet_h32_k2_heads4_layers2_n3000_e15000\
+|punet_h32_k2_heads4_layers2_n30000_e150000\
+|punet_h32_k2_heads4_layers2_n100000_e500000\
 |punet_h64_k4_heads4_layers2_n10000_e50000\
 |punet_h64_k4_heads4_layers2_n100_e500\
 |punet_h64_k4_heads4_layers2_n300_e1500\
 |punet_h64_k4_heads4_layers2_n3000_e15000\
+|punet_h64_k4_heads4_layers2_n30000_e150000\
+|punet_h64_k4_heads4_layers2_n100000_e500000\
+|gnn_h32_k2_n30000_e150000\
+|gnn_h32_k2_n100000_e500000\
+|gnn_h64_k4_n30000_e150000\
+|gnn_h64_k4_n100000_e500000\
 |transformer_L1000_B100\
 |transformer_L100_B100\
-|transformer_L8000_B1)\\.onnx$")
+|transformer_L8000_B1\
+|transformer_d32_h2_L6_ff32_n60_s60)\\.onnx$")
 
 if(NOT BENCHMARK_ONNX_MODELS)
     message(STATUS
@@ -95,12 +132,12 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(alpaka)
 
 ################################################################################
-# CUDA (same as the test suite)
+# Hardware toolkit setup — CUDA (the only supported backend for now)
 ################################################################################
 
 enable_language(CUDA)
 find_package(CUDAToolkit REQUIRED)
-message(STATUS "SOFIE Benchmark: CUDA backend (${CUDAToolkit_VERSION})")
+message(STATUS "SOFIE Benchmark: CUDA toolkit ${CUDAToolkit_VERSION}")
 
 ################################################################################
 # Optional: ONNX Runtime GPU backend
@@ -342,7 +379,8 @@ set_target_properties(sofie_benchmark PROPERTIES
 )
 
 target_compile_definitions(sofie_benchmark PRIVATE
-    ALPAKA_ACC_GPU_CUDA_ENABLED
+    ${_SOFIE_BENCH_ALPAKA_DEFINE}
+    ${_SOFIE_BENCH_BACKEND_DEFINE}
     ALPAKA_HAS_STD_ATOMIC_REF
     $<$<BOOL:${SOFIE_ORT_FOUND}>:SOFIE_BENCHMARK_ORT>
 )
@@ -395,3 +433,269 @@ if(testing)
         WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
     )
 endif()
+
+################################################################################
+# Large-input benchmark (cluster GPUs: A100 / H100 / MI300X, ≥40 GB VRAM)
+#
+# Enables:
+#  • All models excluded from sofie_benchmark due to OOM on ≤8 GB GPUs
+#    (punet large, transformer_L1000_B100, transformer_L8000_B1, ...)
+#  • New very-large GNN / PUNet variants: n=30 000 / n=100 000 nodes
+#  • transformer_d32_h2_L6_ff32_n60_s60  (max sequence length for this arch)
+#
+# Usage:
+#   cmake -Bbuild . -DSOFIE_BENCHMARK=ON -DSOFIE_BENCHMARK_LARGE=ON \
+#         [-DSOFIE_BENCHMARK_LARGE_CUDA_ARCH=80]   # 80=A100, 90=H100
+#   cmake --build build --target sofie_benchmark_large
+################################################################################
+
+option(SOFIE_BENCHMARK_LARGE
+    "Build sofie_benchmark_large for cluster GPUs (A100/H100, ≥40 GB VRAM)"
+    OFF)
+
+if(SOFIE_BENCHMARK_LARGE)
+
+    # CUDA architecture for the cluster.  Override on the command line:
+    #   cmake ... -DSOFIE_BENCHMARK_LARGE_CUDA_ARCH=90   # H100
+    set(SOFIE_BENCHMARK_LARGE_CUDA_ARCH "80" CACHE STRING
+        "CUDA SM architecture(s) for sofie_benchmark_large (e.g. 80=A100, 90=H100)")
+
+    # -------------------------------------------------------------------------
+    # Exact list of large-input models to include.
+    # These are either previously OOM-excluded or brand-new (n=30k / n=100k).
+    # -------------------------------------------------------------------------
+    set(LARGE_MODEL_NAMES
+        # ── PUNet h32/k2  (OOM + new) ──────────────────────────────────────
+        "punet_h32_k2_heads4_layers2_n1000_e5000"
+        "punet_h32_k2_heads4_layers2_n3000_e15000"
+        "punet_h32_k2_heads4_layers2_n10000_e50000"
+        "punet_h32_k2_heads4_layers2_n30000_e150000"
+        "punet_h32_k2_heads4_layers2_n100000_e500000"
+        # ── PUNet h64/k4  (OOM + new) ──────────────────────────────────────
+        "punet_h64_k4_heads4_layers2_n100_e500"
+        "punet_h64_k4_heads4_layers2_n300_e1500"
+        "punet_h64_k4_heads4_layers2_n1000_e5000"
+        "punet_h64_k4_heads4_layers2_n3000_e15000"
+        "punet_h64_k4_heads4_layers2_n10000_e50000"
+        "punet_h64_k4_heads4_layers2_n30000_e150000"
+        "punet_h64_k4_heads4_layers2_n100000_e500000"
+        # ── GNN h32/k2  (new large) ────────────────────────────────────────
+        "gnn_h32_k2_n30000_e150000"
+        "gnn_h32_k2_n100000_e500000"
+        # ── GNN h64/k4  (new large) ────────────────────────────────────────
+        "gnn_h64_k4_n30000_e150000"
+        "gnn_h64_k4_n100000_e500000"
+        # ── Transformers (OOM on 8 GB) ──────────────────────────────────────
+        "transformer_L100_B100"
+        "transformer_L1000_B100"
+        "transformer_L8000_B1"
+        # ── Transformer d32 (max sequence length for this architecture) ─────
+        "transformer_d32_h2_L6_ff32_n60_s60"
+    )
+
+    # Build a regex that matches any of the large model names.
+    set(_large_regex "")
+    foreach(_m ${LARGE_MODEL_NAMES})
+        if(_large_regex)
+            set(_large_regex "${_large_regex}|${_m}")
+        else()
+            set(_large_regex "${_m}")
+        endif()
+    endforeach()
+    set(_large_regex "(${_large_regex})\\.onnx$")
+
+    file(GLOB _ALL_LARGE_ONNX "${CMAKE_CURRENT_SOURCE_DIR}/models/*.onnx")
+    list(FILTER _ALL_LARGE_ONNX INCLUDE REGEX "${_large_regex}")
+
+    if(NOT _ALL_LARGE_ONNX)
+        message(WARNING
+            "SOFIE_BENCHMARK_LARGE=ON but none of the expected large-input .onnx "
+            "files were found in benchmark/models/.  Run specialize_models.py "
+            "(with the extended GNN_VARIANTS list) first, then re-run cmake.")
+    else()
+        list(LENGTH _ALL_LARGE_ONNX N_LARGE)
+        message(STATUS
+            "SOFIE Benchmark Large: ${N_LARGE} large-input model(s), "
+            "CUDA arch = ${SOFIE_BENCHMARK_LARGE_CUDA_ARCH}")
+
+        # ------------------------------------------------------------------
+        # Build per-model strings (same pattern as the small benchmark above)
+        # ------------------------------------------------------------------
+        set(LARGE_EMIT_CAPTURES      "")
+        set(LARGE_FWD_DECLS          "")
+        set(LARGE_SINGLE_MODEL_CASES "")
+        set(LARGE_SPAWN_CALLS        "")
+        set(LARGE_GENERATED_HEADERS  "")
+        set(LARGE_MODEL_CU_SRCS      "")
+
+        foreach(ONNX_FILE ${_ALL_LARGE_ONNX})
+            get_filename_component(MODEL_NAME "${ONNX_FILE}" NAME_WE)
+            string(REGEX REPLACE "[^A-Za-z0-9]" "_" MODEL_CPPNAME "${MODEL_NAME}")
+
+            set(GEN_HXX   "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_GPU_ALPAKA.hxx")
+            set(GEN_BENCH "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_bench.hxx")
+            list(APPEND LARGE_GENERATED_HEADERS "${GEN_HXX}" "${GEN_BENCH}")
+
+            string(REPLACE "@1@" "${ONNX_FILE}"  _ec "${_EMIT_BLOCK}")
+            string(REPLACE "@2@" "${MODEL_NAME}" _ec "${_ec}")
+            string(APPEND LARGE_EMIT_CAPTURES "${_ec}")
+
+            string(APPEND LARGE_FWD_DECLS
+                "void Benchmark_${MODEL_CPPNAME}(int warmup, int iterations, const std::string& weightsDir);\n")
+
+            string(APPEND LARGE_SINGLE_MODEL_CASES
+                "    if (model == \"${MODEL_CPPNAME}\") {\n"
+                "        Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir);\n"
+                "#ifdef SOFIE_BENCHMARK_ORT\n"
+                "        if (run_ort) BenchmarkORT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations);\n"
+                "#endif\n"
+                "        return 0;\n"
+                "    }\n"
+            )
+
+            string(APPEND LARGE_SPAWN_CALLS
+                "    {\n"
+                "        std::string cmd = std::string(argv[0])\n"
+                "            + \" --single-model ${MODEL_CPPNAME}\"\n"
+                "            + commonArgs;\n"
+                "        int rc = std::system(cmd.c_str());\n"
+                "        if (rc != 0) {\n"
+                "            std::fprintf(stderr, \"[ERROR] ${MODEL_NAME}: subprocess exited %d\\n\", rc);\n"
+                "            ++totalFailed;\n"
+                "        }\n"
+                "    }\n"
+            )
+
+            set(_model_cu "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_bench.cu")
+            configure_file(
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/ModelBench.cu.in"
+                "${_model_cu}"
+                @ONLY
+            )
+            list(APPEND LARGE_MODEL_CU_SRCS "${_model_cu}")
+        endforeach()
+
+        # ------------------------------------------------------------------
+        # Configure emitter + runner sources for the large benchmark
+        # ------------------------------------------------------------------
+        set(BENCHMARK_EMIT_CAPTURES      "${LARGE_EMIT_CAPTURES}")
+        configure_file(
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/BenchmarkEmitter.cxx.in"
+            "${CMAKE_CURRENT_BINARY_DIR}/BenchmarkEmitter_large.cxx"
+            @ONLY
+        )
+
+        set(BENCHMARK_FWD_DECLS          "${LARGE_FWD_DECLS}")
+        set(BENCHMARK_SINGLE_MODEL_CASES "${LARGE_SINGLE_MODEL_CASES}")
+        set(BENCHMARK_SPAWN_CALLS        "${LARGE_SPAWN_CALLS}")
+        configure_file(
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/BenchmarkRunner.cxx.in"
+            "${CMAKE_CURRENT_BINARY_DIR}/BenchmarkRunner_large.cpp"
+            @ONLY
+        )
+
+        # ------------------------------------------------------------------
+        # sofie_benchmark_large_emitter — generates hxx + dat at build time
+        # ------------------------------------------------------------------
+        add_executable(sofie_benchmark_large_emitter
+            "${CMAKE_CURRENT_BINARY_DIR}/BenchmarkEmitter_large.cxx"
+        )
+        target_include_directories(sofie_benchmark_large_emitter PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/../core/inc"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../parsers/inc"
+        )
+        target_link_libraries(sofie_benchmark_large_emitter PRIVATE
+            SOFIE_core
+            SOFIE_parsers
+            protobuf::libprotobuf
+        )
+        target_compile_options(sofie_benchmark_large_emitter PRIVATE
+            -Wno-unused-parameter
+            -Wno-array-bounds
+        )
+
+        # ------------------------------------------------------------------
+        # Custom command: run large emitter → large hxx / dat files
+        # ------------------------------------------------------------------
+        add_custom_command(
+            OUTPUT  ${LARGE_GENERATED_HEADERS}
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}"
+            COMMAND "$<TARGET_FILE:sofie_benchmark_large_emitter>" "${CMAKE_CURRENT_BINARY_DIR}"
+            DEPENDS sofie_benchmark_large_emitter ${_ALL_LARGE_ONNX}
+            WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+            COMMENT "SOFIE Benchmark Large: generating headers for ${N_LARGE} large model(s)..."
+            VERBATIM
+        )
+
+        add_custom_target(sofie_benchmark_large_headers
+            DEPENDS ${LARGE_GENERATED_HEADERS}
+        )
+
+        # ------------------------------------------------------------------
+        # sofie_benchmark_large — the cluster benchmark binary
+        # ------------------------------------------------------------------
+        set_source_files_properties(${LARGE_MODEL_CU_SRCS} PROPERTIES LANGUAGE CUDA)
+        set_source_files_properties(
+            "${CMAKE_CURRENT_BINARY_DIR}/BenchmarkRunner_large.cpp"
+            PROPERTIES LANGUAGE CXX)
+
+        add_executable(sofie_benchmark_large
+            "${CMAKE_CURRENT_BINARY_DIR}/BenchmarkRunner_large.cpp"
+            ${LARGE_MODEL_CU_SRCS}
+        )
+        add_dependencies(sofie_benchmark_large sofie_benchmark_large_headers)
+
+        target_include_directories(sofie_benchmark_large PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${alpaka_SOURCE_DIR}/include"
+            "${sofieblas_SOURCE_DIR}/include"
+            "${CUDAToolkit_INCLUDE_DIRS}"
+        )
+
+        set_target_properties(sofie_benchmark_large PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF
+            CUDA_ARCHITECTURES          "${SOFIE_BENCHMARK_LARGE_CUDA_ARCH}"
+            CUDA_STANDARD               20
+            CUDA_STANDARD_REQUIRED      ON
+            RUNTIME_OUTPUT_DIRECTORY    "${CMAKE_CURRENT_BINARY_DIR}"
+        )
+
+        target_compile_definitions(sofie_benchmark_large PRIVATE
+            ${_SOFIE_BENCH_ALPAKA_DEFINE}
+            ${_SOFIE_BENCH_BACKEND_DEFINE}
+            ALPAKA_HAS_STD_ATOMIC_REF
+            # ORT intentionally excluded: libonnxruntime has no static lib,
+            # so the binary would fail on pods that lack the CUDA toolkit.
+        )
+
+        target_compile_options(sofie_benchmark_large PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:
+                --extended-lambda
+                --expt-relaxed-constexpr
+                --use_fast_math
+                -O2
+                -Wno-deprecated-gpu-targets
+                -diag-suppress 177
+                --maxrregcount=64
+            >
+            $<$<COMPILE_LANGUAGE:CXX>:
+                -O2
+                -fPIC
+            >
+        )
+
+        target_link_libraries(sofie_benchmark_large PRIVATE
+            SOFIE_core
+            CUDA::cudart_static      # statically embed libcudart — no .so needed on the pod
+            CUDA::cublas_static      # statically embed libcublas
+            CUDA::cublasLt_static    # statically embed libcublasLt
+            CUDA::culibos            # required companion for static cublas
+            # ORT intentionally excluded — no static libonnxruntime available
+        )
+
+        message(STATUS
+            "SOFIE Benchmark Large: target 'sofie_benchmark_large' configured "
+            "(${N_LARGE} large model(s), sm${SOFIE_BENCHMARK_LARGE_CUDA_ARCH})")
+    endif() # _ALL_LARGE_ONNX
+endif() # SOFIE_BENCHMARK_LARGE

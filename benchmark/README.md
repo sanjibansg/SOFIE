@@ -1,8 +1,26 @@
-# SOFIE Alpaka Benchmark Toolkit
+# SOFIE Benchmark for Inference on Heterogeneous Architectures
 
 Measures **inference latency and throughput** for ONNX models compiled by SOFIE and
-executed via Alpaka (CUDA backend).  Optionally runs the same models through
-**ONNX Runtime GPU** for a side-by-side comparison.
+executed via [Alpaka](https://github.com/alpaka-group/alpaka).  Optionally runs the
+same models through **ONNX Runtime GPU** for a side-by-side comparison.
+
+---
+
+## Supported Backends
+
+| Backend | CMake value | Status |
+|---------|-------------|--------|
+| NVIDIA CUDA | `CUDA` (default) | Supported |
+| AMD HIP/ROCm | `HIP` | Planned — not yet implemented |
+
+The target architecture is selected with `-DSOFIE_BENCHMARK_BACKEND=<value>` at
+configure time.  Specifying any value other than `CUDA` is a **hard CMake error** until
+the corresponding backend is implemented.
+
+The generated inference code and timing harness are backend-agnostic: they use
+`sofie_bench::AccTag`, `sofie_bench::Platform`, `sofie_bench::Queue`, and the
+`SOFIE_BENCH_DEVICE_SYNC()` macro defined in `src/BenchmarkBackend.hxx`.  Only the
+low-level toolkit (CUDA vs HIP) needs to be swapped to add a new backend.
 
 ---
 
@@ -23,8 +41,11 @@ Re-run CMake after adding or removing files (it globs `models/*.onnx`).
 ### 2. Configure
 
 ```bash
-# SOFIE inference only (default)
+# SOFIE inference only — CUDA backend (default)
 cmake -B build -DSOFIE_BENCHMARK=ON /path/to/SOFIE
+
+# Explicitly name the backend (useful for CI or future HIP support)
+cmake -B build -DSOFIE_BENCHMARK=ON -DSOFIE_BENCHMARK_BACKEND=CUDA /path/to/SOFIE
 
 # With ONNX Runtime GPU comparison
 cmake -B build \
@@ -32,13 +53,20 @@ cmake -B build \
   -DSOFIE_BENCHMARK_ORT=ON \
   -DONNXRUNTIME_ROOT=/path/to/onnxruntime \
   /path/to/SOFIE
+
+# Override the CUDA SM architecture (default: native GPU or sm_75)
+cmake -B build -DSOFIE_BENCHMARK=ON -DSOFIE_BENCHMARK_CUDA_ARCH="86" /path/to/SOFIE
 ```
 
 | CMake flag | Default | Description |
 |---|---|---|
 | `-DSOFIE_BENCHMARK=ON` | — | Enable the benchmark suite |
+| `-DSOFIE_BENCHMARK_BACKEND=<val>` | `CUDA` | Target accelerator backend |
+| `-DSOFIE_BENCHMARK_CUDA_ARCH=<sm>` | native / `75` | CUDA SM architecture(s), e.g. `86` for RTX 30xx, `80` for A100 |
 | `-DSOFIE_BENCHMARK_ORT=ON` | `OFF` | Also benchmark ONNX Runtime GPU |
-| `-DONNXRUNTIME_ROOT=<path>` | — | Hint for finding ORT headers/library |
+| `-DONNXRUNTIME_ROOT=<path>` | — | Path for ORT headers/library |
+| `-DSOFIE_BENCHMARK_LARGE=ON` | `OFF` | Build `sofie_benchmark_large` for cluster GPUs (A100/H100, ≥40 GB VRAM) |
+| `-DSOFIE_BENCHMARK_LARGE_CUDA_ARCH=<sm>` | `80` | CUDA SM architecture for the large-input benchmark |
 
 > **Tested with ONNX Runtime 1.22.0 GPU**
 > (`onnxruntime-linux-x64-gpu-1.22.0`).  The CMake config bundled with some ORT
@@ -53,11 +81,10 @@ cmake --build build --target sofie_benchmark -j$(nproc)
 
 This automatically:
 1. Builds **`sofie_benchmark_emitter`** — parses each `.onnx` and emits:
-   - `<Model>_GPU_ALPAKA.hxx` — SOFIE CUDA/Alpaka inference code
+   - `<Model>_GPU_ALPAKA.hxx` — SOFIE Alpaka inference code
    - `<Model>_GPU_ALPAKA.dat` — serialized weights
    - `<Model>_bench.hxx`      — timing wrapper `Benchmark_<Model>()`
-2. Builds **`sofie_benchmark`** — compiles all generated code as `.cu` and links the
-   timing loop.
+2. Builds **`sofie_benchmark`** — compiles all generated code and links the timing loop.
 
 ### 4. Run
 
@@ -84,12 +111,46 @@ LD_LIBRARY_PATH=/path/to/onnxruntime/lib:$LD_LIBRARY_PATH \
 | `--onnxruntime, --ort` | off | Run ONNX Runtime GPU benchmark after each SOFIE model |
 | `--help,       -h`     |     | Print this help and exit |
 
+---
+
+## Large-input Benchmark (`sofie_benchmark_large`)
+
+For cluster GPUs (A100/H100/MI300X with ≥40 GB VRAM) a separate target is available
+that includes models excluded from the default benchmark due to memory constraints on
+consumer cards (≤8 GB):
+
+```bash
+cmake -B build -DSOFIE_BENCHMARK=ON -DSOFIE_BENCHMARK_LARGE=ON \
+      -DSOFIE_BENCHMARK_LARGE_CUDA_ARCH=80   # 80=A100, 90=H100
+cmake --build build --target sofie_benchmark_large -j$(nproc)
+```
+
+The large-benchmark binary links CUDA runtime statically so it can run on cluster
+nodes where the CUDA toolkit is not installed system-wide.
 
 ---
 
 ## Re-running after adding models
 
 ```bash
-cmake build                                               # re-configure (re-globs)
-cmake --build build --target sofie_benchmark -j$(nproc)  # re-build
+cmake build
+cmake --build build --target sofie_benchmark -j$(nproc)
 ```
+
+---
+
+## Adding a New Backend (HIP/ROCm)
+
+The benchmark infrastructure is designed so adding a new backend requires changes
+in only a few places:
+
+1. **`CMakeLists.txt`** — add `"HIP"` to the `SOFIE_BENCHMARK_BACKEND` allowed
+   values, call `enable_language(HIP)`, find `hip::host`, and set
+   `_SOFIE_BENCH_ALPAKA_DEFINE = ALPAKA_ACC_GPU_HIP_ENABLED` /
+   `_SOFIE_BENCH_BACKEND_DEFINE = SOFIE_BACKEND_HIP`.
+2. **`src/BenchmarkBackend.hxx`** — already contains the `SOFIE_BACKEND_HIP` branch
+   with `alpaka::TagGpuHipRt` aliases and `hipDeviceSynchronize()` sync macro.
+3. **`src/ModelBench.cu.in`** — rename to `.hip.in` (or use a common extension) and
+   configure the source file language property to `HIP`.
+4. **`src/ONNXRuntimeBenchmark.hxx`** — swap `OrtCUDAProviderOptions` for the ROCm
+   execution provider options if ORT comparison is desired on AMD hardware.

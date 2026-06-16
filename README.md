@@ -1,40 +1,163 @@
 # SOFIE
-This is an experimental standalone version of SOFIE - a tool for Fast ML Inference within ROOT - the scientific data analysis framework.
 
-Since SOFIE is a part of ROOT and therefore needs to be built altogether, it takes quite a long time in its development and testing. This standalone version allows you to just build SOFIE with the pre-built binaries of ROOT- making the entire development process way faster.
+This is an experimental standalone version of **SOFIE** — a tool for Fast ML Inference
+within [ROOT](https://root.cern), the scientific data analysis framework.
 
+This standalone is especially developed for implementing and evaluating inference on
+**heterogeneous architectures** (CUDA GPUs, AMD GPUs via HIP/ROCm, CPUs) using the
+[Alpaka](https://github.com/alpaka-group/alpaka) portability layer.
+
+---
 
 ## Installation
 
-1. SOFIE requires ROOT by default. To explore SOFIE APIs within ROOT, follow the mentioned steps:      
-    1. Getting a ROOT binary. Download a pre-built binary of ROOT based on your architecture from [here](https://root.cern/install/).
-    2. Source it so that SOFIE is able to include its code. For example:
-    ```
-        source root_v6.36.02.Linux-ubuntu24.04-x86_64-gcc13.3/root/bin/thisroot.sh
-    ```
-    To disable ROOT, simply disable the `-DSOFIE_WITH_ROOT=OFF` cmake flag in the build command.
+### Prerequisites
 
-2. Build standalone SOFIE
+- CMake ≥ 3.16
+- C++20-capable compiler (GCC ≥ 11, Clang ≥ 14)
+- [Protocol Buffers](https://protobuf.dev/) ≥ 3.0 (for ONNX model parsing)
+- *(Optional)* ROOT ≥ 6.28 — only needed if using `.root` weight files or ROOT-based
+  serialization (`-DSOFIE_WITH_ROOT=ON`)
+- *(Optional for GPU testing/benchmarking)* CUDA Toolkit ≥ 11.8
+
+### 1. Clone and build
+
 ```bash
 git clone https://github.com/sanjibansg/SOFIE.git
 cd SOFIE
 mkdir build && cd build
-cmake -Dtesting=ON -DCMAKE_INSTALL_PREFIX=../install -DCMAKE_BUILD_TYPE=RelWithDebInfo ..
-cmake --build . --target install -j10
+cmake -DCMAKE_INSTALL_PREFIX=../install -DCMAKE_BUILD_TYPE=RelWithDebInfo ..
+cmake --build . --target install -j$(nproc)
 ```
-The commands above should build the SOFIE standalone. To include it within the ROOT binary and run altogether, we need to source the shared libraries for `SOFIE_core` and `SOFIE_parsers`. Within the SOFIE repository we may call
+
+To disable ROOT (build without ROOT dependency):
 
 ```bash
-source setup.sh
-
+cmake -DSOFIE_WITH_ROOT=OFF -DCMAKE_INSTALL_PREFIX=../install ..
 ```
-Now ROOT should also access the SOFIE libraries while it runs. This helps to accelerate development. Submit your developments here and we will proceed with the developments in ROOT carefully. This step is not required if SOFIE is built for usage without ROOT (`-DSOFIE_WITH_ROOT=OFF`).
 
-3. To enable testing generated code with alpaka implementations, build using the following command:
+### 2. Source the environment (ROOT-integrated workflow only)
+
+If you need the SOFIE libraries to be accessible from within a ROOT session:
+
 ```bash
-cmake -Dtesting=ON -DENABLE_ALPAKA_TESTS=ON -DCMAKE_INSTALL_PREFIX=../install -DCMAKE_BUILD_TYPE=RelWithDebInfo ..
+# Example — adjust the ROOT tarball name to match your download
+source root_v6.36.02.Linux-ubuntu24.04-x86_64-gcc13.3/root/bin/thisroot.sh
+source setup.sh   # adds SOFIE_core and SOFIE_parsers to LD_LIBRARY_PATH
 ```
-The default architecture is CUDA, but can be configured using an additional`-DALPAKA_BACKEND=hip` cmake option.
-    
+
+This step is **not required** when building without ROOT
+(`-DSOFIE_WITH_ROOT=OFF`).
+
+---
+
+## Testing
+
+Unit and integration tests are enabled with `-Dtesting=ON` and require
+[GoogleTest](https://github.com/google/googletest).
+
+### CPU / default tests
+
+```bash
+cmake -Dtesting=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo ..
+cmake --build . -j$(nproc)
+ctest --output-on-failure
+```
+
+### GPU tests (Alpaka/CUDA)
+
+Alpaka-based GPU tests compile SOFIE-generated inference code as CUDA and verify
+correctness against reference outputs.  They require the CUDA Toolkit and a
+compatible NVIDIA GPU.
+
+```bash
+cmake -Dtesting=ON \
+      -DENABLE_ALPAKA_TESTS=ON \
+      -DALPAKA_BACKEND=cuda \
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo ..
+cmake --build . -j$(nproc)
+ctest --output-on-failure
+```
+
+| CMake flag | Default | Description |
+|---|---|---|
+| `-Dtesting=ON` | `OFF` | Enable the test suite |
+| `-DENABLE_ALPAKA_TESTS=ON` | `OFF` | Enable Alpaka GPU tests |
+| `-DALPAKA_BACKEND=<val>` | `cuda` | Alpaka backend: `cuda`, `hip`, `cpu`, `sycl` |
+
+The test executable is `TestCustomModelsFromONNXForAlpakaCuda`.  ONNX model files
+used as test inputs are located in `core/test/input_models/`.  Models with symbolic
+(dynamic) input dimensions are specialised by the emitter before testing.
+
+---
+
+## Benchmarking
+
+The benchmark toolkit (`benchmark/`) measures **inference latency and throughput** for
+ONNX models compiled by SOFIE and executed via Alpaka.  It supports an optional
+side-by-side comparison with **ONNX Runtime GPU**.
+
+### Supported backends
+
+| Backend | CMake value | Status |
+|---------|-------------|--------|
+| NVIDIA CUDA | `CUDA` (default) | Supported |
+| AMD HIP/ROCm | `HIP` | Planned |
+
+### Quick start
+
+```bash
+# Place .onnx models in benchmark/models/ first
+cmake -B build \
+      -DSOFIE_BENCHMARK=ON \
+      -DSOFIE_BENCHMARK_BACKEND=CUDA \
+      -DSOFIE_BENCHMARK_CUDA_ARCH=86 \   # e.g. 86 for RTX 30xx, 80 for A100
+      /path/to/SOFIE
+cmake --build build --target sofie_benchmark -j$(nproc)
+cd build/benchmark && ./sofie_benchmark
+```
+
+For a full reference of benchmark CMake flags, runtime options, the large-input
+cluster benchmark, and instructions for adding new backends, see
+[benchmark/README.md](benchmark/README.md).
+
+---
+
+## GPU Architecture Support
+
+SOFIE generates Alpaka-based inference code that is portable across GPU
+architectures:
+
+- **NVIDIA CUDA** — select the SM architecture with
+  `-DSOFIE_BENCHMARK_CUDA_ARCH=<sm>` (e.g. `75` for Turing, `86` for Ampere,
+  `90` for Hopper).
+- **AMD HIP/ROCm** — the Alpaka backend tag (`alpaka::TagGpuHipRt`) and the
+  `SOFIE_BACKEND_HIP` compile-time define are already wired in
+  `benchmark/src/BenchmarkBackend.hxx`; full build-system integration is in
+  progress.
+- **CPU** — a serial CPU Alpaka backend (`alpaka::TagCpuSerial`) is available as a
+  fallback for debugging and portability testing.
+
+---
+
+## Project Structure
+
+```
+SOFIE/
+├── core/           # Core SOFIE library (RModel, operators, code generators)
+│   └── test/       # Unit/integration tests
+├── parsers/        # ONNX → RModel parser
+├── benchmark/      # Latency / throughput benchmark toolkit
+│   ├── models/     # Place .onnx benchmark models here
+│   └── src/        # CMake-configured source templates
+├── utils/          # Utility targets
+└── cmake/          # CMake modules and config templates
+```
+
+---
+
 ## Inspiration
-The standalone version of SOFIE is developed with inspiration from the standalone version of RooFit developed by Jonas Rembser that can be found [here](https://github.com/guitargeek/roofit).
+
+The standalone version of SOFIE is developed with inspiration from the standalone
+version of RooFit developed by Jonas Rembser, which can be found
+[here](https://github.com/guitargeek/roofit).

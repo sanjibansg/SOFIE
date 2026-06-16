@@ -117,6 +117,3 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/inc/"
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 
-if(testing)
-  add_subdirectory(test)
-endif()

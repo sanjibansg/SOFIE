@@ -226,19 +226,19 @@ TEST_F(SofieAlpakaTest, Linear64)
 {
    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
 
-   auto A = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{1600}));
+   auto A = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{6400}));
    float *A_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(A));
 
-   for (Idx i = 0; i < 1600; ++i) {
+   for (Idx i = 0; i < 6400; ++i) {
       A_ptr[i] = 1.0;
    }
 
-   auto A_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{1600}));
+   auto A_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{6400}));
    alpaka::memcpy(queue, A_d, A);
    alpaka::wait(queue);
 
-   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{160}));
-   
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{640}));
+
    {
       SOFIE_Linear_64::Session<alpaka::TagGpuCudaRt> session("Linear_64_FromONNX_GPU_ALPAKA.dat");
       auto result = session.infer(A_d);
@@ -248,11 +248,11 @@ TEST_F(SofieAlpakaTest, Linear64)
       alpaka::memcpy(queue, result_h, result);
       alpaka::wait(queue);
    }
-   
+
    float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
    float *correct = Linear_64_ExpectedOutput::all_ones;
 
-   for (size_t i = 0; i < 160; ++i) {
+   for (size_t i = 0; i < 640; ++i) {
       EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE);
    }
 }

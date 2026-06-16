@@ -20,8 +20,6 @@
 #include <string>
 #include <vector>
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-
 namespace sofie_ort_bench_detail {
 
 /// Total element count from a shape vector (-1 dynamic dims are treated as 1).
@@ -31,7 +29,6 @@ inline std::size_t shapeToSize(const std::vector<int64_t>& shape) {
     return n;
 }
 
-/// Human-readable ORT element-type name.
 inline const char* ortTypeName(ONNXTensorElementDataType t) {
     switch (t) {
         case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:  return "float32";
@@ -45,8 +42,6 @@ inline const char* ortTypeName(ONNXTensorElementDataType t) {
 }
 
 } // namespace sofie_ort_bench_detail
-
-// ── main benchmark function ───────────────────────────────────────────────────
 
 /// Run @p model_path through ONNX Runtime's CUDAExecutionProvider.
 /// Results are printed in the same table format as the SOFIE Alpaka benchmark.
@@ -66,7 +61,6 @@ inline void BenchmarkORT_GPU(const std::string& model_path,
 {
     using namespace sofie_ort_bench_detail;
 
-    // ── ORT session setup ────────────────────────────────────────────────────
     Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "sofie_ort_bench");
 
     Ort::SessionOptions opts;
@@ -86,7 +80,6 @@ inline void BenchmarkORT_GPU(const std::string& model_path,
     Ort::MemoryInfo mem_cpu =
         Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
-    // ── introspect inputs ─────────────────────────────────────────────────────
     const std::size_t num_inputs = session.GetInputCount();
 
     std::vector<std::string>      input_names_str(num_inputs);
@@ -94,14 +87,11 @@ inline void BenchmarkORT_GPU(const std::string& model_path,
     std::vector<std::vector<int64_t>> input_shapes(num_inputs);
     std::vector<ONNXTensorElementDataType> input_types(num_inputs);
 
-    // backing storage — one allocation per input
     std::vector<std::vector<float>>   float_data(num_inputs);
     std::vector<std::vector<double>>  double_data(num_inputs);
     std::vector<std::vector<int64_t>> int64_data(num_inputs);
     std::vector<std::vector<int32_t>> int32_data(num_inputs);
     std::vector<std::vector<uint8_t>> uint8_data(num_inputs);
-    // Note: bool_data uses uint8_t storage; pointer is cast to bool* for CreateTensor<bool>
-    // (sizeof(bool)==sizeof(uint8_t)==1 on all supported platforms)
 
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> fdist(-1.f, 1.f);
@@ -110,18 +100,15 @@ inline void BenchmarkORT_GPU(const std::string& model_path,
     input_tensors.reserve(num_inputs);
 
     for (std::size_t i = 0; i < num_inputs; ++i) {
-        // name
         auto name_ptr = session.GetInputNameAllocated(i, alloc);
         input_names_str[i] = name_ptr.get();
         input_names_ptr[i] = input_names_str[i].c_str();
 
-        // type + shape
         auto info = session.GetInputTypeInfo(i);
         auto tinfo = info.GetTensorTypeAndShapeInfo();
         input_types[i]  = tinfo.GetElementType();
         input_shapes[i] = tinfo.GetShape();
 
-        // replace dynamic dims (-1) with 1 for benchmarking
         for (auto& d : input_shapes[i]) if (d < 0) d = 1;
 
         std::size_t n = shapeToSize(input_shapes[i]);
@@ -132,7 +119,6 @@ inline void BenchmarkORT_GPU(const std::string& model_path,
                 ortTypeName(input_types[i]), n);
         }
 
-        // fill data and create OrtValue
         switch (input_types[i]) {
             case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT: {
                 float_data[i].resize(n);
@@ -152,7 +138,6 @@ inline void BenchmarkORT_GPU(const std::string& model_path,
                 break;
             }
             case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64: {
-                // Zero: safe for index tensors (edge_index, etc.)
                 int64_data[i].assign(n, 0);
                 input_tensors.push_back(Ort::Value::CreateTensor<int64_t>(
                     mem_cpu, int64_data[i].data(), n,
@@ -174,7 +159,6 @@ inline void BenchmarkORT_GPU(const std::string& model_path,
                 break;
             }
             case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL: {
-                // ORT requires bool* — use uint8_t backing (1 byte each, same size)
                 uint8_data[i].assign(n, 0);
                 input_tensors.push_back(Ort::Value::CreateTensor<bool>(
                     mem_cpu,
@@ -189,7 +173,6 @@ inline void BenchmarkORT_GPU(const std::string& model_path,
         }
     }
 
-    // ── output names ─────────────────────────────────────────────────────────
     const std::size_t num_outputs = session.GetOutputCount();
     std::vector<std::string> output_names_str(num_outputs);
     std::vector<const char*> output_names_ptr(num_outputs);
@@ -199,10 +182,8 @@ inline void BenchmarkORT_GPU(const std::string& model_path,
         output_names_ptr[i] = output_names_str[i].c_str();
     }
 
-    // build run-options that disable CPU fallback for a pure GPU measurement
     Ort::RunOptions run_opts;
 
-    // ── warm-up ──────────────────────────────────────────────────────────────
     for (int w = 0; w < warmup; ++w) {
         session.Run(run_opts,
                     input_names_ptr.data(),  input_tensors.data(),  num_inputs,
@@ -210,7 +191,6 @@ inline void BenchmarkORT_GPU(const std::string& model_path,
     }
     cudaDeviceSynchronize();
 
-    // ── timed run ─────────────────────────────────────────────────────────────
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int it = 0; it < iterations; ++it) {
         session.Run(run_opts,
@@ -224,7 +204,6 @@ inline void BenchmarkORT_GPU(const std::string& model_path,
                       / iterations;
     double throughput = (avg_ms > 0.0) ? 1000.0 / avg_ms : 0.0;
 
-    // Print in the same table format, with "[ORT]" tag in the model column
     std::string label = std::string(model_name) + " [ORT-GPU]";
     std::printf("%-30s  avg %8.4f ms  (%8.1f inf/s)\n",
                 label.c_str(), avg_ms, throughput);

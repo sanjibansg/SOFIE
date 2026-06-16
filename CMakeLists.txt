@@ -88,6 +88,10 @@ add_subdirectory(utils)
 add_subdirectory(core)
 add_subdirectory(parsers)
 
+if(testing)
+  add_subdirectory(test)
+endif()
+
 if(SOFIE_BENCHMARK)
   add_subdirectory(benchmark)
 endif()

@@ -38,9 +38,6 @@ static int run_single_model(const std::string& model,
     return 1;
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
 int main(int argc, char *argv[]) {
     int warmup     = 10;
     int iterations = 100;
@@ -100,8 +97,9 @@ int main(int argc, char *argv[]) {
 #endif
     std::printf("\n\n");
 
-    std::printf("%-40s  %18s  %16s\n", "Model", "Avg (ms)", "Throughput (inf/s)");
-    std::printf("%s\n", std::string(80, '-').c_str());
+    std::printf("%-40s  %12s  %14s  %15s  %16s\n",
+                "Model", "infer(ms)", "in_xfer(ms)", "out_xfer(ms)", "Throughput(inf/s)");
+    std::printf("%s\n", std::string(103, '-').c_str());
     std::fflush(stdout);
 
     // Build the common argument suffix forwarded to every subprocess.
