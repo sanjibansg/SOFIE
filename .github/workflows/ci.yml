@@ -25,10 +25,8 @@ jobs:
   gpu-ci:
     name: GPU Tests & Benchmark (H100)
     runs-on: ml4ep-h100
-    container:
-      image: registry.cern.ch/ngt/lxplus-like:9
-      options: --gpus all --ipc=host
-
+    container: registry.cern.ch/ngt/lxplus-like:9
+    
     steps:
       - name: GPU check
         run: nvidia-smi
