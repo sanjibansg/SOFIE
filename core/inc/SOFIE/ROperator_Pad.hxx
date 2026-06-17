@@ -231,10 +231,11 @@ public:
 
       op += SP + SP + SP + SP + "bool interior = true;\n";
       for (std::size_t d = 0; d < D; ++d) {
-         std::string lo = std::to_string(fPads[d].first);
          std::string hi = std::to_string(fPads[d].first + static_cast<int64_t>(fInputShape[d]));
-         op += SP + SP + SP + SP + "interior = interior && (out_" + std::to_string(d)
-               + " >= " + lo + "u) && (out_" + std::to_string(d) + " < " + hi + "u);\n";
+         op += SP + SP + SP + SP + "interior = interior";
+         if (fPads[d].first > 0)
+            op += " && (out_" + std::to_string(d) + " >= " + std::to_string(fPads[d].first) + "u)";
+         op += " && (out_" + std::to_string(d) + " < " + hi + "u);\n";
       }
       op += "\n";
 
