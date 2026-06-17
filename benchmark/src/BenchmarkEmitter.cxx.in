@@ -78,7 +78,11 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
     // which runs shape inference on all operators.  Output tensor shapes are only
     // available *after* Initialize(), so we must call GenerateGPU_ALPAKA() before
     // querying output metadata.
+#ifdef SOFIE_BENCHMARK_PROFILE
+    model.GenerateGPU_ALPAKA(Options::kProfile);
+#else
     model.GenerateGPU_ALPAKA();
+#endif
 
     // Collect output metadata AFTER code generation so shapes are fully propagated.
     const auto &outputNames = model.GetOutputTensorNames();
@@ -222,6 +226,20 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
           << "    }\n"
           << "    cudaDeviceSynchronize();\n\n";
 
+    // ---- Profiling path (mutually exclusive with benchmark path) ----
+    bench << "#ifdef SOFIE_BENCHMARK_PROFILE\n"
+          << "    // ---- Profiling: reset warmup data, run iterations, print results ----\n"
+          << "    session.ResetProfilingResults();\n"
+          << "    for (int _i = 0; _i < iterations; ++_i)\n"
+          << "        " << inferCall.str() << ";\n"
+          << "    alpaka::wait(session.queue);\n"
+          << "    std::printf(\"%s\\n\", std::string(60, '-').c_str());\n"
+          << "    std::printf(\"Model: " << modelName << "\\n\");\n"
+          << "    session.PrintProfilingResults();\n"
+          << "    session.PrintMemoryInfo();\n"
+          << "#else\n";
+
+    // ---- Benchmark path ----
     bench
         << "    // ---- Timed input transfer (H2D: host -> device) ----\n"
         << "    auto t0_in = std::chrono::high_resolution_clock::now();\n"
@@ -266,6 +284,7 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         << "    std::printf(\"%-40s  %12.4f  %14.4f  %15.4f  %16.1f\\n\",\n"
         << "                \"" << modelName << "\",\n"
         << "                avg_infer_ms, avg_in_ms, avg_out_ms, throughput);\n"
+        << "#endif  // SOFIE_BENCHMARK_PROFILE\n"
         << "}\n";
 
     bench.close();

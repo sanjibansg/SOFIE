@@ -10,10 +10,14 @@ namespace SOFIE {
 
 class RModel final : public RModel_Base {
 
+   friend class RModelProfiler;
+   friend class RModelProfilerGPU;
+
 private:
    bool fIsInitialized = false;
    bool fIsSubGraph = false;
    bool fUseVDT = false;
+   bool fProfile = false;
    int fVerbose = 0;
    int fBatchSize = -1;
    long fReadPos = 0;  // reading file position

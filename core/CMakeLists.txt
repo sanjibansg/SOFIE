@@ -17,6 +17,8 @@ set(sources_headers
    SOFIE/OperatorList.hxx
    SOFIE/RModel_Base.hxx
    SOFIE/RModel.hxx
+   SOFIE/RModelProfiler.hxx
+   SOFIE/RModelProfilerGPU.hxx
    SOFIE/ROperator.hxx
    SOFIE/ROperator_BasicUnary.hxx
    SOFIE/ROperator_BasicBinary.hxx
@@ -76,6 +78,8 @@ list(TRANSFORM sources_headers PREPEND "inc/")
 set(sources_cxx
     src/RModel_Base.cxx
     src/RModel.cxx
+    src/RModelProfiler.cxx
+    src/RModelProfilerGPU.cxx
     src/RModel_ALPAKA.cxx
     src/RModel_GNN.cxx
     src/RModel_GraphIndependent.cxx

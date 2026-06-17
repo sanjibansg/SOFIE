@@ -21,16 +21,22 @@ option(SOFIE_BENCHMARK_ORT
     "Also benchmark ONNX Runtime GPU alongside SOFIE (requires ORT ≥ 1.18)"
     OFF)
 
+option(SOFIE_BENCHMARK_PROFILE
+    "Enable per-operator GPU profiling (per-op timing + memory breakdown). \
+Mutually exclusive with throughput benchmarking — rebuild without this flag \
+to measure throughput."
+    OFF)
+
 ################################################################################
 # Backend / architecture selection
 #
-# Set SOFIE_BENCHMARK_BACKEND to choose the accelerator target.
+# SOFIE_BENCHMARK_BACKEND applies to both throughput benchmarking and profiling.
 # Currently only CUDA is supported; setting any other value is a hard error.
 # When AMD GPU (HIP/ROCm) support is added, this option will accept "HIP".
 ################################################################################
 
 set(SOFIE_BENCHMARK_BACKEND "CUDA" CACHE STRING
-    "Target accelerator backend for SOFIE benchmark (currently only CUDA is supported)")
+    "Target accelerator backend for SOFIE benchmark and profiling (currently only CUDA)")
 set_property(CACHE SOFIE_BENCHMARK_BACKEND PROPERTY STRINGS CUDA)
 
 string(TOUPPER "${SOFIE_BENCHMARK_BACKEND}" _bench_backend)
@@ -47,7 +53,12 @@ endif()
 set(_SOFIE_BENCH_ALPAKA_DEFINE ALPAKA_ACC_GPU_CUDA_ENABLED)
 set(_SOFIE_BENCH_BACKEND_DEFINE SOFIE_BACKEND_CUDA)
 
-message(STATUS "SOFIE Benchmark: backend = ${SOFIE_BENCHMARK_BACKEND}")
+if(SOFIE_BENCHMARK_PROFILE)
+    message(STATUS "SOFIE Benchmark: profiling ENABLED  "
+                   "(backend = ${SOFIE_BENCHMARK_BACKEND}, throughput benchmarking disabled)")
+else()
+    message(STATUS "SOFIE Benchmark: backend = ${SOFIE_BENCHMARK_BACKEND}")
+endif()
 
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/../core/inc
@@ -317,6 +328,10 @@ target_compile_options(sofie_benchmark_emitter PRIVATE
     -Wno-array-bounds
 )
 
+target_compile_definitions(sofie_benchmark_emitter PRIVATE
+    $<$<BOOL:${SOFIE_BENCHMARK_PROFILE}>:SOFIE_BENCHMARK_PROFILE>
+)
+
 ################################################################################
 # Custom command: run emitter → generate inference + benchmark headers
 ################################################################################
@@ -383,6 +398,7 @@ target_compile_definitions(sofie_benchmark PRIVATE
     ${_SOFIE_BENCH_BACKEND_DEFINE}
     ALPAKA_HAS_STD_ATOMIC_REF
     $<$<BOOL:${SOFIE_ORT_FOUND}>:SOFIE_BENCHMARK_ORT>
+    $<$<BOOL:${SOFIE_BENCHMARK_PROFILE}>:SOFIE_BENCHMARK_PROFILE>
 )
 
 target_compile_options(sofie_benchmark PRIVATE
@@ -613,6 +629,9 @@ if(SOFIE_BENCHMARK_LARGE)
             -Wno-unused-parameter
             -Wno-array-bounds
         )
+        target_compile_definitions(sofie_benchmark_large_emitter PRIVATE
+            $<$<BOOL:${SOFIE_BENCHMARK_PROFILE}>:SOFIE_BENCHMARK_PROFILE>
+        )
 
         # ------------------------------------------------------------------
         # Custom command: run large emitter → large hxx / dat files
@@ -665,6 +684,7 @@ if(SOFIE_BENCHMARK_LARGE)
             ${_SOFIE_BENCH_ALPAKA_DEFINE}
             ${_SOFIE_BENCH_BACKEND_DEFINE}
             ALPAKA_HAS_STD_ATOMIC_REF
+            $<$<BOOL:${SOFIE_BENCHMARK_PROFILE}>:SOFIE_BENCHMARK_PROFILE>
             # ORT intentionally excluded: libonnxruntime has no static lib,
             # so the binary would fail on pods that lack the CUDA toolkit.
         )

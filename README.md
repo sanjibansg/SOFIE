@@ -121,6 +121,27 @@ For a full reference of benchmark CMake flags, runtime options, the large-input
 cluster benchmark, and instructions for adding new backends, see
 [benchmark/README.md](benchmark/README.md).
 
+### Profiling
+
+Add `-DSOFIE_BENCHMARK_PROFILE=ON` to enable **per-operator GPU timing** and a
+**CPU/GPU memory breakdown** printed after each model's throughput line.
+
+```bash
+cmake -B build \
+      -DSOFIE_BENCHMARK=ON \
+      -DSOFIE_BENCHMARK_PROFILE=ON \
+      /path/to/SOFIE
+cmake --build build --target sofie_benchmark -j$(nproc)
+cd build/benchmark && ./sofie_benchmark
+```
+
+> Profiling inserts `alpaka::wait(queue)` after each operator, which serialises
+> GPU execution.  Use a non-profile build for peak-throughput numbers.
+
+Profiling can also be enabled on a per-model basis outside the benchmark by
+passing `Options::kProfile` at code-generation time (see
+[Profiling in user code](#profiling-in-user-code) below).
+
 ---
 
 ## GPU Architecture Support
@@ -153,6 +174,81 @@ SOFIE/
 ├── utils/          # Utility targets
 └── cmake/          # CMake modules and config templates
 ```
+
+---
+
+## Profiling in user code
+
+Both the CPU and GPU code generators accept `Options::kProfile` to embed
+per-operator timing and memory reporting directly in the generated session struct.
+
+### CPU inference
+
+```cpp
+#include "SOFIE/RModel.hxx"
+#include "SOFIE/RModelParser_ONNX.hxx"
+
+SOFIE::RModelParser_ONNX parser;
+SOFIE::RModel model = parser.Parse("my_model.onnx");
+
+// Generate with profiling enabled
+model.Generate(SOFIE::Options::kProfile);
+model.OutputGenerated("MyModel.hxx");
+```
+
+The generated `Session` struct gains:
+
+| Method | Description |
+|--------|-------------|
+| `PrintProfilingResults(bool order=true)` | Per-operator mean ± stderr (µs), sorted by avg time |
+| `ResetProfilingResults()` | Clear accumulated timing data |
+| `GetOpAvgTime()` | `std::map<std::string, double>` of averages |
+| `GetOpVariance()` | `std::map<std::string, double>` of variances |
+
+```cpp
+#include "MyModel.hxx"
+SOFIE_MyModel::Session session("MyModel.dat");
+
+// Warmup
+for (int i = 0; i < 10; ++i) session.infer(input);
+session.ResetProfilingResults();
+
+// Timed runs
+for (int i = 0; i < 100; ++i) session.infer(input);
+session.PrintProfilingResults();
+```
+
+### GPU inference (Alpaka/CUDA)
+
+```cpp
+model.GenerateGPU_ALPAKA(SOFIE::Options::kProfile);
+model.OutputGenerated("MyModel_GPU_ALPAKA.hxx");
+```
+
+The generated GPU `Session` additionally provides:
+
+| Method | Description |
+|--------|-------------|
+| `PrintProfilingResults(bool order=true)` | Per-operator GPU wall-clock time (µs) with `alpaka::wait` sync |
+| `ResetProfilingResults()` | Clear accumulated timing data |
+| `GetOpAvgTime()` | `std::map<std::string, double>` of averages |
+| `PrintMemoryInfo()` | CPU/GPU memory breakdown (computed at code-gen time) |
+
+```cpp
+#include "MyModel_GPU_ALPAKA.hxx"
+SOFIE_MyModel::Session<AccTag> session("MyModel_GPU_ALPAKA.dat");
+
+for (int i = 0; i < 10; ++i) session.infer(input_d);  // warmup
+session.ResetProfilingResults();
+
+for (int i = 0; i < 100; ++i) session.infer(input_d);  // timed
+session.PrintProfilingResults();
+session.PrintMemoryInfo();
+```
+
+> **Timing accuracy:** `alpaka::wait(queue)` is called after each operator kernel
+> so the wall-clock measurement captures actual GPU execution time.  This
+> disables kernel pipelining; use a non-profile build for throughput measurement.
 
 ---
 

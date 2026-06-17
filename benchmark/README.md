@@ -65,6 +65,7 @@ cmake -B build -DSOFIE_BENCHMARK=ON -DSOFIE_BENCHMARK_CUDA_ARCH="86" /path/to/SO
 | `-DSOFIE_BENCHMARK_CUDA_ARCH=<sm>` | native / `75` | CUDA SM architecture(s), e.g. `86` for RTX 30xx, `80` for A100 |
 | `-DSOFIE_BENCHMARK_ORT=ON` | `OFF` | Also benchmark ONNX Runtime GPU |
 | `-DONNXRUNTIME_ROOT=<path>` | — | Path for ORT headers/library |
+| `-DSOFIE_BENCHMARK_PROFILE=ON` | `OFF` | Enable per-operator GPU profiling instead of throughput benchmarking (see [Profiling](#profiling)) |
 | `-DSOFIE_BENCHMARK_LARGE=ON` | `OFF` | Build `sofie_benchmark_large` for cluster GPUs (A100/H100, ≥40 GB VRAM) |
 | `-DSOFIE_BENCHMARK_LARGE_CUDA_ARCH=<sm>` | `80` | CUDA SM architecture for the large-input benchmark |
 
@@ -127,6 +128,83 @@ cmake --build build --target sofie_benchmark_large -j$(nproc)
 
 The large-benchmark binary links CUDA runtime statically so it can run on cluster
 nodes where the CUDA toolkit is not installed system-wide.
+
+---
+
+## Profiling
+
+Profiling and throughput benchmarking are **mutually exclusive** builds.  Rebuild
+with `-DSOFIE_BENCHMARK_PROFILE=ON` to switch the binary into profiling mode: the
+timed H2D/inference/D2H loops are replaced by a profiling pass that measures
+per-operator GPU time and prints a CPU/GPU memory breakdown.  The target backend
+and CUDA architecture are controlled by the same `SOFIE_BENCHMARK_BACKEND` and
+`SOFIE_BENCHMARK_CUDA_ARCH` flags used for benchmarking.
+
+```bash
+cmake -B build \
+  -DSOFIE_BENCHMARK=ON \
+  -DSOFIE_BENCHMARK_PROFILE=ON \
+  /path/to/SOFIE
+cmake --build build --target sofie_benchmark -j$(nproc)
+cd build/benchmark && ./sofie_benchmark
+```
+
+After the normal throughput table, each model will print two additional blocks:
+
+**GPU Profiling Results** — per-operator wall-clock time (microseconds) measured
+with `std::chrono` and an `alpaka::wait(queue)` synchronisation point after every
+kernel.  Results are sorted by average time descending, with ± stderr over all
+timed iterations.  Warmup iterations are excluded (the session is reset before the
+timed runs start).
+
+```
+============================================================
+           GPU PROFILING RESULTS
+   (wall-clock with alpaka::wait synchronization)
+============================================================
+  MatMul_3                      : 142.718 +/- 0.412 us  (100 runs)
+  MatMul_1                      : 138.005 +/- 0.389 us  (100 runs)
+  LayerNorm_5                   :  23.441 +/- 0.201 us  (100 runs)
+  ...
+  Overall_Time                  : 847.332 +/- 1.104 us  (100 runs)
+============================================================
+```
+
+**Memory Usage Breakdown** — sizes computed at code-generation time from tensor
+shapes and types.  No runtime measurement is needed; the values are embedded
+as constants in the generated session code.
+
+```
+============================================================
+              MEMORY USAGE BREAKDOWN
+============================================================
+  CPU Memory:
+    Constant/embedded tensors : 0 bytes  (0.0000 MB)
+    Weight tensors            : 12582912 bytes  (12.000 MB)
+    Intermediate memory pool  : 0 bytes  (0.0000 MB)
+    Total CPU                 : 12582912 bytes  (12.000 MB)
+  GPU Memory (device buffers):
+    Weight device buffers     : 12582912 bytes  (12.000 MB)
+    Intermediate device bufs  : 4194304 bytes  (4.000 MB)
+    Total GPU                 : 16777216 bytes  (16.000 MB)
+============================================================
+```
+
+> **Note:** Profiling and benchmarking are mutually exclusive.  In a profiling
+> build the throughput table is not printed; in a benchmark build
+> `PrintProfilingResults` / `PrintMemoryInfo` are not called.  Rebuild without
+> `-DSOFIE_BENCHMARK_PROFILE=ON` to measure peak throughput.
+
+The same flag works for the large-input benchmark:
+
+```bash
+cmake -B build \
+  -DSOFIE_BENCHMARK=ON \
+  -DSOFIE_BENCHMARK_LARGE=ON \
+  -DSOFIE_BENCHMARK_PROFILE=ON \
+  /path/to/SOFIE
+cmake --build build --target sofie_benchmark_large -j$(nproc)
+```
 
 ---
 

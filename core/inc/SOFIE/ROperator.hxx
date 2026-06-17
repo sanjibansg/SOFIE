@@ -91,6 +91,9 @@ public:
    //virtual void Forward_blas() = 0;
    virtual ~ROperator(){}
 
+   std::string fName = "UnnamedOperator";
+   const std::string &Name() const { return fName; }
+
 protected:
    OperatorKind fKind = OperatorKind::UNDEFINED;
    size_t fOpOrder = 0;

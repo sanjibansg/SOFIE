@@ -9,6 +9,7 @@
 #endif
 
 #include "SOFIE/RModel.hxx"
+#include "SOFIE/RModelProfiler.hxx"
 #include "SOFIE/SOFIE_common.hxx"
 
 namespace SOFIE {
@@ -1319,6 +1320,10 @@ void RModel::GenerateSessionCode()
    GenerateIntermediateTensorInfo();
    // generate code for declarations of some specific operators
    GenerateOperatorDeclarations();
+   // generate profiling session data member if profiling is enabled
+   if (fProfile) {
+      fGC += RModelProfiler::GenerateSessionMembers();
+   }
 
    // storing the parameters for future checking to avoid mismatches
    if (!fDimShapeNames.empty()) {
@@ -1403,6 +1408,11 @@ void RModel::GenerateSessionCode()
    // generate the inference overload that returns an output struct
    GenerateOutput();
 
+   // generate profiling utility functions inside the Session struct
+   if (fProfile) {
+      fGC += RModelProfiler::GenerateUtilityFunctions();
+   }
+
    // end of session
    if (fUseSession && !fIsGNNComponent) {
       fGC += "};   // end of Session\n\n";
@@ -1420,13 +1430,20 @@ void RModel::GenerateSessionCode()
    if (fOutputTensorNames.size() == 0)
       throw std::runtime_error("sofie: output size=0 are not supported");
 
+   if (fProfile) {
+      fGC += RModelProfiler::GenerateBeginInferCode();
+   }
+
    std::string allOperatorCode;
 
    for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
       if (fVerbose)
          std::cout << "Generating code for operator .... " << op_idx << std::endl;
-      std::string operatorCode = fOperators[op_idx]->Generate(std::to_string(op_idx));
-      allOperatorCode += operatorCode;
+      if (fProfile) {
+         allOperatorCode += RModelProfiler::GenerateOperatorCode(*fOperators[op_idx], op_idx);
+      } else {
+         allOperatorCode += fOperators[op_idx]->Generate(std::to_string(op_idx));
+      }
    }
 
    // If the generated code users members of the session struct, use the
@@ -1443,6 +1460,10 @@ void RModel::GenerateSessionCode()
    }
 
    fGC += allOperatorCode;
+
+   if (fProfile) {
+      fGC += RModelProfiler::GenerateEndInferCode();
+   }
 
    for (auto const& name: fOutputTensorNames) {
       bool isDynamic = fDynamicTensorInfos.count(name) > 0;
@@ -1465,6 +1486,7 @@ void RModel::GenerateSessionCode()
 
 void RModel::Generate(std::underlying_type_t<Options> options, int batchSize, long pos, bool verbose)
 {
+   fProfile = static_cast<bool>(options & static_cast<std::underlying_type_t<Options>>(Options::kProfile));
    fVerbose = verbose;
    fBatchSize = batchSize;
    fReadPos = pos;
@@ -1491,6 +1513,9 @@ void RModel::Generate(std::underlying_type_t<Options> options, int batchSize, lo
       fIsGNN = true;
    if (static_cast<std::underlying_type_t<Options>>(Options::kGNNComponent) & options)
       fIsGNNComponent = true;
+
+   if (fProfile)
+      RModelProfiler::AddNeededStdLibs(*this);
 
    // initialize the model including all operators and sub-graphs
    Initialize(batchSize, verbose);

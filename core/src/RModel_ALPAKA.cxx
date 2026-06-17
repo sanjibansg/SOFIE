@@ -11,6 +11,7 @@
 #endif
 
 #include "SOFIE/RModel.hxx"
+#include "SOFIE/RModelProfilerGPU.hxx"
 #include "SOFIE/SOFIE_common.hxx"
 #include "SOFIE/ROperator_Gemm.hxx"
 #include "SOFIE/ROperator_LeakyRelu.hxx"
@@ -404,6 +405,12 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    fGC += GenerateImplSignature_GPU_ALPAKA();
    fGC += "){\n";
 
+   // GPU profiling: _infer_impl is a member of Session, so fProfilingResults
+   // is directly accessible without any alias.
+   if (fProfile) {
+      fGC += RModelProfilerGPU::GenerateBeginInferCode();
+   }
+
    std::set<size_t> fusedGroupsLaunched;
    for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
       if (fVerbose)
@@ -421,24 +428,48 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
             const auto& grp = fEltwiseFusionGroups[gIdx];
             std::string sfx = grp.suffix();
             std::string kname = "fusedEltwiseKernel" + sfx;
-            fGC += "\n//------ FUSED_ELTWISE_GPU_ALPAKA" + sfx + "\n";
-            fGC += SP + "{\n";
-            fGC += SP + SP + "auto const elementsPerThread_fused" + sfx + " = Vec::all(static_cast<Idx>(1));\n";
-            fGC += SP + SP + "auto const elementsPerGrid_fused" + sfx + " = Vec::all(Idx{" + std::to_string(grp.numElements) + "});\n";
-            fGC += SP + SP + "auto const workDiv_fused" + sfx + " = sofie_workdiv(elementsPerGrid_fused" + sfx + ");\n";
-            fGC += SP + SP + "auto task_fused" + sfx + " = alpaka::createTaskKernel<Acc>(workDiv_fused" + sfx + ", " + kname +
+            std::string fusedCode;
+            fusedCode += "\n//------ FUSED_ELTWISE_GPU_ALPAKA" + sfx + "\n";
+            fusedCode += SP + "{\n";
+            fusedCode += SP + SP + "auto const elementsPerThread_fused" + sfx + " = Vec::all(static_cast<Idx>(1));\n";
+            fusedCode += SP + SP + "auto const elementsPerGrid_fused" + sfx + " = Vec::all(Idx{" + std::to_string(grp.numElements) + "});\n";
+            fusedCode += SP + SP + "auto const workDiv_fused" + sfx + " = sofie_workdiv(elementsPerGrid_fused" + sfx + ");\n";
+            fusedCode += SP + SP + "auto task_fused" + sfx + " = alpaka::createTaskKernel<Acc>(workDiv_fused" + sfx + ", " + kname +
                    ", alpaka::getPtrNative(deviceBuf_" + grp.inputTensor + "), alpaka::getPtrNative(deviceBuf_" + grp.outputTensor +
                    "), static_cast<Idx>(" + std::to_string(grp.numElements) + "));\n";
-            fGC += SP + SP + "alpaka::enqueue(queue, task_fused" + sfx + ");\n";
-            fGC += SP + "}\n";
+            fusedCode += SP + SP + "alpaka::enqueue(queue, task_fused" + sfx + ");\n";
+            fusedCode += SP + "}\n";
+            if (fProfile) {
+               // wrap fused group with profiling
+               std::string fusedName = "FusedKernel" + sfx;
+               fGC += "   // -- GPU Profiling fused group: " + fusedName + " --\n";
+               fGC += "   tp_start = std::chrono::steady_clock::now();\n";
+               fGC += fusedCode;
+               fGC += "   alpaka::wait(queue);\n";
+               fGC += "   fProfilingResults[\"" + fusedName + "\"].push_back(\n";
+               fGC += "      std::chrono::duration_cast<std::chrono::duration<double, std::micro>>(\n";
+               fGC += "         std::chrono::steady_clock::now() - tp_start).count());\n\n";
+            } else {
+               fGC += fusedCode;
+            }
             fusedGroupsLaunched.insert(gIdx);
          }
          // Chain followers: skip — their logic is inside the fused kernel
       } else {
-         fGC += fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx));
+         if (fProfile) {
+            fGC += RModelProfilerGPU::GenerateOperatorCode(*fOperators[op_idx], op_idx);
+         } else {
+            fGC += fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx));
+         }
       }
    }
+   // Final wait (no-op when profiling since each op already syncs)
    fGC += "\n\n   alpaka::wait(queue);\n";
+
+   if (fProfile) {
+      fGC += RModelProfilerGPU::GenerateEndInferCode();
+   }
+
    fGC += "}\n\n";
 
 
@@ -446,7 +477,7 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    for (auto &p : dynParamNames)
       spanDynDecl += ", size_t " + p;
 
-   fGC += "__host__ void infer(std::span<ViewConstF1D const> inputs, std::span<ViewF1D> outputs" + spanDynDecl + "){\n";
+   fGC += "void infer(std::span<ViewConstF1D const> inputs, std::span<ViewF1D> outputs" + spanDynDecl + "){\n";
 
    {
       fGC += SP + "_infer_impl(";
@@ -489,7 +520,7 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
       returnType += ">";
    }
 
-   fGC += "__host__ " + returnType + " infer(";
+   fGC += returnType + " infer(";
    fGC += GenerateInferSignature_GPU_ALPAKA();
    fGC += "){\n";
 
@@ -659,6 +690,10 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    GenerateInitializedTensorInfo_GPU_ALPAKA();
    GenerateGPU_ALPAKA_Buffers();
    GenerateOperatorDeclarations();
+   // inject profiling session data member
+   if (fProfile) {
+      fGC += RModelProfilerGPU::GenerateSessionMembers();
+   }
 
    // Session constructor
    if (fUseSession) {
@@ -748,14 +783,25 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
    GenerateOutput_GPU_ALPAKA();
 
+   // inject GPU profiling utility functions and memory report inside Session struct
+   if (fProfile && fUseSession) {
+      fGC += RModelProfilerGPU::GenerateUtilityFunctions();
+      auto memInfo = RModelProfilerGPU::ComputeMemoryInfo(*this);
+      fGC += RModelProfilerGPU::GenerateMemoryReport(memInfo);
+   }
+
    if (fUseSession && !fIsGNNComponent) {
       fGC += "};   // end of Session\n";
    }
 }
 
 void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int batchSize, bool verbose) {
+   fProfile = static_cast<bool>(options & static_cast<std::underlying_type_t<Options>>(Options::kProfile));
    fVerbose = true;
    fBatchSize = batchSize;
+
+   if (fProfile)
+      RModelProfilerGPU::AddNeededStdLibs(*this);
 
    if (static_cast<std::underlying_type_t<Options>>(Options::kNoSession) & options) {
       fUseSession = false;

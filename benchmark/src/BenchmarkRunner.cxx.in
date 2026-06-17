@@ -53,6 +53,18 @@ int main(int argc, char *argv[]) {
         else if  (a == "--single-model"                && i + 1 < argc) singleModel = argv[++i];
         else if  (a == "--onnxruntime"   || a == "--ort")               run_ort    = true;
         else if  (a == "--help"          || a == "-h") {
+#ifdef SOFIE_BENCHMARK_PROFILE
+            std::cout <<
+                "Usage: sofie_benchmark [options]  [PROFILING MODE]\n"
+                "  Per-operator GPU timing (alpaka::wait per op) + memory breakdown.\n"
+                "  Throughput benchmarking is disabled in this build.\n"
+                "  Rebuild without -DSOFIE_BENCHMARK_PROFILE=ON for throughput numbers.\n\n"
+                "  --warmup,      -w <N>   Warmup iterations  (default: 10)\n"
+                "  --iterations,  -n <N>   Profiling runs      (default: 100)\n"
+                "  --weights-dir    <DIR>  SOFIE .dat files    (default: .)\n"
+                "  --single-model   <N>   Run one model (internal)\n"
+                ;
+#else
             std::cout <<
                 "Usage: sofie_benchmark [options]\n"
                 "  --warmup,      -w <N>   Warmup iterations       (default: 10)\n"
@@ -63,8 +75,10 @@ int main(int argc, char *argv[]) {
 #else
                 "  --onnxruntime, --ort    (not available; rebuild with -DSOFIE_BENCHMARK_ORT=ON)\n"
 #endif
+                "  Rebuild with -DSOFIE_BENCHMARK_PROFILE=ON for per-operator profiling.\n"
                 "  --single-model   <N>   Run exactly one model by C++ name (internal)\n"
                 ;
+#endif
             return 0;
         }
     }
@@ -90,8 +104,13 @@ int main(int argc, char *argv[]) {
     }
 #endif
 
+#ifdef SOFIE_BENCHMARK_PROFILE
+    std::printf("=== SOFIE Alpaka Profiler ===\n");
+    std::printf("Backend: @SOFIE_BENCHMARK_BACKEND@  |  Warmup: %d  |  Iterations: %d\n\n",
+                warmup, iterations);
+#else
     std::printf("=== SOFIE Alpaka Benchmark ===\n");
-    std::printf("Warmup: %d  |  Iterations: %d", warmup, iterations);
+    std::printf("Backend: @SOFIE_BENCHMARK_BACKEND@  |  Warmup: %d  |  Iterations: %d", warmup, iterations);
 #ifdef SOFIE_BENCHMARK_ORT
     if (run_ort) std::printf("  |  ORT-GPU: ON");
 #endif
@@ -100,6 +119,7 @@ int main(int argc, char *argv[]) {
     std::printf("%-40s  %12s  %14s  %15s  %16s\n",
                 "Model", "infer(ms)", "in_xfer(ms)", "out_xfer(ms)", "Throughput(inf/s)");
     std::printf("%s\n", std::string(103, '-').c_str());
+#endif  // SOFIE_BENCHMARK_PROFILE
     std::fflush(stdout);
 
     // Build the common argument suffix forwarded to every subprocess.
