@@ -185,6 +185,112 @@ public:
       }
       return out.str();
    }
+
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+      if (fShape.empty())
+         throw std::runtime_error("SOFIE Softmax called to Generate_GPU_Kernel_ALPAKA without being initialized first");
+
+      opName = "op_" + opName;
+      std::string kname = "SoftmaxKernel_" + opName;
+
+      size_t size = fShape.size();
+      size_t axis = fAttrAxis < 0 ? size + fAttrAxis : fAttrAxis;
+
+      std::string axis_size    = fShape[axis].GetVal();// per-row reduction length
+      std::string inner_stride = UTILITY::ComputeStrideFromShape(fShape)[axis].GetVal();// stride along the axis
+
+      //one thread per row, serial 3-pass softmax (max, exp+sum, normalize).
+      std::string op;
+      op  = "\n//------ SOFTMAX_KERNEL_ALPAKA\n";
+      op += SP + "struct " + kname + " {\n";
+      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
+      op += SP + SP + SP + "TAcc const& acc,\n";
+      op += SP + SP + SP + "T const* __restrict__ X,\n";
+      op += SP + SP + SP + "T* __restrict__ Y,\n";
+      op += SP + SP + SP + "std::size_t const numRows) const {\n\n";
+
+      op += SP + SP + SP + "auto const gid = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "auto const grid_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+
+      op += SP + SP + SP + "std::size_t const axis_size = " + axis_size + ";\n";
+      op += SP + SP + SP + "std::size_t const inner_stride = " + inner_stride + ";\n";
+      op += SP + SP + SP + "std::size_t const row_block = axis_size * inner_stride;\n\n";
+
+      op += SP + SP + SP + "for (std::size_t r = gid; r < numRows; r += grid_extent) {\n";
+      op += SP + SP + SP + SP + "std::size_t const row_base = (r / inner_stride) * row_block + (r % inner_stride);\n\n";
+
+      op += SP + SP + SP + SP + "// pass 1: max\n";
+      op += SP + SP + SP + SP + "T vmax = X[row_base];\n";
+      op += SP + SP + SP + SP + "for (std::size_t l = 1; l < axis_size; ++l) {\n";
+      op += SP + SP + SP + SP + SP + "T v = X[row_base + l * inner_stride];\n";
+      op += SP + SP + SP + SP + SP + "if (v > vmax) vmax = v;\n";
+      op += SP + SP + SP + SP + "}\n\n";
+
+      op += SP + SP + SP + SP + "// pass 2: exp(x - max), sum\n";
+      op += SP + SP + SP + SP + "T sum = static_cast<T>(0);\n";
+      op += SP + SP + SP + SP + "for (std::size_t l = 0; l < axis_size; ++l) {\n";
+      op += SP + SP + SP + SP + SP + "std::size_t const idx = row_base + l * inner_stride;\n";
+      op += SP + SP + SP + SP + SP + "T e = alpaka::math::exp(acc, X[idx] - vmax);\n";
+      op += SP + SP + SP + SP + SP + "Y[idx] = e;\n";
+      op += SP + SP + SP + SP + SP + "sum += e;\n";
+      op += SP + SP + SP + SP + "}\n\n";
+
+      op += SP + SP + SP + SP + "// pass 3: normalize\n";
+      op += SP + SP + SP + SP + "T inv = static_cast<T>(1) / sum;\n";
+      op += SP + SP + SP + SP + "for (std::size_t l = 0; l < axis_size; ++l) {\n";
+      op += SP + SP + SP + SP + SP + "std::size_t const idx = row_base + l * inner_stride;\n";
+      op += SP + SP + SP + SP + SP + "Y[idx] *= inv;\n";
+      if (fLogSoftmax)
+         op += SP + SP + SP + SP + SP + "Y[idx] = alpaka::math::log(acc, Y[idx]);\n";
+      op += SP + SP + SP + SP + "}\n";
+
+      op += SP + SP + SP + "}\n";// row loop end
+      op += SP + SP + "}\n";// operator() end
+      op += SP + "};\n";
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      std::string kname = "SoftmaxKernel_" + opName;
+      return SP + kname + " softmaxKernel_" + opName + ";\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string opName) override {
+      if (fShape.empty())
+         throw std::runtime_error("SOFIE Softmax called to Generate_GPU_ALPAKA without being initialized first");
+
+      opName = "op_" + opName;
+      std::string kname = "softmaxKernel_" + opName;
+
+      size_t size = fShape.size();
+      size_t axis = fAttrAxis < 0 ? size + fAttrAxis : fAttrAxis;
+      std::string axis_size  = fShape[axis].GetVal();
+      std::string length_str = ConvertDimShapeToLength(fShape);
+
+      std::string num_rows;
+      if (IsInteger(length_str) && IsInteger(axis_size))
+         num_rows = std::to_string(std::stoul(length_str) / std::stoul(axis_size));
+      else
+         num_rows = "(" + length_str + ") / (" + axis_size + ")";
+
+      std::stringstream out;
+      out << "\n//------ SOFTMAX_GPU_ALPAKA\n";
+      out << SP << "auto const elementsPerThread_" << opName << " = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_"   << opName << " = Vec::all(Idx{" << num_rows << "});\n";
+      out << SP << "auto const workDiv_" << opName << " = sofie_workdiv(elementsPerGrid_" << opName << ");\n";
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << opName
+          << ", " << kname
+          << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
+          << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+          << ", static_cast<Idx>(" << num_rows << "));\n";
+      return out.str();
+   }
+
+   std::vector<std::string> GetStdLibs() override {
+      return { std::string("cmath") };
+   }
 };
 
 } // namespace SOFIE
