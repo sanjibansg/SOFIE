@@ -28,7 +28,7 @@ env:
 jobs:
   benchmark:
     name: Benchmark Comparison (H100)
-    runs-on: [self-hosted, ml4ep-h100]
+    runs-on: ml4ep-h100
     container: registry.cern.ch/ngt/lxplus-like:9
     timeout-minutes: 120
 
