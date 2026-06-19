@@ -1,0 +1,12 @@
+name: test-ci
+on:
+  workflow_dispatch:
+
+jobs:
+  test-ci:
+    runs-on: cern-nextgen-h100 
+    container: registry.cern.ch/ngt/lxplus-like:9 
+    steps:
+      - name: nvidia-smi
+        run: |
+          nvidia-smi
