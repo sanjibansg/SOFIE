@@ -21,7 +21,7 @@ env:
 jobs:
   gpu-tests:
     name: GPU Unit Tests (NVIDIA/H100)
-    runs-on: [self-hosted, ml4ep-h100]
+    runs-on: ml4ep-h100
     container: registry.cern.ch/ngt/lxplus-like:9
     timeout-minutes: 60
 
