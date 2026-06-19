@@ -1,6 +1,8 @@
 name: test-ci
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - test-ci
 
 jobs:
   test-ci:
