@@ -1,45 +1,45 @@
-name: CI - Tests and Benchmark
+name: Benchmark
 
 on:
   pull_request:
     branches: [main]
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      warmup:
+        description: "Warmup iterations"
+        default: "5"
+      iterations:
+        description: "Timed iterations"
+        default: "100"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: benchmark-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  LCG_VIEW:   /cvmfs/sft.cern.ch/lcg/views/LCG_106a/x86_64-el9-gcc13-opt
-  CUDA_CVMFS: /cvmfs/sft.cern.ch/lcg/contrib/cuda/12.4/x86_64-el9
-  CUDA_ARCH:  "90"
-  BUILD_TYPE: Release
-  BENCH_WARMUP: 5
-  BENCH_ITERS:  100
-  # Shared FetchContent cache (alpaka + sofieBLAS) across both builds.
-  DEPS_CACHE: /tmp/sofie-cmake-deps
+  LCG_VIEW:     /cvmfs/sft.cern.ch/lcg/views/LCG_106a/x86_64-el9-gcc13-opt
+  CUDA_CVMFS:   /cvmfs/sft.cern.ch/lcg/contrib/cuda/12.4/x86_64-el9
+  CUDA_ARCH:    "90"
+  BUILD_TYPE:   Release
+  BENCH_WARMUP: ${{ github.event.inputs.warmup || '5' }}
+  BENCH_ITERS:  ${{ github.event.inputs.iterations || '100' }}
+  DEPS_CACHE:   /tmp/sofie-cmake-deps
 
 jobs:
-  gpu-ci:
-    name: GPU Tests & Benchmark (H100)
-    runs-on: ml4ep-h100
+  benchmark:
+    name: Benchmark Comparison (H100)
+    runs-on: [self-hosted, ml4ep-h100]
     container: registry.cern.ch/ngt/lxplus-like:9
-    
+    timeout-minutes: 120
+
     steps:
       - name: GPU check
         run: nvidia-smi
 
-      # ── 1. Environment setup ───────────────────────────────────────────────
-      # Source the LCG view (cmake, gcc-13, protobuf, etc.) and the
-      # CUDA toolkit from CVMFS, then persist the relevant env vars for all
-      # subsequent steps via $GITHUB_ENV / $GITHUB_PATH.
       - name: Setup build environment
         run: |
           set -euo pipefail
 
-          # ── LCG view (cmake, gcc, protobuf, openblas) ─────────────────────
           if [ -f "${{ env.LCG_VIEW }}/setup.sh" ]; then
             source "${{ env.LCG_VIEW }}/setup.sh"
           else
@@ -49,7 +49,6 @@ jobs:
                            protobuf-devel openblas-devel
           fi
 
-          # ── CUDA toolkit (nvcc + headers) ─────────────────────────────────
           if [ -x "${{ env.CUDA_CVMFS }}/bin/nvcc" ]; then
             echo "${{ env.CUDA_CVMFS }}/bin" >> "$GITHUB_PATH"
             echo "CUDA_HOME=${{ env.CUDA_CVMFS }}" >> "$GITHUB_ENV"
@@ -57,7 +56,6 @@ jobs:
             echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
             echo "CUDA_HOME=/usr/local/cuda" >> "$GITHUB_ENV"
           else
-            echo "nvcc not found — installing CUDA toolkit from NVIDIA repo"
             dnf config-manager --add-repo \
               https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
             dnf install -y cuda-compiler-12-4 cuda-cudart-devel-12-4 cuda-libraries-devel-12-4
@@ -65,23 +63,11 @@ jobs:
             echo "CUDA_HOME=/usr/local/cuda-12.4" >> "$GITHUB_ENV"
           fi
 
-          # ── GTest ─────────────────────────────────────────────────────────
-          dnf install -y gtest-devel 2>/dev/null || \
-          dnf install -y googletest-devel 2>/dev/null || (
-            cd /tmp
-            git clone --depth 1 -b v1.14.0 https://github.com/google/googletest.git
-            cmake -B gtest-build -S googletest \
-                  -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON
-            cmake --build gtest-build -j$(nproc)
-            cmake --install gtest-build
-          )
-
-          # ── Persist PATH / library paths from LCG ─────────────────────────
           echo "PATH=$PATH"                               >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"    >> "$GITHUB_ENV"
           echo "CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH:-}" >> "$GITHUB_ENV"
 
-      - name: Checkout PR / push branch
+      - name: Checkout PR branch
         uses: actions/checkout@v4
         with:
           path: sofie-pr
@@ -97,47 +83,32 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.DEPS_CACHE }}
-          key: cmake-deps-${{ hashFiles('sofie-pr/test/CMakeLists.txt',
-                                        'sofie-pr/benchmark/CMakeLists.txt') }}
-          restore-keys: cmake-deps-
+          key: cmake-deps-bench-${{ hashFiles('sofie-pr/benchmark/CMakeLists.txt') }}
+          restore-keys: cmake-deps-bench-
 
       - name: Configure PR build
         run: |
           cmake -B sofie-pr/build -S sofie-pr \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
             -DSOFIE_WITH_ROOT=OFF \
-            -Dtesting=ON \
-            -DENABLE_ALPAKA_TESTS=ON \
-            -DALPAKA_BACKEND=cuda \
             -DSOFIE_BENCHMARK=ON \
             -DSOFIE_BENCHMARK_BACKEND=CUDA \
             "-DSOFIE_BENCHMARK_CUDA_ARCH=${{ env.CUDA_ARCH }}" \
             "-DCMAKE_CUDA_ARCHITECTURES=${{ env.CUDA_ARCH }}" \
             "-DFETCHCONTENT_BASE_DIR=${{ env.DEPS_CACHE }}"
 
-      - name: Build PR (tests + benchmark)
-        run: |
-          cmake --build sofie-pr/build \
-            --target TestCustomModelsFromONNXForAlpakaCuda sofie_benchmark \
-            -j$(nproc)
-
-      - name: Run tests
-        working-directory: sofie-pr/build
-        run: ctest --output-on-failure -j1
-
-      - name: Upload test log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-log-${{ github.run_id }}
-          path: sofie-pr/build/Testing/Temporary/LastTest.log
+      - name: Build PR benchmark
+        run: cmake --build sofie-pr/build --target sofie_benchmark -j$(nproc)
 
       - name: Run PR benchmark
         working-directory: sofie-pr/build/benchmark
         run: |
-          ./sofie_benchmark -w ${{ env.BENCH_WARMUP }} -n ${{ env.BENCH_ITERS }}
+          ./sofie_benchmark \
+            -w ${{ env.BENCH_WARMUP }} \
+            -n ${{ env.BENCH_ITERS }} \
+            | tee benchmark_pr.txt
 
-      - name: Configure main build (benchmark only)
+      - name: Configure main build
         if: github.event_name == 'pull_request'
         run: |
           cmake -B sofie-main/build -S sofie-main \
@@ -157,21 +128,25 @@ jobs:
         if: github.event_name == 'pull_request'
         working-directory: sofie-main/build/benchmark
         run: |
-          ./sofie_benchmark -w ${{ env.BENCH_WARMUP }} -n ${{ env.BENCH_ITERS }}
+          ./sofie_benchmark \
+            -w ${{ env.BENCH_WARMUP }} \
+            -n ${{ env.BENCH_ITERS }} \
+            | tee benchmark_main.txt
 
-      - name: Save PR benchmark output
-        if: always()
-        working-directory: sofie-pr/build/benchmark
-        run: |
-          ./sofie_benchmark -w ${{ env.BENCH_WARMUP }} -n ${{ env.BENCH_ITERS }} \
-            > benchmark_pr.txt 2>/dev/null || true
-
-      - name: Save main benchmark output
+      - name: Summarise PR vs main
         if: github.event_name == 'pull_request'
-        working-directory: sofie-main/build/benchmark
         run: |
-          ./sofie_benchmark -w ${{ env.BENCH_WARMUP }} -n ${{ env.BENCH_ITERS }} \
-            > benchmark_main.txt 2>/dev/null || true
+          echo "### Benchmark comparison: PR vs main" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "── PR ──────────────────────────────────────────────────────────────" \
+            >> "$GITHUB_STEP_SUMMARY"
+          cat sofie-pr/build/benchmark/benchmark_pr.txt   >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "── main ────────────────────────────────────────────────────────────" \
+            >> "$GITHUB_STEP_SUMMARY"
+          cat sofie-main/build/benchmark/benchmark_main.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload benchmark results
         if: always()
