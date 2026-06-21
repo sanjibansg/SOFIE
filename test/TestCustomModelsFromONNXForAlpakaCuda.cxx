@@ -176,6 +176,9 @@
 #include "Clip_FromONNX_GPU_ALPAKA.hxx"
 #include "Not_FromONNX_GPU_ALPAKA.hxx"
 
+#include "TopK_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/TopK.ref.hxx"
+
 #include "GNN_model_FromONNX_GPU_ALPAKA.hxx"
 
 #include <alpaka/alpaka.hpp>
@@ -3160,4 +3163,43 @@ TEST_F(SofieAlpakaTest, Logic_BitwiseNot)
    int32_t* ref = Logic_BitwiseNot_ExpectedOutput::outputs;
    for (std::size_t i = 0; i < N; ++i)
       EXPECT_EQ(res[i], ref[i]) << "  index=" << i;
+}
+
+TEST_F(SofieAlpakaTest, TopK)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+   // axis=-1, largest=1, sorted=1, k=5 (baked); input is a single 9-element row
+   std::vector<float> input {9.0, 8.0, 4.5, 1.7, 2.9, 3.2, 4.0, 2.6, 7.4};
+   constexpr std::size_t K = 5;
+
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
+
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+
+   auto values_h  = alpaka::allocBuf<float,   Idx>(host, Ext1D::all(Idx{K}));
+   auto indices_h = alpaka::allocBuf<int64_t, Idx>(host, Ext1D::all(Idx{K}));
+
+   {
+      SOFIE_TopK::Session<alpaka::TagGpuCudaRt> session;
+      auto [values, indices] = session.infer(input_d);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+
+      alpaka::memcpy(queue, values_h,  values);
+      alpaka::memcpy(queue, indices_h, indices);
+      alpaka::wait(queue);
+   }
+
+   float*   val = reinterpret_cast<float*>(alpaka::getPtrNative(values_h));
+   int64_t* idx = reinterpret_cast<int64_t*>(alpaka::getPtrNative(indices_h));
+
+   for (std::size_t i = 0; i < K; ++i) {
+      EXPECT_LE(std::abs(val[i] - TopK_ExpectedOutput::values[i]), TOLERANCE) << "  value index=" << i;
+      EXPECT_EQ(idx[i], static_cast<int64_t>(TopK_ExpectedOutput::indexes[i])) << "  index index=" << i;
+   }
 }
