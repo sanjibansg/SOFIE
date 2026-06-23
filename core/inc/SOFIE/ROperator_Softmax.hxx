@@ -218,9 +218,11 @@ public:
       const size_t kBlock = SoftmaxBlockSize();   // threads per row (block)
       std::string bs = std::to_string(kBlock);
 
-      // block-per-row: a block of kBlock threads reduces one row cooperatively.
-      // each thread strides over the row (coalesced for the last-axis case), then
-      // two shared-memory tree reductions compute the row max and the sum.
+      // block-per-row online softmax (Milakov & Gimelshein 2018, arXiv:1805.02867).
+      // a block of kBlock threads reduces one row cooperatively; each thread strides
+      // over the row (coalesced for the last-axis case) keeping a running (max, sum)
+      // pair, then a single shared-memory tree reduction merges the pairs with the online opeartor
+
       std::string op;
       op  = "\n//------ SOFTMAX_KERNEL_ALPAKA\n";
       op += SP + "struct " + kname + " {\n";
@@ -231,7 +233,10 @@ public:
       op += SP + SP + SP + "T* __restrict__ Y,\n";
       op += SP + SP + SP + "std::size_t const numRows) const {\n\n";
 
-      op += SP + SP + SP + "auto& sdata = alpaka::declareSharedVar<T[" + bs + "], __COUNTER__>(acc);\n";
+      // running max and sum live in shared memory; declared before the early return
+      // and every thread in the block reaches the collective declaration.
+      op += SP + SP + SP + "auto& smax = alpaka::declareSharedVar<T[" + bs + "], __COUNTER__>(acc);\n";
+      op += SP + SP + SP + "auto& ssum = alpaka::declareSharedVar<T[" + bs + "], __COUNTER__>(acc);\n";
       op += SP + SP + SP + "auto const row = alpaka::getIdx<alpaka::Grid, alpaka::Blocks>(acc)[0];\n";
       op += SP + SP + SP + "auto const tid = alpaka::getIdx<alpaka::Block, alpaka::Threads>(acc)[0];\n";
       op += SP + SP + SP + "if (row >= numRows) return;\n\n";
@@ -241,48 +246,47 @@ public:
       op += SP + SP + SP + "std::size_t const row_block = axis_size * inner_stride;\n";
       op += SP + SP + SP + "std::size_t const row_base = (row / inner_stride) * row_block + (row % inner_stride);\n\n";
 
-      // pass 1: row max (partial per thread, then shared-memory tree reduce)
-      op += SP + SP + SP + "// pass 1: row max\n";
-      op += SP + SP + SP + "T tmax = X[row_base];\n";
+      // fused pass: running max m and normalizer d over this thread's slice
+      // d is updated branchlessly; when the max does not move the correction will simply be exp(0)=1
+      op += SP + SP + SP + "// fused pass: running (max, sum) per thread\n";
+      op += SP + SP + SP + "T m = X[row_base];\n";
+      op += SP + SP + SP + "T d = static_cast<T>(0);\n";
       op += SP + SP + SP + "for (std::size_t l = tid; l < axis_size; l += " + bs + "u) {\n";
-      op += SP + SP + SP + SP + "T v = X[row_base + l * inner_stride];\n";
-      op += SP + SP + SP + SP + "if (v > tmax) tmax = v;\n";
+      op += SP + SP + SP + SP + "T x = X[row_base + l * inner_stride];\n";
+      op += SP + SP + SP + SP + "T m_new = (x > m) ? x : m;\n";
+      op += SP + SP + SP + SP + "d = d * alpaka::math::exp(acc, m - m_new) + alpaka::math::exp(acc, x - m_new);\n";
+      op += SP + SP + SP + SP + "m = m_new;\n";
       op += SP + SP + SP + "}\n";
-      op += SP + SP + SP + "sdata[tid] = tmax;\n";
-      op += SP + SP + SP + "alpaka::syncBlockThreads(acc);\n";
-      op += SP + SP + SP + "for (std::size_t s = " + bs + "u / 2u; s >= 1u; s /= 2u) {\n";
-      op += SP + SP + SP + SP + "if (tid < s && sdata[tid + s] > sdata[tid]) sdata[tid] = sdata[tid + s];\n";
-      op += SP + SP + SP + SP + "alpaka::syncBlockThreads(acc);\n";
-      op += SP + SP + SP + "}\n";
-      op += SP + SP + SP + "T const vmax = sdata[0];\n";
+      op += SP + SP + SP + "smax[tid] = m;\n";
+      op += SP + SP + SP + "ssum[tid] = d;\n";
       op += SP + SP + SP + "alpaka::syncBlockThreads(acc);\n\n";
 
-      // pass 2: exp(x - max) -> Y, sum (tree reduce)
-      op += SP + SP + SP + "// pass 2: exp(x - max) and sum\n";
-      op += SP + SP + SP + "T tsum = static_cast<T>(0);\n";
-      op += SP + SP + SP + "for (std::size_t l = tid; l < axis_size; l += " + bs + "u) {\n";
-      op += SP + SP + SP + SP + "std::size_t const idx = row_base + l * inner_stride;\n";
-      op += SP + SP + SP + SP + "T e = alpaka::math::exp(acc, X[idx] - vmax);\n";
-      op += SP + SP + SP + SP + "Y[idx] = e;\n";
-      op += SP + SP + SP + SP + "tsum += e;\n";
-      op += SP + SP + SP + "}\n";
-      op += SP + SP + SP + "sdata[tid] = tsum;\n";
-      op += SP + SP + SP + "alpaka::syncBlockThreads(acc);\n";
+      // single tree reduction merging (max, sum) pairs with the online operator
+      // (m_a, d_a) + (m_b, d_b) = (max, d_a*exp(m_a-max) + d_b*exp(m_b-max))
+      op += SP + SP + SP + "// combined (max, sum) tree reduction\n";
       op += SP + SP + SP + "for (std::size_t s = " + bs + "u / 2u; s >= 1u; s /= 2u) {\n";
-      op += SP + SP + SP + SP + "if (tid < s) sdata[tid] += sdata[tid + s];\n";
+      op += SP + SP + SP + SP + "if (tid < s) {\n";
+      op += SP + SP + SP + SP + SP + "T m_a = smax[tid];\n";
+      op += SP + SP + SP + SP + SP + "T m_b = smax[tid + s];\n";
+      op += SP + SP + SP + SP + SP + "T m_r = (m_b > m_a) ? m_b : m_a;\n";
+      op += SP + SP + SP + SP + SP + "ssum[tid] = ssum[tid] * alpaka::math::exp(acc, m_a - m_r) + ssum[tid + s] * alpaka::math::exp(acc, m_b - m_r);\n";
+      op += SP + SP + SP + SP + SP + "smax[tid] = m_r;\n";
+      op += SP + SP + SP + SP + "}\n";
       op += SP + SP + SP + SP + "alpaka::syncBlockThreads(acc);\n";
       op += SP + SP + SP + "}\n";
-      op += SP + SP + SP + "T const sum = sdata[0];\n";
+      op += SP + SP + SP + "T const vmax = smax[0];\n";
+      op += SP + SP + SP + "T const sum = ssum[0];\n";
       op += SP + SP + SP + "alpaka::syncBlockThreads(acc);\n\n";
 
-      // pass 3: normalize
-      op += SP + SP + SP + "// pass 3: normalize\n";
+      // normalize pass: recompute exp(x - max) and write Y once
+      op += SP + SP + SP + "// normalize pass\n";
       op += SP + SP + SP + "T const inv = static_cast<T>(1) / sum;\n";
       op += SP + SP + SP + "for (std::size_t l = tid; l < axis_size; l += " + bs + "u) {\n";
       op += SP + SP + SP + SP + "std::size_t const idx = row_base + l * inner_stride;\n";
-      op += SP + SP + SP + SP + "Y[idx] *= inv;\n";
+      op += SP + SP + SP + SP + "T e = alpaka::math::exp(acc, X[idx] - vmax) * inv;\n";
+      op += SP + SP + SP + SP + "Y[idx] = e;\n";
       if (fLogSoftmax)
-         op += SP + SP + SP + SP + "Y[idx] = alpaka::math::log(acc, Y[idx]);\n";
+         op += SP + SP + SP + SP + "Y[idx] = alpaka::math::log(acc, e);\n";
       op += SP + SP + SP + "}\n";
 
       op += SP + SP + "}\n";// operator() end
@@ -322,11 +326,12 @@ public:
       out << SP << SP << "Vec::all(static_cast<Idx>(" << num_rows << ")),\n";// numBlocks = one block per row
       out << SP << SP << "Vec::all(Idx{" << kBlock << "u}),\n";// threads per block
       out << SP << SP << "Vec::all(Idx{1u}));\n";
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << opName
+      out << SP << "auto task_" << opName << " = alpaka::createTaskKernel<Acc>(workDiv_" << opName
           << ", " << kname
           << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
           << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
           << ", static_cast<Idx>(" << num_rows << "));\n";
+      out << SP << "alpaka::enqueue(queue, task_" << opName << ");\n";
       return out.str();
    }
 
