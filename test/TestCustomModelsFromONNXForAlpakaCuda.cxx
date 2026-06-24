@@ -175,6 +175,8 @@
 #include "IsNaN_FromONNX_GPU_ALPAKA.hxx"
 #include "Clip_FromONNX_GPU_ALPAKA.hxx"
 #include "Not_FromONNX_GPU_ALPAKA.hxx"
+#include "Pad_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/Pad.ref.hxx"
 
 #include "GNN_model_FromONNX_GPU_ALPAKA.hxx"
 
@@ -3160,4 +3162,37 @@ TEST_F(SofieAlpakaTest, Logic_BitwiseNot)
    int32_t* ref = Logic_BitwiseNot_ExpectedOutput::outputs;
    for (std::size_t i = 0; i < N; ++i)
       EXPECT_EQ(res[i], ref[i]) << "  index=" << i;
+}
+
+TEST_F(SofieAlpakaTest, Pad)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+   // input shape [1,2,2] -> output shape [2,3,5] (constant pad, before=[1,1,1] after=[0,0,2])
+   constexpr Idx inputSize  = 4;
+   constexpr Idx outputSize = 30;
+
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{inputSize}));
+   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+   for (Idx i = 0; i < inputSize; ++i)
+      input_ptr[i] = static_cast<float>(i + 1);   // 1,2,3,4
+
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{inputSize}));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
+   {
+      SOFIE_Pad::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(input_d);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float* ref = Pad_ExpectedOutput::outputs;
+   for (std::size_t i = 0; i < outputSize; ++i)
+      EXPECT_LE(std::abs(res[i] - ref[i]), TOLERANCE) << "  index=" << i;
 }

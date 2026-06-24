@@ -191,9 +191,105 @@ public:
       return out.str();
    }
 
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+      if (fOutputShape.empty())
+         throw std::runtime_error("SOFIE Pad called to Generate_GPU_Kernel_ALPAKA without being initialized first");
+
+      const size_t D = fOutputShape.size(); //dimensions
+
+      auto inputStrides = UTILITY::ComputeStrideFromShape(fInputShape);
+      auto outputStrides = UTILITY::ComputeStrideFromShape(fOutputShape);
+      size_t totalElements = ConvertShapeToLength(fOutputShape);
+      opName = "op_" + opName;
+      std::string kname = "PadKernel_" + opName;
+
+      std::stringstream cv;
+      cv << fConstantValue;
+
+      std::string op;
+      op  = "\n//------ PAD_KERNEL_ALPAKA\n";
+      op += SP + "struct " + kname + " {\n";
+      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
+      op += SP + SP + SP + "TAcc const& acc,\n";
+      op += SP + SP + SP + "T const* __restrict__ input,\n";
+      op += SP + SP + SP + "T* __restrict__ output,\n";
+      op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
+
+      op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (global_thread_idx >= totalElements) return;\n";
+      op += SP + SP + SP + "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+
+      op += SP + SP + SP + "for (std::size_t elem_idx = global_thread_idx; elem_idx < totalElements; elem_idx += grid_thread_extent) {\n\n";
+
+      for (std::size_t d = 0; d < D; ++d) {
+         op += SP + SP + SP + SP + "std::size_t const out_" + std::to_string(d)
+               + " = (elem_idx / " + std::to_string(outputStrides[d]) + "u) % "
+               + std::to_string(fOutputShape[d]) + "u;\n";
+      }
+      op += "\n";
+
+      op += SP + SP + SP + SP + "bool interior = true;\n";
+      for (std::size_t d = 0; d < D; ++d) {
+         std::string hi = std::to_string(fPads[d].first + static_cast<int64_t>(fInputShape[d]));
+         op += SP + SP + SP + SP + "interior = interior";
+         if (fPads[d].first > 0)
+            op += " && (out_" + std::to_string(d) + " >= " + std::to_string(fPads[d].first) + "u)";
+         op += " && (out_" + std::to_string(d) + " < " + hi + "u);\n";
+      }
+      op += "\n";
+
+      op += SP + SP + SP + SP + "if (interior) {\n";
+      op += SP + SP + SP + SP + SP + "std::size_t const input_idx =\n";
+      for (std::size_t d = 0; d < D; ++d) {
+         std::string lo = std::to_string(fPads[d].first);
+         op += SP + SP + SP + SP + SP + SP
+               + "(out_" + std::to_string(d) + " - " + lo + "u) * "
+               + std::to_string(inputStrides[d]) + "u";
+         op += (d + 1 < D) ? " +\n" : ";\n";
+      }
+      op += SP + SP + SP + SP + SP + "output[elem_idx] = input[input_idx];\n";
+      op += SP + SP + SP + SP + "} else {\n";
+      op += SP + SP + SP + SP + SP + "output[elem_idx] = static_cast<T>(" + cv.str() + ");\n";
+      op += SP + SP + SP + SP + "}\n";
+
+      op += SP + SP + SP + "}\n";
+      op += SP + SP + "}\n";
+      op += SP + "};\n";
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      std::string kname = "PadKernel_" + opName;
+      return SP + kname + " padKernel_" + opName + ";\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      if (fInputShape.empty() || fOutputShape.empty())
+         throw std::runtime_error("SOFIE Pad Op called to Generate without being initialized first");
+
+      std::size_t totalElements = ConvertShapeToLength(fOutputShape);
+      std::string kname = "padKernel_" + opName;
+
+      std::stringstream out;
+      out << "\n//------ PAD_GPU_ALPAKA\n";
+      out << SP << "auto const elementsPerThread_" << opName << " = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_"   << opName << " = Vec::all(Idx{" << totalElements << "});\n";
+      out << SP << "auto const workDiv_" << opName << " = sofie_workdiv(elementsPerGrid_" << opName << ");\n";
+      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << opName
+         << ", " << kname
+         << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
+         << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+         << ", static_cast<Idx>(" << totalElements << "));\n";
+
+      return out.str();
+   }
+
 };
 
 }//SOFIE
 
 
-#endif //SOFIE_ROPERATOR_Swish
+#endif //SOFIE_ROPERATOR_Pad
