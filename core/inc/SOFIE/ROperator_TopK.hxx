@@ -172,20 +172,47 @@ public:
       return out.str();
    }
 
-   // GPU baseline: one thread per slice along the sorted axis. Each thread keeps a
-   // K-sized insertion-sorted buffer and selects its top-K in a single pass.
+   // next power of two >= the axis length (the bitonic network needs a power-of-2 size)
+   size_t TopKPaddedAxis() const {
+      size_t axis = fAttrAxis < 0 ? fShapeX.size() + fAttrAxis : fAttrAxis;
+      size_t n = fShapeX[axis];
+      size_t p = 1; while (p < n) p <<= 1;
+      return p;
+   }
+   // threads per block: cover the paddedN/2 comparator pairs, capped at 1024, one warp
+   // kernel and launch both call this
+   size_t TopKBlockThreads() const {
+      size_t pairs = TopKPaddedAxis() / 2;
+      size_t bt = (pairs < 1024) ? pairs : 1024;
+      if (bt < 32) bt = 32;
+      return bt;
+   }
+
+   // We have one block per slice. Cache the row in shared memory, bitonic-sort it
+   // best-first (indices ride along for the tie-break), then write the first K.
    std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) override {
       if (fShapeX.empty())
          throw std::runtime_error("SOFIE Operator TopK called to Generate without being initialized first");
 
-      size_t axis  = fAttrAxis < 0 ? fShapeX.size() + fAttrAxis : fAttrAxis;
-      std::string NE  = std::to_string(fShapeX[axis]);
-      std::string K   = std::to_string(fK);
-      std::string CMP = fAttrLargest ? ">" : "<"; // best buffer ordered largest first pr smallest first
+      size_t axis = fAttrAxis < 0 ? fShapeX.size() + fAttrAxis : fAttrAxis;
+      std::string NE = std::to_string(fShapeX[axis]); // real axis length
+      std::string PAD = std::to_string(TopKPaddedAxis()); // next power of two >= NE
+      std::string PADH = std::to_string(TopKPaddedAxis() / 2); // number of comparator pairs
+      std::string BT = std::to_string(TopKBlockThreads()); // threads per block
+      std::string K = std::to_string(fK);
+      std::string OP = fAttrLargest ? ">" : "<"; // best-first value comparator
+      std::string SENT = fAttrLargest ? "std::numeric_limits<T>::lowest()"
+                                      : "std::numeric_limits<T>::max()"; // padded slots never win
       std::string kname = "TopKKernel_" + fNVal;
 
+      // shared-memory budget guard (caches the whole padded row)
+      size_t valBytes = (fType == "double" || fType == "int64_t") ? 8 : 4;
+      if (TopKPaddedAxis() * (valBytes + 8) > 48u * 1024u)
+         throw std::runtime_error("SOFIE TopK GPU: axis length " + NE +
+            " too long for shared-memory bitonic top-K");
+
       std::string op;
-      op  = "\n//------ TopK_KERNEL_ALPAKA\n";
+      op  = "\n//------ TopK_KERNEL_ALPAKA (block-per-row bitonic)\n";
       op += SP + "struct " + kname + " {\n";
       op += SP + SP + "template<typename TAcc, typename T>\n";
       op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
@@ -200,40 +227,48 @@ public:
       op += SP + SP + SP + "std::size_t const strideYAxis,\n";
       op += SP + SP + SP + "std::size_t const strideYBefore) const {\n\n";
 
-      op += SP + SP + SP + "auto const slice = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      // shared row buffers (values + indices), declared before the early return
+      op += SP + SP + SP + "auto& sv = alpaka::declareSharedVar<T[" + PAD + "], __COUNTER__>(acc);\n";
+      op += SP + SP + SP + "auto& si = alpaka::declareSharedVar<int64_t[" + PAD + "], __COUNTER__>(acc);\n";
+      op += SP + SP + SP + "auto const slice = alpaka::getIdx<alpaka::Grid, alpaka::Blocks>(acc)[0];\n";
+      op += SP + SP + SP + "auto const tid   = alpaka::getIdx<alpaka::Block, alpaka::Threads>(acc)[0];\n";
       op += SP + SP + SP + "if (slice >= numSlices) return;\n\n";
 
-      // map the flat slice id to its (before, after) position and base offsets
-      op += SP + SP + SP + "std::size_t const i = slice / nAfter;\n";
-      op += SP + SP + SP + "std::size_t const j = slice % nAfter;\n";
-      op += SP + SP + SP + "std::size_t const xbase = i * strideXBefore + j;\n";
-      op += SP + SP + SP + "std::size_t const ybase = i * strideYBefore + j;\n\n";
+      op += SP + SP + SP + "std::size_t const ib = slice / nAfter;\n";
+      op += SP + SP + SP + "std::size_t const jb = slice % nAfter;\n";
+      op += SP + SP + SP + "std::size_t const xbase = ib * strideXBefore + jb;\n";
+      op += SP + SP + SP + "std::size_t const ybase = ib * strideYBefore + jb;\n\n";
 
-      op += SP + SP + SP + "T bestV[" + K + "];\n";
-      op += SP + SP + SP + "int64_t bestI[" + K + "];\n\n";
+      // 1) load row into shared, pad the tail with a sentinel that never wins
+      op += SP + SP + SP + "for (std::size_t l = tid; l < " + PAD + "u; l += " + BT + "u) {\n";
+      op += SP + SP + SP + SP + "if (l < " + NE + "u) { sv[l] = x[xbase + strideXAxis * l]; si[l] = (int64_t)l; }\n";
+      op += SP + SP + SP + SP + "else { sv[l] = " + SENT + "; si[l] = (int64_t)" + NE + "; }\n";
+      op += SP + SP + SP + "}\n";
+      op += SP + SP + SP + "alpaka::syncBlockThreads(acc);\n\n";
 
-      // first K elements fill the buffer (K <= axis length is guaranteed in Initialize)
-      op += SP + SP + SP + "for (int64_t l = 0; l < " + K + "; ++l) {\n";
-      op += SP + SP + SP + SP + "T v = x[xbase + strideXAxis * (std::size_t)l];\n";
-      op += SP + SP + SP + SP + "int64_t p = l;\n";
-      op += SP + SP + SP + SP + "while (p > 0 && v " + CMP + " bestV[p-1]) { bestV[p] = bestV[p-1]; bestI[p] = bestI[p-1]; --p; }\n";
-      op += SP + SP + SP + SP + "bestV[p] = v; bestI[p] = l;\n";
-      op += SP + SP + SP + "}\n\n";
-
-      // remaining elements only compete with the current worst (bestV[K-1])
-      op += SP + SP + SP + "for (int64_t l = " + K + "; l < " + NE + "; ++l) {\n";
-      op += SP + SP + SP + SP + "T v = x[xbase + strideXAxis * (std::size_t)l];\n";
-      op += SP + SP + SP + SP + "if (v " + CMP + " bestV[" + K + "-1]) {\n";
-      op += SP + SP + SP + SP + SP + "int64_t p = " + K + "-1;\n";
-      op += SP + SP + SP + SP + SP + "while (p > 0 && v " + CMP + " bestV[p-1]) { bestV[p] = bestV[p-1]; bestI[p] = bestI[p-1]; --p; }\n";
-      op += SP + SP + SP + SP + SP + "bestV[p] = v; bestI[p] = l;\n";
+      // 2) bitonic sort: kk = bitonic seq size, jj = compare distance, best ends at index 0.
+      // each thread owns ONE comparator pair (i, i^jj)
+      op += SP + SP + SP + "for (std::size_t kk = 2u; kk <= " + PAD + "u; kk <<= 1) {\n";
+      op += SP + SP + SP + SP + "for (std::size_t jj = kk >> 1; jj > 0u; jj >>= 1) {\n";
+      op += SP + SP + SP + SP + SP + "for (std::size_t t = tid; t < " + PADH + "u; t += " + BT + "u) {\n";
+      op += SP + SP + SP + SP + SP + SP + "std::size_t const i = ((t & ~(jj - 1u)) << 1) | (t & (jj - 1u));\n";
+      op += SP + SP + SP + SP + SP + SP + "std::size_t const p = i | jj;\n";
+      op += SP + SP + SP + SP + SP + SP + "T av = sv[i]; T bv = sv[p];\n";
+      op += SP + SP + SP + SP + SP + SP + "int64_t ai = si[i]; int64_t bi = si[p];\n";
+      op += SP + SP + SP + SP + SP + SP + "bool const firstFirst = (av " + OP + " bv) || (av == bv && ai < bi);\n";
+      op += SP + SP + SP + SP + SP + SP + "bool const dir = ((i & kk) == 0u);\n";
+      op += SP + SP + SP + SP + SP + SP + "bool const sw  = (firstFirst != dir);\n";
+      op += SP + SP + SP + SP + SP + SP + "sv[i] = sw ? bv : av; sv[p] = sw ? av : bv;\n";
+      op += SP + SP + SP + SP + SP + SP + "si[i] = sw ? bi : ai; si[p] = sw ? ai : bi;\n";
+      op += SP + SP + SP + SP + SP + "}\n";
+      op += SP + SP + SP + SP + SP + "alpaka::syncBlockThreads(acc);\n";
       op += SP + SP + SP + SP + "}\n";
       op += SP + SP + SP + "}\n\n";
 
-      // buffer already ordered; ties keep the smaller index since l is scanned ascending
-      op += SP + SP + SP + "for (int64_t s = 0; s < " + K + "; ++s) {\n";
-      op += SP + SP + SP + SP + "vals[ybase + strideYAxis * (std::size_t)s] = bestV[s];\n";
-      op += SP + SP + SP + SP + "inds[ybase + strideYAxis * (std::size_t)s] = bestI[s];\n";
+      // 3) write top-K (already best-first)
+      op += SP + SP + SP + "for (std::size_t s = tid; s < " + K + "u; s += " + BT + "u) {\n";
+      op += SP + SP + SP + SP + "vals[ybase + strideYAxis * s] = sv[s];\n";
+      op += SP + SP + SP + SP + "inds[ybase + strideYAxis * s] = si[s];\n";
       op += SP + SP + SP + "}\n";
 
       op += SP + SP + "}\n";// end operator()
@@ -243,6 +278,10 @@ public:
 
    std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) override {
       return SP + "TopKKernel_" + fNVal + " topKernel_" + fNVal + ";\n";
+   }
+
+   std::vector<std::string> GetStdLibs() override {
+      return { std::string("limits") };
    }
 
    // the geometry is computed here at codegen and passed as args matching the kernel signature.
@@ -265,10 +304,12 @@ public:
 
       std::stringstream out;
       out << "\n//-- TopK_GPU_ALPAKA\n";
-      out << SP << "auto const elementsPerThread_" << fNVal << " = Vec::all(static_cast<Idx>(1));\n";
-      out << SP << "auto const elementsPerGrid_"   << fNVal << " = Vec::all(Idx{" << numSlices << "});\n";
-      out << SP << "auto const workDiv_" << fNVal << " = sofie_workdiv(elementsPerGrid_" << fNVal << ");\n";
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNVal << ", topKernel_" << fNVal
+      const size_t blockThreads = TopKBlockThreads();
+      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_" << fNVal << "(\n";
+      out << SP << SP << "Vec::all(static_cast<Idx>(" << numSlices << ")),\n";
+      out << SP << SP << "Vec::all(Idx{" << blockThreads << "u}),\n";
+      out << SP << SP << "Vec::all(Idx{1u}));\n";
+      out << SP << "auto task_" << fNVal << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNVal << ", topKernel_" << fNVal
           << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
           << ", alpaka::getPtrNative(deviceBuf_" << fNVal << ")"
           << ", alpaka::getPtrNative(deviceBuf_" << fNInd << ")"
@@ -278,6 +319,7 @@ public:
           << ", static_cast<std::size_t>(" << strideX_before<< "u)"
           << ", static_cast<std::size_t>(" << strideY_axis  << "u)"
           << ", static_cast<std::size_t>(" << strideY_before<< "u));\n";
+      out << SP << "alpaka::enqueue(queue, task_" << fNVal << ");\n";
       return out.str();
    }
 
