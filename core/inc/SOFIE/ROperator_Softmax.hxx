@@ -185,6 +185,159 @@ public:
       }
       return out.str();
    }
+
+   // threads per row for the block-per-row kernel, picked from the (static) row
+   // length: next power of 2 >= axis_size, clamped to [32, 1024].
+   // Dynamic axis falls back to 256. Kernel and launch both call this so they always agree.
+   size_t SoftmaxBlockSize() const {
+      size_t axis = fAttrAxis < 0 ? fShape.size() + fAttrAxis : fAttrAxis;
+      std::string as = fShape[axis].GetVal();
+      if (!IsInteger(as))
+         return 256;
+      size_t n = std::stoul(as);
+      size_t p = 1;
+      while (p < n) p <<= 1;       // next power of 2 >= n
+      if (p < 32)   p = 32;        // at least one warp
+      if (p > 1024) p = 1024;      // block-size cap
+      return p;
+   }
+
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+      if (fShape.empty())
+         throw std::runtime_error("SOFIE Softmax called to Generate_GPU_Kernel_ALPAKA without being initialized first");
+
+      opName = "op_" + opName;
+      std::string kname = "SoftmaxKernel_" + opName;
+
+      size_t size = fShape.size();
+      size_t axis = fAttrAxis < 0 ? size + fAttrAxis : fAttrAxis;
+
+      std::string axis_size    = fShape[axis].GetVal();// per-row reduction length
+      std::string inner_stride = UTILITY::ComputeStrideFromShape(fShape)[axis].GetVal();// stride along the axis
+
+      const size_t kBlock = SoftmaxBlockSize();   // threads per row (block)
+      std::string bs = std::to_string(kBlock);
+
+      // block-per-row online softmax (Milakov & Gimelshein 2018, arXiv:1805.02867).
+      // a block of kBlock threads reduces one row cooperatively; each thread strides
+      // over the row (coalesced for the last-axis case) keeping a running (max, sum)
+      // pair, then a single shared-memory tree reduction merges the pairs with the online opeartor
+
+      std::string op;
+      op  = "\n//------ SOFTMAX_KERNEL_ALPAKA\n";
+      op += SP + "struct " + kname + " {\n";
+      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
+      op += SP + SP + SP + "TAcc const& acc,\n";
+      op += SP + SP + SP + "T const* __restrict__ X,\n";
+      op += SP + SP + SP + "T* __restrict__ Y,\n";
+      op += SP + SP + SP + "std::size_t const numRows) const {\n\n";
+
+      // running max and sum live in shared memory; declared before the early return
+      // and every thread in the block reaches the collective declaration.
+      op += SP + SP + SP + "auto& smax = alpaka::declareSharedVar<T[" + bs + "], __COUNTER__>(acc);\n";
+      op += SP + SP + SP + "auto& ssum = alpaka::declareSharedVar<T[" + bs + "], __COUNTER__>(acc);\n";
+      op += SP + SP + SP + "auto const row = alpaka::getIdx<alpaka::Grid, alpaka::Blocks>(acc)[0];\n";
+      op += SP + SP + SP + "auto const tid = alpaka::getIdx<alpaka::Block, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (row >= numRows) return;\n\n";
+
+      op += SP + SP + SP + "std::size_t const axis_size = " + axis_size + ";\n";
+      op += SP + SP + SP + "std::size_t const inner_stride = " + inner_stride + ";\n";
+      op += SP + SP + SP + "std::size_t const row_block = axis_size * inner_stride;\n";
+      op += SP + SP + SP + "std::size_t const row_base = (row / inner_stride) * row_block + (row % inner_stride);\n\n";
+
+      // fused pass: running max m and normalizer d over this thread's slice
+      // d is updated branchlessly; when the max does not move the correction will simply be exp(0)=1
+      op += SP + SP + SP + "// fused pass: running (max, sum) per thread\n";
+      op += SP + SP + SP + "T m = X[row_base];\n";
+      op += SP + SP + SP + "T d = static_cast<T>(0);\n";
+      op += SP + SP + SP + "for (std::size_t l = tid; l < axis_size; l += " + bs + "u) {\n";
+      op += SP + SP + SP + SP + "T x = X[row_base + l * inner_stride];\n";
+      op += SP + SP + SP + SP + "T m_new = (x > m) ? x : m;\n";
+      op += SP + SP + SP + SP + "d = d * alpaka::math::exp(acc, m - m_new) + alpaka::math::exp(acc, x - m_new);\n";
+      op += SP + SP + SP + SP + "m = m_new;\n";
+      op += SP + SP + SP + "}\n";
+      op += SP + SP + SP + "smax[tid] = m;\n";
+      op += SP + SP + SP + "ssum[tid] = d;\n";
+      op += SP + SP + SP + "alpaka::syncBlockThreads(acc);\n\n";
+
+      // single tree reduction merging (max, sum) pairs with the online operator
+      // (m_a, d_a) + (m_b, d_b) = (max, d_a*exp(m_a-max) + d_b*exp(m_b-max))
+      op += SP + SP + SP + "// combined (max, sum) tree reduction\n";
+      op += SP + SP + SP + "for (std::size_t s = " + bs + "u / 2u; s >= 1u; s /= 2u) {\n";
+      op += SP + SP + SP + SP + "if (tid < s) {\n";
+      op += SP + SP + SP + SP + SP + "T m_a = smax[tid];\n";
+      op += SP + SP + SP + SP + SP + "T m_b = smax[tid + s];\n";
+      op += SP + SP + SP + SP + SP + "T m_r = (m_b > m_a) ? m_b : m_a;\n";
+      op += SP + SP + SP + SP + SP + "ssum[tid] = ssum[tid] * alpaka::math::exp(acc, m_a - m_r) + ssum[tid + s] * alpaka::math::exp(acc, m_b - m_r);\n";
+      op += SP + SP + SP + SP + SP + "smax[tid] = m_r;\n";
+      op += SP + SP + SP + SP + "}\n";
+      op += SP + SP + SP + SP + "alpaka::syncBlockThreads(acc);\n";
+      op += SP + SP + SP + "}\n";
+      op += SP + SP + SP + "T const vmax = smax[0];\n";
+      op += SP + SP + SP + "T const sum = ssum[0];\n";
+      op += SP + SP + SP + "alpaka::syncBlockThreads(acc);\n\n";
+
+      // normalize pass: recompute exp(x - max) and write Y once
+      op += SP + SP + SP + "// normalize pass\n";
+      op += SP + SP + SP + "T const inv = static_cast<T>(1) / sum;\n";
+      op += SP + SP + SP + "for (std::size_t l = tid; l < axis_size; l += " + bs + "u) {\n";
+      op += SP + SP + SP + SP + "std::size_t const idx = row_base + l * inner_stride;\n";
+      op += SP + SP + SP + SP + "T e = alpaka::math::exp(acc, X[idx] - vmax) * inv;\n";
+      op += SP + SP + SP + SP + "Y[idx] = e;\n";
+      if (fLogSoftmax)
+         op += SP + SP + SP + SP + "Y[idx] = alpaka::math::log(acc, e);\n";
+      op += SP + SP + SP + "}\n";
+
+      op += SP + SP + "}\n";// operator() end
+      op += SP + "};\n";
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      std::string kname = "SoftmaxKernel_" + opName;
+      return SP + kname + " softmaxKernel_" + opName + ";\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string opName) override {
+      if (fShape.empty())
+         throw std::runtime_error("SOFIE Softmax called to Generate_GPU_ALPAKA without being initialized first");
+
+      opName = "op_" + opName;
+      std::string kname = "softmaxKernel_" + opName;
+
+      size_t size = fShape.size();
+      size_t axis = fAttrAxis < 0 ? size + fAttrAxis : fAttrAxis;
+      std::string axis_size  = fShape[axis].GetVal();
+      std::string length_str = ConvertDimShapeToLength(fShape);
+
+      std::string num_rows;
+      if (IsInteger(length_str) && IsInteger(axis_size))
+         num_rows = std::to_string(std::stoul(length_str) / std::stoul(axis_size));
+      else
+         num_rows = "(" + length_str + ") / (" + axis_size + ")";
+
+      const size_t kBlock = SoftmaxBlockSize();   // must match the kernel's block size
+
+      std::stringstream out;
+      out << "\n//------ SOFTMAX_GPU_ALPAKA\n";
+      out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_" << opName << "(\n";
+      out << SP << SP << "Vec::all(static_cast<Idx>(" << num_rows << ")),\n";// numBlocks = one block per row
+      out << SP << SP << "Vec::all(Idx{" << kBlock << "u}),\n";// threads per block
+      out << SP << SP << "Vec::all(Idx{1u}));\n";
+      out << SP << "auto task_" << opName << " = alpaka::createTaskKernel<Acc>(workDiv_" << opName
+          << ", " << kname
+          << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
+          << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+          << ", static_cast<Idx>(" << num_rows << "));\n";
+      out << SP << "alpaka::enqueue(queue, task_" << opName << ");\n";
+      return out.str();
+   }
+
+   std::vector<std::string> GetStdLibs() override {
+      return { std::string("cmath") };
+   }
 };
 
 } // namespace SOFIE
