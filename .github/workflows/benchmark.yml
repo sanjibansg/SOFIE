@@ -41,7 +41,7 @@ jobs:
           set -euo pipefail
 
           if [ -f "${{ env.LCG_VIEW }}/setup.sh" ]; then
-            source "${{ env.LCG_VIEW }}/setup.sh"
+            set +u; source "${{ env.LCG_VIEW }}/setup.sh"; set -u
           else
             echo "LCG view not found — installing from dnf"
             dnf install -y epel-release
