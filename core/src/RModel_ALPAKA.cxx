@@ -248,17 +248,17 @@ void RModel::GenerateGPU_ALPAKA_Buffers() {
    // add also the dynamic tensors (only declarations, allocation will be done later)
    if (!fDynamicTensorInfos.empty()) {
       fGC += "//--- declare the dynamic tensors\n";
-      fGC += "using bufDev_float = alpaka::Buf<devAcc, float, alpaka::DimInt<1u>, size_t>;\n";
-      fGC += "using bufDev_double = alpaka::Buf<devAcc, double, alpaka::DimInt<1u>, size_t>;\n";
-      fGC += "using bufDev_int64  = alpaka::Buf<devAcc, int64_t, alpaka::DimInt<1u>, size_t>;\n";
-
       for (auto &i : fDynamicTensorInfos) {
          if (i.second.type == ETensorType::FLOAT) {
-            fGC += "bufDev_float bufDev_" + i.first + ";\n";
+            fGC += "BufF1D deviceBuf_" + i.first + ";\n";
          } else if (i.second.type == ETensorType::DOUBLE) {
-            fGC += "bufDev_double bufDev_" + i.first + ";\n";
+            fGC += "BufD1D deviceBuf_" + i.first + ";\n";
+         } else if (i.second.type == ETensorType::INT32) {
+            fGC += "BufI321D deviceBuf_" + i.first + ";\n";
          } else if (i.second.type == ETensorType::INT64) {
-            fGC += "bufDev_int64 bufDev_" + i.first + ";\n";
+            fGC += "BufI641D deviceBuf_" + i.first + ";\n";
+         } else if (i.second.type == ETensorType::BOOL) {
+            fGC += "BufUI81D deviceBuf_" + i.first + ";\n";
          }
       }
    }
@@ -271,8 +271,17 @@ void RModel::GenerateDynamicTensorInfo_GPU_ALPAKA() {
    for (auto &i : fDynamicTensorInfos) {
       auto length = ConvertDimShapeToLength(i.second.shape);
       out << SP << "if (" << length << " > 0) {\n";
-      out << "auto bufDev_" + i.first +
-                 " = alpaka::allocBuf<float, size_t>(devAcc, Ext1D::all(Idx{" << length << "}));\n";
+      if (i.second.type == ETensorType::FLOAT) {
+         out << SP << "deviceBuf_" << i.first << " = alpaka::allocBuf<float, size_t>(devAcc, Ext1D::all(Idx{" << length << "}));\n";
+      } else if (i.second.type == ETensorType::DOUBLE) {
+         out << SP << "deviceBuf_" << i.first << " = alpaka::allocBuf<double, size_t>(devAcc, Ext1D::all(Idx{" << length << "}));\n";
+      } else if (i.second.type == ETensorType::INT32) {
+         out << SP << "deviceBuf_" << i.first << " = alpaka::allocBuf<int32_t, size_t>(devAcc, Ext1D::all(Idx{" << length << "}));\n";
+      } else if (i.second.type == ETensorType::INT64) {
+         out << SP << "deviceBuf_" << i.first << " = alpaka::allocBuf<int64_t, size_t>(devAcc, Ext1D::all(Idx{" << length << "}));\n";
+      } else if (i.second.type == ETensorType::BOOL) {
+         out << SP << "deviceBuf_" << i.first << " = alpaka::allocBuf<std::uint8_t, size_t>(devAcc, Ext1D::all(Idx{" << length << "}));\n";
+      }
       out << SP << "}\n";
    }
    fGC += out.str();
