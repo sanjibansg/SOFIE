@@ -250,15 +250,15 @@ void RModel::GenerateGPU_ALPAKA_Buffers() {
       fGC += "//--- declare the dynamic tensors\n";
       for (auto &i : fDynamicTensorInfos) {
          if (i.second.type == ETensorType::FLOAT) {
-            fGC += "BufF1D deviceBuf_" + i.first + ";\n";
+            fGC += "BufF1D deviceBuf_" + i.first + " = alpaka::allocBuf<float, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
          } else if (i.second.type == ETensorType::DOUBLE) {
-            fGC += "BufD1D deviceBuf_" + i.first + ";\n";
+            fGC += "BufD1D deviceBuf_" + i.first + " = alpaka::allocBuf<double, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
          } else if (i.second.type == ETensorType::INT32) {
-            fGC += "BufI321D deviceBuf_" + i.first + ";\n";
+            fGC += "BufI321D deviceBuf_" + i.first + " = alpaka::allocBuf<int32_t, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
          } else if (i.second.type == ETensorType::INT64) {
-            fGC += "BufI641D deviceBuf_" + i.first + ";\n";
+            fGC += "BufI641D deviceBuf_" + i.first + " = alpaka::allocBuf<int64_t, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
          } else if (i.second.type == ETensorType::BOOL) {
-            fGC += "BufUI81D deviceBuf_" + i.first + ";\n";
+            fGC += "BufUI81D deviceBuf_" + i.first + " = alpaka::allocBuf<std::uint8_t, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
          }
       }
    }
