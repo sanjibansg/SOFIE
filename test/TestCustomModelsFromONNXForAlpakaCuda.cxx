@@ -64,6 +64,7 @@
 
 #include "Tile5D_FromONNX_GPU_ALPAKA.hxx"
 #include "input_models/references/Tile5D.ref.hxx"
+#include "DynamicTile_FromONNX_GPU_ALPAKA.hxx"
 
 #include "GatherAxis0_FromONNX_GPU_ALPAKA.hxx"
 #include "GatherAxis1_FromONNX_GPU_ALPAKA.hxx"
@@ -720,6 +721,43 @@ TEST_F(SofieAlpakaTest, Tile5D)
     EXPECT_EQ(outputSize, sizeof(Tile5D_ExpectedOutput::output) / sizeof(float));
     for (size_t i = 0; i < outputSize; ++i)
         EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE);
+}
+
+TEST_F(SofieAlpakaTest, DynamicTile)
+{
+    // X[N,2] -> Tile([2,3]) -> Y[2N,6], with N dynamic. Run at two batch sizes.
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t inCols = 2, outCols = 6;
+
+    for (std::size_t N : {std::size_t(1), std::size_t(8)}) {
+        const std::size_t inRows = N, outRows = 2 * N;
+        const std::size_t inSize = inRows * inCols, outSize = outRows * outCols;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{inSize}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < inSize; ++i)
+            in_ptr[i] = static_cast<float>(i + 1);
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{inSize}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outSize}));
+        {
+            SOFIE_DynamicTile::Session<alpaka::TagGpuCudaRt> session("", N);
+            auto result = session.infer(N, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t r = 0; r < outRows; ++r)
+            for (std::size_t c = 0; c < outCols; ++c) {
+                float expected = in_ptr[(r % inRows) * inCols + (c % inCols)];
+                EXPECT_LE(std::abs(res[r * outCols + c] - expected), TOLERANCE);
+            }
+    }
 }
 
 TEST_F(SofieAlpakaTest, GatherAxis0)
