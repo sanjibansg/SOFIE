@@ -65,6 +65,7 @@
 #include "Tile5D_FromONNX_GPU_ALPAKA.hxx"
 #include "input_models/references/Tile5D.ref.hxx"
 #include "DynamicTile_FromONNX_GPU_ALPAKA.hxx"
+#include "DynamicEqual_FromONNX_GPU_ALPAKA.hxx"
 
 #include "GatherAxis0_FromONNX_GPU_ALPAKA.hxx"
 #include "GatherAxis1_FromONNX_GPU_ALPAKA.hxx"
@@ -1295,6 +1296,45 @@ TEST_F(SofieAlpakaTest, Equal)
     EXPECT_EQ(outputSize, sizeof(Equal_ExpectedOutput::outputs) / sizeof(bool));
     for (size_t i = 0; i < outputSize; ++i)
         EXPECT_EQ(res_ptr[i], correct[i]) << "i=" << i;
+}
+
+TEST_F(SofieAlpakaTest, DynamicEqual)
+{
+    // X1[N,3] == X2[N,3] -> Y[N,3] (bool/uint8), N dynamic. Run at two batch sizes.
+    const std::size_t cols = 3;
+    for (std::size_t N : {std::size_t(1), std::size_t(8)}) {
+        const std::size_t sz = N * cols;
+
+        auto x1_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sz}));
+        auto x2_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sz}));
+        float* x1p = reinterpret_cast<float*>(alpaka::getPtrNative(x1_h));
+        float* x2p = reinterpret_cast<float*>(alpaka::getPtrNative(x2_h));
+        for (Idx i = 0; i < sz; ++i) {
+            x1p[i] = static_cast<float>(i % 3);
+            x2p[i] = static_cast<float>(i % 2);   // mix of equal and unequal
+        }
+
+        auto x1_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{sz}));
+        auto x2_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{sz}));
+        alpaka::memcpy(queue, x1_d, x1_h);
+        alpaka::memcpy(queue, x2_d, x2_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<uint8_t, Idx>(host, Ext1D::all(Idx{sz}));
+        {
+            SOFIE_DynamicEqual::Session<alpaka::TagGpuCudaRt> session("", N);
+            auto result = session.infer(N, x1_d, x2_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        uint8_t* res = reinterpret_cast<uint8_t*>(alpaka::getPtrNative(result_h));
+        for (std::size_t i = 0; i < sz; ++i) {
+            uint8_t expected = (x1p[i] == x2p[i]) ? 1 : 0;
+            EXPECT_EQ(res[i], expected);
+        }
+    }
 }
 
 TEST_F(SofieAlpakaTest, LessOrEqual)
