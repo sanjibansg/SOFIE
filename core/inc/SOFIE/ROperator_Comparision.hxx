@@ -61,6 +61,10 @@ private:
    std::vector<size_t> fShapeX1;
    std::vector<size_t> fShapeX2;
    std::vector<size_t> fShapeY;
+   std::vector<Dim> fDimShapeX1;
+   std::vector<Dim> fDimShapeX2;
+   std::vector<Dim> fDimShapeY;
+   bool fIsDynamic = false;
    std::string fNBroadcastedX1;
    std::string fNBroadcastedX2;
    ETensorType fTensorType1 = ETensorType::UNDEFINED;
@@ -93,10 +97,26 @@ public:
       if (!model.CheckIfTensorAlreadyExist(fNX2)) {
          throw std::runtime_error(std::string("SOFIE Comparision Op Input Tensor ") + fNX2 + "is not found in model");
       }
-      fShapeX1 = model.GetTensorShape(fNX1);
-      fShapeX2 = model.GetTensorShape(fNX2);
       fTensorType1 = model.GetTensorType(fNX1);
       fTensorType2 = model.GetTensorType(fNX2);
+
+      fIsDynamic = model.IsDynamicTensor(fNX1) || model.IsDimInputTensor(fNX1)
+                || model.IsDynamicTensor(fNX2) || model.IsDimInputTensor(fNX2);
+      if (fIsDynamic) {
+         fDimShapeX1 = model.GetDynamicTensorShape(fNX1);
+         fDimShapeX2 = model.GetDynamicTensorShape(fNX2);
+         if (UTILITY::AreSameShape(fDimShapeX1, fDimShapeX2))
+            fDimShapeY = fDimShapeX1;
+         else
+            fDimShapeY = UTILITY::MultidirectionalBroadcastShape(fDimShapeX1, fDimShapeX2).second;
+         model.AddIntermediateTensor(fNY, ETensorType::BOOL, fDimShapeY);
+         const auto & outNames = model.GetOutputTensorNames();
+         fIsModelOutput = (std::find(outNames.begin(), outNames.end(), fNY) != outNames.end());
+         return;
+      }
+
+      fShapeX1 = model.GetTensorShape(fNX1);
+      fShapeX2 = model.GetTensorShape(fNX2);
       bool broadcast = !UTILITY::AreSameShape(fShapeX1, fShapeX2);
       if (broadcast) {
          // ONNX comparison ops support multidirectional broadcasting (numpy semantics):
@@ -196,26 +216,49 @@ public:
    std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
       if (fIsOutputConstant) return "";
       opName = "op_" + opName;
-      if (fShapeY.empty())
+      if ((fIsDynamic ? fDimShapeY.empty() : fShapeY.empty()))
          throw std::runtime_error("SOFIE Comparision Op called to Generate without being initialized first");
 
-      const std::size_t D = fShapeY.size();
-      std::size_t totalElements = ConvertShapeToLength(fShapeY);
+      auto dimX1 = fIsDynamic ? fDimShapeX1 : ConvertShapeToDim(fShapeX1);
+      auto dimX2 = fIsDynamic ? fDimShapeX2 : ConvertShapeToDim(fShapeX2);
+      auto dimY  = fIsDynamic ? fDimShapeY  : ConvertShapeToDim(fShapeY);
 
-      std::vector<size_t> shapeX1_padded(D, 1);
-      std::vector<size_t> shapeX2_padded(D, 1);
+      const std::size_t D = dimY.size();
+      std::string totalElements = ConvertDimShapeToLength(dimY);
+
+      std::vector<Dim> shapeX1_padded(D, Dim(1));
+      std::vector<Dim> shapeX2_padded(D, Dim(1));
       {
-         size_t off1 = D - fShapeX1.size();
-         for (size_t i = 0; i < fShapeX1.size(); ++i)
-            shapeX1_padded[off1 + i] = fShapeX1[i];
-         size_t off2 = D - fShapeX2.size();
-         for (size_t i = 0; i < fShapeX2.size(); ++i)
-            shapeX2_padded[off2 + i] = fShapeX2[i];
+         size_t off1 = D - dimX1.size();
+         for (size_t i = 0; i < dimX1.size(); ++i)
+            shapeX1_padded[off1 + i] = dimX1[i];
+         size_t off2 = D - dimX2.size();
+         for (size_t i = 0; i < dimX2.size(); ++i)
+            shapeX2_padded[off2 + i] = dimX2[i];
       }
 
       auto stridesX1 = UTILITY::ComputeStrideFromShape(shapeX1_padded);
       auto stridesX2 = UTILITY::ComputeStrideFromShape(shapeX2_padded);
-      auto stridesY  = UTILITY::ComputeStrideFromShape(fShapeY);
+      auto stridesY  = UTILITY::ComputeStrideFromShape(dimY);
+
+      auto isIdent = [](const std::string &s){
+         if (s.empty() || (s[0] >= '0' && s[0] <= '9')) return false;
+         for (char c : s)
+            if (!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_')) return false;
+         return true;
+      };
+      std::vector<std::string> dynParams;
+      auto collect = [&](const std::vector<Dim>& v){
+         for (auto &d : v)
+            if (d.isParam && isIdent(d.param)) {
+               bool seen = false;
+               for (auto &q : dynParams) if (q == d.param) seen = true;
+               if (!seen) dynParams.push_back(d.param);
+            }
+      };
+      collect(dimX1); collect(dimX2);
+
+      auto isOne = [](const Dim &d){ return !d.isParam && d.dim == 1; };
 
       std::string type1  = ConvertTypeToString(fTensorType1);
       std::string type2  = ConvertTypeToString(fTensorType2);
@@ -231,6 +274,8 @@ public:
       op += SP + SP + SP + type1 + " const* __restrict__ x1,\n";
       op += SP + SP + SP + type2 + " const* __restrict__ x2,\n";
       op += SP + SP + SP + "uint8_t* __restrict__ output,\n";
+      for (auto &p : dynParams)
+         op += SP + SP + SP + "std::size_t const " + p + ",\n";
       op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
 
       op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
@@ -241,30 +286,30 @@ public:
 
       for (std::size_t d = 0; d < D; ++d) {
          op += SP + SP + SP + SP + "std::size_t const out_" + std::to_string(d)
-             + " = (elem_idx / " + std::to_string(stridesY[d]) + "u) % "
-             + std::to_string(fShapeY[d]) + "u;\n";
+             + " = (elem_idx / (" + stridesY[d].GetVal() + ")) % ("
+             + dimY[d].GetVal() + ");\n";
       }
       op += "\n";
 
       op += SP + SP + SP + SP + "std::size_t const x1_idx =\n";
       for (std::size_t d = 0; d < D; ++d) {
-         if (shapeX1_padded[d] == 1)
+         if (isOne(shapeX1_padded[d]))
             op += SP + SP + SP + SP + SP + "0u";
          else
             op += SP + SP + SP + SP + SP
                 + "out_" + std::to_string(d)
-                + " * " + std::to_string(stridesX1[d]) + "u";
+                + " * (" + stridesX1[d].GetVal() + ")";
          op += (d + 1 < D) ? " +\n" : ";\n\n";
       }
 
       op += SP + SP + SP + SP + "std::size_t const x2_idx =\n";
       for (std::size_t d = 0; d < D; ++d) {
-         if (shapeX2_padded[d] == 1)
+         if (isOne(shapeX2_padded[d]))
             op += SP + SP + SP + SP + SP + "0u";
          else
             op += SP + SP + SP + SP + SP
                 + "out_" + std::to_string(d)
-                + " * " + std::to_string(stridesX2[d]) + "u";
+                + " * (" + stridesX2[d].GetVal() + ")";
          op += (d + 1 < D) ? " +\n" : ";\n\n";
       }
 
@@ -286,11 +331,33 @@ public:
    std::string Generate_GPU_ALPAKA(std::string opName) override {
       if (fIsOutputConstant) return "";
       opName = "op_" + opName;
-      if (fShapeY.empty())
+      if ((fIsDynamic ? fDimShapeY.empty() : fShapeY.empty()))
          throw std::runtime_error("SOFIE Comparision Op called to Generate without being initialized first");
 
-      std::size_t totalElements = ConvertShapeToLength(fShapeY);
+      auto dimX1 = fIsDynamic ? fDimShapeX1 : ConvertShapeToDim(fShapeX1);
+      auto dimX2 = fIsDynamic ? fDimShapeX2 : ConvertShapeToDim(fShapeX2);
+      auto dimY  = fIsDynamic ? fDimShapeY  : ConvertShapeToDim(fShapeY);
+      std::string totalElements = ConvertDimShapeToLength(dimY);
       std::string kname = "comparisonKernel_" + opName;
+
+      auto isIdent = [](const std::string &s){
+         if (s.empty() || (s[0] >= '0' && s[0] <= '9')) return false;
+         for (char c : s)
+            if (!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_')) return false;
+         return true;
+      };
+      std::vector<std::string> dynParams;
+      auto collect = [&](const std::vector<Dim>& v){
+         for (auto &d : v)
+            if (d.isParam && isIdent(d.param)) {
+               bool seen = false;
+               for (auto &q : dynParams) if (q == d.param) seen = true;
+               if (!seen) dynParams.push_back(d.param);
+            }
+      };
+      collect(dimX1); collect(dimX2);
+      std::string dynArgs;
+      for (auto &p : dynParams) dynArgs += ", static_cast<std::size_t>(" + p + ")";
 
       std::stringstream out;
       out << "\n//------ " << ComparisionTrait<T,Op>::Name() << "_GPU_ALPAKA\n";
@@ -302,6 +369,7 @@ public:
          << ", alpaka::getPtrNative(deviceBuf_" << fNX1 << ")"
          << ", alpaka::getPtrNative(deviceBuf_" << fNX2 << ")"
          << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+         << dynArgs
          << ", static_cast<Idx>(" << totalElements << "));\n";
       out << SP << "alpaka::enqueue(queue, task_" << opName << ");\n";
       
