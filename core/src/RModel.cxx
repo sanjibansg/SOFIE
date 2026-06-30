@@ -3,6 +3,8 @@
 #include <cctype>
 #include <memory>
 #include <string>
+#include <utility>
+#include <set>
 
 #ifdef SOFIE_SUPPORT_ROOT_BINARY
 #include "TFile.h"
@@ -51,6 +53,13 @@ std::string TensorMember(std::string const &name)
 }
 
 } // namespace
+
+void RModel::BuildLoweredOperatorView(EQuantizedBackend backend)
+{
+   fLoweredOperators.clear();
+   fLoweredConsumedOperatorIndices.clear();
+   AddLoweredQuantizedGemmOperators(backend);
+}
 
 std::vector<size_t> RModel::GetTensorShape(const std::string & name) const {
     auto f = fReadyInputTensorInfos.find(name);
@@ -677,6 +686,8 @@ void RModel::Initialize(const std::map<std::string, size_t> & inputParams, bool 
       i++;
    }
 
+   AnalyzeQuantizedRegions();
+
    // loop on initialized tensors and make the integers as constant to be
    // not written in a weight file and check if the tensors flagged as not writable are really not writable,
    // i.e. are not used by non constant operators
@@ -823,7 +834,10 @@ void RModel::GenerateInitializedTensorInfo()
          } else if (i.second.type() == ETensorType::INT32) {
             fGC += GenerateConstantTensorCode<int32_t>(i);
             fConstantTensorSize += length * sizeof(int32_t);
-         }  else if (i.second.type() == ETensorType::BOOL || i.second.type() == ETensorType::UINT8 ) {
+         } else if (i.second.type() == ETensorType::INT8) {
+            fGC += GenerateConstantTensorCode<int8_t>(i);
+            fConstantTensorSize += length * sizeof(int8_t);
+         } else if (i.second.type() == ETensorType::BOOL || i.second.type() == ETensorType::UINT8 ) {
             fGC += GenerateConstantTensorCode<uint8_t>(i);
             fConstantTensorSize += length * sizeof(uint8_t);
          }
@@ -1439,8 +1453,13 @@ void RModel::GenerateSessionCode()
    for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
       if (fVerbose)
          std::cout << "Generating code for operator .... " << op_idx << std::endl;
+      if (!fProfile && fLoweredConsumedOperatorIndices.count(op_idx) != 0) {
+         continue;
+      }
       if (fProfile) {
          allOperatorCode += RModelProfiler::GenerateOperatorCode(*fOperators[op_idx], op_idx);
+      } else if (auto lowered = fLoweredOperators.find(op_idx); lowered != fLoweredOperators.end()) {
+         allOperatorCode += lowered->second->Generate(std::to_string(op_idx));
       } else {
          allOperatorCode += fOperators[op_idx]->Generate(std::to_string(op_idx));
       }
@@ -1519,6 +1538,9 @@ void RModel::Generate(std::underlying_type_t<Options> options, int batchSize, lo
 
    // initialize the model including all operators and sub-graphs
    Initialize(batchSize, verbose);
+   BuildLoweredOperatorView(EQuantizedBackend::CPU);
+
+   AddQuantizedGeneratedHeaders();
 
    // if having dynamic tensor we need to have a Session
    if (!fDynamicTensorInfos.empty()) {

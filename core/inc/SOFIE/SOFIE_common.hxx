@@ -20,6 +20,7 @@
 #include <iomanip>
 #include <cassert>
 #include <limits>
+#include <optional>
 
 namespace SOFIE {
 

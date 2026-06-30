@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <limits>
 #include <cassert>
+#include <utility>
 
 
 namespace SOFIE{
@@ -72,6 +73,20 @@ namespace SOFIE{
          fOutputTensorNames = { fNY };
          fKind = OperatorKind::GEMM;
       }
+      // Getters for further quantized GEMM lowering-elimination.
+      float GetAlpha() const { return fAttrAlpha; }
+      float GetBeta() const { return fAttrBeta; }
+      int_t GetTransA() const { return fAttrTransA; }
+      int_t GetTransB() const { return fAttrTransB; }
+      bool HasBias() const { return !fNC.empty(); }
+      const std::string &GetInputTensorName() const { return fNA; }
+      const std::string &GetWeightTensorName() const { return fNB; }
+      const std::string &GetBiasTensorName() const { return fNC; }
+      const std::string &GetOutputTensorName() const { return fNY; }
+      const std::vector<Dim> &GetInputShape() const { return fShapeA; }
+      const std::vector<Dim> &GetWeightShape() const { return fShapeB; }
+      const std::vector<Dim> &GetOutputShape() const { return fShapeY; }
+      std::vector<std::string> GetStdLibs() override { return { std::string("cmath"), std::string("cstdint"), std::string("vector") }; }
 
       std::vector<ETensorType> TypeInference(std::vector<ETensorType> input) override {
          ETensorType out = input[0];

@@ -27,6 +27,9 @@ set(sources_headers
    SOFIE/ROperator_Conv.hxx
    SOFIE/ROperator_ConvTranspose.hxx
    SOFIE/ROperator_Gemm.hxx
+   SOFIE/ROperator_QuantizedGemm.hxx
+   SOFIE/SOFIE_QuantizedRuntime.hxx
+   SOFIE/RQuantization.hxx
    SOFIE/ROperator_Relu.hxx
    SOFIE/ROperator_Tanh.hxx
    SOFIE/ROperator_LeakyRelu.hxx
@@ -57,6 +60,7 @@ set(sources_headers
    SOFIE/ROperator_Split.hxx
    SOFIE/ROperator_SubGraph.hxx
    SOFIE/ROperator_Pad.hxx
+   SOFIE/ROperator_QONNXQuant.hxx
    SOFIE/ROperator_Where.hxx
    SOFIE/ROperator_Einsum.hxx
    SOFIE/ROperator_Random.hxx
@@ -78,6 +82,7 @@ list(TRANSFORM sources_headers PREPEND "inc/")
 set(sources_cxx
     src/RModel_Base.cxx
     src/RModel.cxx
+    src/RModel_Quantization.cxx
     src/RModelProfiler.cxx
     src/RModelProfilerGPU.cxx
     src/RModel_ALPAKA.cxx
