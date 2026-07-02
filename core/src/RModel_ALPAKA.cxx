@@ -155,6 +155,8 @@ void RModel::GenerateInitializedTensorInfo_GPU_ALPAKA() {
             fGC += GenerateConstantTensorCode<int64_t>(i);
          else if (i.second.type() == ETensorType::INT32)
             fGC += GenerateConstantTensorCode<int32_t>(i);
+         else if (i.second.type() == ETensorType::INT8)
+            fGC += GenerateConstantTensorCode<int8_t>(i);
 
          else if (i.second.type() == ETensorType::BOOL ||
                   i.second.type() == ETensorType::UINT8)
@@ -169,6 +171,10 @@ void RModel::GenerateInitializedTensorInfo_GPU_ALPAKA() {
          } else if (i.second.type() == ETensorType::INT32) {
             fGC += "BufI321D deviceBuf_" + i.first +
                    " = alpaka::allocBuf<int32_t, Idx>(devAcc, Ext1D::all(Idx{" +
+                   std::to_string(length) + "}));\n";
+         } else if (i.second.type() == ETensorType::INT8) {
+            fGC += "BufI81D deviceBuf_" + i.first +
+                   " = alpaka::allocBuf<int8_t, Idx>(devAcc, Ext1D::all(Idx{" +
                    std::to_string(length) + "}));\n";
          } else if (i.second.type() == ETensorType::INT64) {
             fGC += "BufI641D deviceBuf_" + i.first +
@@ -197,6 +203,8 @@ void RModel::GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA()
             fGC += "std::vector<float> tensor_" + i.first + "(" + std::to_string(length) + ");\n";
          } else if (i.second.type() == ETensorType::INT32) {
             fGC += "std::vector<int32_t> tensor_" + i.first + "(" + std::to_string(length) + ");\n";
+         } else if (i.second.type() == ETensorType::INT8) {
+            fGC += "std::vector<int8_t> tensor_" + i.first + "(" + std::to_string(length) + ");\n";
          } else if (i.second.type() == ETensorType::INT64) {
             fGC += "std::vector<int64_t> tensor_" + i.first + "(" + std::to_string(length) + ");\n";
          } else if (i.second.type() == ETensorType::BOOL ||
@@ -229,11 +237,15 @@ void RModel::GenerateGPU_ALPAKA_Buffers() {
             tensor_declaration_block += "BufI321D deviceBuf_" + i.first +
                                           " = alpaka::allocBuf<int32_t, size_t>(devAcc, Ext1D::all(Idx{" +
                                           std::to_string(length) + "}));\n";
+         } else if (i.second.type == ETensorType::INT8) {
+            tensor_declaration_block += "BufI81D deviceBuf_" + i.first +
+                                          " = alpaka::allocBuf<int8_t, size_t>(devAcc, Ext1D::all(Idx{" +
+                                          std::to_string(length) + "}));\n";
          } else if (i.second.type == ETensorType::INT64) {
             tensor_declaration_block += "BufI641D deviceBuf_" + i.first +
                                           " = alpaka::allocBuf<int64_t, size_t>(devAcc, Ext1D::all(Idx{" +
                                           std::to_string(length) + "}));\n";
-         } else if (i.second.type == ETensorType::BOOL) {
+         } else if (i.second.type == ETensorType::BOOL || i.second.type == ETensorType::UINT8) {
             tensor_declaration_block += "BufUI81D deviceBuf_" + i.first +
                                           " = alpaka::allocBuf<std::uint8_t, size_t>(devAcc, Ext1D::all(Idx{" +
                                           std::to_string(length) + "}));\n";
@@ -326,7 +338,8 @@ std::string RModel::GenerateImplSignature_GPU_ALPAKA(bool isdecl) {
       if (type == ETensorType::DOUBLE) return "ViewConstD1D";
       if (type == ETensorType::INT32)  return "ViewConstI321D";
       if (type == ETensorType::INT64)  return "ViewConstI641D";
-      if (type == ETensorType::BOOL)   return "ViewConstUI81D";
+      if (type == ETensorType::INT8)   return "ViewConstI81D";
+      if (type == ETensorType::BOOL || type == ETensorType::UINT8)   return "ViewConstUI81D";
       throw std::runtime_error("sofie: input tensor " + name +
                                " is of a data type which is not yet supported.");
    };
@@ -378,7 +391,8 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
       if (type == ETensorType::DOUBLE) return "ViewConstD1D";
       if (type == ETensorType::INT32)  return "ViewConstI321D";
       if (type == ETensorType::INT64)  return "ViewConstI641D";
-      if (type == ETensorType::BOOL)   return "ViewConstUI81D";
+      if (type == ETensorType::INT8)   return "ViewConstI81D";
+      if (type == ETensorType::BOOL || type == ETensorType::UINT8)   return "ViewConstUI81D";
       throw std::runtime_error("sofie: input tensor " + name + " is of an unsupported data type.");
    };
 
@@ -416,7 +430,9 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
       if (fVerbose)
          std::cout << "Generating code for operator .... " << op_idx << std::endl;
 
-      if (fSkipOperators.count(op_idx)) continue;
+      if (fSkipOperators.count(op_idx) || fLoweredConsumedOperatorIndices.count(op_idx) != 0) continue;
+      auto loweredIt = fLoweredOperators.find(op_idx);
+      ROperator *op = (loweredIt != fLoweredOperators.end()) ? loweredIt->second.get() : fOperators[op_idx].get();
 
       auto gIt = fOpToFusionGroupIdx.find(op_idx);
       size_t gIdx = (gIt != fOpToFusionGroupIdx.end()) ? gIt->second : SIZE_MAX;
@@ -457,9 +473,9 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
          // Chain followers: skip — their logic is inside the fused kernel
       } else {
          if (fProfile) {
-            fGC += RModelProfilerGPU::GenerateOperatorCode(*fOperators[op_idx], op_idx);
+            fGC += RModelProfilerGPU::GenerateOperatorCode(*op, op_idx);
          } else {
-            fGC += fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx));
+            fGC += op->Generate_GPU_ALPAKA(std::to_string(op_idx));
          }
       }
    }
@@ -477,31 +493,34 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    for (auto &p : dynParamNames)
       spanDynDecl += ", size_t " + p;
 
-   fGC += "void infer(std::span<ViewConstF1D const> inputs, std::span<ViewF1D> outputs" + spanDynDecl + "){\n";
+   const bool allFloatOutputs = sameOutputTypes && eFirstOutputType == ETensorType::FLOAT;
+   if (allFloatOutputs) {
+      fGC += "void infer(std::span<ViewConstF1D const> inputs, std::span<ViewF1D> outputs" + spanDynDecl + "){\n";
 
-   {
-      fGC += SP + "_infer_impl(";
-      bool first = true;
-      for (auto &p : dynParamNames) {
-         if (!first) fGC += ", ";
-         fGC += p;
-         first = false;
+      {
+         fGC += SP + "_infer_impl(";
+         bool first = true;
+         for (auto &p : dynParamNames) {
+            if (!first) fGC += ", ";
+            fGC += p;
+            first = false;
+         }
+         for (size_t i = 0; i < fInputTensorNames.size(); i++) {
+            if (!first) fGC += ", ";
+            fGC += "inputs[" + std::to_string(i) + "]";
+            first = false;
+         }
+         fGC += ");\n";
       }
-      for (size_t i = 0; i < fInputTensorNames.size(); i++) {
-         if (!first) fGC += ", ";
-         fGC += "inputs[" + std::to_string(i) + "]";
-         first = false;
-      }
-      fGC += ");\n";
-   }
 
-   // Copy member output buffers into caller-provided output views
-   for (size_t i = 0; i < outputSize; i++) {
-      std::string tensorName = *(fOutputTensorNames.begin() + i);
-      fGC += SP + "alpaka::memcpy(queue, outputs[" + std::to_string(i) + "], deviceBuf_" + tensorName + ");\n";
+      // Copy member output buffers into caller-provided output views
+      for (size_t i = 0; i < outputSize; i++) {
+         std::string tensorName = *(fOutputTensorNames.begin() + i);
+         fGC += SP + "alpaka::memcpy(queue, outputs[" + std::to_string(i) + "], deviceBuf_" + tensorName + ");\n";
+      }
+      fGC += SP + "alpaka::wait(queue);\n";
+      fGC += "}\n\n";
    }
-   fGC += SP + "alpaka::wait(queue);\n";
-   fGC += "}\n\n";
 
 
    std::string returnType;
@@ -583,7 +602,10 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
    fGC += "\n//--- ALPAKA Kernels\n";
    for (size_t id = 0; id < fOperators.size(); id++) {
-      if(fOperators[id]->GetKind() == OperatorKind::GEMM || fOperators[id]->GetKind() == OperatorKind::CONV) {
+      if (fLoweredConsumedOperatorIndices.count(id) != 0) continue;
+      auto loweredIt = fLoweredOperators.find(id);
+      ROperator *op = (loweredIt != fLoweredOperators.end()) ? loweredIt->second.get() : fOperators[id].get();
+      if(op->GetKind() == OperatorKind::GEMM || op->GetKind() == OperatorKind::CONV) {
          OpNeedsBlas = true;
       }
 
@@ -614,17 +636,17 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          // Chain followers: skip (their logic is inside the fused kernel)
       } else {
          // Unfused op: generate individual kernel struct (with dedup for single_initialized_operators)
-         if (single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
-            if (registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+         if (single_initialized_operators.find(op->GetKind()) != single_initialized_operators.end()) {
+            if (registered_operators.find(op->GetKind()) == registered_operators.end()) {
                if (fVerbose)
-                  std::cout << "Generating ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
-               fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
-               registered_operators.insert(fOperators[id]->GetKind());
+                  std::cout << "Generating ALPAKA kernel for operator " << toString(op->GetKind()) << std::endl;
+               fGC += op->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
+               registered_operators.insert(op->GetKind());
             }
          } else {
             if (fVerbose)
-               std::cout << "Generating ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
-            fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
+               std::cout << "Generating ALPAKA kernel for operator " << toString(op->GetKind()) << std::endl;
+            fGC += op->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
          }
       }
    }
@@ -659,6 +681,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
     fGC += "using QueueAcc = alpaka::Queue<Acc, QueueProperty>;\n\n";
     fGC += "using BufF1D = alpaka::Buf<Acc, float, Dim, Idx>;\n";
     fGC += "using BufD1D = alpaka::Buf<Acc, double, Dim, Idx>;\n";
+    fGC += "using BufI81D = alpaka::Buf<Acc, int8_t, Dim, Idx>;\n";
     fGC += "using BufI321D = alpaka::Buf<Acc, int32_t, Dim, Idx>;\n";
     fGC += "using BufI641D = alpaka::Buf<Acc, int64_t, Dim, Idx>;\n";
     fGC += "using BufUI81D = alpaka::Buf<Acc, uint8_t, Dim, Idx>;\n\n";
@@ -667,6 +690,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
     fGC += "using ViewConstF1D = alpaka::ViewPlainPtr<DevAcc, const float, Dim, Idx>;\n";
     fGC += "using ViewD1D = alpaka::ViewPlainPtr<DevAcc, double, Dim, Idx>;\n";
     fGC += "using ViewConstD1D = alpaka::ViewPlainPtr<DevAcc, const double, Dim, Idx>;\n";
+    fGC += "using ViewI81D = alpaka::ViewPlainPtr<DevAcc, int8_t, Dim, Idx>;\n";
+    fGC += "using ViewConstI81D = alpaka::ViewPlainPtr<DevAcc, const int8_t, Dim, Idx>;\n";
     fGC += "using ViewI321D = alpaka::ViewPlainPtr<DevAcc, int32_t, Dim, Idx>;\n";
     fGC += "using ViewConstI321D = alpaka::ViewPlainPtr<DevAcc, const int32_t, Dim, Idx>;\n";
     fGC += "using ViewI641D = alpaka::ViewPlainPtr<DevAcc, int64_t, Dim, Idx>;\n";
@@ -732,12 +757,14 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       GenerateDynamicTensorInfo_GPU_ALPAKA();
 
       for (size_t id = 0; id < fOperators.size(); id++) {
-         if (fSkipOperators.count(id)) continue;
-         fGC += fOperators[id]->GenerateInitCode_GPU_ALPAKA();
-         if (fOperators[id]->GetKind() == OperatorKind::GEMM || fOperators[id]->GetKind() == OperatorKind::CONV) {
+         if (fSkipOperators.count(id) || fLoweredConsumedOperatorIndices.count(id) != 0) continue;
+         auto loweredIt = fLoweredOperators.find(id);
+         ROperator *op = (loweredIt != fLoweredOperators.end()) ? loweredIt->second.get() : fOperators[id].get();
+         fGC += op->GenerateInitCode_GPU_ALPAKA();
+         if (op->GetKind() == OperatorKind::GEMM || op->GetKind() == OperatorKind::CONV) {
             // GetBlasConfig() returns "" for ops that use gemmStridedBatched
-            // (legacy cuBLAS path, no cuBLASLt layout registration needed).
-            auto blasCfg = fOperators[id]->GetBlasConfig();
+            // (legacy cuBLAS path, no cuBLASLt layout needed).
+            auto blasCfg = op->GetBlasConfig();
             if (!blasCfg.empty())
                fGC += "\nblas.addLayoutConfig("+blasCfg+");\n";
          }
@@ -751,6 +778,9 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    fusedGroupsEmitted.clear();
 
    for (size_t id = 0; id < fOperators.size(); id++) {
+      if (fLoweredConsumedOperatorIndices.count(id) != 0) continue;
+      auto loweredIt = fLoweredOperators.find(id);
+      ROperator *op = (loweredIt != fLoweredOperators.end()) ? loweredIt->second.get() : fOperators[id].get();
       // Same as the kernel-struct loop above: fused activation ops must still
       // declare their member variable (e.g. `leakyReluKernel`) even though
       // their Generate_GPU_ALPAKA call is skipped in the infer-body loop.
@@ -766,17 +796,17 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
             fusedGroupsEmitted.insert(gIdx);
          }
       } else {
-         if (single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
-            if (registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+         if (single_initialized_operators.find(op->GetKind()) != single_initialized_operators.end()) {
+            if (registered_operators.find(op->GetKind()) == registered_operators.end()) {
                if (fVerbose)
-                  std::cout << "Declaring ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
-               fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
-               registered_operators.insert(fOperators[id]->GetKind());
+                  std::cout << "Declaring ALPAKA kernel for operator " << toString(op->GetKind()) << std::endl;
+               fGC += op->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
+               registered_operators.insert(op->GetKind());
             }
          } else {
             if (fVerbose)
-               std::cout << "Declaring ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
-            fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
+               std::cout << "Declaring ALPAKA kernel for operator " << toString(op->GetKind()) << std::endl;
+            fGC += op->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
          }
       }
    }
@@ -825,6 +855,8 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
       throw std::runtime_error("SOFIE GPU does not yet supports GNN Inference.");
 
    Initialize(batchSize, verbose);
+   BuildLoweredOperatorView(EQuantizedBackend::ALPAKA);
+   AddQuantizedGeneratedHeaders(EQuantizedBackend::ALPAKA);
    FuseGemmActivations_GPU();   // must run before elementwise fusion (redirects tensors)
    ComputeEltwiseFusionGroups();
 
@@ -848,6 +880,15 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
 void RModel::MoveInitializedTensorsToBuffers_ALPAKA(){
       for (auto &i : fInitializedTensors) {
          if (i.second.IsNotWritable())  continue;
+         if (HasQuantizedTensorStorage(i.first)) {
+            const auto &storage = GetQuantizedTensorStorage(i.first);
+            if (storage.layout == EQuantizedLayout::PackedCPU || !storage.isDeviceResident)
+               continue;
+         }
+         const auto type = i.second.type();
+         if (type != ETensorType::FLOAT && type != ETensorType::INT32 && type != ETensorType::INT64 &&
+             type != ETensorType::BOOL && type != ETensorType::INT8 && type != ETensorType::UINT8)
+            continue;
          std::string tensor_name = "tensor_" + i.first;
          auto length = ConvertShapeToLength(i.second.shape());
          std::string slength = std::to_string(length);

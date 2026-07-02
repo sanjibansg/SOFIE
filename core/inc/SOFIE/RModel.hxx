@@ -82,16 +82,8 @@ private:
    /// handled by the ONNX parser) into a single in-place kernel sequence.
    void FuseGemmActivations_GPU();
    void BuildLoweredOperatorView(EQuantizedBackend backend = EQuantizedBackend::CPU);
-   void AddQuantizedGeneratedHeaders();
-
-   // private gemm-specific methods for RModel_Quantization.cxx. must move out of
-   // RModel into a dedicated state once more operators are added.
-   void AddLoweredQuantizedGemmOperators(EQuantizedBackend backend = EQuantizedBackend::CPU);
-   bool HasQuantizedGemmRegion(std::size_t op_index) const;
-   const QuantizedGemmRegion & GetQuantizedGemmRegion(std::size_t op_index) const;
-   std::vector<std::size_t> GetQuantizedGemmOperatorIndices() const;
-   bool HasQuantizedLoweringPlan(std::size_t op_index, EQuantizedBackend backend) const;
-   const QuantizedLoweringPlan & GetQuantizedLoweringPlan(std::size_t op_index, EQuantizedBackend backend) const;
+   void AddQuantizedGeneratedHeaders(EQuantizedBackend backend = EQuantizedBackend::CPU);
+   void AddLoweredQuantizedOperators(EQuantizedBackend backend = EQuantizedBackend::CPU);
 
 public:
    // Rule of five: explicitly define move semantics, disallow copy

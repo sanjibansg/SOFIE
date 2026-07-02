@@ -28,7 +28,8 @@ set(sources_headers
    SOFIE/ROperator_ConvTranspose.hxx
    SOFIE/ROperator_Gemm.hxx
    SOFIE/ROperator_QuantizedGemm.hxx
-   SOFIE/SOFIE_QuantizedRuntime.hxx
+   SOFIE/SOFIE_Quantized.hxx
+   SOFIE/SOFIE_QuantizedAlpaka.hxx
    SOFIE/RQuantization.hxx
    SOFIE/ROperator_Relu.hxx
    SOFIE/ROperator_Tanh.hxx

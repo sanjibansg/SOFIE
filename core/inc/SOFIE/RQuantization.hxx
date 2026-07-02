@@ -83,6 +83,11 @@ inline bool IsQuantizedLoweringUnsupported(EQuantizedLoweringStatus status)
           status == EQuantizedLoweringStatus::SemanticUnsupported;
 }
 
+inline bool IsQuantizedLoweringOptimized(EQuantizedLoweringStatus status)
+{
+   return status == EQuantizedLoweringStatus::Optimized;
+}
+
 enum class EQuantizedBackend {
    UNDEFINED = 0, CPU = 1, ALPAKA = 2
 };
@@ -91,8 +96,55 @@ enum class EQuantizedStorageType {
    UNDEFINED = 0, FloatCarrier = 1, Int8 = 2, UInt8 = 3, Int32Accumulator = 4, MetadataOnly = 5
 };
 
+enum class EQuantizedCarrierMode {
+   UNDEFINED = 0,
+   Float = 1,
+   Int8 = 2,
+   UInt8 = 3,
+   Int32Accumulator = 4
+};
+
+enum class EQuantizedOutputMode {
+   UNDEFINED = 0,
+   ExactFakeQuantFloat = 1,
+   Quantized = 2,
+   Int32Accumulator = 3
+};
+
+enum class EQuantizedComputeProfile {
+   UNDEFINED = 0,
+   GenericRecognized = 1,
+   SignedInt8SymmetricPerTensorRank2 = 2
+};
+
 enum class EQuantizedLayout {
-   UNDEFINED = 0, Plain = 1, Transposed = 2, PackedCPU = 3, TiledAlpaka = 4
+   UNDEFINED = 0, Plain = 1, Transposed = 2, PackedCPU = 3, PlainDevice = 4, TiledAlpaka = 5
+};
+
+
+enum class EQuantizedShapePolicy {
+   UNDEFINED = 0,
+   Exact = 1,
+   ExactTooSmall = 2,
+   PaddedCandidate = 3,
+   Fallback = 4,
+   Unsupported = 5
+};
+
+struct QuantizedMatMulShapePolicy {
+   EQuantizedShapePolicy policy = EQuantizedShapePolicy::UNDEFINED;
+   std::size_t logicalM = 0;
+   std::size_t logicalK = 0;
+   std::size_t logicalN = 0;
+   std::size_t physicalM = 0;
+   std::size_t physicalK = 0;
+   std::size_t physicalN = 0;
+   std::size_t logicalMacs = 0;
+   std::size_t physicalMacs = 0;
+   std::size_t minimumOptimizedMacs = 0;
+   bool belowMinimumWork = false;
+   double paddingWorkRatio = 1.0;
+   std::string reason;
 };
 
 struct QuantizedTensorStorage {
@@ -104,11 +156,10 @@ struct QuantizedTensorStorage {
    QuantizationInfo quantization;
    std::vector<std::size_t> shape;
 
+   EQuantizedBackend residentBackend = EQuantizedBackend::UNDEFINED;
+
    bool isConstant = false;
-   bool isPersistent = true;
-   bool isTransient = false;
    bool isDeviceResident = false;
-   std::size_t byteSize = 0;
 };
 
 inline std::size_t QuantizedStorageElementSize(EQuantizedStorageType type)
@@ -159,18 +210,42 @@ struct QuantizedLoweringPlan {
    EQuantizedStorageType accumulatorStorage = EQuantizedStorageType::UNDEFINED;
    EQuantizedStorageType outputStorage = EQuantizedStorageType::UNDEFINED;
 
+   EQuantizedCarrierMode inputCarrierMode = EQuantizedCarrierMode::UNDEFINED;
+   EQuantizedOutputMode outputMode = EQuantizedOutputMode::UNDEFINED;
+   EQuantizedComputeProfile computeProfile = EQuantizedComputeProfile::UNDEFINED;
+   std::string capabilityTag;
+   QuantizedMatMulShapePolicy shapePolicy;
+
    std::string weightStorageTensor;
    EQuantizedLayout weightLayout = EQuantizedLayout::UNDEFINED;
 
    std::vector<std::size_t> consumedOperatorIndices;
    bool preservesQuantizationSemantics = false;
-   bool hasBaselineLowering = false;
-   bool hasOptimizedLowering = false;
    bool isMetadataOnly = false;
-   bool usesInt32Accumulator = false;
-   bool usesPrequantizedWeights = false;
+   bool supportsPrequantizedInputCarrier = false;
    bool suppressesGraphOperators = false;
 };
+
+inline bool QuantizedPlanUsesInt32Accumulator(const QuantizedLoweringPlan &plan)
+{
+   return plan.accumulatorStorage == EQuantizedStorageType::Int32Accumulator;
+}
+
+inline bool QuantizedPlanUsesPrequantizedWeights(const QuantizedLoweringPlan &plan)
+{
+   return !plan.weightStorageTensor.empty();
+}
+
+inline bool IsOptimizedQuantizedPlainDevicePlan(const QuantizedLoweringPlan &plan)
+{
+   return IsQuantizedLoweringOptimized(plan.status) && QuantizedPlanUsesPrequantizedWeights(plan) &&
+          plan.weightLayout == EQuantizedLayout::PlainDevice;
+}
+
+inline bool IsOptimizedQuantizedAlpakaPlainDevicePlan(const QuantizedLoweringPlan &plan)
+{
+   return plan.backend == EQuantizedBackend::ALPAKA && IsOptimizedQuantizedPlainDevicePlan(plan);
+}
 
 struct QuantizedGemmRegion {
    // Quantized carrier tensors, i.e. outputs of quantization boundaries.

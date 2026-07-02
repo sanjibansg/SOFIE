@@ -1,5 +1,5 @@
-#ifndef SOFIE_SOFIE_QUANTIZED_RUNTIME
-#define SOFIE_SOFIE_QUANTIZED_RUNTIME
+#ifndef SOFIE_QUANTIZED
+#define SOFIE_QUANTIZED
 
 #include <algorithm>
 #include <cmath>
@@ -11,7 +11,53 @@
 
 namespace SOFIE {
 
-// GEMM only, need to abstract for multiple operators / backends.
+// Portable quantized runtime helpers used by generated lowered quantized operators.
+
+inline bool NearlyEqualQuantizedScale(double lhs, double rhs)
+{
+   const auto scale = std::max({1.0, std::fabs(lhs), std::fabs(rhs)});
+   return std::fabs(lhs - rhs) <= (1.0e-12 * scale);
+}
+
+inline bool MakeQuantizedFixedPointMultiplier(double realMultiplier, std::int64_t &multiplier, int &shift)
+{
+   if (!std::isfinite(realMultiplier) || realMultiplier <= 0.0) {
+      return false;
+   }
+
+   int exponent = 0;
+   const double significand = std::frexp(realMultiplier, &exponent);
+   auto q31 = static_cast<std::int64_t>(std::llround(significand * 2147483648.0));
+   if (q31 == (std::int64_t{1} << 31)) {
+      q31 /= 2;
+      ++exponent;
+   }
+
+   const int candidateShift = 31 - exponent;
+   if (q31 <= 0 || candidateShift < 0 || candidateShift >= 62) {
+      return false;
+   }
+
+   multiplier = q31;
+   shift = candidateShift;
+   return true;
+}
+
+inline bool MakeExactIntegerScaleMultiplier(double scale, std::int64_t &multiplier, int &shift)
+{
+   if (!std::isfinite(scale) || scale < 0.0) {
+      return false;
+   }
+
+   const auto rounded = std::llround(scale);
+   if (!NearlyEqualQuantizedScale(scale, static_cast<double>(rounded))) {
+      return false;
+   }
+
+   multiplier = rounded;
+   shift = 0;
+   return true;
+}
 
 enum class EQuantizedGemmActivation {
    None = 0,
@@ -265,4 +311,4 @@ inline void QuantizedGemm_Call(float *output, const float *input, const WeightT 
 
 } // namespace SOFIE
 
-#endif // SOFIE_SOFIE_QUANTIZED_RUNTIME
+#endif // SOFIE_QUANTIZED

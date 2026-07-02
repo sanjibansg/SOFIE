@@ -4,7 +4,7 @@
 #include "SOFIE/ROperator.hxx"
 #include "SOFIE/SOFIE_common.hxx"
 #include "SOFIE/RQuantization.hxx"
-#include "SOFIE/SOFIE_QuantizedRuntime.hxx"
+#include "SOFIE/SOFIE_Quantized.hxx"
 
 #include <algorithm>
 #include <cmath>
@@ -20,10 +20,6 @@
 namespace SOFIE {
 
 struct QuantizedGemmCodegenContext {
-   std::string inputTensor;
-   std::string weightTensor;
-   std::string biasTensor;
-   std::string outputTensor;
    std::vector<Dim> inputShape;
    std::vector<Dim> weightShape;
    std::vector<Dim> outputShape;
@@ -32,7 +28,6 @@ struct QuantizedGemmCodegenContext {
    std::int64_t transA = 0;
    std::int64_t transB = 0;
    EActivationType activation = EActivationType::UNDEFINED;
-   std::string indent = "   ";
 };
 
 namespace INTERNAL {
@@ -57,50 +52,41 @@ inline void ValidateQuantizedGemmContext(const QuantizedGemmCodegenContext &cont
    }
 }
 
-inline bool NearlyEqualQuantizedScale(double lhs, double rhs)
+inline bool HasQuantizedGemmBias(const QuantizedGemmRegion &region)
 {
-   const auto scale = std::max({1.0, std::fabs(lhs), std::fabs(rhs)});
-   return std::fabs(lhs - rhs) <= (1.0e-12 * scale);
+   return !region.biasSourceTensor.empty();
 }
 
-inline bool MakeQuantizedGemmFixedPointMultiplier(double realMultiplier, std::int64_t &multiplier, int &shift)
+inline const char *QuantizedCudaInputCarrierName(EQuantizedCarrierMode mode)
 {
-   if (!std::isfinite(realMultiplier) || realMultiplier <= 0.0) {
-      return false;
+   switch (mode) {
+   case EQuantizedCarrierMode::Int8:
+      return "Int8";
+   case EQuantizedCarrierMode::Float:
+      return "Float";
+   default:
+      throw std::runtime_error("SOFIE quantized CUDA GEMM received unsupported input carrier mode");
    }
-
-   int exponent = 0;
-   const double significand = std::frexp(realMultiplier, &exponent);
-   auto q31 = static_cast<std::int64_t>(std::llround(significand * 2147483648.0));
-   if (q31 == (std::int64_t{1} << 31)) {
-      q31 /= 2;
-      ++exponent;
-   }
-
-   const int candidateShift = 31 - exponent;
-   if (q31 <= 0 || candidateShift < 0 || candidateShift >= 62) {
-      return false;
-   }
-
-   multiplier = q31;
-   shift = candidateShift;
-   return true;
 }
 
-inline bool MakeExactIntegerScaleMultiplier(double scale, std::int64_t &multiplier, int &shift)
+inline const char *QuantizedCudaEpilogueModeName(EQuantizedOutputMode mode)
 {
-   if (!std::isfinite(scale) || scale < 0.0) {
-      return false;
+   switch (mode) {
+   case EQuantizedOutputMode::ExactFakeQuantFloat:
+      return "ExactFakeQuant";
+   case EQuantizedOutputMode::Quantized:
+      return "Quantized";
+   default:
+      throw std::runtime_error("SOFIE quantized CUDA GEMM received unsupported output mode");
    }
+}
 
-   const auto rounded = std::llround(scale);
-   if (!NearlyEqualQuantizedScale(scale, static_cast<double>(rounded))) {
-      return false;
+inline const char *QuantizedCudaOutputCarrierName(const QuantizationInfo &info)
+{
+   if (info.bitWidth != 8) {
+      throw std::runtime_error("SOFIE quantized CUDA GEMM currently supports only 8-bit output carriers");
    }
-
-   multiplier = rounded;
-   shift = 0;
-   return true;
+   return info.isSigned ? "Int8" : "UInt8";
 }
 
 } // namespace INTERNAL
@@ -112,7 +98,7 @@ inline std::string GenerateFusedQuantizedGemmCallCPUCode(std::string opName, con
    opName = "op_" + opName;
    INTERNAL::ValidateQuantizedGemmContext(context, "fused Quantized Gemm call CPU");
 
-   if (!plan.usesPrequantizedWeights) {
+   if (!QuantizedPlanUsesPrequantizedWeights(plan)) {
       throw std::runtime_error("SOFIE fused Quantized Gemm call CPU path requires pre-quantized weight storage");
    }
    if (plan.weightStorageTensor.empty()) {
@@ -127,7 +113,7 @@ inline std::string GenerateFusedQuantizedGemmCallCPUCode(std::string opName, con
    if (region.inputSourceTensor.empty() || region.outputTensor.empty()) {
       throw std::runtime_error("SOFIE fused Quantized Gemm call CPU path is missing quantization source/output tensors");
    }
-   if (!context.biasTensor.empty() && (region.biasSourceTensor.empty() || !region.biasQuant.has_value())) {
+   if (INTERNAL::HasQuantizedGemmBias(region) && !region.biasQuant.has_value()) {
       throw std::runtime_error("SOFIE fused Quantized Gemm call CPU path is missing quantized bias metadata");
    }
 
@@ -136,7 +122,7 @@ inline std::string GenerateFusedQuantizedGemmCallCPUCode(std::string opName, con
    const auto m = context.inputShape[dimA - 2].GetVal();
    const auto k = context.inputShape[dimA - 1].GetVal();
    const auto n = context.weightShape[dimB - 2].GetVal();
-   const auto &SP = context.indent;
+   const std::string SP = "   ";
    constexpr std::size_t tileN = 4;
 
    const auto inputRange = QuantizedIntegerRange(region.inputQuant);
@@ -174,17 +160,17 @@ inline std::string GenerateFusedQuantizedGemmCallCPUCode(std::string opName, con
    std::int64_t requantMultiplier = 0;
    int requantShift = 0;
    const bool hasFixedPointRequantization =
-      INTERNAL::MakeQuantizedGemmFixedPointMultiplier(requantScale, requantMultiplier, requantShift);
+      MakeQuantizedFixedPointMultiplier(requantScale, requantMultiplier, requantShift);
 
-   const bool hasBiasTensor = !context.biasTensor.empty();
+   const bool hasBiasTensor = INTERNAL::HasQuantizedGemmBias(region);
    const bool hasAccumulatorBias =
       !hasBiasTensor ||
-      (region.biasQuant.has_value() && INTERNAL::NearlyEqualQuantizedScale(region.biasQuant->scale, accumulatorScale));
+      (region.biasQuant.has_value() && NearlyEqualQuantizedScale(region.biasQuant->scale, accumulatorScale));
    std::int64_t biasRequantMultiplier = 0;
    int biasRequantShift = 0;
    const bool hasExactIntegerBias =
       !hasBiasTensor ||
-      (region.biasQuant.has_value() && INTERNAL::MakeExactIntegerScaleMultiplier(
+      (region.biasQuant.has_value() && MakeExactIntegerScaleMultiplier(
                                       region.biasQuant->scale / region.outputQuant.scale, biasRequantMultiplier,
                                       biasRequantShift));
    const bool useIntegerEpilogue = hasFixedPointRequantization && (!hasBiasTensor || hasAccumulatorBias || hasExactIntegerBias);
@@ -216,7 +202,7 @@ inline std::string GenerateFusedQuantizedGemmCallCPUCode(std::string opName, con
       out << SP << opName << "_params.activation = SOFIE::EQuantizedGemmActivation::None;\n";
    }
 
-   if (!context.biasTensor.empty()) {
+   if (INTERNAL::HasQuantizedGemmBias(region)) {
       const auto biasRange = QuantizedIntegerRange(*region.biasQuant);
       out << SP << opName << "_params.hasBias = true;\n";
       out << SP << opName << "_params.scaleB = "
@@ -230,7 +216,7 @@ inline std::string GenerateFusedQuantizedGemmCallCPUCode(std::string opName, con
 
    out << SP << "SOFIE::QuantizedGemm_Call(tensor_" << region.outputTensor << ", tensor_"
        << region.inputSourceTensor << ", tensor_" << plan.weightStorageTensor << ", ";
-   if (!context.biasTensor.empty()) {
+   if (INTERNAL::HasQuantizedGemmBias(region)) {
       out << "tensor_" << region.biasSourceTensor;
    } else {
       out << "nullptr";
@@ -294,6 +280,84 @@ inline std::string GenerateFusedQuantizedGemmAlpakaFakeQuantDefinition(std::stri
    return "   QuantizedGemmAlpakaFakeQuantKernel_" + opName + " quantizedGemmAlpakaFakeQuantKernel_" + opName + ";\n";
 }
 
+inline std::string GenerateFusedQuantizedGemmCublasLtCoreLaunch(std::string opName,
+                                                               const QuantizedGemmCodegenContext &context,
+                                                               const QuantizedGemmRegion &region,
+                                                               const QuantizedLoweringPlan &plan)
+{
+   INTERNAL::ValidateQuantizedGemmContext(context, "fused Quantized Gemm cuBLASLt core launch");
+   if (plan.backend != EQuantizedBackend::ALPAKA || plan.status != EQuantizedLoweringStatus::Optimized ||
+       !QuantizedPlanUsesPrequantizedWeights(plan) || plan.weightLayout != EQuantizedLayout::PlainDevice ||
+       plan.weightStorageTensor.empty()) {
+      throw std::runtime_error("SOFIE fused Quantized Gemm cuBLASLt core launch requires an optimized Alpaka PlainDevice plan");
+   }
+   if (region.inputSourceTensor.empty() || region.outputTensor.empty()) {
+      throw std::runtime_error("SOFIE fused Quantized Gemm cuBLASLt core launch is missing input/output tensors");
+   }
+
+   const auto dimA = context.inputShape.size();
+   const auto dimB = context.weightShape.size();
+   const auto m = context.inputShape[dimA - 2].GetVal();
+   const auto k = context.inputShape[dimA - 1].GetVal();
+   const auto n = context.weightShape[dimB - 2].GetVal();
+
+   std::stringstream out;
+   out << "\n//--------- ROperator_QuantizedGemm cuBLASLt int8 GEMM core boundary " << opName << "\n";
+   out << "   // Optimized GPU boundary: stream-ordered cuBLASLt int8 GEMM selected by the lowering plan.\n";
+   out << "   {\n";
+   out << "      // Quantized lowering capability: " << plan.capabilityTag << "\n";
+   out << "      // Quantized lowering reason: " << plan.reason << "\n";
+   out << "      SOFIE::QuantizedGemmCudaLtParams params_quantizedGemm_" << opName << "{};\n";
+   out << "      params_quantizedGemm_" << opName << ".m = static_cast<std::size_t>(" << m << ");\n";
+   out << "      params_quantizedGemm_" << opName << ".n = static_cast<std::size_t>(" << n << ");\n";
+   out << "      params_quantizedGemm_" << opName << ".k = static_cast<std::size_t>(" << k << ");\n";
+   out << std::setprecision(17);
+   out << "      params_quantizedGemm_" << opName << ".inputScale = " << region.inputQuant.scale << ";\n";
+   out << "      params_quantizedGemm_" << opName << ".weightScale = " << region.weightQuant.scale << ";\n";
+   out << "      params_quantizedGemm_" << opName << ".biasScale = " << (region.biasQuant ? region.biasQuant->scale : 1.0) << ";\n";
+   out << "      params_quantizedGemm_" << opName << ".outputScale = " << region.outputQuant.scale << ";\n";
+   out << "      params_quantizedGemm_" << opName << ".inputZeroPoint = " << region.inputQuant.zeroPoint << ";\n";
+   out << "      params_quantizedGemm_" << opName << ".weightZeroPoint = " << region.weightQuant.zeroPoint << ";\n";
+   out << "      params_quantizedGemm_" << opName << ".biasZeroPoint = " << (region.biasQuant ? region.biasQuant->zeroPoint : 0) << ";\n";
+   out << "      params_quantizedGemm_" << opName << ".outputZeroPoint = " << region.outputQuant.zeroPoint << ";\n";
+   const auto inputRange = QuantizedIntegerRange(region.inputQuant);
+   const auto biasRange = region.biasQuant ? QuantizedIntegerRange(*region.biasQuant) : std::pair<std::int64_t, std::int64_t>{0, 0};
+   const auto outputRange = QuantizedIntegerRange(region.outputQuant);
+   out << "      params_quantizedGemm_" << opName << ".inputQMin = static_cast<std::int32_t>(" << inputRange.first << ");\n";
+   out << "      params_quantizedGemm_" << opName << ".inputQMax = static_cast<std::int32_t>(" << inputRange.second << ");\n";
+   out << "      params_quantizedGemm_" << opName << ".biasQMin = static_cast<std::int32_t>(" << biasRange.first << ");\n";
+   out << "      params_quantizedGemm_" << opName << ".biasQMax = static_cast<std::int32_t>(" << biasRange.second << ");\n";
+   out << "      params_quantizedGemm_" << opName << ".outputQMin = static_cast<std::int32_t>(" << outputRange.first << ");\n";
+   out << "      params_quantizedGemm_" << opName << ".outputQMax = static_cast<std::int32_t>(" << outputRange.second << ");\n";
+   out << "      params_quantizedGemm_" << opName << ".hasBias = " << (INTERNAL::HasQuantizedGemmBias(region) ? "true" : "false") << ";\n";
+   out << "      params_quantizedGemm_" << opName << ".hasRelu = " << (context.activation == EActivationType::RELU ? "true" : "false") << ";\n";
+   out << "      params_quantizedGemm_" << opName << ".maxWorkspaceBytes = 32ULL * 1024ULL * 1024ULL;\n";
+   const auto planEpilogueMode = INTERNAL::QuantizedCudaEpilogueModeName(plan.outputMode);
+   const auto planInputCarrier = INTERNAL::QuantizedCudaInputCarrierName(plan.inputCarrierMode);
+   out << "      params_quantizedGemm_" << opName << ".epilogueMode = SOFIE::EQuantizedCudaEpilogueMode::" << planEpilogueMode << ";\n";
+   out << "      params_quantizedGemm_" << opName << ".inputCarrier = SOFIE::EQuantizedCudaInputCarrier::" << planInputCarrier << ";\n";
+   out << "      params_quantizedGemm_" << opName << ".outputCarrier = SOFIE::EQuantizedCudaOutputCarrier::" << INTERNAL::QuantizedCudaOutputCarrierName(region.outputQuant) << ";\n";
+   if (plan.supportsPrequantizedInputCarrier) {
+      out << "#ifdef SOFIE_QUANTIZED_GEMM_PREQUANTIZED_INPUT\n";
+      out << "      params_quantizedGemm_" << opName << ".inputCarrier = SOFIE::EQuantizedCudaInputCarrier::Int8;\n";
+      out << "#endif\n";
+   }
+   out << "      params_quantizedGemm_" << opName << ".weightType = SOFIE::EQuantizedCudaWeightType::" << (region.weightQuant.isSigned ? "Int8" : "UInt8") << ";\n";
+   out << "      SOFIE::QuantizedGemmCudaLt_Call(quantizedGemmCudaLtState_" << opName
+       << ", alpaka::getNativeHandle(queue)"
+       << ", alpaka::getPtrNative(deviceBuf_" << region.outputTensor << ")"
+       << ", alpaka::getPtrNative(deviceBuf_" << region.inputSourceTensor << ")"
+       << ", alpaka::getPtrNative(deviceBuf_" << plan.weightStorageTensor << ")";
+   if (INTERNAL::HasQuantizedGemmBias(region)) {
+      out << ", alpaka::getPtrNative(deviceBuf_" << region.biasSourceTensor << ")";
+   } else {
+      out << ", static_cast<const float *>(nullptr)";
+   }
+   out << ", params_quantizedGemm_" << opName << ");\n";
+   out << "   }\n";
+   return out.str();
+}
+
 inline std::string GenerateFusedQuantizedGemmAlpakaFakeQuantLaunch(std::string opName,
                                                                    const QuantizedGemmCodegenContext &context,
                                                                    const QuantizedGemmRegion &region,
@@ -306,7 +370,7 @@ inline std::string GenerateFusedQuantizedGemmAlpakaFakeQuantLaunch(std::string o
    if (region.inputSourceTensor.empty() || region.weightSourceTensor.empty() || region.outputTensor.empty()) {
       throw std::runtime_error("SOFIE fused Quantized Gemm Alpaka fake-quant launch is missing quantization source/output tensors");
    }
-   if (!context.biasTensor.empty() && (region.biasSourceTensor.empty() || !region.biasQuant.has_value())) {
+   if (INTERNAL::HasQuantizedGemmBias(region) && !region.biasQuant.has_value()) {
       throw std::runtime_error("SOFIE fused Quantized Gemm Alpaka fake-quant launch is missing quantized bias metadata");
    }
 
@@ -331,7 +395,7 @@ inline std::string GenerateFusedQuantizedGemmAlpakaFakeQuantLaunch(std::string o
        << ", quantizedGemmAlpakaFakeQuantKernel_" << opName
        << ", alpaka::getPtrNative(deviceBuf_" << region.inputSourceTensor << ")"
        << ", alpaka::getPtrNative(deviceBuf_" << region.weightSourceTensor << ")";
-   if (!context.biasTensor.empty()) {
+   if (INTERNAL::HasQuantizedGemmBias(region)) {
       out << ", alpaka::getPtrNative(deviceBuf_" << region.biasSourceTensor << ")";
    } else {
       out << ", static_cast<const float *>(nullptr)";
@@ -340,7 +404,7 @@ inline std::string GenerateFusedQuantizedGemmAlpakaFakeQuantLaunch(std::string o
        << ", static_cast<std::size_t>(" << elements << ")"
        << ", static_cast<std::size_t>(" << n << ")"
        << ", static_cast<std::size_t>(" << k << ")"
-       << ", " << (!context.biasTensor.empty() ? "true" : "false")
+       << ", " << (INTERNAL::HasQuantizedGemmBias(region) ? "true" : "false")
        << ", " << (context.activation == EActivationType::RELU ? "true" : "false")
        << ", " << std::setprecision(std::numeric_limits<double>::max_digits10) << region.inputQuant.scale
        << ", " << std::setprecision(std::numeric_limits<double>::max_digits10) << region.weightQuant.scale
@@ -389,7 +453,7 @@ public:
    std::string Generate(std::string opName) override
    {
       if (fPlan.backend != EQuantizedBackend::CPU || !IsQuantizedLoweringAvailable(fPlan.status) ||
-          !fPlan.suppressesGraphOperators || !fPlan.usesPrequantizedWeights ||
+          !fPlan.suppressesGraphOperators || !QuantizedPlanUsesPrequantizedWeights(fPlan) ||
           fPlan.weightLayout != EQuantizedLayout::PackedCPU) {
          throw std::runtime_error("SOFIE ROperator_QuantizedGemm CPU code generation requires an available packed-weight CPU lowering plan");
       }
@@ -399,16 +463,22 @@ public:
 
    std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override
    {
+      if (IsOptimizedQuantizedAlpakaPlainDevicePlan(fPlan))
+         return "";
       return GenerateFusedQuantizedGemmAlpakaFakeQuantKernel(std::move(opName), fContext);
    }
 
    std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override
    {
+      if (IsOptimizedQuantizedAlpakaPlainDevicePlan(fPlan))
+         return "   SOFIE::QuantizedGemmCudaLtState quantizedGemmCudaLtState_" + opName + "; // owns cuBLASLt state and CUDA temporaries\n";
       return GenerateFusedQuantizedGemmAlpakaFakeQuantDefinition(std::move(opName), fContext);
    }
 
    std::string Generate_GPU_ALPAKA(std::string opName) override
    {
+      if (IsOptimizedQuantizedAlpakaPlainDevicePlan(fPlan))
+         return GenerateFusedQuantizedGemmCublasLtCoreLaunch(std::move(opName), fContext, fRegion, fPlan);
       return GenerateFusedQuantizedGemmAlpakaFakeQuantLaunch(std::move(opName), fContext, fRegion, fPlan);
    }
 };

@@ -58,7 +58,7 @@ void RModel::BuildLoweredOperatorView(EQuantizedBackend backend)
 {
    fLoweredOperators.clear();
    fLoweredConsumedOperatorIndices.clear();
-   AddLoweredQuantizedGemmOperators(backend);
+   AddLoweredQuantizedOperators(backend);
 }
 
 std::vector<size_t> RModel::GetTensorShape(const std::string & name) const {
@@ -1540,7 +1540,7 @@ void RModel::Generate(std::underlying_type_t<Options> options, int batchSize, lo
    Initialize(batchSize, verbose);
    BuildLoweredOperatorView(EQuantizedBackend::CPU);
 
-   AddQuantizedGeneratedHeaders();
+   AddQuantizedGeneratedHeaders(EQuantizedBackend::CPU);
 
    // if having dynamic tensor we need to have a Session
    if (!fDynamicTensorInfos.empty()) {
