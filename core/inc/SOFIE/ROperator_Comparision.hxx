@@ -103,8 +103,14 @@ public:
       fIsDynamic = model.IsDynamicTensor(fNX1) || model.IsDimInputTensor(fNX1)
                 || model.IsDynamicTensor(fNX2) || model.IsDimInputTensor(fNX2);
       if (fIsDynamic) {
-         fDimShapeX1 = model.GetDynamicTensorShape(fNX1);
-         fDimShapeX2 = model.GetDynamicTensorShape(fNX2);
+         // one input may be dynamic while the other is static, so resolve each
+         // shape on its own; GetDynamicTensorShape throws on a static tensor
+         fDimShapeX1 = (model.IsDynamicTensor(fNX1) || model.IsDimInputTensor(fNX1))
+                          ? model.GetDynamicTensorShape(fNX1)
+                          : ConvertShapeToDim(model.GetTensorShape(fNX1));
+         fDimShapeX2 = (model.IsDynamicTensor(fNX2) || model.IsDimInputTensor(fNX2))
+                          ? model.GetDynamicTensorShape(fNX2)
+                          : ConvertShapeToDim(model.GetTensorShape(fNX2));
          if (UTILITY::AreSameShape(fDimShapeX1, fDimShapeX2))
             fDimShapeY = fDimShapeX1;
          else

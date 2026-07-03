@@ -150,6 +150,10 @@
 #include "ReduceMax_FromONNX_GPU_ALPAKA.hxx"
 #include "ReduceMax_axis0_FromONNX_GPU_ALPAKA.hxx"
 #include "ReduceMax_mid_FromONNX_GPU_ALPAKA.hxx"
+#include "DynamicReduceSumLast_FromONNX_GPU_ALPAKA.hxx"
+#include "DynamicReduceMeanMid_FromONNX_GPU_ALPAKA.hxx"
+#include "DynamicReduceMaxFirst_FromONNX_GPU_ALPAKA.hxx"
+#include "DynamicReduceSumMulti_FromONNX_GPU_ALPAKA.hxx"
 #include "input_models/references/ReduceMean.ref.hxx"
 #include "input_models/references/ReduceProd.ref.hxx"
 #include "input_models/references/ReduceL2.ref.hxx"
@@ -2546,6 +2550,160 @@ TEST_F(SofieAlpakaTest, ReduceMax_mid)
     float* correct = ReduceMax_mid_ExpectedOutput::output;
     for (std::size_t i = 0; i < outputSize; ++i)
         EXPECT_NEAR(res_ptr[i], correct[i], TOLERANCE) << "  i=" << i;
+}
+
+// ── Dynamic (symbolic-shape) Reduce tests: each runs at two runtime sizes so a
+//    baked-in shape would fail one of them. References are computed in-test.
+
+// DynamicReduceSumLast: X[N,4] -> ReduceSum(axis=-1, keepdims=0) -> Y[N]
+//   last-axis (kLast), pruned output, negative axis, static reduced-length.
+TEST_F(SofieAlpakaTest, DynamicReduceSumLast)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t cols = 4;
+    for (std::size_t N : {std::size_t(1), std::size_t(8)}) {
+        const std::size_t inSize = N * cols, outSize = N;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{inSize}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < inSize; ++i) in_ptr[i] = static_cast<float>(i + 1);
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{inSize}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outSize}));
+        {
+            SOFIE_DynamicReduceSumLast::Session<alpaka::TagGpuCudaRt> session("", N);
+            auto result = session.infer(N, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t n = 0; n < N; ++n) {
+            float expected = 0.f;
+            for (std::size_t c = 0; c < cols; ++c) expected += in_ptr[n * cols + c];
+            EXPECT_LE(std::abs(res[n] - expected), TOLERANCE);
+        }
+    }
+}
+
+// DynamicReduceMeanMid: X[N,4,M] -> ReduceMean(axis=1, keepdims=1) -> Y[N,1,M]
+//   middle-axis (kMiddle) with TWO symbolic dims. Reconstruct the session per size so
+//   the returned Y buffer matches outSize; the output length N*M is a symmetric product
+//   so the unordered_map ctor-arg order is immaterial, and infer args stay in
+//   declaration order (N, M).
+TEST_F(SofieAlpakaTest, DynamicReduceMeanMid)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t K = 4;
+
+    const std::size_t Ns[] = {1, 8};
+    const std::size_t Ms[] = {1, 3};
+    for (int t = 0; t < 2; ++t) {
+        const std::size_t N = Ns[t], M = Ms[t];
+        const std::size_t inSize = N * K * M, outSize = N * M;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{inSize}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < inSize; ++i) in_ptr[i] = static_cast<float>(i + 1);
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{inSize}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outSize}));
+        {
+            SOFIE_DynamicReduceMeanMid::Session<alpaka::TagGpuCudaRt> session("", N, M);
+            auto result = session.infer(N, M, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t n = 0; n < N; ++n)
+            for (std::size_t m = 0; m < M; ++m) {
+                float sum = 0.f;
+                for (std::size_t k = 0; k < K; ++k)
+                    sum += in_ptr[n * K * M + k * M + m];
+                float expected = sum / static_cast<float>(K);
+                EXPECT_LE(std::abs(res[n * M + m] - expected), TOLERANCE);
+            }
+    }
+}
+
+// DynamicReduceMaxFirst: X[N,4] -> ReduceMax(axis=0, keepdims=0) -> Y[4]
+//   reduces the DYNAMIC axis, so reducedLength is symbolic (=N); kFirst path, Max op.
+TEST_F(SofieAlpakaTest, DynamicReduceMaxFirst)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t cols = 4;
+    for (std::size_t N : {std::size_t(1), std::size_t(8)}) {
+        const std::size_t inSize = N * cols, outSize = cols;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{inSize}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < inSize; ++i) in_ptr[i] = static_cast<float>((i * 7 + 3) % 11);
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{inSize}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outSize}));
+        {
+            SOFIE_DynamicReduceMaxFirst::Session<alpaka::TagGpuCudaRt> session("", N);
+            auto result = session.infer(N, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t c = 0; c < cols; ++c) {
+            float expected = in_ptr[c];   // n == 0
+            for (std::size_t n = 1; n < N; ++n)
+                if (in_ptr[n * cols + c] > expected) expected = in_ptr[n * cols + c];
+            EXPECT_LE(std::abs(res[c] - expected), TOLERANCE);
+        }
+    }
+}
+
+// DynamicReduceSumMulti: X[N,3,2] -> ReduceSum(axes=[1,2], keepdims=0) -> Y[N]
+//   multi-axis reduce -> exercises the redStrides product string in the kernel.
+TEST_F(SofieAlpakaTest, DynamicReduceSumMulti)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t slice = 3 * 2;
+    for (std::size_t N : {std::size_t(1), std::size_t(8)}) {
+        const std::size_t inSize = N * slice, outSize = N;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{inSize}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < inSize; ++i) in_ptr[i] = static_cast<float>(i + 1);
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{inSize}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outSize}));
+        {
+            SOFIE_DynamicReduceSumMulti::Session<alpaka::TagGpuCudaRt> session("", N);
+            auto result = session.infer(N, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t n = 0; n < N; ++n) {
+            float expected = 0.f;
+            for (std::size_t j = 0; j < slice; ++j) expected += in_ptr[n * slice + j];
+            EXPECT_LE(std::abs(res[n] - expected), TOLERANCE);
+        }
+    }
 }
 
 TEST_F(SofieAlpakaTest, ConvWithPadding)
