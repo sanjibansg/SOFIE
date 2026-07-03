@@ -116,9 +116,15 @@ int main(int argc, char *argv[]) {
 #endif
     std::printf("\n\n");
 
-    std::printf("%-40s  %12s  %14s  %15s  %16s\n",
-                "Model", "infer(ms)", "in_xfer(ms)", "out_xfer(ms)", "Throughput(inf/s)");
-    std::printf("%s\n", std::string(103, '-').c_str());
+    std::printf("%-40s  %12s  %14s  %15s  %16s  %14s\n",
+                "Model",
+                "infer(ms)",
+                "in_xfer(ms)",
+                "out_xfer(ms)",
+                "Throughput(inf/s)",
+                "Runtime(MB)");
+
+    std::printf("%s\n", std::string(118, '-').c_str());
 #endif  // SOFIE_BENCHMARK_PROFILE
     std::fflush(stdout);
 

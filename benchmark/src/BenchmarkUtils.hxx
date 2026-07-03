@@ -99,6 +99,8 @@ inline void PrintHeader(const BenchmarkConfig &cfg, const std::string &deviceNam
                   << std::setw(12) << "Output"
                   << std::setw(14) << "Avg(ms)"
                   << std::setw(16) << "Throughput(i/s)"
+                  << std::setw(14) << "Weights(MB)"
+                  << std::setw(16) << "Runtime(MB)"
                   << std::setw(12) << "ORT Check"
                   << "\n";
         std::cout << std::string(96, '-') << "\n";
@@ -140,6 +142,8 @@ inline void PrintResult(const BenchmarkResult &r, const BenchmarkConfig &cfg) {
                   << std::setw(12) << r.outputElements
                   << std::setw(14) << std::fixed << std::setprecision(4) << r.avgInferMs
                   << std::setw(16) << std::fixed << std::setprecision(1) << r.throughput
+                  << std::setw(14) << std::fixed << std::setprecision(4) << r.weightMemMB
+                  << std::setw(16) << std::fixed << std::setprecision(1) << r.runtimeMemMB
                   << std::setw(12) << ortStr
                   << "\n";
     }

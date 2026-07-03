@@ -985,9 +985,17 @@ void RModel::GenerateIntermediateMemoryPool_GPU_ALPAKA() {
    // of other data types
    auto const &totalStack = fIntermediateMemoryInfoGPU.total_stack;
    const size_t memPoolSize = totalStack.rbegin()->first + totalStack.rbegin()->second.reserved_size;
+
+   fGC += "static constexpr std::size_t kIntermediateMemoryPoolSize = "
+          + std::to_string(memPoolSize) + ";\n";
+
    fGC += "BufUI81D fIntermediateMemoryPool = "
           "alpaka::allocBuf<std::uint8_t, size_t>(devAcc, "
-          "Ext1D::all(Idx{" + std::to_string(memPoolSize) + "}));\n\n";
+          "Ext1D::all(Idx{kIntermediateMemoryPoolSize}));\n\n";
+
+   fGC += "std::size_t GetIntermediateMemoryPoolSize() const {\n";
+   fGC += "   return kIntermediateMemoryPoolSize;\n";
+   fGC += "}\n\n";
 }
 
 void RModel::GenerateSessionCode_GPU_ALPAKA() {
