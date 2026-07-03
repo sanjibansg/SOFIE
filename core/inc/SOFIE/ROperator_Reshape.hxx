@@ -339,6 +339,7 @@ public:
       else {
          // non-constant case
          model.AddIntermediateTensor(fNOutput, model.GetTensorType(fNData), fShapeOutput);
+         model.AddAliasTensor(fNOutput, fNData);
          if (model.Verbose())
             std::cout << Name() << " : " << fNData << " " << ConvertDimShapeToString(fShapeInput) << " -->  "<< fNOutput << "  " << ConvertDimShapeToString(fShapeOutput)  << std::endl;
       }

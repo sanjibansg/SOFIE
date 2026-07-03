@@ -189,10 +189,47 @@ struct TensorMemoryInfo {
    }
 };
 
+struct TensorMemoryInfoGPU {
+   std::string_view tensor_name;
+   size_t tensor_size;     // actual tensor payload bytes
+   size_t reserved_size;   // bytes reserved in pool, including padding
+
+   TensorMemoryInfoGPU split(const std::string_view new_name,
+                             size_t new_tensor_size,
+                             size_t new_reserved_size) {
+      if (new_reserved_size > reserved_size) {
+         throw std::invalid_argument("New size exceeds available tensor size.");
+      }
+
+      reserved_size -= new_reserved_size;
+      tensor_size = reserved_size;
+
+      return TensorMemoryInfoGPU{
+         new_name,
+         new_tensor_size,
+         new_reserved_size
+      };
+   }
+
+   void merge(const TensorMemoryInfoGPU& other) {
+      reserved_size += other.reserved_size;
+      tensor_size = reserved_size;
+   }
+};
+
 struct MemoryPoolInfo {
 
    // ordered map with chunk_idx as key and TensorMemoryInfo as value
    std::map<size_t, TensorMemoryInfo> total_stack;
+
+   // ordered map with chunk_idx as key and chunk_size as value
+   std::map<size_t, size_t> available_stack;
+};
+
+struct MemoryPoolInfoGPU {
+
+   // ordered map with chunk_idx as key and TensorMemoryInfo as value
+   std::map<size_t, TensorMemoryInfoGPU> total_stack;
 
    // ordered map with chunk_idx as key and chunk_size as value
    std::map<size_t, size_t> available_stack;

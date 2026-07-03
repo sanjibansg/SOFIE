@@ -49,6 +49,7 @@ private:
 
    // memory pool information for intermediate tensors
    MemoryPoolInfo fIntermediateMemoryInfo;    ///<!  intermediate memory info (transient)
+   MemoryPoolInfoGPU fIntermediateMemoryInfoGPU; // For GPU 
    std::unordered_map<std::string_view, size_t> fIntermediateTensorFrequencyLookup;    ///<!  lookup table for intermediate tensor frequency (transient)
 
    std::string fExtraCodeForDimShapes; // extra code needed for initialization of dynamic parameters (e.g. number of non zero elements in NonZero operator)
@@ -218,6 +219,15 @@ public:
    // calculate total intermediate memory and position intermediate tensor addresses
    std::string AllocateIntermediateMemory(std::span<const std::string> op_output_tensors);
    void CheckAndFlushIntermediateMemory(std::span<const std::string> op_output_tensors, const size_t& op_idx);
+
+
+   // GPU memory allocation
+   std::string AllocateIntermediateMemory_GPU_ALPAKA(std::span<const std::string> op_output_tensors);
+
+   void CheckAndFlushIntermediateMemory_GPU_ALPAKA(std::span<const std::string> op_input_tensors,
+                                                   const size_t& op_idx);
+
+   void GenerateIntermediateMemoryPool_GPU_ALPAKA();
 
 protected:
    // internal functions

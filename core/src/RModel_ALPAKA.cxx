@@ -6,6 +6,8 @@
 #include <string>
 #include <unordered_map>
 
+#include "../inc/SOFIE/SOFIE_common.hxx"
+
 #ifdef SOFIE_SUPPORT_ROOT_BINARY
 #include "TFile.h"
 #endif
@@ -382,6 +384,33 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
       throw std::runtime_error("sofie: input tensor " + name + " is of an unsupported data type.");
    };
 
+   auto IsPooledIntermediate = [this](const std::string &name) -> bool {
+      return fIntermediateTensorInfos.count(name) > 0 &&
+             fInitializedTensors.count(name) == 0 &&
+             fDynamicTensorInfos.count(name) == 0 &&
+             fFusionIntermediateTensors.count(name) == 0;
+   };
+
+   auto GetOutputReturnType = [&](const std::string &name) -> std::string {
+      ETensorType type = GetTensorType(name);
+
+      if (IsPooledIntermediate(name)) {
+         if (type == ETensorType::FLOAT)  return "ViewF1D";
+         if (type == ETensorType::DOUBLE) return "ViewD1D";
+         if (type == ETensorType::INT32)  return "ViewI321D";
+         if (type == ETensorType::INT64)  return "ViewI641D";
+         if (type == ETensorType::BOOL)   return "ViewUI81D";
+      }
+
+      if (type == ETensorType::FLOAT)  return "BufF1D";
+      if (type == ETensorType::DOUBLE) return "BufD1D";
+      if (type == ETensorType::INT32)  return "BufI321D";
+      if (type == ETensorType::INT64)  return "BufI641D";
+      if (type == ETensorType::BOOL)   return "BufUI81D";
+
+      throw std::runtime_error("Unsupported output tensor type: " + name);
+   };
+
    // Collect deduplicated dynamic dimension parameter names in declaration order
    std::vector<std::string> dynParamNames;
    {
@@ -505,16 +534,15 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
 
 
    std::string returnType;
+
    if (outputSize == 1) {
-      returnType = "alpaka::Buf<Acc, " + ConvertOutputTypeToString(eFirstOutputType) + ", Dim, Idx>";
-   } else if (sameOutputTypes) {
-      returnType = "std::array<alpaka::Buf<Acc, " + ConvertOutputTypeToString(eFirstOutputType) +
-                   ", Dim, Idx>, " + std::to_string(outputSize) + ">";
+      std::string tname = *fOutputTensorNames.begin();
+      returnType = GetOutputReturnType(tname);
    } else {
       returnType = "std::tuple<";
       for (size_t i = 0; i < outputSize; i++) {
          std::string tname = *(fOutputTensorNames.begin() + i);
-         returnType += "alpaka::Buf<Acc, " + ConvertOutputTypeToString(GetTensorType(tname)) + ", Dim, Idx>";
+         returnType += GetOutputReturnType(tname);
          if (i < outputSize - 1) returnType += ",";
       }
       returnType += ">";
@@ -555,8 +583,369 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    fGC += "}\n";
 }
 
-void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
+// Get the data member name corresponding to a tensor with a given name.
+std::string TensorMember(std::string const &name) {
+   return "tensor_" + name;
+}
+
+// Round up memory location to required alignment
+size_t AlignUp(size_t offset, size_t alignment) {
+   return (offset + alignment - 1) & ~(alignment - 1);
+}
+
+// Round down memory location to required alignment
+size_t AlignDown(size_t offset, size_t alignment) {
+   return offset & ~(alignment - 1);
+}
+
+void CheckGPUStacks(const MemoryPoolInfoGPU& info) {
+   std::vector<std::tuple<size_t, size_t, std::string>> ranges;
+
+   for (auto const& [offset, t] : info.total_stack) {
+      if (t.reserved_size == 0) continue;
+      ranges.emplace_back(offset, offset + t.reserved_size, std::string(t.tensor_name));
+   }
+
+   std::sort(ranges.begin(), ranges.end());
+
+   for (size_t i = 1; i < ranges.size(); ++i) {
+      auto [prevBegin, prevEnd, prevName] = ranges[i - 1];
+      auto [curBegin, curEnd, curName] = ranges[i];
+
+      if (curBegin < prevEnd) {
+         std::cout << "OVERLAP: "
+                   << prevName << " [" << prevBegin << "," << prevEnd << ") and "
+                   << curName << " [" << curBegin << "," << curEnd << ")\n";
+         throw std::runtime_error("GPU memory pool overlap detected");
+      }
+   }
+
+   for (auto const& [offset, size] : info.available_stack) {
+      auto it = info.total_stack.find(offset);
+      if (it == info.total_stack.end()) {
+         throw std::runtime_error("available_stack entry missing from total_stack");
+      }
+      if (it->second.reserved_size != size) {
+         std::cout << "SIZE MISMATCH free chunk at " << offset
+                   << " available=" << size
+                   << " total=" << it->second.reserved_size << "\n";
+         throw std::runtime_error("GPU free chunk size mismatch");
+      }
+   }
+}
+
+std::string RModel::AllocateIntermediateMemory_GPU_ALPAKA(std::span<const std::string> op_output_tensors) {
+   std::stringstream code;
+
+   if (fVerbose) {
+      std::cout << "Total chunks allocated\n";
+      for (auto chunk = fIntermediateMemoryInfoGPU.total_stack.begin(); chunk != fIntermediateMemoryInfoGPU.total_stack.end(); ++chunk) {
+         std::cout << "..... chunk " << chunk->first << " size " << chunk->second.reserved_size << " " << chunk->second.tensor_name << std::endl;
+      }
+   }
+
+   auto declareIntermediateTensor =
+   [this, &code](std::string const &name, size_t size, size_t location) {
+      ETensorType type = GetTensorType(name);
+      std::string typeName = ConvertTypeToString(type);
+      auto shape = GetTensorShape(name);
+      size_t length = ConvertShapeToLength(shape);
+      std::string viewType;
+
+      if (type == ETensorType::FLOAT)
+         viewType = "ViewF1D";
+      else if (type == ETensorType::DOUBLE)
+         viewType = "ViewD1D";
+      else if (type == ETensorType::INT32)
+         viewType = "ViewI321D";
+      else if (type == ETensorType::INT64)
+         viewType = "ViewI641D";
+      else if (type == ETensorType::BOOL)
+         viewType = "ViewUI81D";
+      else
+         throw std::runtime_error("Unsupported tensor type for GPU pooled intermediate tensor: " + name);
+
+      code << "\n// Allocating GPU pooled view for intermediate tensor "
+           << name << " with size " << size << " bytes\n";
+
+      code << viewType << " deviceBuf_" << name << "{"
+           << "reinterpret_cast<" << typeName << "*>("
+           << "alpaka::getPtrNative(fIntermediateMemoryPool) + " << location << "), "
+           << "devAcc, "
+           << "Ext1D::all(Idx{" << length << "})};\n";
+
+      size_t align = GetTypeSize(type);
+      if (location % align != 0 && fVerbose) {
+         std::cout << "MISALIGNED tensor " << name
+                   << " location " << location
+                   << " align " << align << std::endl;
+      }
+   };
+
+   if (fVerbose) std::cout << "*** AllocateIntermediateMemory: Loop on op output tensors\n";
+   // order output tensors by size
+   std::vector<TensorMemoryInfoGPU> ordered_output_tensors;
+
+   for (auto &it : op_output_tensors) {
+      auto name = std::string(it);
+
+      ETensorType type;
+      std::vector<size_t> shape;
+
+      try {
+         type = GetTensorType(name);
+         shape = GetTensorShape(name);
+      } catch (...) {
+         std::cout << "Skipping unresolved tensor: " << name << std::endl;
+         continue;
+      }
+
+      // if (std::find(fOutputTensorNames.begin(), fOutputTensorNames.end(), name)!= fOutputTensorNames.end())
+      //    continue;
+
+      if (fInitializedTensors.find(name) != fInitializedTensors.end() ||
+          fDynamicTensorInfos.find(name) != fDynamicTensorInfos.end())
+         continue;
+
+      if (fFusionIntermediateTensors.count(name))
+         continue;
+
+      if (IsAliasTensor(name))
+         continue;
+
+      auto tensor_size = GetTypeSize(type) * ConvertShapeToLength(shape);
+
+      TensorMemoryInfoGPU tmi = {it, tensor_size, tensor_size};
+      ordered_output_tensors.push_back(tmi);
+   }
+
+   std::sort(ordered_output_tensors.begin(), ordered_output_tensors.end(),
+             [](const TensorMemoryInfoGPU &a, const TensorMemoryInfoGPU &b) { return a.tensor_size > b.tensor_size; });
+
+   for (auto &it : ordered_output_tensors) {
+      bool allocated = false;
+      std::string name = std::string{it.tensor_name};
+      size_t tensor_size = it.tensor_size;
+      ETensorType type = GetTensorType(name);
+
+      if (fVerbose)
+         std::cout << "output tensor " << name << " size " << tensor_size << std::endl;
+
+      for (auto chunk = fIntermediateMemoryInfoGPU.available_stack.begin();
+           chunk != fIntermediateMemoryInfoGPU.available_stack.end();) {
+
+         if (fVerbose) std::cout << ".. available chunk " << chunk->first << " with size = " << chunk->second;
+         // check if available memory chunks can accommodate the tensor
+         if (chunk->second >= tensor_size) {
+            size_t align = GetTypeSize(type);
+
+            auto raw_location = chunk->first + chunk->second - tensor_size;
+            auto new_chunk_location = AlignDown(raw_location, align);
+
+            // If alignment pushes the tensor before the start of the free chunk,
+            // this chunk cannot fit the tensor after alignment.
+            if (new_chunk_location < chunk->first) {
+               ++chunk;
+               continue;
+            }
+
+            auto padding = raw_location - new_chunk_location;
+
+            // Need enough space for tensor + alignment padding.
+            if (chunk->second < tensor_size + padding) {
+               ++chunk;
+               continue;
+            }
+
+            auto new_chunk = fIntermediateMemoryInfoGPU.total_stack[chunk->first]
+        .split(it.tensor_name, tensor_size, tensor_size + padding);
+
+            const size_t free_offset = chunk->first;
+            const size_t remaining_free = new_chunk_location - free_offset;
+
+            // Update/remove the free chunk before inserting the allocated chunk.
+            if (remaining_free == 0) {
+               fIntermediateMemoryInfoGPU.available_stack.erase(chunk);
+               fIntermediateMemoryInfoGPU.total_stack.erase(free_offset);
+            } else {
+               chunk->second = remaining_free;
+
+               auto &free_chunk = fIntermediateMemoryInfoGPU.total_stack[free_offset];
+               free_chunk.tensor_name = "free";
+               free_chunk.tensor_size = remaining_free;
+               free_chunk.reserved_size = remaining_free;
+            }
+
+            // Insert the allocated tensor.
+            fIntermediateMemoryInfoGPU.total_stack[new_chunk_location] = new_chunk;
+
+            declareIntermediateTensor(name, tensor_size, new_chunk_location);
+
+            allocated = true;
+
+            CheckGPUStacks(fIntermediateMemoryInfoGPU);
+
+            if (fVerbose) std::cout << " is re-used and split in a new of size " << new_chunk.tensor_size << " at " << new_chunk_location;
+
+            if (fVerbose) std::cout << std::endl;
+            break;
+         }
+
+         // else if (chunk->first == fIntermediateMemoryInfoGPU.available_stack.rbegin()->first &&
+         //            fIntermediateMemoryInfoGPU.total_stack.rbegin()->first == chunk->first) {
+         //    // case last available chunk is the last in the memory, we can increase that one
+         //    size_t align = GetTypeSize(type);
+         //    size_t aligned_location = AlignUp(chunk->first, align);
+         //
+         //    size_t padding = aligned_location - chunk->first;
+         //    if (chunk->second < tensor_size + padding) {
+         //       ++chunk;
+         //       continue;
+         //    }
+         //
+         //    fIntermediateMemoryInfoGPU.total_stack[aligned_location] = {it.tensor_name, tensor_size};
+         //    declareIntermediateTensor(name, tensor_size, aligned_location);
+         //
+         //    fIntermediateMemoryInfoGPU.available_stack.erase(chunk);
+         //    allocated = true;
+         //    if (fVerbose) std::cout << " is extended  with a bigger one of size " << tensor_size << std::endl;
+         //    break;
+         // }
+         ++chunk;
+         if (fVerbose) std::cout << std::endl;
+      }
+
+      if (!allocated) {
+         size_t chunk_idx = fIntermediateMemoryInfoGPU.total_stack.empty()
+                               ? 0
+                               : fIntermediateMemoryInfoGPU.total_stack.rbegin()->first +
+                                    fIntermediateMemoryInfoGPU.total_stack.rbegin()->second.reserved_size;
+
+         chunk_idx = AlignUp(chunk_idx, GetTypeSize(type));
+         fIntermediateMemoryInfoGPU.total_stack[chunk_idx] = TensorMemoryInfoGPU{it.tensor_name, tensor_size, tensor_size};
+
+         declareIntermediateTensor(name, tensor_size, chunk_idx);
+
+         CheckGPUStacks(fIntermediateMemoryInfoGPU);
+
+         if (fVerbose) std::cout << "no chunk available - add in total stack a new chunk with size of tensor and idx : " << chunk_idx
+                   << std::endl;
+      }
+   }
+   return code.str();
+}
+
+
+void RModel::CheckAndFlushIntermediateMemory_GPU_ALPAKA(std::span<const std::string> op_input_tensors, const size_t& op_idx) {
+   if (fVerbose) std::cout << "*** CheckAndFlushIntermediateMemory: Loop on input tensors for op " << op_idx << "\n";
+   //print available chunks
+   if (fVerbose) std::cout << "available chunks before freeing them : \n";
+   for (auto chunk = fIntermediateMemoryInfoGPU.available_stack.begin();
+        chunk != fIntermediateMemoryInfoGPU.available_stack.end(); chunk++) {
+      if (fVerbose) std::cout << "-- free chunk " << chunk->first <<  " size = " << chunk->second << std::endl;
+   }
+   for (auto &iv : op_input_tensors) {
+      // last occurrence of the tensor is reached => flush it from memory
+      if (fVerbose) std::cout << ".. input tensors : " << iv;
+
+      // for alias tensors replace name with its alias
+      std::string it{iv};  // convert view to string
+      if (IsAliasTensor(it))
+         it = fAliasTensors[it];
+      auto freqIt = fIntermediateTensorFrequencyLookup.find(it);
+      if (freqIt == fIntermediateTensorFrequencyLookup.end()) {
+         if (fVerbose) std::cout << std::endl;
+         continue;
+
+      }
+
+      if (freqIt->second == op_idx) {
+         if (fVerbose) std::cout << "  flash condition is met - looping on chunks to find matching one \n";
+         for (auto chunk = fIntermediateMemoryInfoGPU.total_stack.begin();
+              chunk != fIntermediateMemoryInfoGPU.total_stack.end(); ++chunk) {
+            if (fVerbose) std::cout << "---  chunk " << chunk->first << " , " << chunk->second.tensor_name << " size " << chunk->second.reserved_size;
+            if (chunk->second.tensor_name == it) {
+               if (fVerbose) std::cout << " --  Found chunk corresponding to input tensor:  " << chunk->first;
+               // check if nearby chunks in available memory can coalesce
+               auto first_greater = fIntermediateMemoryInfoGPU.available_stack.upper_bound(
+                  chunk->first); // smallest element greater than the flushed chunk idx
+               auto last_smaller = (first_greater == fIntermediateMemoryInfoGPU.available_stack.begin())
+                                      ? fIntermediateMemoryInfoGPU.available_stack.end()
+                                      : std::prev(first_greater); // largest element smaller than the flushed chunk idx
+
+               // check if the next stack entry is actually adjacent in memory
+
+               const size_t freedOffset = chunk->first;
+               const size_t freedSize = chunk->second.reserved_size;
+
+               // Mark the chunk free before any merge.
+               chunk->second.tensor_name = "free";
+               chunk->second.tensor_size = freedSize;
+               chunk->second.reserved_size = freedSize;
+
+               if (last_smaller != fIntermediateMemoryInfoGPU.available_stack.end() &&
+                   last_smaller->first + last_smaller->second == freedOffset) {
+                  // Merge with previous free chunk.
+                  last_smaller->second += freedSize;
+                  fIntermediateMemoryInfoGPU.total_stack[last_smaller->first].merge(
+                     fIntermediateMemoryInfoGPU.total_stack[freedOffset]);
+
+                  fIntermediateMemoryInfoGPU.total_stack.erase(freedOffset);
+
+                  if (first_greater != fIntermediateMemoryInfoGPU.available_stack.end() &&
+                      last_smaller->first + last_smaller->second == first_greater->first) {
+
+                     last_smaller->second += first_greater->second;
+                     fIntermediateMemoryInfoGPU.total_stack[last_smaller->first].merge(
+                        fIntermediateMemoryInfoGPU.total_stack[first_greater->first]);
+
+                     fIntermediateMemoryInfoGPU.total_stack.erase(first_greater->first);
+                     fIntermediateMemoryInfoGPU.available_stack.erase(first_greater);
+                      }
+                  } else if (first_greater != fIntermediateMemoryInfoGPU.available_stack.end() &&
+                              freedOffset + freedSize == first_greater->first) {
+                     // Merge with following free chunk.
+                     size_t newSize = freedSize + first_greater->second;
+                     size_t firstGreaterOffset = first_greater->first;
+
+                     fIntermediateMemoryInfoGPU.available_stack.erase(first_greater);
+                     fIntermediateMemoryInfoGPU.available_stack.insert({freedOffset, newSize});
+
+                     fIntermediateMemoryInfoGPU.total_stack[freedOffset].merge(
+                      fIntermediateMemoryInfoGPU.total_stack[firstGreaterOffset]);
+
+                     fIntermediateMemoryInfoGPU.total_stack.erase(firstGreaterOffset);
+                  } else {
+                     // No merge.
+                     fIntermediateMemoryInfoGPU.available_stack.insert({freedOffset, freedSize});
+                  }
+
+               CheckGPUStacks(fIntermediateMemoryInfoGPU);
+               break;
+            }
+         }
+      } else {
+         if (fVerbose) std::cout << std::endl;
+      }
+   }
+}
+
+
+void RModel::GenerateIntermediateMemoryPool_GPU_ALPAKA() {
+   if (fIntermediateMemoryInfoGPU.total_stack.empty()) return;
+   fGC += "\n//--- Allocating session memory pool to be used for allocating intermediate tensors\n";
+
+   // char memory block is allocated since char takes 1 byte, thus easier to allocate tensors
+   // of other data types
+   auto const &totalStack = fIntermediateMemoryInfoGPU.total_stack;
+   const size_t memPoolSize = totalStack.rbegin()->first + totalStack.rbegin()->second.reserved_size;
+   fGC += "BufUI81D fIntermediateMemoryPool = "
+          "alpaka::allocBuf<std::uint8_t, size_t>(devAcc, "
+          "Ext1D::all(Idx{" + std::to_string(memPoolSize) + "}));\n\n";
+}
+
+void RModel::GenerateSessionCode_GPU_ALPAKA() {
    std::set<SOFIE::OperatorKind> registered_operators;
    std::set<size_t> fusedGroupsEmitted; // tracks which fusion groups have had their struct/decl emitted
 
@@ -687,9 +1076,33 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          fGC += "sofieBLAS<tagAcc> blas{queue};\n";
     }
 
+   // Allocate memory efficiently
    GenerateInitializedTensorInfo_GPU_ALPAKA();
-   GenerateGPU_ALPAKA_Buffers();
+
+   // if (fOptimizationLevel == OptimizationLevel::kExtended) {
+      std::string intermediate_memory_alloc_string = "";
+      intermediate_memory_alloc_string += "\n// --- Positioning GPU intermediate tensor memory --\n";
+
+      for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
+         if (fSkipOperators.count(op_idx)) continue;
+
+         intermediate_memory_alloc_string +=
+            AllocateIntermediateMemory_GPU_ALPAKA(
+               fOperators[op_idx]->GetOpOutputTensors());
+
+         CheckAndFlushIntermediateMemory_GPU_ALPAKA(
+            fOperators[op_idx]->GetOpInputTensors(), op_idx);
+      }
+
+   GenerateIntermediateMemoryPool_GPU_ALPAKA();
+
+      fGC += intermediate_memory_alloc_string;
+   // } else {
+   //    GenerateGPU_ALPAKA_Buffers();
+   // } TODO: uncomment
+
    GenerateOperatorDeclarations();
+
    // inject profiling session data member
    if (fProfile) {
       fGC += RModelProfilerGPU::GenerateSessionMembers();
