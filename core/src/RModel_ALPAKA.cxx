@@ -792,30 +792,75 @@ std::string RModel::AllocateIntermediateMemory_GPU_ALPAKA(std::span<const std::s
             break;
          }
 
-         // else if (chunk->first == fIntermediateMemoryInfoGPU.available_stack.rbegin()->first &&
-         //            fIntermediateMemoryInfoGPU.total_stack.rbegin()->first == chunk->first) {
-         //    // case last available chunk is the last in the memory, we can increase that one
-         //    size_t align = GetTypeSize(type);
-         //    size_t aligned_location = AlignUp(chunk->first, align);
-         //
-         //    size_t padding = aligned_location - chunk->first;
-         //    if (chunk->second < tensor_size + padding) {
-         //       ++chunk;
-         //       continue;
-         //    }
-         //
-         //    fIntermediateMemoryInfoGPU.total_stack[aligned_location] = {it.tensor_name, tensor_size};
-         //    declareIntermediateTensor(name, tensor_size, aligned_location);
-         //
-         //    fIntermediateMemoryInfoGPU.available_stack.erase(chunk);
-         //    allocated = true;
-         //    if (fVerbose) std::cout << " is extended  with a bigger one of size " << tensor_size << std::endl;
-         //    break;
-         // }
          ++chunk;
          if (fVerbose) std::cout << std::endl;
       }
 
+      // Not enough memory, try to extend last chunk
+      if (!allocated) {
+
+         bool canExtend =
+             !fIntermediateMemoryInfoGPU.available_stack.empty() &&
+             !fIntermediateMemoryInfoGPU.total_stack.empty() &&
+             fIntermediateMemoryInfoGPU.available_stack.rbegin()->first ==
+             fIntermediateMemoryInfoGPU.total_stack.rbegin()->first;
+
+         if (canExtend) {
+
+            auto lastFree =
+                std::prev(fIntermediateMemoryInfoGPU.available_stack.end());
+
+            size_t freeOffset = lastFree->first;
+            size_t freeSize   = lastFree->second;
+
+            size_t align = GetTypeSize(type);
+
+            // end of current pool
+            size_t poolEnd = freeOffset + freeSize;
+
+            // tensor starts after the current free chunk
+            size_t tensorOffset = AlignUp(poolEnd, align);
+
+            size_t extraBytes =
+                (tensorOffset - poolEnd) + tensor_size;
+
+            // enlarge the last free chunk
+            lastFree->second += extraBytes;
+
+            auto &freeChunk =
+                fIntermediateMemoryInfoGPU.total_stack[freeOffset];
+
+            freeChunk.tensor_size += extraBytes;
+            freeChunk.reserved_size += extraBytes;
+
+            // allocate from the end exactly like a normal split
+            auto newChunk =
+                freeChunk.split(it.tensor_name,
+                                tensor_size,
+                                tensor_size);
+
+            size_t remaining =
+                tensorOffset - freeOffset;
+
+            if (remaining == 0) {
+               fIntermediateMemoryInfoGPU.available_stack.erase(lastFree);
+               fIntermediateMemoryInfoGPU.total_stack.erase(freeOffset);
+            } else {
+               lastFree->second = remaining;
+               freeChunk.tensor_name = "free";
+               freeChunk.tensor_size = remaining;
+               freeChunk.reserved_size = remaining;
+            }
+
+            fIntermediateMemoryInfoGPU.total_stack[tensorOffset] = newChunk;
+
+            declareIntermediateTensor(name, tensor_size, tensorOffset);
+
+            allocated = true;
+         }
+      }
+
+      // Last chunk is not empty, extend memory
       if (!allocated) {
          size_t chunk_idx = fIntermediateMemoryInfoGPU.total_stack.empty()
                                ? 0
