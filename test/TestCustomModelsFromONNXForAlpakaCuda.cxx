@@ -168,6 +168,9 @@
 
 #include "BatchNorm_FromONNX_GPU_ALPAKA.hxx"
 #include "BatchNormRelu_FromONNX_GPU_ALPAKA.hxx"
+#include "DynamicBatchNorm4D_FromONNX_GPU_ALPAKA.hxx"
+#include "DynamicBatchNormDynSpatialRelu_FromONNX_GPU_ALPAKA.hxx"
+#include "DynamicBatchNorm2D_FromONNX_GPU_ALPAKA.hxx"
 
 #include "LayerNorm_FromONNX_GPU_ALPAKA.hxx"
 #include "LayerNormScaleBias_FromONNX_GPU_ALPAKA.hxx"
@@ -2593,6 +2596,132 @@ TEST_F(SofieAlpakaTest, BatchNormalizationRelu)
     for (size_t i = 0; i < outputSize; ++i) {
         float expected = std::max(0.f, input[i] * inv_std);
         EXPECT_LE(std::abs(res_ptr[i] - expected), TOLERANCE) << "i=" << i;
+    }
+}
+
+// dynamic BatchNorm, run at two batch sizes. weights are per-channel [C=4] (same values in
+// each test); fused scale is scale[c]/sqrt(var[c]+eps). the static BN tests above cover the
+// shared code path, these cover the dynamic shapes.
+
+// X[N,4,2,3]: dynamic batch, static spatial (6)
+TEST_F(SofieAlpakaTest, DynamicBatchNorm4D)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t C = 4, spatial = 2 * 3;
+    const float scale[4] = {1.0f, 2.0f, 0.5f, 1.5f}, bias[4] = {0.1f, -0.2f, 0.3f, 0.0f};
+    const float mean_[4] = {0.5f, 1.0f, -0.5f, 2.0f}, var_[4] = {1.0f, 4.0f, 0.25f, 2.0f};
+    const float eps = 1e-5f;
+
+    for (std::size_t N : {std::size_t(1), std::size_t(8)}) {
+        const std::size_t sz = N * C * spatial;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sz}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < sz; ++i) in_ptr[i] = static_cast<float>(i % 10) - 5.0f;
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{sz}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sz}));
+        {
+            SOFIE_DynamicBatchNorm4D::Session<alpaka::TagGpuCudaRt> session("DynamicBatchNorm4D_FromONNX_GPU_ALPAKA.dat", N);
+            auto result = session.infer(N, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t i = 0; i < sz; ++i) {
+            std::size_t c = (i / spatial) % C;
+            float fused = scale[c] / std::sqrt(var_[c] + eps);
+            float expected = (in_ptr[i] - mean_[c]) * fused + bias[c];
+            EXPECT_LE(std::abs(res[i] - expected), TOLERANCE) << "i=" << i;
+        }
+    }
+}
+
+// X[N,4,n_pf] + relu: dynamic batch and spatial. rebuilt per size so Y matches its length;
+// Y length is a symmetric product so the ctor arg order doesn't matter, infer is (N, n_pf).
+TEST_F(SofieAlpakaTest, DynamicBatchNormDynSpatialRelu)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t C = 4;
+    const float scale[4] = {1.0f, 2.0f, 0.5f, 1.5f}, bias[4] = {0.1f, -0.2f, 0.3f, 0.0f};
+    const float mean_[4] = {0.5f, 1.0f, -0.5f, 2.0f}, var_[4] = {1.0f, 4.0f, 0.25f, 2.0f};
+    const float eps = 1e-5f;
+
+    const std::size_t Ns[] = {1, 8};
+    const std::size_t Ps[] = {1, 5};   // n_pf
+    for (int t = 0; t < 2; ++t) {
+        const std::size_t N = Ns[t], P = Ps[t];
+        const std::size_t sz = N * C * P;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sz}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < sz; ++i) in_ptr[i] = static_cast<float>(i % 10) - 5.0f;
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{sz}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sz}));
+        {
+            SOFIE_DynamicBatchNormDynSpatialRelu::Session<alpaka::TagGpuCudaRt> session("DynamicBatchNormDynSpatialRelu_FromONNX_GPU_ALPAKA.dat", N, P);
+            auto result = session.infer(N, P, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t i = 0; i < sz; ++i) {
+            std::size_t c = (i / P) % C;
+            float fused = scale[c] / std::sqrt(var_[c] + eps);
+            float expected = (in_ptr[i] - mean_[c]) * fused + bias[c];
+            expected = expected > 0.0f ? expected : 0.0f;   // relu
+            EXPECT_LE(std::abs(res[i] - expected), TOLERANCE) << "i=" << i;
+        }
+    }
+}
+
+// X[N,4]: rank 2, spatial is 1
+TEST_F(SofieAlpakaTest, DynamicBatchNorm2D)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t C = 4;
+    const float scale[4] = {1.0f, 2.0f, 0.5f, 1.5f}, bias[4] = {0.1f, -0.2f, 0.3f, 0.0f};
+    const float mean_[4] = {0.5f, 1.0f, -0.5f, 2.0f}, var_[4] = {1.0f, 4.0f, 0.25f, 2.0f};
+    const float eps = 1e-5f;
+
+    for (std::size_t N : {std::size_t(1), std::size_t(8)}) {
+        const std::size_t sz = N * C;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sz}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < sz; ++i) in_ptr[i] = static_cast<float>(i % 10) - 5.0f;
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{sz}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sz}));
+        {
+            SOFIE_DynamicBatchNorm2D::Session<alpaka::TagGpuCudaRt> session("DynamicBatchNorm2D_FromONNX_GPU_ALPAKA.dat", N);
+            auto result = session.infer(N, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t i = 0; i < sz; ++i) {
+            std::size_t c = i % C;
+            float fused = scale[c] / std::sqrt(var_[c] + eps);
+            float expected = (in_ptr[i] - mean_[c]) * fused + bias[c];
+            EXPECT_LE(std::abs(res[i] - expected), TOLERANCE) << "i=" << i;
+        }
     }
 }
 
