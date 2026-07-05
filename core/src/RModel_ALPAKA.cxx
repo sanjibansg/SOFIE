@@ -723,10 +723,22 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       }
 
       if (!fShapeParams.empty()) {
-         for (auto &p : fShapeParams) {
-            fGC += ",\n";
-            fGC += "        size_t " + p.first + " = " + p.second;
+         // emit params in declaration order (like the infer signature), not unordered_map order,
+         // so ctor and infer agree on arg order for multi-symbol models
+         std::unordered_map<std::string, int> seenParam;
+         for (auto &name : fInputTensorNames) {
+            if (IsDimInputTensor(name)) {
+               for (auto &d : GetDynamicTensorShape(name)) {
+                  if (d.isParam && seenParam.count(d.param) == 0) {
+                     seenParam[d.param] = 1;
+                     fGC += ",\n        size_t " + d.param + " = " + fShapeParams[d.param];
+                  }
+               }
+            }
          }
+         for (auto &p : fShapeParams)
+            if (seenParam.count(p.first) == 0)
+               fGC += ",\n        size_t " + p.first + " = " + p.second;
       }
       fGC += ") {\n";
       
