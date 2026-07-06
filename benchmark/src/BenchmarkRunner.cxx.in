@@ -16,6 +16,10 @@
 #include <iostream>
 #include <string>
 #include <sstream>
+#include <filesystem>
+#include <chrono>
+#include <ctime>
+#include <fstream>
 
 // Optional ONNX Runtime GPU comparison
 #ifdef SOFIE_BENCHMARK_ORT
@@ -125,6 +129,39 @@ int main(int argc, char *argv[]) {
                 "Runtime(MB)");
 
     std::printf("%s\n", std::string(118, '-').c_str());
+
+    // Add results to a file
+    namespace fs = std::filesystem;
+
+    // Create results directory if it doesn't exist
+    fs::create_directories("../../results");
+
+    // Create timestamp
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm = *std::localtime(&t);
+
+    char timestamp[32];
+    std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &tm);
+
+    // Store filename in environment so child processes can use it
+    std::string resultsFile =
+        std::string("../../results/benchmark_") + timestamp + ".csv";
+
+    #ifdef _WIN32
+    _putenv_s("SOFIE_BENCHMARK_RESULTS", resultsFile.c_str());
+    #else
+    setenv("SOFIE_BENCHMARK_RESULTS", resultsFile.c_str(), 1);
+    #endif
+
+    std::ofstream results(resultsFile);
+    results << "Model,"
+            << "infer_ms,"
+            << "in_xfer_ms,"
+            << "out_xfer_ms,"
+            << "throughput_inf_s,"
+            << "runtime_mem_mb\n";
+
 #endif  // SOFIE_BENCHMARK_PROFILE
     std::fflush(stdout);
 
