@@ -556,6 +556,31 @@ std::vector<Dim> UTILITY::ComputeStrideFromShape(const std::vector<Dim> & shape)
    return strides;
 }
 
+void UTILITY::CollectDimParams(const std::vector<Dim> & dims, std::vector<std::string> & params) {
+   auto isAlpha = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; };
+   auto isAlnum = [&](char c) { return isAlpha(c) || (c >= '0' && c <= '9'); };
+   for (auto & d : dims) {
+      if (!d.isParam) continue;
+      const std::string & e = d.param;
+      std::size_t i = 0;
+      while (i < e.size()) {
+         if (isAlpha(e[i])) {
+            std::size_t j = i;
+            while (j < e.size() && isAlnum(e[j])) j++;
+            std::string tok = e.substr(i, j - i);
+            // skip function names from expressions like std::max(...)
+            bool skip = (tok == "std" || tok == "max" || tok == "min");
+            for (auto & p : params)
+               if (p == tok) skip = true;
+            if (!skip) params.push_back(tok);
+            i = j;
+         } else {
+            i++;
+         }
+      }
+   }
+}
+
 struct FreeBlock {
   std::size_t offset;
   std::size_t size;

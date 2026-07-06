@@ -375,6 +375,18 @@
             return out.str();
          }
 
+   // symbolic names used by the kernel index expressions, shared by the
+   // kernel signature and the launch call
+   std::vector<std::string> GetGPUDynParams() const {
+      std::vector<std::string> params;
+      UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fOutputShape), params);
+      for (std::size_t k = 0; k < fInputShapes.size(); ++k) {
+         UTILITY::CollectDimParams({fInputShapes[k][fAxis]}, params);
+         UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fInputShapes[k]), params);
+      }
+      return params;
+   }
+
    std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
       if (fIsOutputConstant || fIsOutputParamShape) return "";
       opName = "op_" + opName;
@@ -386,10 +398,12 @@
 
       auto outStrides = UTILITY::ComputeStrideFromShape(fOutputShape);
 
-      std::vector<std::size_t> prefix(Nin);
-      prefix[0] = 0;
+      // cumulative offsets along the concat axis, kept as expression strings
+      // since an axis dim can be symbolic
+      std::vector<std::string> prefix(Nin);
+      prefix[0] = "0";
       for (std::size_t k = 1; k < Nin; ++k)
-         prefix[k] = prefix[k - 1] + std::stoul(fInputShapes[k - 1][fAxis].GetVal());
+         prefix[k] = prefix[k - 1] + " + (" + fInputShapes[k - 1][fAxis].GetVal() + ")";
 
       std::vector<std::vector<Dim>> inStrides(Nin);
       for (std::size_t k = 0; k < Nin; ++k)
@@ -403,6 +417,8 @@
       op += SP + SP + SP + "TAcc const& acc,\n";
       op += SP + SP + SP + "std::array<T const*, " + std::to_string(Nin) + "> inputs,\n";
       op += SP + SP + SP + "T* output,\n";
+      for (auto &p : GetGPUDynParams())
+         op += SP + SP + SP + "std::size_t const " + p + ",\n";
       op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
 
       op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
@@ -414,26 +430,26 @@
 
       op += SP + SP + SP + SP + "remaining = elem_idx;\n";
       for (std::size_t d = 0; d < D; ++d) {
-         std::string stride_val = outStrides[d].GetVal();
+         std::string stride_val = "(" + outStrides[d].GetVal() + ")";
          op += SP + SP + SP + SP + "std::size_t const out_" + std::to_string(d)
-               + " = remaining / " + stride_val + "u;\n";
+               + " = remaining / " + stride_val + ";\n";
          op += SP + SP + SP + SP + "remaining -= out_" + std::to_string(d)
-               + " * " + stride_val + "u;\n";
+               + " * " + stride_val + ";\n";
       }
       op += "\n";
 
       op += SP + SP + SP + SP + "std::size_t chosen = 0;\n";
       for (std::size_t k = 0; k < Nin; ++k) {
-         std::size_t end_k = prefix[k] + std::stoul(fInputShapes[k][fAxis].GetVal());
+         std::string end_k = "(" + prefix[k] + " + (" + fInputShapes[k][fAxis].GetVal() + "))";
          op += SP + SP + SP + SP + "chosen += static_cast<std::size_t>("
-               + std::to_string(end_k) + "u <= out_" + std::to_string(fAxis) + ");\n";
+               + end_k + " <= out_" + std::to_string(fAxis) + ");\n";
       }
       op += "\n";
 
       op += SP + SP + SP + SP + "std::size_t const output_idx =\n";
       for (std::size_t d = 0; d < D; ++d) {
          op += SP + SP + SP + SP + SP + "out_" + std::to_string(d)
-               + " * " + outStrides[d].GetVal() + "u";
+               + " * (" + outStrides[d].GetVal() + ")";
          op += (d + 1 < D) ? " +\n" : ";\n\n";
       }
 
@@ -442,10 +458,10 @@
          op += SP + SP + SP + SP + SP + "(chosen == " + std::to_string(k) + "u) * (\n";
          for (std::size_t d = 0; d < D; ++d) {
                std::string coord = (d == static_cast<std::size_t>(fAxis))
-                  ? ("(out_" + std::to_string(d) + " - " + std::to_string(prefix[k]) + "u)")
+                  ? ("(out_" + std::to_string(d) + " - (" + prefix[k] + "))")
                   : ("out_" + std::to_string(d));
                op += SP + SP + SP + SP + SP + SP + coord
-                  + " * " + inStrides[k][d].GetVal() + "u";
+                  + " * (" + inStrides[k][d].GetVal() + ")";
                op += (d + 1 < D) ? " +\n" : "\n";
          }
          op += SP + SP + SP + SP + SP + ")";
@@ -493,7 +509,10 @@
       out << SP << "auto const elementsPerGrid_"<<OpName<<" = Vec::all(Idx{"<< length << "});\n";
       out << SP << "auto const workDiv_" << OpName << " = sofie_workdiv(elementsPerGrid_" << OpName << ");\n";
       out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << OpName
-         << ", concatKernel_" << OpName << ", input_ptrs_" << OpName << ", alpaka::getPtrNative(deviceBuf_" << fOutput << "), static_cast<Idx>(" << length << "));\n";
+         << ", concatKernel_" << OpName << ", input_ptrs_" << OpName << ", alpaka::getPtrNative(deviceBuf_" << fOutput << ")";
+      for (auto &p : GetGPUDynParams())
+         out << ", static_cast<std::size_t>(" << p << ")";
+      out << ", static_cast<Idx>(" << length << "));\n";
       out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";
       return out.str();
    }
