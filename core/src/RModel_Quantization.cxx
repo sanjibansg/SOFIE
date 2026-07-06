@@ -35,9 +35,20 @@ bool IsScalarPerTensor(const QuantizationInfo &info)
    return info.granularity == EQuantizationGranularity::PerTensor && info.axis == -1;
 }
 
-EQuantizedStorageType StorageTypeForQuantizedTensor(const QuantizationInfo &info)
+ETensorType TensorTypeForQuantizedStorage(EQuantizedStorageType storage)
 {
-   return info.isSigned ? EQuantizedStorageType::Int8 : EQuantizedStorageType::UInt8;
+   switch (storage) {
+   case EQuantizedStorageType::FloatCarrier:
+      return ETensorType::FLOAT;
+   case EQuantizedStorageType::Int8:
+      return ETensorType::INT8;
+   case EQuantizedStorageType::UInt8:
+      return ETensorType::UINT8;
+   case EQuantizedStorageType::Int32Accumulator:
+      return ETensorType::INT32;
+   default:
+      throw std::runtime_error("SOFIE quantized lowering plan has no physical tensor type for this storage");
+   }
 }
 
 std::vector<std::int8_t> QuantizeTensorToInt8(const float *data, std::size_t length, const QuantizationInfo &info)
@@ -137,8 +148,8 @@ QuantizedLoweringPlan MakeCPUPackedWeightBaselinePlan(const QuantizedGemmRegion 
    auto plan = MakeAvailableQuantizedGemmPlan(region, EQuantizedBackend::CPU, EQuantizedLoweringStatus::Baseline,
                                               "CPU baseline lowering with packed pre-quantized weight storage",
                                               "cpu_packed_weight_baseline");
-   plan.inputStorage = StorageTypeForQuantizedTensor(region.inputQuant);
-   plan.weightStorage = StorageTypeForQuantizedTensor(region.weightQuant);
+   plan.inputStorage = QuantizedStorageTypeForCarrier(region.inputQuant);
+   plan.weightStorage = QuantizedStorageTypeForCarrier(region.weightQuant);
    plan.biasStorage = EQuantizedStorageType::FloatCarrier;
    plan.accumulatorStorage = EQuantizedStorageType::Int32Accumulator;
    plan.outputStorage = EQuantizedStorageType::FloatCarrier;
@@ -168,7 +179,6 @@ QuantizedLoweringPlan MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend backend
    plan.capabilityTag = preservesSemantics ? "recognized_backend_unsupported" : "semantic_unsupported";
    plan.preservesQuantizationSemantics = preservesSemantics;
    plan.isMetadataOnly = preservesSemantics;
-   plan.supportsPrequantizedInputCarrier = false;
    plan.suppressesGraphOperators = false;
    return plan;
 }
@@ -347,18 +357,17 @@ QuantizedLoweringPlan MakeAlpakaCublasLtCorePlan(const QuantizedGemmRegion &regi
 {
    auto plan = MakeAvailableQuantizedGemmPlan(region, EQuantizedBackend::ALPAKA, EQuantizedLoweringStatus::Optimized,
                                               capability.reason, capability.tag);
-   plan.inputStorage = StorageTypeForQuantizedTensor(region.inputQuant);
-   plan.weightStorage = StorageTypeForQuantizedTensor(region.weightQuant);
+   plan.inputStorage = QuantizedStorageTypeForCarrier(region.inputQuant);
+   plan.weightStorage = QuantizedStorageTypeForCarrier(region.weightQuant);
    plan.biasStorage = EQuantizedStorageType::FloatCarrier;
    plan.accumulatorStorage = EQuantizedStorageType::Int32Accumulator;
-   plan.outputStorage = StorageTypeForQuantizedTensor(region.outputQuant);
-   plan.inputCarrierMode = EQuantizedCarrierMode::Float;
+   plan.outputStorage = QuantizedStorageTypeForCarrier(region.outputQuant);
+   plan.inputCarrierMode = QuantizedCarrierModeForStorage(plan.inputStorage);
    plan.outputMode = EQuantizedOutputMode::Quantized;
    plan.computeProfile = EQuantizedComputeProfile::SignedInt8SymmetricPerTensorRank2;
    plan.shapePolicy = capability.shapePolicy;
    plan.weightStorageTensor = weightStorageTensor;
    plan.weightLayout = EQuantizedLayout::PlainDevice;
-   plan.supportsPrequantizedInputCarrier = true;
    return plan;
 }
 
@@ -642,7 +651,7 @@ void RModel::AnalyzeQuantizedRegions()
                storage.logicalTensor = info.weightTensor;
                storage.sourceTensor = info.weightSourceTensor;
                storage.storageTensor = storageTensor;
-               storage.storageType = StorageTypeForQuantizedTensor(info.weightQuant);
+               storage.storageType = QuantizedStorageTypeForCarrier(info.weightQuant);
                storage.layout = EQuantizedLayout::PackedCPU;
                storage.quantization = info.weightQuant;
                storage.shape = packedShape;
@@ -673,7 +682,7 @@ void RModel::AnalyzeQuantizedRegions()
             deviceStorage.logicalTensor = info.weightTensor;
             deviceStorage.sourceTensor = info.weightSourceTensor;
             deviceStorage.storageTensor = deviceStorageTensor;
-            deviceStorage.storageType = StorageTypeForQuantizedTensor(info.weightQuant);
+            deviceStorage.storageType = QuantizedStorageTypeForCarrier(info.weightQuant);
             deviceStorage.layout = EQuantizedLayout::PlainDevice;
             deviceStorage.quantization = info.weightQuant;
             deviceStorage.shape = weightShape;
@@ -719,6 +728,24 @@ void RModel::AnalyzeQuantizedRegions()
 
 void RModel::AddLoweredQuantizedOperators(EQuantizedBackend backend)
 {
+   auto setKnownTensorType = [this](const std::string &tensorName, ETensorType type) {
+      if (auto it = fIntermediateTensorInfos.find(tensorName); it != fIntermediateTensorInfos.end()) {
+         it->second.type = type;
+         return;
+      }
+      if (auto it = fReadyInputTensorInfos.find(tensorName); it != fReadyInputTensorInfos.end()) {
+         it->second.type = type;
+         return;
+      }
+      if (auto it = fInputTensorInfos.find(tensorName); it != fInputTensorInfos.end()) {
+         it->second.type = type;
+         return;
+      }
+      if (auto it = fDynamicTensorInfos.find(tensorName); it != fDynamicTensorInfos.end()) {
+         it->second.type = type;
+      }
+   };
+
    for (auto op_idx : QuantizedGemmOperatorIndices(fQuantizationState)) {
       const auto *planPtr = FindQuantizedLoweringPlan(fQuantizationState, op_idx, backend);
       if (planPtr == nullptr)
@@ -736,17 +763,11 @@ void RModel::AddLoweredQuantizedOperators(EQuantizedBackend backend)
       if (regionIt == fQuantizationState.gemmRegions.end())
          throw std::runtime_error("SOFIE quantized Gemm lowering plan has no matching region");
       const auto &region = regionIt->second;
-      if (backend == EQuantizedBackend::ALPAKA && plan.outputMode == EQuantizedOutputMode::Quantized) {
-         const auto outputType = region.outputQuant.isSigned ? ETensorType::INT8 : ETensorType::UINT8;
-         if (auto outputIt = fIntermediateTensorInfos.find(region.outputTensor); outputIt != fIntermediateTensorInfos.end()) {
-            outputIt->second.type = outputType;
-         } else if (auto readyIt = fReadyInputTensorInfos.find(region.outputTensor); readyIt != fReadyInputTensorInfos.end()) {
-            readyIt->second.type = outputType;
-         } else if (auto inputIt = fInputTensorInfos.find(region.outputTensor); inputIt != fInputTensorInfos.end()) {
-            inputIt->second.type = outputType;
-         } else if (auto dynamicIt = fDynamicTensorInfos.find(region.outputTensor); dynamicIt != fDynamicTensorInfos.end()) {
-            dynamicIt->second.type = outputType;
-         }
+      if (QuantizedPlanExposesQuantizedInputCarrier(plan)) {
+         setKnownTensorType(region.inputSourceTensor, TensorTypeForQuantizedStorage(plan.inputStorage));
+      }
+      if (QuantizedPlanExposesQuantizedOutputCarrier(plan)) {
+         setKnownTensorType(region.outputTensor, TensorTypeForQuantizedStorage(plan.outputStorage));
       }
 
       fLoweredOperators[op_idx] = std::make_unique<ROperator_QuantizedGemm>(

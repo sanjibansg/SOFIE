@@ -91,7 +91,7 @@ inline void QuantizedGemmCudaLt_SetProfiling(bool) {}
 inline bool QuantizedGemmCudaLt_ProfilingEnabled() { return false; }
 inline QuantizedGemmCudaLtProfile QuantizedGemmCudaLt_GetLastProfile() { return {}; }
 
-inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &, QuantizedGemmCudaStream, void *, const float *,
+inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &, QuantizedGemmCudaStream, void *, const void *,
                                      const void *, const float *, const QuantizedGemmCudaLtParams &)
 {
    throw std::runtime_error("SOFIE cuBLASLt quantized GEMM path was selected, but SOFIE_USE_CUBLASLT is not enabled");
@@ -805,7 +805,7 @@ private:
 };
 
 inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &state, QuantizedGemmCudaStream stream,
-                                     void *output, const float *input, const void *weight, const float *bias,
+                                     void *output, const void *input, const void *weight, const float *bias,
                                      const QuantizedGemmCudaLtParams &params)
 {
    if (output == nullptr || input == nullptr || weight == nullptr) {
@@ -844,11 +844,12 @@ inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &state, QuantizedG
    constexpr int threads = 256;
    const std::int8_t *inputQuantized = nullptr;
    if (effectiveParams.inputCarrier == EQuantizedCudaInputCarrier::Int8) {
-      inputQuantized = reinterpret_cast<const std::int8_t *>(input);
+      inputQuantized = static_cast<const std::int8_t *>(input);
    } else {
       const int inputBlocks = static_cast<int>((inputElements + threads - 1) / threads);
+      const float *inputFloat = static_cast<const float *>(input);
       INTERNAL::QuantizedGemmCudaQuantizeInputKernel<<<inputBlocks, threads, 0, stream>>>(
-         input, state.InputQuantizedBuffer(), inputElements, effectiveParams.inputScale, effectiveParams.inputZeroPoint,
+         inputFloat, state.InputQuantizedBuffer(), inputElements, effectiveParams.inputScale, effectiveParams.inputZeroPoint,
          effectiveParams.inputQMin, effectiveParams.inputQMax);
       INTERNAL::CheckCudaStatus(cudaGetLastError(), "QuantizedGemmCudaQuantizeInputKernel launch");
       inputQuantized = state.InputQuantizedBuffer();

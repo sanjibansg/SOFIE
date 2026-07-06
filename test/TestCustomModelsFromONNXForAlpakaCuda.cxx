@@ -44,6 +44,10 @@
 #include "Linear_64_FromONNX_GPU_ALPAKA.hxx"
 #include "input_models/references/Linear_64.ref.hxx"
 
+#include "QONNX_QuantGemm_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/QONNX_QuantGemm_input.ref.hxx"
+#include "input_models/references/QONNX_QuantGemm.ref.hxx"
+
 #include "AddBroadcast1_FromONNX_GPU_ALPAKA.hxx"
 #include "input_models/references/AddBroadcast1.ref.hxx"
 
@@ -221,6 +225,43 @@ protected:
     }
 };
 
+
+TEST_F(SofieAlpakaTest, QuantizedGemm)
+{
+   constexpr Idx inputSize = QONNX_QuantGemm_Input::input_size;
+   constexpr Idx outputSize = QONNX_QuantGemm_ExpectedOutput::output_size;
+   static_assert(inputSize == 128 * 128);
+   static_assert(outputSize == 128 * 128);
+
+   auto input_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(inputSize));
+   std::int8_t *input_ptr = reinterpret_cast<std::int8_t *>(alpaka::getPtrNative(input_h));
+   for (Idx i = 0; i < inputSize; ++i) {
+      input_ptr[i] = QONNX_QuantGemm_Input::input[i];
+   }
+
+   auto input_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(inputSize));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+
+   auto result_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(outputSize));
+
+   {
+      SOFIE_QONNX_QuantGemm::Session<alpaka::TagGpuCudaRt> model("QONNX_QuantGemm_FromONNX_GPU_ALPAKA.dat");
+      auto result = model.infer(input_d);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   const auto *res_ptr = reinterpret_cast<const std::int8_t *>(alpaka::getPtrNative(result_h));
+   const auto *correct = QONNX_QuantGemm_ExpectedOutput::output;
+
+   for (Idx i = 0; i < outputSize; ++i) {
+      EXPECT_EQ(static_cast<int>(res_ptr[i]), static_cast<int>(correct[i])) << "i=" << i;
+   }
+}
 
 TEST_F(SofieAlpakaTest, Linear64)
 {

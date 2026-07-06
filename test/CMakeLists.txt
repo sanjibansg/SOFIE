@@ -148,6 +148,7 @@ if (ENABLE_ALPAKA_TESTS)
       TestCustomModelsFromONNXForAlpakaCuda PRIVATE
       ALPAKA_ACC_GPU_CUDA_ENABLED
       ALPAKA_HAS_STD_ATOMIC_REF
+      SOFIE_USE_CUBLASLT
     )
 
     target_compile_options(

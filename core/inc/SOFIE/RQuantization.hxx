@@ -199,6 +199,27 @@ inline bool IsPhysicalQuantizedStorage(EQuantizedStorageType type)
           type == EQuantizedStorageType::Int32Accumulator;
 }
 
+inline EQuantizedStorageType QuantizedStorageTypeForCarrier(const QuantizationInfo &info)
+{
+   return info.isSigned ? EQuantizedStorageType::Int8 : EQuantizedStorageType::UInt8;
+}
+
+inline EQuantizedCarrierMode QuantizedCarrierModeForStorage(EQuantizedStorageType type)
+{
+   switch (type) {
+   case EQuantizedStorageType::FloatCarrier:
+      return EQuantizedCarrierMode::Float;
+   case EQuantizedStorageType::Int8:
+      return EQuantizedCarrierMode::Int8;
+   case EQuantizedStorageType::UInt8:
+      return EQuantizedCarrierMode::UInt8;
+   case EQuantizedStorageType::Int32Accumulator:
+      return EQuantizedCarrierMode::Int32Accumulator;
+   default:
+      return EQuantizedCarrierMode::UNDEFINED;
+   }
+}
+
 struct QuantizedLoweringPlan {
    EQuantizedBackend backend = EQuantizedBackend::UNDEFINED;
    EQuantizedLoweringStatus status = EQuantizedLoweringStatus::UNDEFINED;
@@ -222,7 +243,6 @@ struct QuantizedLoweringPlan {
    std::vector<std::size_t> consumedOperatorIndices;
    bool preservesQuantizationSemantics = false;
    bool isMetadataOnly = false;
-   bool supportsPrequantizedInputCarrier = false;
    bool suppressesGraphOperators = false;
 };
 
@@ -234,6 +254,19 @@ inline bool QuantizedPlanUsesInt32Accumulator(const QuantizedLoweringPlan &plan)
 inline bool QuantizedPlanUsesPrequantizedWeights(const QuantizedLoweringPlan &plan)
 {
    return !plan.weightStorageTensor.empty();
+}
+
+inline bool QuantizedPlanExposesQuantizedInputCarrier(const QuantizedLoweringPlan &plan)
+{
+   return plan.inputCarrierMode == EQuantizedCarrierMode::Int8 ||
+          plan.inputCarrierMode == EQuantizedCarrierMode::UInt8;
+}
+
+inline bool QuantizedPlanExposesQuantizedOutputCarrier(const QuantizedLoweringPlan &plan)
+{
+   return plan.outputMode == EQuantizedOutputMode::Quantized &&
+          (plan.outputStorage == EQuantizedStorageType::Int8 ||
+           plan.outputStorage == EQuantizedStorageType::UInt8);
 }
 
 inline bool IsOptimizedQuantizedPlainDevicePlan(const QuantizedLoweringPlan &plan)

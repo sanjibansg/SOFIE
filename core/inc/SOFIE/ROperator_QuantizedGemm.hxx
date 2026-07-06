@@ -64,6 +64,8 @@ inline const char *QuantizedCudaInputCarrierName(EQuantizedCarrierMode mode)
       return "Int8";
    case EQuantizedCarrierMode::Float:
       return "Float";
+   case EQuantizedCarrierMode::UInt8:
+      throw std::runtime_error("SOFIE quantized CUDA GEMM currently supports signed int8 input carriers only");
    default:
       throw std::runtime_error("SOFIE quantized CUDA GEMM received unsupported input carrier mode");
    }
@@ -337,11 +339,6 @@ inline std::string GenerateFusedQuantizedGemmCublasLtCoreLaunch(std::string opNa
    out << "      params_quantizedGemm_" << opName << ".epilogueMode = SOFIE::EQuantizedCudaEpilogueMode::" << planEpilogueMode << ";\n";
    out << "      params_quantizedGemm_" << opName << ".inputCarrier = SOFIE::EQuantizedCudaInputCarrier::" << planInputCarrier << ";\n";
    out << "      params_quantizedGemm_" << opName << ".outputCarrier = SOFIE::EQuantizedCudaOutputCarrier::" << INTERNAL::QuantizedCudaOutputCarrierName(region.outputQuant) << ";\n";
-   if (plan.supportsPrequantizedInputCarrier) {
-      out << "#ifdef SOFIE_QUANTIZED_GEMM_PREQUANTIZED_INPUT\n";
-      out << "      params_quantizedGemm_" << opName << ".inputCarrier = SOFIE::EQuantizedCudaInputCarrier::Int8;\n";
-      out << "#endif\n";
-   }
    out << "      params_quantizedGemm_" << opName << ".weightType = SOFIE::EQuantizedCudaWeightType::" << (region.weightQuant.isSigned ? "Int8" : "UInt8") << ";\n";
    out << "      SOFIE::QuantizedGemmCudaLt_Call(quantizedGemmCudaLtState_" << opName
        << ", alpaka::getNativeHandle(queue)"
