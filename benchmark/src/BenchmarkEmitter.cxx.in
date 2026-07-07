@@ -132,6 +132,7 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         << "#pragma once\n\n"
         << "#include \"" << modelName << "_GPU_ALPAKA.hxx\"\n"
         << "#include \"BenchmarkBackend.hxx\"\n"
+        << "#include \"GPUMemoryMonitor.hxx\"\n"
         << "#include <chrono>\n"
         << "#include <fstream>\n"
         << "#include <iostream>\n"
@@ -188,8 +189,22 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         << modelName << "_GPU_ALPAKA.dat\";\n"
         << "    SOFIE_" << cppName
         << "::Session<AccTag> session(weightFile);\n"
-        << "    double runtime_mem_mb = "
-        << "static_cast<double>(session.GetIntermediateMemoryPoolSize()) / (1024.0 * 1024.0);\n\n";
+        << "    double sofie_pool_mem_mb = "
+        << "static_cast<double>(session.GetIntermediateMemoryPoolSize()) / (1024.0 * 1024.0);\n"
+
+        << "    double sofie_free_mem_mb = "
+        << "static_cast<double>(session.GetTotalFreeMemory()) / (1024.0 * 1024.0);\n"
+
+        << "    double sofie_largest_free_mb = "
+        << "static_cast<double>(session.GetLargestFreeBlock()) / (1024.0 * 1024.0);\n"
+
+        << "    double sofie_used_mem_mb = "
+        << "sofie_pool_mem_mb - sofie_free_mem_mb;\n"
+
+        << "    double sofie_fragmentation = "
+        << "100.0 * session.GetFragmentation();\n"
+
+        << "    GPUMemoryMonitor gpuMem;\n\n";
 
 
     bench << "    // ---- One priming inference to obtain output buffer handle(s) ----\n"
@@ -257,12 +272,15 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
 
     bench
         << "    // ---- Timed inference ----\n"
+        << "    gpuMem.Start();\n"
         << "    auto t0_infer = std::chrono::high_resolution_clock::now();\n"
         << "    for (int _i = 0; _i < iterations; ++_i)\n"
         << "        " << inferCall.str() << ";\n"
         << "    alpaka::wait(session.queue);\n"
         << "    SOFIE_BENCH_DEVICE_SYNC();\n"
-        << "    auto t1_infer = std::chrono::high_resolution_clock::now();\n\n";
+        << "    auto t1_infer = std::chrono::high_resolution_clock::now();\n"
+        << "    gpuMem.Stop();\n"
+        << "    double gpu_peak_mem_mb = gpuMem.PeakMB();\n\n";
 
     bench
         << "    // ---- Timed output transfer (D2H: device -> host) ----\n"
@@ -284,13 +302,18 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         << "    double avg_out_ms    = std::chrono::duration<double, std::milli>"
            "(t1_out   - t0_out  ).count() / iterations;\n"
         << "    double throughput    = (avg_infer_ms > 0.0) ? 1000.0 / avg_infer_ms : 0.0;\n\n"
-        << "    std::printf(\"%-40s  %12.4f  %14.4f  %15.4f  %16.1f  %14.2f\\n\",\n"
+        << "    std::printf(\"%-40s %12.4f %14.4f %15.4f %16.1f %10.2f %10.2f %10.2f %10.2f %10.2f %12.2f\\n\", "
         << "                \"" << modelName << "\",\n"
         << "                avg_infer_ms,\n"
         << "                avg_in_ms,\n"
         << "                avg_out_ms,\n"
         << "                throughput,\n"
-        << "                runtime_mem_mb);\n"
+        << "                sofie_pool_mem_mb,\n"
+        << "                sofie_used_mem_mb,\n"
+        << "                sofie_free_mem_mb,\n"
+        << "                sofie_largest_free_mb,\n"
+        << "                sofie_fragmentation,\n"
+        << "                gpu_peak_mem_mb);\n"
         << "    {\n"
         << "        const char *resultsPath = std::getenv(\"SOFIE_BENCHMARK_RESULTS\");\n"
         << "        std::ofstream results(resultsPath ? resultsPath : \"../../results/benchmark.csv\", std::ios::app);\n"
@@ -299,7 +322,12 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         << "                << avg_in_ms << \",\"\n"
         << "                << avg_out_ms << \",\"\n"
         << "                << throughput << \",\"\n"
-        << "                << runtime_mem_mb << \"\\n\";\n"
+        << "                << sofie_pool_mem_mb << \",\"\n"
+        << "                << sofie_used_mem_mb << \",\"\n"
+        << "                << sofie_free_mem_mb << \",\"\n"
+        << "                << sofie_largest_free_mb << \",\"\n"
+        << "                << sofie_fragmentation << \",\"\n"
+        << "                << gpu_peak_mem_mb << \"\\n\";\n"
         << "    }\n"
         << "#endif  // SOFIE_BENCHMARK_PROFILE\n"
         << "}\n";

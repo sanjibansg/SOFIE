@@ -25,6 +25,12 @@ private:
    size_t fWeightsTensorSize = 0;  // size  (in Bytes) of the allocated weight tensors
    size_t fOtherTensorSize = 0;    // size  (in Bytes) of intermediate tensors which are not managed by the memory pool
 
+   // Fragmentation tracking
+   size_t fPeakAllocatedGPU = 0;
+   size_t fPeakLargestFreeBlockGPU = 0;
+   size_t fPeakTotalFreeMemoryGPU = 0;
+   double fPeakFragmentationGPU = 0.0;
+
    OptimizationLevel fOptimizationLevel = OptimizationLevel::kExtended;
 
    std::unordered_map<std::string, InputTensorInfo> fInputTensorInfos; // input tensors where shape may not fully defined or other graph inputs?
@@ -75,6 +81,8 @@ private:
    /// GPU-only pass: fuse GEMM→LeakyReLU (and GEMM→ReLU where not already
    /// handled by the ONNX parser) into a single in-place kernel sequence.
    void FuseGemmActivations_GPU();
+
+   void UpdatePeakAllocatorStats();
 
 public:
    // Rule of five: explicitly define move semantics, disallow copy

@@ -147,6 +147,8 @@ FetchContent_MakeAvailable(alpaka)
 ################################################################################
 
 enable_language(CUDA)
+find_library(NVML_LIBRARY NAMES nvidia-ml REQUIRED)
+message(STATUS "SOFIE Benchmark: NVML = ${NVML_LIBRARY}")
 find_package(CUDAToolkit REQUIRED)
 message(STATUS "SOFIE Benchmark: CUDA toolkit ${CUDAToolkit_VERSION}")
 
@@ -425,11 +427,12 @@ target_compile_options(sofie_benchmark PRIVATE
 )
 
 target_link_libraries(sofie_benchmark PRIVATE
-    SOFIE_core
-    CUDA::cudart
-    CUDA::cublas
-    CUDA::cublasLt
-    $<$<BOOL:${SOFIE_ORT_FOUND}>:${SOFIE_ORT_TARGET}>
+        SOFIE_core
+        CUDA::cudart
+        CUDA::cublas
+        CUDA::cublasLt
+        ${NVML_LIBRARY}
+        $<$<BOOL:${SOFIE_ORT_FOUND}>:${SOFIE_ORT_TARGET}>
 )
 
 if(SOFIE_ORT_FOUND)
@@ -711,6 +714,7 @@ if(SOFIE_BENCHMARK_LARGE)
             CUDA::cublas_static      # statically embed libcublas
             CUDA::cublasLt_static    # statically embed libcublasLt
             CUDA::culibos            # required companion for static cublas
+            ${NVML_LIBRARY}
             # ORT intentionally excluded — no static libonnxruntime available
         )
 

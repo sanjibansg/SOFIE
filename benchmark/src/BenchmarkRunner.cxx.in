@@ -120,15 +120,20 @@ int main(int argc, char *argv[]) {
 #endif
     std::printf("\n\n");
 
-    std::printf("%-40s  %12s  %14s  %15s  %16s  %14s\n",
+    std::printf("%-40s %12s %14s %15s %16s %10s %10s %10s %10s %10s %12s\n",
                 "Model",
                 "infer(ms)",
                 "in_xfer(ms)",
                 "out_xfer(ms)",
-                "Throughput(inf/s)",
-                "Runtime(MB)");
+                "Throughput(i/s)",
+                "Pool(MB)",
+                "Used(MB)",
+                "Free(MB)",
+                "Largest(MB)",
+                "Frag(%)",
+                "PeakGPU(MB)");
 
-    std::printf("%s\n", std::string(118, '-').c_str());
+    std::printf("%s\n", std::string(180, '-').c_str());
 
     // Add results to a file
     namespace fs = std::filesystem;
@@ -160,7 +165,12 @@ int main(int argc, char *argv[]) {
             << "in_xfer_ms,"
             << "out_xfer_ms,"
             << "throughput_inf_s,"
-            << "runtime_mem_mb\n";
+            << "sofie_pool_mem_mb,"
+            << "sofie_used_mem_mb,"
+            << "sofie_free_mem_mb,"
+            << "sofie_largest_free_mb,"
+            << "sofie_fragmentation_percent,"
+            << "gpu_peak_mem_mb\n";
 
 #endif  // SOFIE_BENCHMARK_PROFILE
     std::fflush(stdout);

@@ -144,6 +144,37 @@ void RModel::FuseGemmActivations_GPU() {
    }
 }
 
+// Helper for getting stats for benchmarking
+void RModel::UpdatePeakAllocatorStats()
+{
+   size_t totalFree = 0;
+   size_t largestFree = 0;
+
+   for (const auto &chunk : fIntermediateMemoryInfoGPU.available_stack) {
+      totalFree += chunk.second;
+      largestFree = std::max(largestFree, chunk.second);
+   }
+
+   size_t allocated = 0;
+   if (!fIntermediateMemoryInfoGPU.total_stack.empty()) {
+      const auto &last = *fIntermediateMemoryInfoGPU.total_stack.rbegin();
+      allocated =
+          last.first + last.second.reserved_size - totalFree;
+   }
+
+   if (allocated > fPeakAllocatedGPU) {
+      fPeakAllocatedGPU = allocated;
+      fPeakLargestFreeBlockGPU = largestFree;
+      fPeakTotalFreeMemoryGPU = totalFree;
+
+      if (totalFree)
+         fPeakFragmentationGPU =
+             1.0 - double(largestFree) / double(totalFree);
+      else
+         fPeakFragmentationGPU = 0.0;
+   }
+}
+
 void RModel::GenerateInitializedTensorInfo_GPU_ALPAKA() {
    if (!fInitializedTensors.empty()){
       fGC += "\n// initialized tensors for weights\n";
@@ -583,7 +614,6 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    fGC += "}\n";
 }
 
-
 // Get the data member name corresponding to a tensor with a given name.
 std::string TensorMember(std::string const &name) {
    return "tensor_" + name;
@@ -782,6 +812,8 @@ std::string RModel::AllocateIntermediateMemory_GPU_ALPAKA(std::span<const std::s
 
             declareIntermediateTensor(name, tensor_size, new_chunk_location);
 
+            UpdatePeakAllocatorStats();
+
             allocated = true;
 
             CheckGPUStacks(fIntermediateMemoryInfoGPU);
@@ -856,6 +888,8 @@ std::string RModel::AllocateIntermediateMemory_GPU_ALPAKA(std::span<const std::s
 
             declareIntermediateTensor(name, tensor_size, tensorOffset);
 
+            UpdatePeakAllocatorStats();
+
             allocated = true;
          }
       }
@@ -871,6 +905,8 @@ std::string RModel::AllocateIntermediateMemory_GPU_ALPAKA(std::span<const std::s
          fIntermediateMemoryInfoGPU.total_stack[chunk_idx] = TensorMemoryInfoGPU{it.tensor_name, tensor_size, tensor_size};
 
          declareIntermediateTensor(name, tensor_size, chunk_idx);
+
+         UpdatePeakAllocatorStats();
 
          CheckGPUStacks(fIntermediateMemoryInfoGPU);
 
@@ -989,12 +1025,33 @@ void RModel::GenerateIntermediateMemoryPool_GPU_ALPAKA() {
    fGC += "static constexpr std::size_t kIntermediateMemoryPoolSize = "
           + std::to_string(memPoolSize) + ";\n";
 
+   fGC += "static constexpr std::size_t kLargestFreeBlock = "
+     + std::to_string(fPeakLargestFreeBlockGPU) + ";\n";
+
+   fGC += "static constexpr std::size_t kTotalFreeMemory = "
+        + std::to_string(fPeakTotalFreeMemoryGPU) + ";\n";
+
+   fGC += "static constexpr double kFragmentation = "
+        + std::to_string(fPeakFragmentationGPU) + ";\n\n";
+
    fGC += "BufUI81D fIntermediateMemoryPool = "
           "alpaka::allocBuf<std::uint8_t, size_t>(devAcc, "
           "Ext1D::all(Idx{kIntermediateMemoryPoolSize}));\n\n";
 
    fGC += "std::size_t GetIntermediateMemoryPoolSize() const {\n";
    fGC += "   return kIntermediateMemoryPoolSize;\n";
+   fGC += "}\n\n";
+
+   fGC += "std::size_t GetLargestFreeBlock() const {\n";
+   fGC += "   return kLargestFreeBlock;\n";
+   fGC += "}\n\n";
+
+   fGC += "std::size_t GetTotalFreeMemory() const {\n";
+   fGC += "   return kTotalFreeMemory;\n";
+   fGC += "}\n\n";
+
+   fGC += "double GetFragmentation() const {\n";
+   fGC += "   return kFragmentation;\n";
    fGC += "}\n\n";
 }
 
