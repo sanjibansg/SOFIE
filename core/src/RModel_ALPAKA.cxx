@@ -52,9 +52,9 @@ void RModel::ComputeEltwiseFusionGroups() {
       auto firstInputs = fOperators[i]->GetOpInputTensors();
       group.inputTensor = firstInputs.empty() ? "" : std::string(firstInputs[0]);
 
-      // Extend chain: only if CURRENT op is elementwise and its single output can be fused
+      // Extend chain: only if CURRENT op is elementwise with runtime (non constant) output that can be fused
       size_t current = i;
-      while (fOperators[current]->IsElementwise()) {
+      while (fOperators[current]->IsElementwise() && !fOperators[current]->IsOutputConstant()) {
          auto curOutputs = fOperators[current]->GetOpOutputTensors();
          if (curOutputs.size() != 1) break;
          std::string curOut = std::string(curOutputs[0]);
@@ -64,7 +64,7 @@ void RModel::ComputeEltwiseFusionGroups() {
          // Must be strictly the next op in sequence and itself elementwise with single input
          if (nextIdx != current + 1) break;
          if (opAssigned[nextIdx]) break;
-         if (!fOperators[nextIdx]->IsElementwise()) break;
+         if (!fOperators[nextIdx]->IsElementwise() || fOperators[nextIdx]->IsOutputConstant()) break;
          auto nextInputs = fOperators[nextIdx]->GetOpInputTensors();
          if (nextInputs.size() != 1) break;
 
@@ -77,11 +77,19 @@ void RModel::ComputeEltwiseFusionGroups() {
       auto lastOutputs = fOperators[current]->GetOpOutputTensors();
       group.outputTensor = lastOutputs.empty() ? "" : std::string(lastOutputs[0]);
 
-      // Element count from intermediate tensor info (all op outputs are intermediates)
+      // Element count: literal for static tensors, runtime expression for dynamic ones
       if (!group.outputTensor.empty()) {
          auto it = fIntermediateTensorInfos.find(group.outputTensor);
-         if (it != fIntermediateTensorInfos.end())
-            group.numElements = ConvertShapeToLength(it->second.shape);
+         if (it != fIntermediateTensorInfos.end()) {
+            group.lengthExpr = std::to_string(ConvertShapeToLength(it->second.shape));
+         } else {
+            auto itDyn = fDynamicTensorInfos.find(group.outputTensor);
+            if (itDyn != fDynamicTensorInfos.end())
+               group.lengthExpr = ConvertDimShapeToLength(itDyn->second.shape);
+            else if (group.isFused())
+               throw std::runtime_error("SOFIE eltwise fusion: output tensor " + group.outputTensor +
+                                        " not found in intermediate or dynamic tensor infos");
+         }
       }
 
       size_t gIdx = fEltwiseFusionGroups.size();
@@ -249,6 +257,7 @@ void RModel::GenerateGPU_ALPAKA_Buffers() {
    if (!fDynamicTensorInfos.empty()) {
       fGC += "//--- declare the dynamic tensors\n";
       for (auto &i : fDynamicTensorInfos) {
+         if (fFusionIntermediateTensors.count(i.first)) continue;
          if (i.second.type == ETensorType::FLOAT) {
             fGC += "BufF1D deviceBuf_" + i.first + " = alpaka::allocBuf<float, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
          } else if (i.second.type == ETensorType::DOUBLE) {
@@ -269,6 +278,7 @@ void RModel::GenerateDynamicTensorInfo_GPU_ALPAKA() {
    std::stringstream out;
 
    for (auto &i : fDynamicTensorInfos) {
+      if (fFusionIntermediateTensors.count(i.first)) continue;
       auto length = ConvertDimShapeToLength(i.second.shape);
       out << SP << "if (" << length << " > 0) {\n";
       if (i.second.type == ETensorType::FLOAT) {
@@ -441,11 +451,11 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
             fusedCode += "\n//------ FUSED_ELTWISE_GPU_ALPAKA" + sfx + "\n";
             fusedCode += SP + "{\n";
             fusedCode += SP + SP + "auto const elementsPerThread_fused" + sfx + " = Vec::all(static_cast<Idx>(1));\n";
-            fusedCode += SP + SP + "auto const elementsPerGrid_fused" + sfx + " = Vec::all(Idx{" + std::to_string(grp.numElements) + "});\n";
+            fusedCode += SP + SP + "auto const elementsPerGrid_fused" + sfx + " = Vec::all(Idx{" + grp.lengthExpr + "});\n";
             fusedCode += SP + SP + "auto const workDiv_fused" + sfx + " = sofie_workdiv(elementsPerGrid_fused" + sfx + ");\n";
             fusedCode += SP + SP + "auto task_fused" + sfx + " = alpaka::createTaskKernel<Acc>(workDiv_fused" + sfx + ", " + kname +
                    ", alpaka::getPtrNative(deviceBuf_" + grp.inputTensor + "), alpaka::getPtrNative(deviceBuf_" + grp.outputTensor +
-                   "), static_cast<Idx>(" + std::to_string(grp.numElements) + "));\n";
+                   "), static_cast<Idx>(" + grp.lengthExpr + "));\n";
             fusedCode += SP + SP + "alpaka::enqueue(queue, task_fused" + sfx + ");\n";
             fusedCode += SP + "}\n";
             if (fProfile) {

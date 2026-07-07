@@ -58,7 +58,7 @@ private:
       std::vector<size_t> opIndices; ///< consecutive op indices forming this group
       std::string inputTensor;       ///< input tensor name of the first op
       std::string outputTensor;      ///< output tensor name of the last op
-      size_t numElements = 0;
+      std::string lengthExpr;        ///< element count: literal for static tensors, runtime expression for dynamic
       bool isFused() const { return opIndices.size() > 1; }
       std::string suffix() const {
          std::string s;
