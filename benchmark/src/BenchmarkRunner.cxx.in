@@ -20,6 +20,7 @@
 #include <chrono>
 #include <ctime>
 #include <fstream>
+#include <unistd.h>
 
 // Optional ONNX Runtime GPU comparison
 #ifdef SOFIE_BENCHMARK_ORT
@@ -47,6 +48,8 @@ int main(int argc, char *argv[]) {
     int iterations = 100;
     std::string weightsDir = ".";
     bool run_ort   = false;
+    bool profile = false;
+    std::string ncuPath;
     std::string singleModel;
 
     for (int i = 1; i < argc; ++i) {
@@ -56,6 +59,8 @@ int main(int argc, char *argv[]) {
         else if  (a == "--weights-dir"                 && i + 1 < argc) weightsDir = argv[++i];
         else if  (a == "--single-model"                && i + 1 < argc) singleModel = argv[++i];
         else if  (a == "--onnxruntime"   || a == "--ort")               run_ort    = true;
+        else if (a == "--profile")                                      profile = true;
+        else if (a == "--ncu" && i + 1 < argc)                          ncuPath = argv[++i];
         else if  (a == "--help"          || a == "-h") {
 #ifdef SOFIE_BENCHMARK_PROFILE
             std::cout <<
@@ -85,6 +90,32 @@ int main(int argc, char *argv[]) {
 #endif
             return 0;
         }
+    }
+
+    if (profile) {
+        warmup = 0;
+        iterations = 1;
+        if (ncuPath.empty()) {
+            std::cerr
+                << "Profiling requested, but no Nsight Compute executable was provided.\n"
+                << "Use:\n"
+                << "  --ncu /path/to/ncu\n\n"
+                << "Example:\n"
+                << "  sudo ./sofie_benchmark --profile "
+                   "--ncu /usr/local/cuda/bin/ncu\n";
+            return 1;
+        }
+
+    #ifndef _WIN32
+        if (geteuid() != 0) {
+            std::cerr
+                << "Profiling requires administrator privileges.\n"
+                << "Run:\n"
+                << "  sudo ./sofie_benchmark --profile "
+                   "--ncu " << ncuPath << "\n";
+            return 1;
+        }
+    #endif
     }
 
     // -----------------------------------------------------------------------
@@ -149,14 +180,20 @@ int main(int argc, char *argv[]) {
     char timestamp[32];
     std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &tm);
 
+    std::string resultsDir =
+        std::string("../../results/benchmark_") + timestamp;
+
+    fs::create_directories(resultsDir);
+
     // Store filename in environment so child processes can use it
-    std::string resultsFile =
-        std::string("../../results/benchmark_") + timestamp + ".csv";
+    std::string resultsFile = resultsDir + "/benchmark.csv";
 
     #ifdef _WIN32
     _putenv_s("SOFIE_BENCHMARK_RESULTS", resultsFile.c_str());
+    _putenv_s("SOFIE_BENCHMARK_RESULTS_DIR", resultsDir.c_str());
     #else
     setenv("SOFIE_BENCHMARK_RESULTS", resultsFile.c_str(), 1);
+    setenv("SOFIE_BENCHMARK_RESULTS_DIR", resultsDir.c_str(), 1);
     #endif
 
     std::ofstream results(resultsFile);
@@ -172,6 +209,9 @@ int main(int argc, char *argv[]) {
             << "sofie_fragmentation_percent,"
             << "gpu_peak_mem_mb\n";
 
+    results.flush();
+    results.close();
+
 #endif  // SOFIE_BENCHMARK_PROFILE
     std::fflush(stdout);
 
@@ -180,11 +220,36 @@ int main(int argc, char *argv[]) {
     common << " -w " << warmup
            << " -n " << iterations
            << " --weights-dir \"" << weightsDir << "\"";
+
     if (run_ort) common << " --ort";
+    if (profile) common << " --profile";
+    if (!ncuPath.empty()) common << " --ncu \"" << ncuPath << "\"";
+
     std::string commonArgs = common.str();
 
     int totalFailed = 0;
 @BENCHMARK_SPAWN_CALLS@
+
+    if (profile) {
+
+        std::cout << "\nConverting Nsight Compute reports to CSV...\n";
+
+        for (const auto& entry : std::filesystem::directory_iterator(resultsDir)) {
+
+            if (entry.path().extension() != ".ncu-rep")
+                continue;
+
+            std::string rep = entry.path().string();
+            std::string csv = rep.substr(0, rep.size() - 8) + ".csv";
+
+            std::string cmd =
+                ncuPath +
+                " --import \"" + rep +
+                "\" --csv --page raw > \"" + csv + "\"";
+
+            std::system(cmd.c_str());
+        }
+    }
 
     if (totalFailed > 0)
         std::fprintf(stderr, "\n%d model(s) failed.\n", totalFailed);
