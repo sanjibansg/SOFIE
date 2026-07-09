@@ -148,6 +148,8 @@ void RModel::GenerateInitializedTensorInfo_GPU_ALPAKA() {
    }
 
    for (auto &i : fInitializedTensors) {
+      if (i.second.IsNotWritable())
+         continue;
       if (!fUseWeightFile || i.second.IsConstantTensor()) {
          if (i.second.type() == ETensorType::FLOAT)
             fGC += GenerateConstantTensorCode<float>(i);
@@ -196,6 +198,8 @@ void RModel::GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA()
       fGC += "// temporary initialized tensors for loading weights\n";
 
    for (auto &i : fInitializedTensors) {
+      if (i.second.IsNotWritable())
+         continue;
       if (fUseWeightFile && !i.second.IsConstantTensor()) {
          // case of tensors which are read from a file
          size_t length = ConvertShapeToLength(i.second.shape());
@@ -883,7 +887,8 @@ void RModel::MoveInitializedTensorsToBuffers_ALPAKA(){
          if (i.second.IsNotWritable())  continue;
          if (HasQuantizedTensorStorage(i.first)) {
             const auto &storage = GetQuantizedTensorStorage(i.first);
-            if (storage.layout == EQuantizedLayout::PackedCPU || !storage.isDeviceResident)
+            if (storage.layout == EQuantizedLayout::PackedCPU ||
+                storage.residentBackend != EQuantizedBackend::ALPAKA)
                continue;
          }
          const auto type = i.second.type();

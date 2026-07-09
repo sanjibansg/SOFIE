@@ -82,6 +82,7 @@ private:
    /// handled by the ONNX parser) into a single in-place kernel sequence.
    void FuseGemmActivations_GPU();
    void BuildLoweredOperatorView(EQuantizedBackend backend = EQuantizedBackend::CPU);
+   void PrepareQuantizedTensorStorage(EQuantizedBackend backend);
    void AddQuantizedGeneratedHeaders(EQuantizedBackend backend = EQuantizedBackend::CPU);
    void AddLoweredQuantizedOperators(EQuantizedBackend backend = EQuantizedBackend::CPU);
 
@@ -164,6 +165,18 @@ public:
       std::shared_ptr<void> data(malloc(size * sizeof(T)), free);
       std::memcpy(data.get(), raw_data, size * sizeof(T));
       AddInitializedTensor(tensor_name,  GetTemplatedType(T()), shape, data);
+   }
+
+   template <typename T>
+   void AddInitializedTensor(const std::string & tensor_name, const std::vector<std::size_t> & shape, const std::vector<T> &values)
+   {
+      size_t size = ConvertShapeToLength(shape);
+      if (values.size() != size) {
+         throw std::runtime_error("sofie: initialized tensor " + tensor_name + " data length does not match shape");
+      }
+      std::shared_ptr<void> data(malloc(size * sizeof(T)), free);
+      std::copy(values.begin(), values.end(), static_cast<T *>(data.get()));
+      AddInitializedTensor(tensor_name, GetTemplatedType(T()), shape, data);
    }
 
    void AddShapeTensor(const std::string & name, const std::vector<Dim> & shapeValues, bool scalar = false);

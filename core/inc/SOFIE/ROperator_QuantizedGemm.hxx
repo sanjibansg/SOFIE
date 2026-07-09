@@ -4,6 +4,7 @@
 #include "SOFIE/ROperator.hxx"
 #include "SOFIE/SOFIE_common.hxx"
 #include "SOFIE/RQuantization.hxx"
+#include "SOFIE/ROperator_QuantizedMatrix.hxx"
 #include "SOFIE/SOFIE_Quantized.hxx"
 
 #include <algorithm>
@@ -19,10 +20,7 @@
 
 namespace SOFIE {
 
-struct QuantizedGemmCodegenContext {
-   std::vector<Dim> inputShape;
-   std::vector<Dim> weightShape;
-   std::vector<Dim> outputShape;
+struct QuantizedGemmCodegenContext : QuantizedMatrixCodegenContext {
    float alpha = 1.0f;
    float beta = 1.0f;
    std::int64_t transA = 0;
@@ -35,9 +33,7 @@ namespace INTERNAL {
 inline void ValidateQuantizedGemmContext(const QuantizedGemmCodegenContext &context,
                                                  const std::string &pathName)
 {
-   if (context.inputShape.empty() || context.weightShape.empty() || context.outputShape.empty()) {
-      throw std::runtime_error("SOFIE " + pathName + " called before Gemm initialization");
-   }
+   ValidateQuantizedMatrixContext(context, "Gemm", pathName);
    if (context.transA != 0 || context.transB != 1) {
       throw std::runtime_error("SOFIE " + pathName + " supports transA=0 and transB=1");
    }
@@ -47,48 +43,11 @@ inline void ValidateQuantizedGemmContext(const QuantizedGemmCodegenContext &cont
    if (context.activation != EActivationType::UNDEFINED && context.activation != EActivationType::RELU) {
       throw std::runtime_error("SOFIE " + pathName + " supports only no fused activation or fused ReLU");
    }
-   if (context.inputShape.size() != 2 || context.weightShape.size() != 2 || context.outputShape.size() != 2) {
-      throw std::runtime_error("SOFIE " + pathName + " supports rank-2 Gemm only");
-   }
 }
 
 inline bool HasQuantizedGemmBias(const QuantizedGemmRegion &region)
 {
    return !region.biasSourceTensor.empty();
-}
-
-inline const char *QuantizedCudaInputCarrierName(EQuantizedCarrierMode mode)
-{
-   switch (mode) {
-   case EQuantizedCarrierMode::Int8:
-      return "Int8";
-   case EQuantizedCarrierMode::Float:
-      return "Float";
-   case EQuantizedCarrierMode::UInt8:
-      throw std::runtime_error("SOFIE quantized CUDA GEMM currently supports signed int8 input carriers only");
-   default:
-      throw std::runtime_error("SOFIE quantized CUDA GEMM received unsupported input carrier mode");
-   }
-}
-
-inline const char *QuantizedCudaEpilogueModeName(EQuantizedOutputMode mode)
-{
-   switch (mode) {
-   case EQuantizedOutputMode::ExactFakeQuantFloat:
-      return "ExactFakeQuant";
-   case EQuantizedOutputMode::Quantized:
-      return "Quantized";
-   default:
-      throw std::runtime_error("SOFIE quantized CUDA GEMM received unsupported output mode");
-   }
-}
-
-inline const char *QuantizedCudaOutputCarrierName(const QuantizationInfo &info)
-{
-   if (info.bitWidth != 8) {
-      throw std::runtime_error("SOFIE quantized CUDA GEMM currently supports only 8-bit output carriers");
-   }
-   return info.isSigned ? "Int8" : "UInt8";
 }
 
 } // namespace INTERNAL
@@ -296,63 +255,39 @@ inline std::string GenerateFusedQuantizedGemmCublasLtCoreLaunch(std::string opNa
    if (region.inputSourceTensor.empty() || region.outputTensor.empty()) {
       throw std::runtime_error("SOFIE fused Quantized Gemm cuBLASLt core launch is missing input/output tensors");
    }
+   if (plan.weightScaleMode == EQuantizedParameterMode::PerOutputChannel && plan.weightScaleTensor.empty()) {
+      throw std::runtime_error("SOFIE fused Quantized Gemm cuBLASLt per-channel launch is missing a weight scale tensor");
+   }
 
    const auto dimA = context.inputShape.size();
    const auto dimB = context.weightShape.size();
-   const auto m = context.inputShape[dimA - 2].GetVal();
-   const auto k = context.inputShape[dimA - 1].GetVal();
-   const auto n = context.weightShape[dimB - 2].GetVal();
 
-   std::stringstream out;
-   out << "\n//--------- ROperator_QuantizedGemm cuBLASLt int8 GEMM core boundary " << opName << "\n";
-   out << "   // Optimized GPU boundary: stream-ordered cuBLASLt int8 GEMM selected by the lowering plan.\n";
-   out << "   {\n";
-   out << "      // Quantized lowering capability: " << plan.capabilityTag << "\n";
-   out << "      // Quantized lowering reason: " << plan.reason << "\n";
-   out << "      SOFIE::QuantizedGemmCudaLtParams params_quantizedGemm_" << opName << "{};\n";
-   out << "      params_quantizedGemm_" << opName << ".m = static_cast<std::size_t>(" << m << ");\n";
-   out << "      params_quantizedGemm_" << opName << ".n = static_cast<std::size_t>(" << n << ");\n";
-   out << "      params_quantizedGemm_" << opName << ".k = static_cast<std::size_t>(" << k << ");\n";
-   out << std::setprecision(17);
-   out << "      params_quantizedGemm_" << opName << ".inputScale = " << region.inputQuant.scale << ";\n";
-   out << "      params_quantizedGemm_" << opName << ".weightScale = " << region.weightQuant.scale << ";\n";
-   out << "      params_quantizedGemm_" << opName << ".biasScale = " << (region.biasQuant ? region.biasQuant->scale : 1.0) << ";\n";
-   out << "      params_quantizedGemm_" << opName << ".outputScale = " << region.outputQuant.scale << ";\n";
-   out << "      params_quantizedGemm_" << opName << ".inputZeroPoint = " << region.inputQuant.zeroPoint << ";\n";
-   out << "      params_quantizedGemm_" << opName << ".weightZeroPoint = " << region.weightQuant.zeroPoint << ";\n";
-   out << "      params_quantizedGemm_" << opName << ".biasZeroPoint = " << (region.biasQuant ? region.biasQuant->zeroPoint : 0) << ";\n";
-   out << "      params_quantizedGemm_" << opName << ".outputZeroPoint = " << region.outputQuant.zeroPoint << ";\n";
-   const auto inputRange = QuantizedIntegerRange(region.inputQuant);
-   const auto biasRange = region.biasQuant ? QuantizedIntegerRange(*region.biasQuant) : std::pair<std::int64_t, std::int64_t>{0, 0};
-   const auto outputRange = QuantizedIntegerRange(region.outputQuant);
-   out << "      params_quantizedGemm_" << opName << ".inputQMin = static_cast<std::int32_t>(" << inputRange.first << ");\n";
-   out << "      params_quantizedGemm_" << opName << ".inputQMax = static_cast<std::int32_t>(" << inputRange.second << ");\n";
-   out << "      params_quantizedGemm_" << opName << ".biasQMin = static_cast<std::int32_t>(" << biasRange.first << ");\n";
-   out << "      params_quantizedGemm_" << opName << ".biasQMax = static_cast<std::int32_t>(" << biasRange.second << ");\n";
-   out << "      params_quantizedGemm_" << opName << ".outputQMin = static_cast<std::int32_t>(" << outputRange.first << ");\n";
-   out << "      params_quantizedGemm_" << opName << ".outputQMax = static_cast<std::int32_t>(" << outputRange.second << ");\n";
-   out << "      params_quantizedGemm_" << opName << ".hasBias = " << (INTERNAL::HasQuantizedGemmBias(region) ? "true" : "false") << ";\n";
-   out << "      params_quantizedGemm_" << opName << ".hasRelu = " << (context.activation == EActivationType::RELU ? "true" : "false") << ";\n";
-   out << "      params_quantizedGemm_" << opName << ".maxWorkspaceBytes = 32ULL * 1024ULL * 1024ULL;\n";
-   const auto planEpilogueMode = INTERNAL::QuantizedCudaEpilogueModeName(plan.outputMode);
-   const auto planInputCarrier = INTERNAL::QuantizedCudaInputCarrierName(plan.inputCarrierMode);
-   out << "      params_quantizedGemm_" << opName << ".epilogueMode = SOFIE::EQuantizedCudaEpilogueMode::" << planEpilogueMode << ";\n";
-   out << "      params_quantizedGemm_" << opName << ".inputCarrier = SOFIE::EQuantizedCudaInputCarrier::" << planInputCarrier << ";\n";
-   out << "      params_quantizedGemm_" << opName << ".outputCarrier = SOFIE::EQuantizedCudaOutputCarrier::" << INTERNAL::QuantizedCudaOutputCarrierName(region.outputQuant) << ";\n";
-   out << "      params_quantizedGemm_" << opName << ".weightType = SOFIE::EQuantizedCudaWeightType::" << (region.weightQuant.isSigned ? "Int8" : "UInt8") << ";\n";
-   out << "      SOFIE::QuantizedGemmCudaLt_Call(quantizedGemmCudaLtState_" << opName
-       << ", alpaka::getNativeHandle(queue)"
-       << ", alpaka::getPtrNative(deviceBuf_" << region.outputTensor << ")"
-       << ", alpaka::getPtrNative(deviceBuf_" << region.inputSourceTensor << ")"
-       << ", alpaka::getPtrNative(deviceBuf_" << plan.weightStorageTensor << ")";
-   if (INTERNAL::HasQuantizedGemmBias(region)) {
-      out << ", alpaka::getPtrNative(deviceBuf_" << region.biasSourceTensor << ")";
-   } else {
-      out << ", static_cast<const float *>(nullptr)";
-   }
-   out << ", params_quantizedGemm_" << opName << ");\n";
-   out << "   }\n";
-   return out.str();
+   INTERNAL::QuantizedCudaLtMatMulCall call;
+   call.boundaryName = "ROperator_QuantizedGemm cuBLASLt int8 GEMM core boundary " + opName;
+   call.stateName = "quantizedGemmCudaLtState_" + opName;
+   call.paramsName = "params_quantizedGemm_" + opName;
+   call.outputTensor = region.outputTensor;
+   call.inputTensor = region.inputSourceTensor;
+   call.weightStorageTensor = plan.weightStorageTensor;
+   call.biasTensor = region.biasSourceTensor;
+   call.weightScaleTensor = plan.weightScaleTensor;
+   call.m = context.inputShape[dimA - 2].GetVal();
+   call.k = context.inputShape[dimA - 1].GetVal();
+   call.n = context.weightShape[dimB - 2].GetVal();
+   call.inputQuant = region.inputQuant;
+   call.weightQuant = region.weightQuant;
+   call.biasQuant = region.biasQuant;
+   call.outputQuant = region.outputQuant;
+   call.outputMode = plan.outputMode;
+   call.inputCarrierMode = plan.inputCarrierMode;
+   call.weightScaleMode = plan.weightScaleMode;
+   call.shapePolicy = plan.shapePolicy;
+   call.capabilityTag = plan.capabilityTag;
+   call.reason = plan.reason;
+   call.hasBias = INTERNAL::HasQuantizedGemmBias(region);
+   call.hasRelu = context.activation == EActivationType::RELU;
+   call.weightIsSigned = region.weightQuant.isSigned;
+   return INTERNAL::GenerateQuantizedCudaLtMatMulCall(call);
 }
 
 inline std::string GenerateFusedQuantizedGemmAlpakaFakeQuantLaunch(std::string opName,

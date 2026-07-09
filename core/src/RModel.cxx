@@ -58,6 +58,7 @@ void RModel::BuildLoweredOperatorView(EQuantizedBackend backend)
 {
    fLoweredOperators.clear();
    fLoweredConsumedOperatorIndices.clear();
+   PrepareQuantizedTensorStorage(backend);
    AddLoweredQuantizedOperators(backend);
 }
 
@@ -688,9 +689,9 @@ void RModel::Initialize(const std::map<std::string, size_t> & inputParams, bool 
 
    AnalyzeQuantizedRegions();
 
-   // loop on initialized tensors and make the integers as constant to be
-   // not written in a weight file and check if the tensors flagged as not writable are really not writable,
-   // i.e. are not used by non constant operators
+   // Check whether tensors flagged as not writable are used by runtime operators.
+   // Integer initializers remain embedded for compatibility, except for physical
+   // quantized storage explicitly registered as file-backed model weights.
    for (auto &it : fInitializedTensors) {
       // check if not-writable tensors are really not writable, i.e. are not used by non constant operators
       if (it.second.IsNotWritable() && runtimeInitializedInputs.find(it.first) != runtimeInitializedInputs.end()) {
@@ -699,9 +700,8 @@ void RModel::Initialize(const std::map<std::string, size_t> & inputParams, bool 
             std::cout << "Initialized tensor " << it.first << " is flagged as not writable but is used by non constant operators, set it as writable \n";
          }
       }
-      // if the tensor is an integer we can flag it as constant since it will not be written in a weight file and it is considered equivalent as being created from a Constant operator
-      // only FLOAT tensors are written in a weight file
-      if (it.second.type() !=  ETensorType::FLOAT) {
+      const bool isFileBackedQuantizedStorage = HasQuantizedTensorStorage(it.first);
+      if (it.second.type() != ETensorType::FLOAT && !isFileBackedQuantizedStorage) {
          it.second.SetConstant();
       }
    }
@@ -811,7 +811,7 @@ void RModel::GenerateInitializedTensorInfo()
    for (auto &i : fInitializedTensors) {
       if (i.second.IsNotWritable())  continue;
       size_t length = ConvertShapeToLength(i.second.shape());
-      if (!fUseWeightFile || i.second.IsConstantTensor() || !i.second.IsWeightTensor() || i.second.type() != ETensorType::FLOAT ) {
+      if (!fUseWeightFile || i.second.IsConstantTensor() || !i.second.IsWeightTensor()) {
          if (i.second.type() == ETensorType::FLOAT) {
             // check if NaN of Inf are inside tensor data
             bool hasInfOrNaN = false;
@@ -844,12 +844,14 @@ void RModel::GenerateInitializedTensorInfo()
 
 
       } else {
-         // case of tensors which are read from a file
-         if (i.second.type() == ETensorType::FLOAT) {
-            fGC += "std::vector<float> fTensor_" + i.first + " = std::vector<float>(" + std::to_string(length) + ");\n";
-            fGC += "float * " + TensorMember(i.first) + " = fTensor_" + i.first + ".data();\n";
-            fWeightsTensorSize += length * sizeof(float);
-         }
+         const auto typeName = ConvertTypeToString(i.second.type());
+         if (i.second.type() != ETensorType::FLOAT && i.second.type() != ETensorType::INT8 &&
+             i.second.type() != ETensorType::UINT8 && i.second.type() != ETensorType::INT32 &&
+             i.second.type() != ETensorType::INT64)
+            throw std::runtime_error("sofie initialized tensor " + i.first + " has a type unsupported by weight files");
+         fGC += "std::vector<" + typeName + "> fTensor_" + i.first + " = std::vector<" + typeName + ">(" + std::to_string(length) + ");\n";
+         fGC += typeName + " * " + TensorMember(i.first) + " = fTensor_" + i.first + ".data();\n";
+         fWeightsTensorSize += length * GetTypeSize(i.second.type());
       }
    }
 }
@@ -1599,7 +1601,9 @@ void RModel::ReadInitializedTensorsFromFile(long pos) {
             // skip Constant and shape tensors (not written in a file)
             if (!i.second.IsWeightTensor()) continue;
             std::string tensor_name = "tensor_" + i.first;
-            if (i.second.type() == ETensorType::FLOAT) {
+            if (i.second.type() == ETensorType::FLOAT || i.second.type() == ETensorType::INT8 ||
+                i.second.type() == ETensorType::UINT8 || i.second.type() == ETensorType::INT32 ||
+                i.second.type() == ETensorType::INT64) {
                std::string length = std::to_string(ConvertShapeToLength(i.second.shape()));
                fGC += "   ReadTensorFromStream(f, " + tensor_name + ", \"" + tensor_name + "\", " + length + ");\n";
             } else {
@@ -1751,6 +1755,30 @@ long RModel::WriteInitializedTensorsToFile(std::string filename) {
                   else
                      f << std::setprecision(std::numeric_limits<float>::max_digits10) << value;
                   f <<  ( (idx < length-1) ? " " : "\n" );
+               }
+            }
+            else if (i.second.type() == ETensorType::INT8) {
+               const int8_t * data = i.second.data<int8_t>();
+               for (size_t idx = 0; idx < length; idx++) {
+                  f << static_cast<int>(data[idx]) <<  ( (idx < length-1) ? " " : "\n" );
+               }
+            }
+            else if (i.second.type() == ETensorType::UINT8) {
+               const uint8_t * data = i.second.data<uint8_t>();
+               for (size_t idx = 0; idx < length; idx++) {
+                  f << static_cast<unsigned int>(data[idx]) <<  ( (idx < length-1) ? " " : "\n" );
+               }
+            }
+            else if (i.second.type() == ETensorType::INT32) {
+               const int32_t * data = i.second.data<int32_t>();
+               for (size_t idx = 0; idx < length; idx++) {
+                  f << data[idx] <<  ( (idx < length-1) ? " " : "\n" );
+               }
+            }
+            else if (i.second.type() == ETensorType::INT64) {
+               const int64_t * data = i.second.data<int64_t>();
+               for (size_t idx = 0; idx < length; idx++) {
+                  f << data[idx] <<  ( (idx < length-1) ? " " : "\n" );
                }
             }
             else {

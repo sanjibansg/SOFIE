@@ -1,17 +1,19 @@
 #include "SOFIE/RModel.hxx"
 #include "SOFIE/ROperator_Gemm.hxx"
 #include "SOFIE/ROperator_QuantizedGemm.hxx"
+#include "SOFIE/ROperator_QuantizedMatMul.hxx"
 #include "SOFIE/RQuantization.hxx"
+#include "SOFIE/RQuantization_Analysis.hxx"
+#include "SOFIE/RQuantization_DenseLinear.hxx"
+#include "SOFIE/RQuantization_Storage.hxx"
 
 #include <algorithm>
-#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -19,63 +21,9 @@ namespace SOFIE {
 
 namespace {
 
-std::string JoinReasons(const std::vector<std::string> &reasons)
-{
-   std::ostringstream out;
-   for (std::size_t i = 0; i < reasons.size(); ++i) {
-      if (i != 0)
-         out << "; ";
-      out << reasons[i];
-   }
-   return out.str();
-}
-
-bool IsScalarPerTensor(const QuantizationInfo &info)
-{
-   return info.granularity == EQuantizationGranularity::PerTensor && info.axis == -1;
-}
-
-ETensorType TensorTypeForQuantizedStorage(EQuantizedStorageType storage)
-{
-   switch (storage) {
-   case EQuantizedStorageType::FloatCarrier:
-      return ETensorType::FLOAT;
-   case EQuantizedStorageType::Int8:
-      return ETensorType::INT8;
-   case EQuantizedStorageType::UInt8:
-      return ETensorType::UINT8;
-   case EQuantizedStorageType::Int32Accumulator:
-      return ETensorType::INT32;
-   default:
-      throw std::runtime_error("SOFIE quantized lowering plan has no physical tensor type for this storage");
-   }
-}
-
-std::vector<std::int8_t> QuantizeTensorToInt8(const float *data, std::size_t length, const QuantizationInfo &info)
-{
-   std::vector<std::int8_t> quantized(length);
-   for (std::size_t i = 0; i < length; ++i) {
-      quantized[i] = static_cast<std::int8_t>(QuantizeScalarToIntegerGrid(data[i], info));
-   }
-   return quantized;
-}
-
-std::vector<std::uint8_t> QuantizeTensorToUInt8(const float *data, std::size_t length, const QuantizationInfo &info)
-{
-   std::vector<std::uint8_t> quantized(length);
-   for (std::size_t i = 0; i < length; ++i) {
-      quantized[i] = static_cast<std::uint8_t>(QuantizeScalarToIntegerGrid(data[i], info));
-   }
-   return quantized;
-}
-
 std::string GetQuantBoundarySourceTensor(const ROperator &op)
 {
-   auto inputs = op.GetOpInputTensors();
-   if (inputs.empty()) {
-      return {};
-   }
-   return std::string(inputs[0]);
+   return op.GetQuantizationSourceTensor();
 }
 
 QuantizedGemmCodegenContext MakeQuantizedGemmCodegenContext(const ROperator_Gemm<float> &gemm)
@@ -92,301 +40,15 @@ QuantizedGemmCodegenContext MakeQuantizedGemmCodegenContext(const ROperator_Gemm
    return context;
 }
 
-std::vector<std::size_t> QuantizedGemmConsumedOperatorIndices(const QuantizedGemmRegion &region)
+QuantizedMatrixCodegenContext MakeQuantizedMatMulCodegenContext(const ROperator_Gemm<float> &gemm)
 {
-   std::vector<std::size_t> indices = { region.inputQuantOpIndex, region.weightQuantOpIndex,
-                                        region.gemmOpIndex, region.outputQuantOpIndex };
-   if (region.biasQuantOpIndex) {
-      indices.push_back(*region.biasQuantOpIndex);
-   }
-   std::sort(indices.begin(), indices.end());
-   return indices;
+   QuantizedMatrixCodegenContext context;
+   context.inputShape = gemm.GetInputShape();
+   context.weightShape = gemm.GetWeightShape();
+   context.outputShape = gemm.GetOutputShape();
+   return context;
 }
 
-QuantizedLoweringPlan MakeAvailableQuantizedGemmPlan(const QuantizedGemmRegion &region,
-                                                     EQuantizedBackend backend,
-                                                     EQuantizedLoweringStatus status,
-                                                     std::string reason,
-                                                     std::string capabilityTag)
-{
-   QuantizedLoweringPlan plan;
-   plan.backend = backend;
-   plan.status = status;
-   plan.reason = std::move(reason);
-   plan.capabilityTag = std::move(capabilityTag);
-   plan.consumedOperatorIndices = QuantizedGemmConsumedOperatorIndices(region);
-   plan.preservesQuantizationSemantics = true;
-   plan.isMetadataOnly = false;
-   plan.suppressesGraphOperators = true;
-   return plan;
-}
-
-std::vector<std::size_t> QuantizedGemmOperatorIndices(const QuantizationModelState &state)
-{
-   std::vector<std::size_t> indices;
-   indices.reserve(state.gemmRegions.size());
-   for (const auto &entry : state.gemmRegions) {
-      indices.push_back(entry.first);
-   }
-   std::sort(indices.begin(), indices.end());
-   return indices;
-}
-
-const QuantizedLoweringPlan *FindQuantizedLoweringPlan(const QuantizationModelState &state,
-                                                       std::size_t opIndex, EQuantizedBackend backend)
-{
-   auto opIt = state.loweringPlans.find(opIndex);
-   if (opIt == state.loweringPlans.end())
-      return nullptr;
-   auto backendIt = opIt->second.find(backend);
-   return backendIt == opIt->second.end() ? nullptr : &backendIt->second;
-}
-
-QuantizedLoweringPlan MakeCPUPackedWeightBaselinePlan(const QuantizedGemmRegion &region,
-                                                       const std::string &weightStorageTensor)
-{
-   auto plan = MakeAvailableQuantizedGemmPlan(region, EQuantizedBackend::CPU, EQuantizedLoweringStatus::Baseline,
-                                              "CPU baseline lowering with packed pre-quantized weight storage",
-                                              "cpu_packed_weight_baseline");
-   plan.inputStorage = QuantizedStorageTypeForCarrier(region.inputQuant);
-   plan.weightStorage = QuantizedStorageTypeForCarrier(region.weightQuant);
-   plan.biasStorage = EQuantizedStorageType::FloatCarrier;
-   plan.accumulatorStorage = EQuantizedStorageType::Int32Accumulator;
-   plan.outputStorage = EQuantizedStorageType::FloatCarrier;
-   plan.inputCarrierMode = EQuantizedCarrierMode::Float;
-   plan.outputMode = EQuantizedOutputMode::ExactFakeQuantFloat;
-   plan.computeProfile = EQuantizedComputeProfile::GenericRecognized;
-   plan.weightStorageTensor = weightStorageTensor;
-   plan.weightLayout = EQuantizedLayout::PackedCPU;
-   return plan;
-}
-
-QuantizedLoweringPlan MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend backend, std::string reason, bool preservesSemantics)
-{
-   QuantizedLoweringPlan plan;
-   plan.backend = backend;
-   plan.status = preservesSemantics ? EQuantizedLoweringStatus::BackendUnsupported
-                                    : EQuantizedLoweringStatus::SemanticUnsupported;
-   plan.reason = std::move(reason);
-   plan.inputStorage = preservesSemantics ? EQuantizedStorageType::MetadataOnly : EQuantizedStorageType::UNDEFINED;
-   plan.weightStorage = preservesSemantics ? EQuantizedStorageType::MetadataOnly : EQuantizedStorageType::UNDEFINED;
-   plan.biasStorage = preservesSemantics ? EQuantizedStorageType::MetadataOnly : EQuantizedStorageType::UNDEFINED;
-   plan.accumulatorStorage = EQuantizedStorageType::UNDEFINED;
-   plan.outputStorage = preservesSemantics ? EQuantizedStorageType::MetadataOnly : EQuantizedStorageType::UNDEFINED;
-   plan.inputCarrierMode = preservesSemantics ? EQuantizedCarrierMode::Float : EQuantizedCarrierMode::UNDEFINED;
-   plan.outputMode = preservesSemantics ? EQuantizedOutputMode::ExactFakeQuantFloat : EQuantizedOutputMode::UNDEFINED;
-   plan.computeProfile = preservesSemantics ? EQuantizedComputeProfile::GenericRecognized : EQuantizedComputeProfile::UNDEFINED;
-   plan.capabilityTag = preservesSemantics ? "recognized_backend_unsupported" : "semantic_unsupported";
-   plan.preservesQuantizationSemantics = preservesSemantics;
-   plan.isMetadataOnly = preservesSemantics;
-   plan.suppressesGraphOperators = false;
-   return plan;
-}
-
-QuantizedLoweringPlan MakeAlpakaFakeQuantPlan(const QuantizedGemmRegion &region)
-{
-   auto plan = MakeAvailableQuantizedGemmPlan(region, EQuantizedBackend::ALPAKA, EQuantizedLoweringStatus::Baseline,
-                                              "Alpaka fake-quant lowering over float carrier tensors",
-                                              "alpaka_fake_quant_baseline");
-   plan.inputStorage = EQuantizedStorageType::FloatCarrier;
-   plan.weightStorage = EQuantizedStorageType::FloatCarrier;
-   plan.biasStorage = EQuantizedStorageType::FloatCarrier;
-   plan.accumulatorStorage = EQuantizedStorageType::Int32Accumulator;
-   plan.outputStorage = EQuantizedStorageType::FloatCarrier;
-   plan.inputCarrierMode = EQuantizedCarrierMode::Float;
-   plan.outputMode = EQuantizedOutputMode::ExactFakeQuantFloat;
-   plan.computeProfile = EQuantizedComputeProfile::GenericRecognized;
-   plan.weightLayout = EQuantizedLayout::Plain;
-   return plan;
-}
-
-struct QuantizedGemmCublasLtCapability {
-   bool optimized = false;
-   EQuantizedComputeProfile profile = EQuantizedComputeProfile::GenericRecognized;
-   std::string tag = "recognized_not_cublaslt_optimized";
-   std::string reason;
-   QuantizedMatMulShapePolicy shapePolicy;
-};
-
-void AddCapabilityReason(std::vector<std::string> &reasons, std::string reason)
-{
-   reasons.push_back(std::move(reason));
-}
-
-constexpr std::size_t kCublasLtInt8Alignment = 16;
-constexpr std::size_t kCublasLtMinOptimizedMacs = 1'000'000;
-constexpr double kCublasLtPaddingCandidateMaxWorkRatio = 1.50;
-
-std::size_t RoundUpToMultiple(std::size_t value, std::size_t multiple)
-{
-   if (multiple == 0 || value == 0)
-      return value;
-   return ((value + multiple - 1) / multiple) * multiple;
-}
-
-bool IsAlignedTo(std::size_t value, std::size_t multiple)
-{
-   return multiple != 0 && (value % multiple) == 0;
-}
-
-QuantizedMatMulShapePolicy MakeCublasLtShapePolicy(std::size_t m, std::size_t k, std::size_t n)
-{
-   QuantizedMatMulShapePolicy policy;
-   policy.logicalM = m;
-   policy.logicalK = k;
-   policy.logicalN = n;
-   policy.physicalM = RoundUpToMultiple(m, kCublasLtInt8Alignment);
-   policy.physicalK = RoundUpToMultiple(k, kCublasLtInt8Alignment);
-   policy.physicalN = RoundUpToMultiple(n, kCublasLtInt8Alignment);
-
-   policy.logicalMacs = m * k * n;
-   policy.physicalMacs = policy.physicalM * policy.physicalK * policy.physicalN;
-   policy.minimumOptimizedMacs = kCublasLtMinOptimizedMacs;
-   policy.belowMinimumWork = policy.logicalMacs < policy.minimumOptimizedMacs;
-   policy.paddingWorkRatio = policy.logicalMacs > 0 ? static_cast<double>(policy.physicalMacs) /
-                                                     static_cast<double>(policy.logicalMacs) : 1.0;
-
-   std::ostringstream reason;
-   reason << "logical M/K/N=" << policy.logicalM << "/" << policy.logicalK << "/" << policy.logicalN
-          << ", physical M/K/N=" << policy.physicalM << "/" << policy.physicalK << "/" << policy.physicalN
-          << ", logical MACs=" << policy.logicalMacs
-          << ", physical MACs=" << policy.physicalMacs
-          << ", minimum optimized MACs=" << policy.minimumOptimizedMacs
-          << ", padding work ratio=" << policy.paddingWorkRatio;
-
-   if (IsAlignedTo(m, kCublasLtInt8Alignment) && IsAlignedTo(k, kCublasLtInt8Alignment) &&
-       IsAlignedTo(n, kCublasLtInt8Alignment)) {
-      if (policy.belowMinimumWork) {
-         policy.policy = EQuantizedShapePolicy::ExactTooSmall;
-         policy.reason = "exact cuBLASLt int8 shape below minimum optimized work threshold; " + reason.str();
-      } else {
-         policy.policy = EQuantizedShapePolicy::Exact;
-         policy.reason = "exact cuBLASLt int8 shape; " + reason.str();
-      }
-   } else if (policy.paddingWorkRatio <= kCublasLtPaddingCandidateMaxWorkRatio) {
-      policy.policy = EQuantizedShapePolicy::PaddedCandidate;
-      policy.reason = "padded cuBLASLt candidate; " + reason.str();
-   } else {
-      policy.policy = EQuantizedShapePolicy::Fallback;
-      policy.reason = "padding too expensive for cuBLASLt candidate; " + reason.str();
-   }
-   return policy;
-}
-
-QuantizedGemmCublasLtCapability AssessCublasLtQuantizedGemmCapability(
-   const QuantizedGemmRegion &region,
-   const std::vector<std::size_t> &inputShape,
-   const std::vector<std::size_t> &weightShape)
-{
-   QuantizedGemmCublasLtCapability capability;
-   std::vector<std::string> semanticReasons;
-
-   if (inputShape.size() != 2)
-      AddCapabilityReason(semanticReasons, "input rank is not 2");
-   if (weightShape.size() != 2)
-      AddCapabilityReason(semanticReasons, "weight rank is not 2");
-
-   if (inputShape.size() == 2 && weightShape.size() == 2) {
-      const auto m = inputShape[0];
-      const auto k = inputShape[1];
-      const auto n = weightShape[0];
-      const auto weightK = weightShape[1];
-      if (m == 0 || n == 0 || k == 0)
-         AddCapabilityReason(semanticReasons, "M, N, and K must be nonzero");
-      if (k != weightK)
-         AddCapabilityReason(semanticReasons, "input K does not match weight K");
-      if (m != 0 && n != 0 && k != 0 && k == weightK)
-         capability.shapePolicy = MakeCublasLtShapePolicy(m, k, n);
-   }
-
-   if (region.inputQuant.bitWidth != 8)
-      AddCapabilityReason(semanticReasons, "input bit width is not 8");
-   if (region.weightQuant.bitWidth != 8)
-      AddCapabilityReason(semanticReasons, "weight bit width is not 8");
-   if (region.outputQuant.bitWidth != 8)
-      AddCapabilityReason(semanticReasons, "output bit width is not 8");
-   if (!region.inputQuant.isSigned)
-      AddCapabilityReason(semanticReasons, "input quantization is not signed int8");
-   if (!region.weightQuant.isSigned)
-      AddCapabilityReason(semanticReasons, "weight quantization is not signed int8");
-   if (region.inputQuant.zeroPoint != 0)
-      AddCapabilityReason(semanticReasons, "input zero point is not 0");
-   if (region.weightQuant.zeroPoint != 0)
-      AddCapabilityReason(semanticReasons, "weight zero point is not 0");
-   if (!IsScalarPerTensor(region.inputQuant))
-      AddCapabilityReason(semanticReasons, "input quantization is not per-tensor scalar");
-   if (!IsScalarPerTensor(region.weightQuant))
-      AddCapabilityReason(semanticReasons, "weight quantization is not per-tensor scalar");
-   if (!IsScalarPerTensor(region.outputQuant))
-      AddCapabilityReason(semanticReasons, "output quantization is not per-tensor scalar");
-
-   if (!semanticReasons.empty()) {
-      capability.shapePolicy.policy = EQuantizedShapePolicy::Unsupported;
-      capability.shapePolicy.reason = "cuBLASLt semantic requirements are not met";
-      capability.reason = JoinReasons(semanticReasons);
-      capability.tag = "cublaslt_i8i8_semantic_unsupported";
-      return capability;
-   }
-
-   capability.profile = EQuantizedComputeProfile::SignedInt8SymmetricPerTensorRank2;
-   if (capability.shapePolicy.policy == EQuantizedShapePolicy::Exact) {
-      capability.optimized = true;
-      capability.tag = "cublaslt_i8i8_symmetric_per_tensor_rank2_exact";
-      capability.reason = "cuBLASLt optimized signed-int8 symmetric per-tensor rank-2 exact-shape GEMM; " +
-                          capability.shapePolicy.reason;
-   } else if (capability.shapePolicy.policy == EQuantizedShapePolicy::ExactTooSmall) {
-      capability.tag = "cublaslt_i8i8_symmetric_per_tensor_rank2_exact_too_small";
-      capability.reason = "cuBLASLt exact-shape execution is legal but below the minimum optimized work threshold; " +
-                          capability.shapePolicy.reason;
-   } else if (capability.shapePolicy.policy == EQuantizedShapePolicy::PaddedCandidate) {
-      capability.tag = "cublaslt_i8i8_symmetric_per_tensor_rank2_padded_candidate";
-      capability.reason = "cuBLASLt padded execution is a candidate but is not implemented in this lowering; " +
-                          capability.shapePolicy.reason;
-   } else {
-      capability.tag = "cublaslt_i8i8_symmetric_per_tensor_rank2_shape_fallback";
-      capability.reason = capability.shapePolicy.reason.empty() ?
-                          "cuBLASLt shape policy is unavailable" : capability.shapePolicy.reason;
-   }
-   return capability;
-}
-
-
-QuantizedLoweringPlan MakeAlpakaCublasLtCorePlan(const QuantizedGemmRegion &region,
-                                                 const std::string &weightStorageTensor,
-                                                 const QuantizedGemmCublasLtCapability &capability)
-{
-   auto plan = MakeAvailableQuantizedGemmPlan(region, EQuantizedBackend::ALPAKA, EQuantizedLoweringStatus::Optimized,
-                                              capability.reason, capability.tag);
-   plan.inputStorage = QuantizedStorageTypeForCarrier(region.inputQuant);
-   plan.weightStorage = QuantizedStorageTypeForCarrier(region.weightQuant);
-   plan.biasStorage = EQuantizedStorageType::FloatCarrier;
-   plan.accumulatorStorage = EQuantizedStorageType::Int32Accumulator;
-   plan.outputStorage = QuantizedStorageTypeForCarrier(region.outputQuant);
-   plan.inputCarrierMode = QuantizedCarrierModeForStorage(plan.inputStorage);
-   plan.outputMode = EQuantizedOutputMode::Quantized;
-   plan.computeProfile = EQuantizedComputeProfile::SignedInt8SymmetricPerTensorRank2;
-   plan.shapePolicy = capability.shapePolicy;
-   plan.weightStorageTensor = weightStorageTensor;
-   plan.weightLayout = EQuantizedLayout::PlainDevice;
-   return plan;
-}
-
-void CheckQuantInfo(const QuantizationInfo &info, const std::string &role, bool,
-                    std::vector<std::string> &reasons)
-{
-   if (info.bitWidth == 0 || info.bitWidth > 8) {
-      reasons.push_back(role + " bit width is not in the supported QONNX fake-quant range [1, 8]");
-   }
-   if (info.scale <= 0.0 || !std::isfinite(info.scale)) {
-      reasons.push_back(role + " scale is not positive and finite");
-   }
-   if (info.rounding != EQuantizationRoundingMode::ROUND) {
-      reasons.push_back(role + " rounding mode is not ROUND");
-   }
-   if (info.overflow != EQuantizationOverflowMode::SAT && info.overflow != EQuantizationOverflowMode::SAT_SYM) {
-      reasons.push_back(role + " overflow mode is unsupported");
-   }
-}
 
 } // namespace
 
@@ -445,19 +107,55 @@ const QuantizedTensorStorage & RModel::GetQuantizedTensorStorage(const std::stri
 
 void RModel::AnalyzeQuantizedRegions()
 {
+   for (const auto &[name, storage] : fQuantizationState.tensorStorages)
+      fInitializedTensors.erase(name);
    fQuantizationState.ClearDerivedAnalysis();
 
-   std::unordered_map<std::string, std::size_t> producerByTensor;
-   std::unordered_map<std::string, std::vector<std::size_t>> consumersByTensor;
+   const auto graph = BuildQuantizationGraphIndex(fOperators);
+   auto readZeroPointTensor = [this](const std::string &tensorName) {
+      std::vector<std::int64_t> values;
+      auto appendValues = [&values](const auto &typedValues) {
+         values.reserve(typedValues.size());
+         for (auto value : typedValues)
+            values.push_back(static_cast<std::int64_t>(value));
+      };
 
-   for (std::size_t opIndex = 0; opIndex < fOperators.size(); ++opIndex) {
-      for (const auto &output : fOperators[opIndex]->GetOpOutputTensors()) {
-         producerByTensor[std::string(output)] = opIndex;
+      switch (GetTensorType(tensorName)) {
+      case ETensorType::FLOAT:
+         appendValues(GetTensorData<float>(tensorName));
+         break;
+      case ETensorType::DOUBLE:
+         appendValues(GetTensorData<double>(tensorName));
+         break;
+      case ETensorType::INT8:
+         appendValues(GetTensorData<std::int8_t>(tensorName));
+         break;
+      case ETensorType::UINT8:
+         appendValues(GetTensorData<std::uint8_t>(tensorName));
+         break;
+      case ETensorType::INT16:
+         appendValues(GetTensorData<std::int16_t>(tensorName));
+         break;
+      case ETensorType::UINT16:
+         appendValues(GetTensorData<std::uint16_t>(tensorName));
+         break;
+      case ETensorType::INT32:
+         appendValues(GetTensorData<std::int32_t>(tensorName));
+         break;
+      case ETensorType::UINT32:
+         appendValues(GetTensorData<std::uint32_t>(tensorName));
+         break;
+      case ETensorType::INT64:
+         appendValues(GetTensorData<std::int64_t>(tensorName));
+         break;
+      case ETensorType::UINT64:
+         appendValues(GetTensorData<std::uint64_t>(tensorName));
+         break;
+      default:
+         throw std::runtime_error("SOFIE quantized lowering expects numeric zero-point tensor [" + tensorName + "]");
       }
-      for (const auto &input : fOperators[opIndex]->GetOpInputTensors()) {
-         consumersByTensor[std::string(input)].push_back(opIndex);
-      }
-   }
+      return values;
+   };
 
    for (std::size_t opIndex = 0; opIndex < fOperators.size(); ++opIndex) {
       if (fOperators[opIndex]->GetKind() != OperatorKind::GEMM)
@@ -467,119 +165,139 @@ void RModel::AnalyzeQuantizedRegions()
       if (!gemm)
          continue;
 
-      QuantizedGemmRegion info;
-      info.status = EQuantizedLoweringStatus::SemanticUnsupported;
-      info.alpha = gemm->GetAlpha();
-      info.beta = gemm->GetBeta();
-      info.transA = gemm->GetTransA();
-      info.transB = gemm->GetTransB();
-      info.gemmOpIndex = opIndex;
-
-      std::vector<std::string> reasons;
-
-      auto inputs = gemm->GetOpInputTensors();
-      auto outputs = gemm->GetOpOutputTensors();
-      if (inputs.size() < 2 || outputs.size() != 1) {
-         reasons.push_back("Gemm does not have the expected input/output arity");
-      } else {
-         info.inputTensor = std::string(inputs[0]);
-         info.weightTensor = std::string(inputs[1]);
-         if (inputs.size() >= 3)
-            info.biasTensor = std::string(inputs[2]);
-         info.gemmOutputTensor = std::string(outputs[0]);
-      }
-
-      if (std::fabs(info.alpha - 1.0f) > 0.0f)
-         reasons.push_back("Gemm alpha is not 1");
-      if (std::fabs(info.beta - 1.0f) > 0.0f)
-         reasons.push_back("Gemm beta is not 1");
-      if (info.transA != 0)
-         reasons.push_back("Gemm transA is not 0");
-      if (info.transB != 1)
-         reasons.push_back("Gemm transB is not 1");
-      if (!info.inputTensor.empty() && GetTensorShape(info.inputTensor).size() != 2)
-         reasons.push_back("input tensor is not rank-2 for quantized Gemm lowering");
-      if (!info.weightTensor.empty() && GetTensorShape(info.weightTensor).size() != 2)
-         reasons.push_back("weight tensor is not rank-2 for quantized Gemm lowering");
-      if (!info.gemmOutputTensor.empty() && GetTensorShape(info.gemmOutputTensor).size() != 2)
-         reasons.push_back("Gemm output tensor is not rank-2 for quantized Gemm lowering");
-
-      const auto requireQuantProducer = [&](const std::string &tensor, const std::string &role) -> std::optional<std::size_t> {
-         auto producer = producerByTensor.find(tensor);
-         if (producer == producerByTensor.end()) {
-            reasons.push_back(role + " tensor has no producer quantization boundary");
-            return std::nullopt;
-         }
-         if (!fOperators[producer->second]->IsQuantizationBoundary()) {
-            reasons.push_back(role + " tensor producer is not a quantization boundary");
-            return std::nullopt;
-         }
-         return producer->second;
-      };
+      auto pattern = MatchQuantizedDenseLinearPattern(
+         *gemm, opIndex, [this](const std::string &tensor) { return GetTensorShape(tensor); });
+      auto info = std::move(pattern.region);
+      auto reasons = std::move(pattern.reasons);
+      const bool isQuantizedMatMulSpelling = pattern.isMatMul;
+      const bool isMatMulAddSpelling = pattern.hasInlineMatMulBias;
+      const bool isMatMulSpelling = pattern.isMatMul && !pattern.hasInlineMatMulBias;
+      auto matmulShape = std::move(pattern.matmulShape);
 
       if (!info.inputTensor.empty()) {
-         if (auto producer = requireQuantProducer(info.inputTensor, "input")) {
+         if (auto producer = MatchQuantizationBoundaryProducer(graph, fOperators, info.inputTensor, "input", reasons)) {
             info.inputQuantOpIndex = *producer;
             info.inputSourceTensor = GetQuantBoundarySourceTensor(*fOperators[*producer]);
          }
          if (HasQuantizationInfo(info.inputTensor)) {
             info.inputQuant = GetQuantizationInfo(info.inputTensor);
-            CheckQuantInfo(info.inputQuant, "input", false, reasons);
+            CheckQuantizationInfo(info.inputQuant, "input", reasons);
          } else {
             reasons.push_back("input tensor has no QuantizationInfo");
          }
       }
 
       if (!info.weightTensor.empty()) {
-         if (auto producer = requireQuantProducer(info.weightTensor, "weight")) {
+         if (auto producer = MatchQuantizationBoundaryProducer(graph, fOperators, info.weightTensor, "weight", reasons)) {
             info.weightQuantOpIndex = *producer;
             info.weightSourceTensor = GetQuantBoundarySourceTensor(*fOperators[*producer]);
+            if (IsInitializedTensor(info.weightTensor) && GetTensorType(info.weightTensor) == ETensorType::FLOAT)
+               info.weightSourceTensor = info.weightTensor;
          }
          if (HasQuantizationInfo(info.weightTensor)) {
             info.weightQuant = GetQuantizationInfo(info.weightTensor);
-            CheckQuantInfo(info.weightQuant, "weight", true, reasons);
+            CheckQuantizationInfo(info.weightQuant, "weight", reasons);
          } else {
             reasons.push_back("weight tensor has no QuantizationInfo");
          }
       }
 
       if (!info.biasTensor.empty()) {
-         if (auto producer = requireQuantProducer(info.biasTensor, "bias")) {
-            info.biasQuantOpIndex = *producer;
-            info.biasSourceTensor = GetQuantBoundarySourceTensor(*fOperators[*producer]);
-         }
-         if (HasQuantizationInfo(info.biasTensor)) {
-            info.biasQuant = GetQuantizationInfo(info.biasTensor);
-            CheckQuantInfo(*info.biasQuant, "bias", true, reasons);
+         if (isMatMulAddSpelling) {
+            info.biasSourceTensor = info.biasTensor;
+            if (!IsInitializedTensor(info.biasSourceTensor)) {
+               reasons.push_back("MatMul fused Add bias must be an initialized constant tensor");
+            } else if (!info.gemmOutputTensor.empty() &&
+                       !IsDenseLinearBiasLikeShape(GetTensorShape(info.biasSourceTensor), GetTensorShape(info.gemmOutputTensor))) {
+               reasons.push_back("MatMul fused Add bias is not a dense-linear projection bias broadcast shape");
+            } else {
+               info.biasQuant = MakeAccumulatorBiasQuantization(info.inputQuant, info.weightQuant);
+            }
          } else {
-            reasons.push_back("bias tensor has no QuantizationInfo");
+            if (auto producer = MatchQuantizationBoundaryProducer(graph, fOperators, info.biasTensor, "bias", reasons)) {
+               info.biasQuantOpIndex = *producer;
+               info.biasSourceTensor = GetQuantBoundarySourceTensor(*fOperators[*producer]);
+               if (IsInitializedTensor(info.biasTensor) && GetTensorType(info.biasTensor) == ETensorType::FLOAT)
+                  info.biasSourceTensor = info.biasTensor;
+            }
+            if (HasQuantizationInfo(info.biasTensor)) {
+               info.biasQuant = GetQuantizationInfo(info.biasTensor);
+               CheckQuantizationInfo(*info.biasQuant, "bias", reasons);
+            } else {
+               reasons.push_back("bias tensor has no QuantizationInfo");
+            }
          }
       }
 
+      QuantizedEpilogue matmulEpilogue;
+      if (isMatMulAddSpelling && !info.biasSourceTensor.empty() && info.biasQuant.has_value()) {
+         matmulEpilogue.kind = EQuantizedEpilogueKind::Bias;
+         matmulEpilogue.biasSourceTensor = info.biasSourceTensor;
+         matmulEpilogue.biasQuant = info.biasQuant;
+      }
+
       if (!info.gemmOutputTensor.empty()) {
-         auto consumers = consumersByTensor.find(info.gemmOutputTensor);
-         if (consumers == consumersByTensor.end() || consumers->second.empty()) {
+         auto consumers = graph.consumersByTensor.find(info.gemmOutputTensor);
+         if (consumers == graph.consumersByTensor.end() || consumers->second.empty()) {
             reasons.push_back("Gemm output has no output quantization consumer");
          } else if (consumers->second.size() != 1) {
             reasons.push_back("Gemm output has multiple consumers");
          } else {
             auto consumerIndex = consumers->second.front();
-            if (!fOperators[consumerIndex]->IsQuantizationBoundary()) {
-               reasons.push_back("Gemm output consumer is not a quantization boundary");
-            } else {
-               info.outputQuantOpIndex = consumerIndex;
-               auto quantOutputs = fOperators[consumerIndex]->GetOpOutputTensors();
+            auto setOutputQuantFromBoundary = [&](std::size_t quantIndex) {
+               info.outputQuantOpIndex = quantIndex;
+               auto quantOutputs = fOperators[quantIndex]->GetOpOutputTensors();
                if (quantOutputs.size() != 1) {
                   reasons.push_back("output quantization boundary does not have exactly one output");
                } else {
                   info.outputTensor = std::string(quantOutputs[0]);
                   if (HasQuantizationInfo(info.outputTensor)) {
                      info.outputQuant = GetQuantizationInfo(info.outputTensor);
-                     CheckQuantInfo(info.outputQuant, "output", false, reasons);
+                     CheckQuantizationInfo(info.outputQuant, "output", reasons);
                   } else {
                      reasons.push_back("output tensor has no QuantizationInfo");
                   }
                }
+            };
+
+            if (fOperators[consumerIndex]->IsQuantizationBoundary()) {
+               setOutputQuantFromBoundary(consumerIndex);
+            } else if (isMatMulSpelling && IsFloatAddOperator(*fOperators[consumerIndex])) {
+               const auto addInputs = fOperators[consumerIndex]->GetOpInputTensors();
+               const auto addOutputs = fOperators[consumerIndex]->GetOpOutputTensors();
+               if (addInputs.size() != 2 || addOutputs.size() != 1) {
+                  reasons.push_back("MatMul Add epilogue does not have two inputs and one output");
+               } else {
+                  const std::string addInputA = std::string(addInputs[0]);
+                  const std::string addInputB = std::string(addInputs[1]);
+                  const std::string biasCandidate = addInputA == info.gemmOutputTensor ? addInputB :
+                                                    (addInputB == info.gemmOutputTensor ? addInputA : std::string{});
+                  if (biasCandidate.empty()) {
+                     reasons.push_back("MatMul Add epilogue does not consume the MatMul output");
+                  } else if (!IsInitializedTensor(biasCandidate)) {
+                     reasons.push_back("MatMul Add epilogue bias must be an initialized constant tensor");
+                  } else if (!IsDenseLinearBiasLikeShape(GetTensorShape(biasCandidate), GetTensorShape(info.gemmOutputTensor))) {
+                     reasons.push_back("MatMul Add epilogue constant is not a dense-linear projection bias broadcast shape");
+                  } else {
+                     const std::string addOutput = std::string(addOutputs[0]);
+                     auto addOutputConsumers = graph.consumersByTensor.find(addOutput);
+                     if (addOutputConsumers == graph.consumersByTensor.end() || addOutputConsumers->second.empty()) {
+                        reasons.push_back("MatMul Add epilogue output has no output quantization consumer");
+                     } else if (addOutputConsumers->second.size() != 1) {
+                        reasons.push_back("MatMul Add epilogue output has multiple consumers");
+                     } else if (!fOperators[addOutputConsumers->second.front()]->IsQuantizationBoundary()) {
+                        reasons.push_back("MatMul Add epilogue output consumer is not a quantization boundary");
+                     } else {
+                        matmulEpilogue.kind = EQuantizedEpilogueKind::Bias;
+                        matmulEpilogue.biasSourceTensor = biasCandidate;
+                        matmulEpilogue.biasQuant = MakeAccumulatorBiasQuantization(info.inputQuant, info.weightQuant);
+                        matmulEpilogue.addOpIndex = consumerIndex;
+                        setOutputQuantFromBoundary(addOutputConsumers->second.front());
+                     }
+                  }
+               }
+            } else {
+               reasons.push_back("Gemm output consumer is not a quantization boundary");
             }
          }
       }
@@ -593,73 +311,156 @@ void RModel::AnalyzeQuantizedRegions()
          (!info.biasTensor.empty() && HasQuantizationInfo(info.biasTensor)) ||
          (!info.outputTensor.empty() && HasQuantizationInfo(info.outputTensor));
 
+      if (isQuantizedMatMulSpelling) {
+         if (hasQuantizationEvidence) {
+            auto matmul = MakeQuantizedMatMulRegionFromGemmLikeRegion(info);
+            matmul.epilogue = matmulEpilogue;
+            matmul.shape = matmulShape;
+            auto &plans = fQuantizationState.loweringPlans[opIndex];
+            if (reasons.empty()) {
+               matmul.status = EQuantizedLoweringStatus::SemanticRecognized;
+               matmul.reason = QuantizedEpilogueHasBias(matmul.epilogue.kind)
+                                  ? "recognized quantized MatMul+Add bias region"
+                                  : "recognized quantized MatMul region";
+               if (!matmul.shape.reason.empty())
+                  matmul.reason += "; " + matmul.shape.reason;
+
+               auto cpuReason = matmul.reason + "; CPU QuantizedMatMul lowering is not implemented";
+               plans[EQuantizedBackend::CPU] = MakeUnsupportedQuantizedMatMulPlan(matmul, EQuantizedBackend::CPU, cpuReason, true);
+
+               std::vector<std::string> storageReasons;
+               std::vector<float> perChannelWeightScales;
+               const bool perChannelWeight = IsPerChannelAxis(matmul.weightQuant, 1);
+
+               std::vector<std::size_t> inputShape;
+               std::vector<std::size_t> weightShape;
+               std::vector<std::size_t> outputShape;
+               if (!matmul.inputSourceTensor.empty())
+                  inputShape = GetTensorShape(matmul.inputSourceTensor);
+               if (!matmul.weightSourceTensor.empty() && IsInitializedTensor(matmul.weightSourceTensor))
+                  weightShape = GetTensorShape(matmul.weightSourceTensor);
+               else
+                  storageReasons.push_back("MatMul weight source tensor must be initialized for transposed quantized storage");
+               if (!matmul.outputTensor.empty())
+                  outputShape = GetTensorShape(matmul.outputTensor);
+
+               const auto capability = AssessCublasLtDenseLinearCapability(
+                  MakeDenseLinearOperands(matmul, inputShape, weightShape, outputShape));
+               const auto selectedCapability = SelectExecutableDenseLinearCapability(capability);
+               if (!selectedCapability.optimized) {
+                  storageReasons.push_back("MatMul cuBLASLt optimized profile unavailable: " + selectedCapability.reason);
+               }
+
+               if (perChannelWeight) {
+                  if (!IsInitializedTensor(matmul.weightQuant.scaleTensor)) {
+                     storageReasons.push_back("MatMul per-channel weight scale tensor is not initialized");
+                  } else if (weightShape.size() == 2) {
+                     perChannelWeightScales = GetTensorData<float>(matmul.weightQuant.scaleTensor);
+                     if (perChannelWeightScales.size() != weightShape[1]) {
+                        storageReasons.push_back("MatMul per-channel weight scale length does not match output channels N");
+                     }
+                  }
+                  if (!IsInitializedTensor(matmul.weightQuant.zeroPointTensor)) {
+                     storageReasons.push_back("MatMul per-channel weight zero-point tensor is not initialized");
+                  } else {
+                     const auto zeroPoints = readZeroPointTensor(matmul.weightQuant.zeroPointTensor);
+                     if (weightShape.size() == 2 && zeroPoints.size() != weightShape[1]) {
+                        storageReasons.push_back("MatMul per-channel weight zero-point length does not match output channels N");
+                     }
+                     for (std::int64_t zeroPoint : zeroPoints) {
+                        if (zeroPoint != 0) {
+                           storageReasons.push_back("MatMul per-channel weight zero-points must all be 0");
+                           break;
+                        }
+                     }
+                  }
+               }
+
+               if (storageReasons.empty()) {
+                  const bool paddedStorage = selectedCapability.shapePolicy.policy == EQuantizedShapePolicy::Padded;
+                  const auto deviceStorageTensor = matmul.weightSourceTensor +
+                                                   (paddedStorage ? "_s22_matmul_transposed_padded_plain_device_storage"
+                                                                  : "_s19_matmul_transposed_plain_device_storage");
+                  auto alpakaPlan = MakeMatMulAlpakaTransposedWeightStoragePlan(matmul, deviceStorageTensor, selectedCapability.shapePolicy);
+                  alpakaPlan.computeProfile = selectedCapability.profile;
+                  alpakaPlan.capabilityTag = selectedCapability.tag;
+                  alpakaPlan.reason = matmul.reason + "; " + selectedCapability.reason;
+                  plans[EQuantizedBackend::ALPAKA] = std::move(alpakaPlan);
+                  matmul.reason += "; transposed pre-quantized ALPAKA weight storage selected";
+               } else {
+                  auto alpakaReason = matmul.reason + "; " + JoinQuantizationReasons(storageReasons);
+                  auto unsupportedPlan = MakeUnsupportedQuantizedMatMulPlan(matmul, EQuantizedBackend::ALPAKA, alpakaReason, true);
+                  unsupportedPlan.capabilityTag = capability.tag;
+                  unsupportedPlan.computeProfile = capability.profile;
+                  unsupportedPlan.shapePolicy = capability.shapePolicy;
+                  plans[EQuantizedBackend::ALPAKA] = std::move(unsupportedPlan);
+                  matmul.reason = alpakaReason;
+               }
+            } else {
+               matmul.status = EQuantizedLoweringStatus::SemanticUnsupported;
+               matmul.reason = JoinQuantizationReasons(reasons);
+               plans[EQuantizedBackend::CPU] = MakeUnsupportedQuantizedMatMulPlan(matmul, EQuantizedBackend::CPU, matmul.reason, false);
+               plans[EQuantizedBackend::ALPAKA] = MakeUnsupportedQuantizedMatMulPlan(matmul, EQuantizedBackend::ALPAKA, matmul.reason, false);
+            }
+            fQuantizationState.matmulRegions[opIndex] = std::move(matmul);
+            if (fVerbose > 0) {
+               std::cout << "SOFIE quantized MatMul candidate at operator " << opIndex << ": "
+                         << fQuantizationState.matmulRegions[opIndex].reason << std::endl;
+            }
+         }
+         continue;
+      }
+
       if (reasons.empty()) {
          info.status = EQuantizedLoweringStatus::SemanticRecognized;
          info.reason = "recognized quantized Gemm region";
+
+         auto currentLoweringUnsupportedReasons = QuantizedGemmLoweringUnsupportedReasons(info);
+         std::vector<float> perChannelWeightScales;
+         if (IsPerChannelAxis(info.weightQuant, 0)) {
+            if (!IsInitializedTensor(info.weightQuant.scaleTensor)) {
+               currentLoweringUnsupportedReasons.push_back("per-channel weight scale tensor is not initialized");
+            } else {
+               perChannelWeightScales = GetTensorData<float>(info.weightQuant.scaleTensor);
+               const auto weightShape = GetTensorShape(info.weightSourceTensor);
+               if (weightShape.size() != 2 || perChannelWeightScales.size() != weightShape[0]) {
+                  currentLoweringUnsupportedReasons.push_back("per-channel weight scale length does not match GEMM output channels");
+               }
+            }
+            if (!IsInitializedTensor(info.weightQuant.zeroPointTensor)) {
+               currentLoweringUnsupportedReasons.push_back("per-channel weight zero-point tensor is not initialized");
+            } else {
+               const auto zeroPoints = readZeroPointTensor(info.weightQuant.zeroPointTensor);
+               for (std::int64_t zeroPoint : zeroPoints) {
+                  if (zeroPoint != 0) {
+                     currentLoweringUnsupportedReasons.push_back("per-channel weight zero-points must all be 0");
+                     break;
+                  }
+               }
+            }
+         }
+         if (!currentLoweringUnsupportedReasons.empty()) {
+            info.reason += "; " + JoinQuantizationReasons(currentLoweringUnsupportedReasons);
+            auto &plans = fQuantizationState.loweringPlans[opIndex];
+            plans[EQuantizedBackend::CPU] = MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend::CPU, info.reason, true);
+            plans[EQuantizedBackend::ALPAKA] = MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend::ALPAKA, info.reason, true);
+            fQuantizationState.gemmRegions[opIndex] = std::move(info);
+            if (fVerbose > 0) {
+               std::cout << "SOFIE quantized Gemm candidate recognized but not lowered at operator " << opIndex << ": "
+                         << fQuantizationState.gemmRegions[opIndex].reason << std::endl;
+            }
+            continue;
+         }
+
          auto cpuPlan = MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend::CPU, "CPU quantized Gemm lowering requires constant pre-quantized weight storage", true);
          auto alpakaPlan = MakeAlpakaFakeQuantPlan(info);
 
-         if (!info.weightSourceTensor.empty() && IsInitializedTensor(info.weightSourceTensor)) {
-            constexpr std::size_t packedTileN = 4;
+         if (!IsPerChannelAxis(info.weightQuant, 0) && !info.weightSourceTensor.empty() && IsInitializedTensor(info.weightSourceTensor)) {
             const auto storageTensor = info.weightSourceTensor + "_s11_packed_cpu_storage";
             const auto weightShape = GetTensorShape(info.weightSourceTensor);
             if (weightShape.size() != 2) {
                reasons.push_back("weight tensor is not rank-2 for packed CPU storage");
             } else {
-               const auto n = weightShape[0];
-               const auto k = weightShape[1];
-               const auto packedBlocks = (n + packedTileN - 1) / packedTileN;
-               const std::vector<std::size_t> packedShape = { packedBlocks, k, packedTileN };
-               const auto packedLength = ConvertShapeToLength(packedShape);
-               const float *weightData = fInitializedTensors.at(info.weightSourceTensor).data<float>();
-
-               if (info.weightQuant.isSigned) {
-                  std::vector<std::int8_t> packedWeights(packedLength, 0);
-                  for (std::size_t block = 0; block < packedBlocks; ++block) {
-                     for (std::size_t kk = 0; kk < k; ++kk) {
-                        for (std::size_t ji = 0; ji < packedTileN; ++ji) {
-                           const auto col = block * packedTileN + ji;
-                           if (col < n) {
-                              packedWeights[(block * k + kk) * packedTileN + ji] =
-                                 static_cast<std::int8_t>(QuantizeScalarToIntegerGrid(weightData[col * k + kk], info.weightQuant));
-                           }
-                        }
-                     }
-                  }
-                  if (!IsInitializedTensor(storageTensor)) {
-                     AddConstantTensor(storageTensor, packedShape, packedWeights);
-                  }
-               } else {
-                  std::vector<std::uint8_t> packedWeights(packedLength, 0);
-                  for (std::size_t block = 0; block < packedBlocks; ++block) {
-                     for (std::size_t kk = 0; kk < k; ++kk) {
-                        for (std::size_t ji = 0; ji < packedTileN; ++ji) {
-                           const auto col = block * packedTileN + ji;
-                           if (col < n) {
-                              packedWeights[(block * k + kk) * packedTileN + ji] =
-                                 static_cast<std::uint8_t>(QuantizeScalarToIntegerGrid(weightData[col * k + kk], info.weightQuant));
-                           }
-                        }
-                     }
-                  }
-                  if (!IsInitializedTensor(storageTensor)) {
-                     AddConstantTensor(storageTensor, packedShape, packedWeights);
-                  }
-               }
-
-               QuantizedTensorStorage storage;
-               storage.logicalTensor = info.weightTensor;
-               storage.sourceTensor = info.weightSourceTensor;
-               storage.storageTensor = storageTensor;
-               storage.storageType = QuantizedStorageTypeForCarrier(info.weightQuant);
-               storage.layout = EQuantizedLayout::PackedCPU;
-               storage.quantization = info.weightQuant;
-               storage.shape = packedShape;
-               storage.residentBackend = EQuantizedBackend::CPU;
-               storage.isConstant = true;
-               storage.isDeviceResident = false;
-               RegisterQuantizedTensorStorage(std::move(storage));
-
                cpuPlan = MakeCPUPackedWeightBaselinePlan(info, storageTensor);
             }
          }
@@ -667,43 +468,29 @@ void RModel::AnalyzeQuantizedRegions()
          if (!info.weightSourceTensor.empty() && IsInitializedTensor(info.weightSourceTensor)) {
             const auto deviceStorageTensor = info.weightSourceTensor + "_s17g3_plain_device_storage";
             const auto weightShape = GetTensorShape(info.weightSourceTensor);
-            const auto weightLength = ConvertShapeToLength(weightShape);
-            const float *weightData = fInitializedTensors.at(info.weightSourceTensor).data<float>();
-
-            if (!IsInitializedTensor(deviceStorageTensor)) {
-               if (info.weightQuant.isSigned) {
-                  AddConstantTensor(deviceStorageTensor, weightShape, QuantizeTensorToInt8(weightData, weightLength, info.weightQuant));
-               } else {
-                  AddConstantTensor(deviceStorageTensor, weightShape, QuantizeTensorToUInt8(weightData, weightLength, info.weightQuant));
-               }
-            }
-
-            QuantizedTensorStorage deviceStorage;
-            deviceStorage.logicalTensor = info.weightTensor;
-            deviceStorage.sourceTensor = info.weightSourceTensor;
-            deviceStorage.storageTensor = deviceStorageTensor;
-            deviceStorage.storageType = QuantizedStorageTypeForCarrier(info.weightQuant);
-            deviceStorage.layout = EQuantizedLayout::PlainDevice;
-            deviceStorage.quantization = info.weightQuant;
-            deviceStorage.shape = weightShape;
-            deviceStorage.residentBackend = EQuantizedBackend::ALPAKA;
-            deviceStorage.isConstant = true;
-            deviceStorage.isDeviceResident = true;
-            RegisterQuantizedTensorStorage(std::move(deviceStorage));
 
             try {
                const auto inputShape = GetTensorShape(info.inputSourceTensor);
-               const auto capability = AssessCublasLtQuantizedGemmCapability(info, inputShape, weightShape);
-               if (capability.optimized) {
-                  alpakaPlan = MakeAlpakaCublasLtCorePlan(info, deviceStorageTensor, capability);
+               const auto outputShape = GetTensorShape(info.outputTensor);
+               auto capability = AssessCublasLtDenseLinearCapability(
+                  MakeDenseLinearOperands(info, inputShape, weightShape, outputShape));
+               auto selectedCapability = SelectExecutableDenseLinearCapability(capability);
+               if (selectedCapability.optimized) {
+                  std::string selectedStorageTensor = deviceStorageTensor;
+                  if (selectedCapability.shapePolicy.policy == EQuantizedShapePolicy::Padded) {
+                     const auto paddedStorageTensor = info.weightSourceTensor + "_s22_gemm_padded_plain_device_storage";
+                     selectedStorageTensor = paddedStorageTensor;
+                  }
+                  alpakaPlan = MakeAlpakaCublasLtCorePlan(info, selectedStorageTensor, selectedCapability);
                } else {
                   alpakaPlan.reason += "; cuBLASLt optimized profile unavailable: " + capability.reason;
                   alpakaPlan.capabilityTag = capability.tag;
                   alpakaPlan.computeProfile = capability.profile;
                   alpakaPlan.shapePolicy = capability.shapePolicy;
                }
-            } catch (const std::exception &) {
-               // Dynamic or unavailable input shapes keep the Alpaka fake-quant baseline plan.
+            } catch (const std::exception &e) {
+               alpakaPlan.reason += "; cuBLASLt optimized profile unavailable: " + std::string(e.what());
+               alpakaPlan.capabilityTag = "cublaslt_shape_unavailable";
             }
          }
 
@@ -712,7 +499,7 @@ void RModel::AnalyzeQuantizedRegions()
          plans[EQuantizedBackend::ALPAKA] = std::move(alpakaPlan);
          fQuantizationState.gemmRegions[opIndex] = std::move(info);
       } else {
-         info.reason = JoinReasons(reasons);
+         info.reason = JoinQuantizationReasons(reasons);
          if (hasQuantizationEvidence) {
             auto &plans = fQuantizationState.loweringPlans[opIndex];
             plans[EQuantizedBackend::CPU] = MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend::CPU, info.reason, true);
@@ -723,6 +510,135 @@ void RModel::AnalyzeQuantizedRegions()
             std::cout << "SOFIE quantized Gemm candidate rejected at operator " << opIndex << ": " << info.reason << std::endl;
          }
       }
+   }
+}
+
+void RModel::PrepareQuantizedTensorStorage(EQuantizedBackend backend)
+{
+   for (const auto &[name, storage] : fQuantizationState.tensorStorages)
+      fInitializedTensors.erase(name);
+   fQuantizationState.tensorStorages.clear();
+
+   auto restoreSource = [this](const std::string &name) {
+      auto it = fInitializedTensors.find(name);
+      if (it != fInitializedTensors.end())
+         it->second.SetWritable();
+   };
+   for (const auto &[index, region] : fQuantizationState.gemmRegions)
+      restoreSource(region.weightSourceTensor);
+   for (const auto &[index, region] : fQuantizationState.matmulRegions)
+      restoreSource(region.weightSourceTensor);
+
+   auto installStorage = [this](MaterializedQuantizedWeight materialized) {
+      const auto name = materialized.storage.storageTensor;
+      const auto shape = materialized.storage.shape;
+      std::visit([this, &name, &shape](auto &&buffer) {
+         AddInitializedTensor(name, shape, std::forward<decltype(buffer)>(buffer));
+      }, std::move(materialized.buffer));
+      RegisterQuantizedTensorStorage(std::move(materialized.storage));
+   };
+
+   for (auto opIndex : SortedQuantizedRegionOperatorIndices(fQuantizationState.gemmRegions)) {
+      const auto *plan = FindQuantizedLoweringPlan(fQuantizationState, opIndex, backend);
+      if (plan == nullptr || !IsQuantizedLoweringAvailable(plan->status) || plan->weightStorageTensor.empty())
+         continue;
+
+      const auto regionIt = fQuantizationState.gemmRegions.find(opIndex);
+      if (regionIt == fQuantizationState.gemmRegions.end())
+         throw std::runtime_error("SOFIE quantized Gemm storage plan has no matching region");
+      const auto &region = regionIt->second;
+      const auto weightShape = GetTensorShape(region.weightSourceTensor);
+      if (weightShape.size() != 2 || !IsInitializedTensor(region.weightSourceTensor))
+         throw std::runtime_error("SOFIE quantized Gemm storage requires an initialized rank-2 weight tensor");
+      const auto *weightData = fInitializedTensors.at(region.weightSourceTensor).data<float>();
+
+      std::vector<float> perChannelScales;
+      if (backend == EQuantizedBackend::ALPAKA && IsPerChannelAxis(region.weightQuant, 0))
+         perChannelScales = GetTensorData<float>(region.weightQuant.scaleTensor);
+      installStorage(MaterializeQuantizedGemmWeight(region, *plan, backend, weightData,
+                                                    weightShape, perChannelScales));
+   }
+
+   for (auto opIndex : SortedQuantizedRegionOperatorIndices(fQuantizationState.matmulRegions)) {
+      const auto *plan = FindQuantizedLoweringPlan(fQuantizationState, opIndex, backend);
+      if (plan == nullptr || !IsQuantizedLoweringAvailable(plan->status) || plan->weightStorageTensor.empty())
+         continue;
+      if (backend != EQuantizedBackend::ALPAKA)
+         continue;
+
+      const auto regionIt = fQuantizationState.matmulRegions.find(opIndex);
+      if (regionIt == fQuantizationState.matmulRegions.end())
+         throw std::runtime_error("SOFIE quantized MatMul storage plan has no matching region");
+      const auto &region = regionIt->second;
+      const auto weightShape = GetTensorShape(region.weightSourceTensor);
+      if (weightShape.size() != 2 || !IsInitializedTensor(region.weightSourceTensor))
+         throw std::runtime_error("SOFIE quantized MatMul storage requires an initialized rank-2 weight tensor");
+
+      const auto *weightData = fInitializedTensors.at(region.weightSourceTensor).data<float>();
+      std::vector<float> perChannelScales;
+      if (IsPerChannelAxis(region.weightQuant, 1))
+         perChannelScales = GetTensorData<float>(region.weightQuant.scaleTensor);
+
+      installStorage(MaterializeQuantizedMatMulWeight(region, *plan, backend, weightData,
+                                                      weightShape, perChannelScales));
+   }
+
+   std::unordered_set<std::size_t> consumedOperators;
+   std::unordered_set<std::string> pruneCandidates;
+   std::unordered_set<std::string> protectedTensors;
+   for (const auto &[opIndex, backendPlans] : fQuantizationState.loweringPlans) {
+      auto planIt = backendPlans.find(backend);
+      if (planIt == backendPlans.end() || !IsQuantizedLoweringAvailable(planIt->second.status) ||
+          planIt->second.weightStorageTensor.empty())
+         continue;
+      consumedOperators.insert(planIt->second.consumedOperatorIndices.begin(),
+                               planIt->second.consumedOperatorIndices.end());
+      protectedTensors.insert(planIt->second.weightStorageTensor);
+      if (!planIt->second.weightScaleTensor.empty())
+         protectedTensors.insert(planIt->second.weightScaleTensor);
+      if (!planIt->second.weightZeroPointTensor.empty())
+         protectedTensors.insert(planIt->second.weightZeroPointTensor);
+      if (auto gemm = fQuantizationState.gemmRegions.find(opIndex); gemm != fQuantizationState.gemmRegions.end()) {
+         pruneCandidates.insert(gemm->second.weightSourceTensor);
+         if (!gemm->second.biasSourceTensor.empty())
+            protectedTensors.insert(gemm->second.biasSourceTensor);
+      }
+      if (auto matmul = fQuantizationState.matmulRegions.find(opIndex); matmul != fQuantizationState.matmulRegions.end()) {
+         pruneCandidates.insert(matmul->second.weightSourceTensor);
+         if (!matmul->second.epilogue.biasSourceTensor.empty())
+            protectedTensors.insert(matmul->second.epilogue.biasSourceTensor);
+      }
+   }
+
+   for (auto opIndex : consumedOperators) {
+      if (opIndex >= fOperators.size())
+         continue;
+      for (const auto &input : fOperators[opIndex]->GetOpInputTensors()) {
+         const auto name = UTILITY::Clean_name(std::string(input));
+         if (fInitializedTensors.find(name) != fInitializedTensors.end())
+            pruneCandidates.insert(name);
+      }
+   }
+
+   for (const auto &source : pruneCandidates) {
+      auto tensor = fInitializedTensors.find(source);
+      if (tensor == fInitializedTensors.end() || protectedTensors.count(source) != 0)
+         continue;
+
+      bool hasLiveConsumer = false;
+      for (std::size_t opIndex = 0; opIndex < fOperators.size() && !hasLiveConsumer; ++opIndex) {
+         for (const auto &input : fOperators[opIndex]->GetOpInputTensors()) {
+            if (UTILITY::Clean_name(std::string(input)) == source && consumedOperators.count(opIndex) == 0) {
+               hasLiveConsumer = true;
+               break;
+            }
+         }
+      }
+      if (std::find(fOutputTensorNames.begin(), fOutputTensorNames.end(), source) != fOutputTensorNames.end())
+         hasLiveConsumer = true;
+
+      if (!hasLiveConsumer)
+         tensor->second.SetNotWritable();
    }
 }
 
@@ -746,7 +662,26 @@ void RModel::AddLoweredQuantizedOperators(EQuantizedBackend backend)
       }
    };
 
-   for (auto op_idx : QuantizedGemmOperatorIndices(fQuantizationState)) {
+   auto installLoweredOperator = [this, &setKnownTensorType](std::size_t opIndex,
+                                                             const QuantizedLoweringPlan &plan,
+                                                             const std::string &inputSourceTensor,
+                                                             const std::string &outputTensor,
+                                                             std::unique_ptr<ROperator> lowered) {
+      if (QuantizedPlanExposesQuantizedInputCarrier(plan))
+         setKnownTensorType(inputSourceTensor, TensorTypeForQuantizedStorage(plan.inputStorage));
+      if (QuantizedPlanExposesQuantizedOutputCarrier(plan))
+         setKnownTensorType(outputTensor, TensorTypeForQuantizedStorage(plan.outputStorage));
+
+      fLoweredOperators[opIndex] = std::move(lowered);
+      if (!plan.suppressesGraphOperators)
+         return;
+      for (auto consumedOpIndex : plan.consumedOperatorIndices) {
+         if (consumedOpIndex != opIndex)
+            fLoweredConsumedOperatorIndices.insert(consumedOpIndex);
+      }
+   };
+
+   for (auto op_idx : SortedQuantizedRegionOperatorIndices(fQuantizationState.gemmRegions)) {
       const auto *planPtr = FindQuantizedLoweringPlan(fQuantizationState, op_idx, backend);
       if (planPtr == nullptr)
          continue;
@@ -763,38 +698,44 @@ void RModel::AddLoweredQuantizedOperators(EQuantizedBackend backend)
       if (regionIt == fQuantizationState.gemmRegions.end())
          throw std::runtime_error("SOFIE quantized Gemm lowering plan has no matching region");
       const auto &region = regionIt->second;
-      if (QuantizedPlanExposesQuantizedInputCarrier(plan)) {
-         setKnownTensorType(region.inputSourceTensor, TensorTypeForQuantizedStorage(plan.inputStorage));
-      }
-      if (QuantizedPlanExposesQuantizedOutputCarrier(plan)) {
-         setKnownTensorType(region.outputTensor, TensorTypeForQuantizedStorage(plan.outputStorage));
-      }
+      installLoweredOperator(op_idx, plan, region.inputSourceTensor, region.outputTensor,
+         std::make_unique<ROperator_QuantizedGemm>(region, plan, MakeQuantizedGemmCodegenContext(*gemm)));
+   }
 
-      fLoweredOperators[op_idx] = std::make_unique<ROperator_QuantizedGemm>(
-         region, plan, MakeQuantizedGemmCodegenContext(*gemm));
+   for (auto op_idx : SortedQuantizedRegionOperatorIndices(fQuantizationState.matmulRegions)) {
+      const auto *planPtr = FindQuantizedLoweringPlan(fQuantizationState, op_idx, backend);
+      if (planPtr == nullptr)
+         continue;
 
-      if (plan.suppressesGraphOperators) {
-         for (auto consumedOpIndex : plan.consumedOperatorIndices) {
-            if (consumedOpIndex != op_idx)
-               fLoweredConsumedOperatorIndices.insert(consumedOpIndex);
-         }
-      }
+      auto *gemm = dynamic_cast<ROperator_Gemm<float> *>(fOperators[op_idx].get());
+      if (!gemm)
+         throw std::runtime_error("SOFIE quantized MatMul region is attached to a non-float Gemm-spelled MatMul operator");
+
+      const auto &plan = *planPtr;
+      if (!IsQuantizedLoweringAvailable(plan.status))
+         continue;
+
+      const auto regionIt = fQuantizationState.matmulRegions.find(op_idx);
+      if (regionIt == fQuantizationState.matmulRegions.end())
+         throw std::runtime_error("SOFIE quantized MatMul lowering plan has no matching region");
+      const auto &region = regionIt->second;
+      installLoweredOperator(op_idx, plan, region.inputSourceTensor, region.outputTensor,
+         std::make_unique<ROperator_QuantizedMatMul>(region, plan, MakeQuantizedMatMulCodegenContext(*gemm)));
    }
 }
 
 void RModel::AddQuantizedGeneratedHeaders(EQuantizedBackend backend)
 {
-   for (auto op_idx : QuantizedGemmOperatorIndices(fQuantizationState)) {
-      const auto *planPtr = FindQuantizedLoweringPlan(fQuantizationState, op_idx, backend);
-      if (planPtr == nullptr)
+   for (const auto &[opIndex, backendPlans] : fQuantizationState.loweringPlans) {
+      auto planIt = backendPlans.find(backend);
+      if (planIt == backendPlans.end())
          continue;
-      const auto &plan = *planPtr;
+      const auto &plan = planIt->second;
       if (!IsQuantizedLoweringAvailable(plan.status) || !plan.suppressesGraphOperators)
          continue;
       if (backend == EQuantizedBackend::CPU && QuantizedPlanUsesPrequantizedWeights(plan) &&
-          plan.weightLayout == EQuantizedLayout::PackedCPU) {
+          plan.weightLayout == EQuantizedLayout::PackedCPU)
          AddNeededCustomHeader("SOFIE/SOFIE_Quantized.hxx");
-      }
       if (backend == EQuantizedBackend::ALPAKA && IsOptimizedQuantizedAlpakaPlainDevicePlan(plan)) {
          AddNeededCustomHeader("SOFIE/SOFIE_QuantizedAlpaka.hxx");
       }

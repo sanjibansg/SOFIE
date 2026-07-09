@@ -1,6 +1,7 @@
 #ifndef SOFIE_RQUANTIZATION
 #define SOFIE_RQUANTIZATION
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +32,8 @@ struct QuantizationInfo {
    bool narrow = false;
    double scale = 1.0;
    std::int64_t zeroPoint = 0;
+   std::string scaleTensor;
+   std::string zeroPointTensor;
    EQuantizationRoundingMode rounding = EQuantizationRoundingMode::UNDEFINED;
    EQuantizationOverflowMode overflow = EQuantizationOverflowMode::UNDEFINED;
    EQuantizationGranularity granularity = EQuantizationGranularity::PerTensor;
@@ -114,7 +117,12 @@ enum class EQuantizedOutputMode {
 enum class EQuantizedComputeProfile {
    UNDEFINED = 0,
    GenericRecognized = 1,
-   SignedInt8SymmetricPerTensorRank2 = 2
+   SignedInt8SymmetricPerTensorRank2 = 2,
+   SignedInt8PerTensorActivationPerChannelWeightRank2 = 3,
+   UnsignedInt8ActivationSignedInt8WeightRank2 = 4,
+   UnsignedInt8SymmetricRank2 = 5,
+   AsymmetricZeroPointRank2 = 6,
+   UnsupportedDenseLinearRank2 = 7
 };
 
 enum class EQuantizedLayout {
@@ -122,16 +130,58 @@ enum class EQuantizedLayout {
 };
 
 
+enum class EQuantizedParameterMode {
+   UNDEFINED = 0,
+   Scalar = 1,
+   PerOutputChannel = 2
+};
+
+
+enum class EQuantizedEpilogueKind {
+   None = 0,
+   Bias = 1,
+   Relu = 2,
+   BiasRelu = 3
+};
+
+inline bool QuantizedEpilogueHasBias(EQuantizedEpilogueKind kind)
+{
+   return kind == EQuantizedEpilogueKind::Bias || kind == EQuantizedEpilogueKind::BiasRelu;
+}
+
+inline bool QuantizedEpilogueHasRelu(EQuantizedEpilogueKind kind)
+{
+   return kind == EQuantizedEpilogueKind::Relu || kind == EQuantizedEpilogueKind::BiasRelu;
+}
+
+struct QuantizedEpilogue {
+   EQuantizedEpilogueKind kind = EQuantizedEpilogueKind::None;
+   std::string biasSourceTensor;
+   std::optional<QuantizationInfo> biasQuant;
+   std::optional<std::size_t> addOpIndex;
+};
+
 enum class EQuantizedShapePolicy {
    UNDEFINED = 0,
    Exact = 1,
    ExactTooSmall = 2,
    PaddedCandidate = 3,
-   Fallback = 4,
-   Unsupported = 5
+   Padded = 4,
+   Fallback = 5,
+   Unsupported = 6
 };
 
-struct QuantizedMatMulShapePolicy {
+inline bool QuantizedShapePolicyUsesPadding(EQuantizedShapePolicy policy)
+{
+   return policy == EQuantizedShapePolicy::PaddedCandidate || policy == EQuantizedShapePolicy::Padded;
+}
+
+inline bool QuantizedShapePolicyIsExecutable(EQuantizedShapePolicy policy)
+{
+   return policy == EQuantizedShapePolicy::Exact || policy == EQuantizedShapePolicy::Padded;
+}
+
+struct QuantizedDenseLinearShapePolicy {
    EQuantizedShapePolicy policy = EQuantizedShapePolicy::UNDEFINED;
    std::size_t logicalM = 0;
    std::size_t logicalK = 0;
@@ -147,6 +197,37 @@ struct QuantizedMatMulShapePolicy {
    std::string reason;
 };
 
+enum class EQuantizedMatMulShapeKind {
+   UNDEFINED = 0,
+   Unsupported = 1,
+   Rank2 = 2,
+   FlattenableProjection = 3,
+   TrueBatched = 4
+};
+
+struct QuantizedMatMulShapeAssessment {
+   EQuantizedMatMulShapeKind kind = EQuantizedMatMulShapeKind::UNDEFINED;
+   std::size_t logicalM = 0;
+   std::size_t logicalK = 0;
+   std::size_t logicalN = 0;
+   std::vector<std::size_t> flattenedInputShape;
+   std::vector<std::size_t> flattenedOutputShape;
+   std::string reason;
+   std::vector<std::string> unsupportedReasons;
+};
+
+inline bool QuantizedMatMulShapeIsRecognized(const QuantizedMatMulShapeAssessment &assessment)
+{
+   return assessment.kind == EQuantizedMatMulShapeKind::Rank2 ||
+          assessment.kind == EQuantizedMatMulShapeKind::FlattenableProjection ||
+          assessment.kind == EQuantizedMatMulShapeKind::TrueBatched;
+}
+
+inline bool QuantizedMatMulShapeIsRank2Executable(const QuantizedMatMulShapeAssessment &assessment)
+{
+   return assessment.kind == EQuantizedMatMulShapeKind::Rank2;
+}
+
 struct QuantizedTensorStorage {
    std::string logicalTensor;
    std::string sourceTensor;
@@ -157,9 +238,6 @@ struct QuantizedTensorStorage {
    std::vector<std::size_t> shape;
 
    EQuantizedBackend residentBackend = EQuantizedBackend::UNDEFINED;
-
-   bool isConstant = false;
-   bool isDeviceResident = false;
 };
 
 inline std::size_t QuantizedStorageElementSize(EQuantizedStorageType type)
@@ -235,10 +313,13 @@ struct QuantizedLoweringPlan {
    EQuantizedOutputMode outputMode = EQuantizedOutputMode::UNDEFINED;
    EQuantizedComputeProfile computeProfile = EQuantizedComputeProfile::UNDEFINED;
    std::string capabilityTag;
-   QuantizedMatMulShapePolicy shapePolicy;
+   QuantizedDenseLinearShapePolicy shapePolicy;
 
    std::string weightStorageTensor;
    EQuantizedLayout weightLayout = EQuantizedLayout::UNDEFINED;
+   EQuantizedParameterMode weightScaleMode = EQuantizedParameterMode::Scalar;
+   std::string weightScaleTensor;
+   std::string weightZeroPointTensor;
 
    std::vector<std::size_t> consumedOperatorIndices;
    bool preservesQuantizationSemantics = false;
@@ -280,6 +361,33 @@ inline bool IsOptimizedQuantizedAlpakaPlainDevicePlan(const QuantizedLoweringPla
    return plan.backend == EQuantizedBackend::ALPAKA && IsOptimizedQuantizedPlainDevicePlan(plan);
 }
 
+struct QuantizedMatMulRegion {
+   // Quantized carrier tensors, i.e. outputs of quantization boundaries.
+   std::string inputTensor;
+   std::string weightTensor;
+   std::string matmulOutputTensor;
+   std::string outputTensor;
+
+   // Source tensors consumed by the quantization boundaries.
+   std::string inputSourceTensor;
+   std::string weightSourceTensor;
+
+   std::size_t inputQuantOpIndex = static_cast<std::size_t>(-1);
+   std::size_t weightQuantOpIndex = static_cast<std::size_t>(-1);
+   std::size_t matmulOpIndex = static_cast<std::size_t>(-1);
+   std::size_t outputQuantOpIndex = static_cast<std::size_t>(-1);
+
+   QuantizedEpilogue epilogue;
+   QuantizedMatMulShapeAssessment shape;
+
+   QuantizationInfo inputQuant;
+   QuantizationInfo weightQuant;
+   QuantizationInfo outputQuant;
+
+   EQuantizedLoweringStatus status = EQuantizedLoweringStatus::UNDEFINED;
+   std::string reason;
+};
+
 struct QuantizedGemmRegion {
    // Quantized carrier tensors, i.e. outputs of quantization boundaries.
    std::string inputTensor;
@@ -318,15 +426,39 @@ struct QuantizationModelState {
    std::unordered_map<std::string, QuantizationInfo> tensorInfos;
    std::unordered_map<std::string, QuantizedTensorStorage> tensorStorages;
    std::unordered_map<std::size_t, QuantizedGemmRegion> gemmRegions;
+   std::unordered_map<std::size_t, QuantizedMatMulRegion> matmulRegions;
    std::unordered_map<std::size_t, std::unordered_map<EQuantizedBackend, QuantizedLoweringPlan>> loweringPlans;
 
    void ClearDerivedAnalysis()
    {
       tensorStorages.clear();
       gemmRegions.clear();
+      matmulRegions.clear();
       loweringPlans.clear();
    }
 };
+
+template <class RegionMap>
+std::vector<std::size_t> SortedQuantizedRegionOperatorIndices(const RegionMap &regions)
+{
+   std::vector<std::size_t> indices;
+   indices.reserve(regions.size());
+   for (const auto &entry : regions)
+      indices.push_back(entry.first);
+   std::sort(indices.begin(), indices.end());
+   return indices;
+}
+
+inline const QuantizedLoweringPlan *FindQuantizedLoweringPlan(const QuantizationModelState &state,
+                                                              std::size_t opIndex,
+                                                              EQuantizedBackend backend)
+{
+   auto opIt = state.loweringPlans.find(opIndex);
+   if (opIt == state.loweringPlans.end())
+      return nullptr;
+   auto backendIt = opIt->second.find(backend);
+   return backendIt == opIt->second.end() ? nullptr : &backendIt->second;
+}
 
 } // namespace SOFIE
 

@@ -39,13 +39,15 @@ enum class OperatorKind {
    UNARY_ABS=23,
    CLIP=24,
    NOT=25,
-   QUANTIZED_GEMM=26
+   QUANTIZED_GEMM=26,
+   QUANTIZED_MATMUL=27
 };
 
 inline const char* toString(OperatorKind kind) {
    switch (kind) {
        case OperatorKind::GEMM:       return "GEMM";
        case OperatorKind::QUANTIZED_GEMM: return "QUANTIZED_GEMM";
+       case OperatorKind::QUANTIZED_MATMUL: return "QUANTIZED_MATMUL";
        case OperatorKind::LAYERNORM:  return "LAYERNORM";
        case OperatorKind::RELU:       return "RELU";
        case OperatorKind::CONSTANT:        return "CONSTANT";
@@ -86,6 +88,12 @@ public:
 
    // Semantic graph-analysis hooks
    virtual bool IsQuantizationBoundary() const { return false; }
+   virtual std::string GetQuantizationSourceTensor() const
+   {
+      if (fInputTensorNames.empty())
+         return {};
+      return std::string(fInputTensorNames.front());
+   }
 
    // Elementwise kernel fusion interface
    virtual bool IsElementwise() const { return false; }

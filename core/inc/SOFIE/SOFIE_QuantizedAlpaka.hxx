@@ -34,10 +34,19 @@ enum class EQuantizedCudaOutputCarrier {
    UInt8
 };
 
+enum class EQuantizedCudaScaleMode {
+   PerTensor,
+   PerOutputChannel
+};
+
 struct QuantizedGemmCudaLtParams {
    std::size_t m = 0;
    std::size_t n = 0;
    std::size_t k = 0;
+   std::size_t logicalM = 0;
+   std::size_t logicalN = 0;
+   std::size_t logicalK = 0;
+   bool paddedExecution = false;
    double inputScale = 1.0;
    double weightScale = 1.0;
    double biasScale = 1.0;
@@ -59,6 +68,7 @@ struct QuantizedGemmCudaLtParams {
    EQuantizedCudaInputCarrier inputCarrier = EQuantizedCudaInputCarrier::Float;
    EQuantizedCudaOutputCarrier outputCarrier = EQuantizedCudaOutputCarrier::Float;
    EQuantizedCudaWeightType weightType = EQuantizedCudaWeightType::Int8;
+   EQuantizedCudaScaleMode weightScaleMode = EQuantizedCudaScaleMode::PerTensor;
    bool enableAutotuning = true;
    int autotuneIterations = 3;
    double accumulatorToOutputScale = 0.0;
@@ -91,8 +101,26 @@ inline void QuantizedGemmCudaLt_SetProfiling(bool) {}
 inline bool QuantizedGemmCudaLt_ProfilingEnabled() { return false; }
 inline QuantizedGemmCudaLtProfile QuantizedGemmCudaLt_GetLastProfile() { return {}; }
 
+inline void QuantizedGemmCudaPadInt8Matrix(QuantizedGemmCudaStream, const std::int8_t *, std::int8_t *,
+                                           std::size_t, std::size_t, std::size_t, std::size_t, std::int8_t = 0)
+{
+   throw std::runtime_error("SOFIE quantized padded CUDA input path was selected, but SOFIE_USE_CUBLASLT is not enabled");
+}
+
+inline void QuantizedGemmCudaUnpadInt8Matrix(QuantizedGemmCudaStream, const std::int8_t *, std::int8_t *,
+                                             std::size_t, std::size_t, std::size_t, std::size_t)
+{
+   throw std::runtime_error("SOFIE quantized padded CUDA output path was selected, but SOFIE_USE_CUBLASLT is not enabled");
+}
+
+inline void QuantizedGemmCudaUnpadUInt8Matrix(QuantizedGemmCudaStream, const std::uint8_t *, std::uint8_t *,
+                                              std::size_t, std::size_t, std::size_t, std::size_t)
+{
+   throw std::runtime_error("SOFIE quantized padded CUDA output path was selected, but SOFIE_USE_CUBLASLT is not enabled");
+}
+
 inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &, QuantizedGemmCudaStream, void *, const void *,
-                                     const void *, const float *, const QuantizedGemmCudaLtParams &)
+                                     const void *, const float *, const float *, const QuantizedGemmCudaLtParams &)
 {
    throw std::runtime_error("SOFIE cuBLASLt quantized GEMM path was selected, but SOFIE_USE_CUBLASLT is not enabled");
 }
@@ -143,27 +171,59 @@ __global__ void QuantizedGemmCudaQuantizeInputKernel(const float *input, std::in
                                                                               zero, qmin, qmax));
 }
 
+__global__ void QuantizedGemmCudaPadInt8MatrixKernel(const std::int8_t *__restrict__ input,
+                                                     std::int8_t *__restrict__ padded,
+                                                     std::size_t logicalRows, std::size_t logicalCols,
+                                                     std::size_t physicalRows, std::size_t physicalCols,
+                                                     std::int8_t padValue)
+{
+   const std::size_t elements = physicalRows * physicalCols;
+   const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+   if (idx >= elements)
+      return;
+   const std::size_t row = idx / physicalCols;
+   const std::size_t col = idx % physicalCols;
+   padded[idx] = (row < logicalRows && col < logicalCols) ? input[row * logicalCols + col] : padValue;
+}
+
+template <typename T>
+__global__ void QuantizedGemmCudaUnpadMatrixKernel(const T *__restrict__ padded,
+                                                   T *__restrict__ output,
+                                                   std::size_t logicalRows, std::size_t logicalCols,
+                                                   std::size_t physicalRows, std::size_t physicalCols)
+{
+   const std::size_t elements = logicalRows * logicalCols;
+   const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+   if (idx >= elements)
+      return;
+   const std::size_t row = idx / logicalCols;
+   const std::size_t col = idx % logicalCols;
+   output[idx] = row < physicalRows && col < physicalCols ? padded[row * physicalCols + col] : T{};
+}
+
 __global__ void QuantizedGemmCudaBiasOutputOffsetKernel(float *__restrict__ biasOutputOffset,
-                                                            const float *__restrict__ bias,
-                                                            QuantizedGemmCudaLtParams params)
+                                                        const float *__restrict__ bias,
+                                                        const float *__restrict__ weightScaleVector,
+                                                        QuantizedGemmCudaLtParams params)
 {
    const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
    if (idx >= params.n)
       return;
 
-   int bq = __float2int_rn((bias[idx] / static_cast<float>(params.biasScale)) +
-                           static_cast<float>(params.biasZeroPoint));
+   const float biasScale = (params.weightScaleMode == EQuantizedCudaScaleMode::PerOutputChannel)
+                              ? static_cast<float>(params.inputScale * static_cast<double>(weightScaleVector[idx]))
+                              : static_cast<float>(params.biasScale);
+   int bq = __float2int_rn((bias[idx] / biasScale) + static_cast<float>(params.biasZeroPoint));
    bq = QuantizedCudaClamp(bq, params.biasQMin, params.biasQMax);
    biasOutputOffset[idx] =
-      (static_cast<float>(bq - params.biasZeroPoint) * static_cast<float>(params.biasScale) /
-       static_cast<float>(params.outputScale)) +
+      (static_cast<float>(bq - params.biasZeroPoint) * biasScale / static_cast<float>(params.outputScale)) +
       static_cast<float>(params.outputZeroPoint);
 }
-
 template <typename OutputT, bool HasBias, bool HasRelu>
 __global__ void QuantizedGemmCudaQuantizedEpilogueKernel(OutputT *__restrict__ output,
                                                         const std::int32_t *__restrict__ accumulator,
                                                         const float *__restrict__ biasOutputOffset,
+                                                        const float *__restrict__ weightScaleVector,
                                                         QuantizedGemmCudaLtParams params)
 {
    const std::size_t elements = params.m * params.n;
@@ -172,9 +232,12 @@ __global__ void QuantizedGemmCudaQuantizedEpilogueKernel(OutputT *__restrict__ o
       return;
 
    const std::size_t col = idx % params.n;
+   const float scale = (params.weightScaleMode == EQuantizedCudaScaleMode::PerOutputChannel)
+                         ? static_cast<float>((params.inputScale * static_cast<double>(weightScaleVector[col])) / params.outputScale)
+                         : static_cast<float>(params.accumulatorToOutputScale);
    const float offset = HasBias ? biasOutputOffset[col] : static_cast<float>(params.outputZeroPoint);
    int yq = __float2int_rn(
-      __fmaf_rn(static_cast<float>(accumulator[idx]), static_cast<float>(params.accumulatorToOutputScale), offset));
+      __fmaf_rn(static_cast<float>(accumulator[idx]), scale, offset));
    if constexpr (HasRelu) {
       if (yq < params.outputZeroPoint)
          yq = params.outputZeroPoint;
@@ -276,6 +339,52 @@ inline bool QuantizedGemmCudaLt_ProfilingEnabled()
 inline QuantizedGemmCudaLtProfile QuantizedGemmCudaLt_GetLastProfile()
 {
    return QuantizedGemmCudaLt_LastProfileStorage();
+}
+
+inline void QuantizedGemmCudaPadInt8Matrix(QuantizedGemmCudaStream stream, const std::int8_t *input,
+                                           std::int8_t *padded, std::size_t logicalRows,
+                                           std::size_t logicalCols, std::size_t physicalRows,
+                                           std::size_t physicalCols, std::int8_t padValue = 0)
+{
+   const std::size_t elements = physicalRows * physicalCols;
+   if (elements == 0)
+      return;
+   constexpr int blockSize = 256;
+   const int gridSize = static_cast<int>((elements + blockSize - 1) / blockSize);
+   INTERNAL::QuantizedGemmCudaPadInt8MatrixKernel<<<gridSize, blockSize, 0, stream>>>(
+      input, padded, logicalRows, logicalCols, physicalRows, physicalCols, padValue);
+   INTERNAL::CheckCudaStatus(cudaGetLastError(), "QuantizedGemmCudaPadInt8MatrixKernel");
+}
+
+template <typename T>
+inline void QuantizedGemmCudaUnpadMatrix(QuantizedGemmCudaStream stream, const T *padded, T *output,
+                                         std::size_t logicalRows, std::size_t logicalCols,
+                                         std::size_t physicalRows, std::size_t physicalCols)
+{
+   const std::size_t elements = logicalRows * logicalCols;
+   if (elements == 0)
+      return;
+   constexpr int blockSize = 256;
+   const int gridSize = static_cast<int>((elements + blockSize - 1) / blockSize);
+   INTERNAL::QuantizedGemmCudaUnpadMatrixKernel<T><<<gridSize, blockSize, 0, stream>>>(
+      padded, output, logicalRows, logicalCols, physicalRows, physicalCols);
+   INTERNAL::CheckCudaStatus(cudaGetLastError(), "QuantizedGemmCudaUnpadMatrixKernel");
+}
+
+inline void QuantizedGemmCudaUnpadInt8Matrix(QuantizedGemmCudaStream stream, const std::int8_t *padded,
+                                             std::int8_t *output, std::size_t logicalRows,
+                                             std::size_t logicalCols, std::size_t physicalRows,
+                                             std::size_t physicalCols)
+{
+   QuantizedGemmCudaUnpadMatrix(stream, padded, output, logicalRows, logicalCols, physicalRows, physicalCols);
+}
+
+inline void QuantizedGemmCudaUnpadUInt8Matrix(QuantizedGemmCudaStream stream, const std::uint8_t *padded,
+                                              std::uint8_t *output, std::size_t logicalRows,
+                                              std::size_t logicalCols, std::size_t physicalRows,
+                                              std::size_t physicalCols)
+{
+   QuantizedGemmCudaUnpadMatrix(stream, padded, output, logicalRows, logicalCols, physicalRows, physicalCols);
 }
 
 struct QuantizedGemmCudaLtEventTimer {
@@ -384,9 +493,11 @@ struct QuantizedGemmCudaLtState {
    float fSelectedCandidateMs = 0.0f;
    std::int8_t *fInputQuantized = nullptr;
    std::int32_t *fAccumulator = nullptr;
+   void *fOutputQuantized = nullptr;
    float *fBiasOutputOffset = nullptr;
    std::size_t fInputQuantizedBytes = 0;
    std::size_t fAccumulatorBytes = 0;
+   std::size_t fOutputQuantizedBytes = 0;
    std::size_t fBiasOutputOffsetBytes = 0;
    const float *fBiasOutputOffsetSource = nullptr;
    double fBiasOutputOffsetBiasScale = 0.0;
@@ -396,6 +507,8 @@ struct QuantizedGemmCudaLtState {
    std::int32_t fBiasOutputOffsetBiasQMin = 0;
    std::int32_t fBiasOutputOffsetBiasQMax = 0;
    std::size_t fBiasOutputOffsetN = 0;
+   const float *fBiasOutputOffsetWeightScaleVector = nullptr;
+   EQuantizedCudaScaleMode fBiasOutputOffsetWeightScaleMode = EQuantizedCudaScaleMode::PerTensor;
    std::size_t fM = 0;
    std::size_t fN = 0;
    std::size_t fK = 0;
@@ -450,6 +563,10 @@ struct QuantizedGemmCudaLtState {
          cudaFree(fAccumulator);
          fAccumulator = nullptr;
       }
+      if (fOutputQuantized != nullptr) {
+         cudaFree(fOutputQuantized);
+         fOutputQuantized = nullptr;
+      }
       if (fBiasOutputOffset != nullptr) {
          cudaFree(fBiasOutputOffset);
          fBiasOutputOffset = nullptr;
@@ -469,6 +586,7 @@ struct QuantizedGemmCudaLtState {
       fSelectedCandidateMs = 0.0f;
       fInputQuantizedBytes = 0;
       fAccumulatorBytes = 0;
+      fOutputQuantizedBytes = 0;
       fBiasOutputOffsetBytes = 0;
       fBiasOutputOffsetSource = nullptr;
       fBiasOutputOffsetBiasScale = 0.0;
@@ -478,6 +596,8 @@ struct QuantizedGemmCudaLtState {
       fBiasOutputOffsetBiasQMin = 0;
       fBiasOutputOffsetBiasQMax = 0;
       fBiasOutputOffsetN = 0;
+      fBiasOutputOffsetWeightScaleVector = nullptr;
+      fBiasOutputOffsetWeightScaleMode = EQuantizedCudaScaleMode::PerTensor;
       fM = 0;
       fN = 0;
       fK = 0;
@@ -575,10 +695,26 @@ struct QuantizedGemmCudaLtState {
                                    "cudaMalloc(accumulator cache)");
          fAccumulatorBytes = requiredAccumulatorBytes;
       }
+
+      if (params.paddedExecution && params.epilogueMode == EQuantizedCudaEpilogueMode::Quantized) {
+         const std::size_t outputElementSize = params.outputCarrier == EQuantizedCudaOutputCarrier::UInt8
+                                                ? sizeof(std::uint8_t) : sizeof(std::int8_t);
+         const std::size_t requiredOutputBytes = params.m * params.n * outputElementSize;
+         if (requiredOutputBytes > fOutputQuantizedBytes) {
+            if (fOutputQuantized != nullptr) {
+               INTERNAL::CheckCudaStatus(cudaFree(fOutputQuantized), "cudaFree(padded output cache)");
+               fOutputQuantized = nullptr;
+               fOutputQuantizedBytes = 0;
+            }
+            INTERNAL::CheckCudaStatus(cudaMalloc(&fOutputQuantized, requiredOutputBytes),
+                                      "cudaMalloc(padded output cache)");
+            fOutputQuantizedBytes = requiredOutputBytes;
+         }
+      }
    }
 
    const float *EnsureBiasOutputOffsetBuffer(const QuantizedGemmCudaLtParams &params, const float *bias,
-                                           QuantizedGemmCudaStream stream)
+                                             const float *weightScaleVector, QuantizedGemmCudaStream stream)
    {
       if (bias == nullptr || !params.hasBias)
          return nullptr;
@@ -602,12 +738,14 @@ struct QuantizedGemmCudaLtState {
                               fBiasOutputOffsetBiasZeroPoint == params.biasZeroPoint &&
                               fBiasOutputOffsetOutputZeroPoint == params.outputZeroPoint &&
                               fBiasOutputOffsetBiasQMin == params.biasQMin &&
-                              fBiasOutputOffsetBiasQMax == params.biasQMax;
+                              fBiasOutputOffsetBiasQMax == params.biasQMax &&
+                              fBiasOutputOffsetWeightScaleVector == weightScaleVector &&
+                              fBiasOutputOffsetWeightScaleMode == params.weightScaleMode;
       if (!cacheValid) {
          constexpr int threads = 256;
          const int blocks = static_cast<int>((params.n + threads - 1) / threads);
          INTERNAL::QuantizedGemmCudaBiasOutputOffsetKernel<<<blocks, threads, 0, stream>>>(
-            fBiasOutputOffset, bias, params);
+            fBiasOutputOffset, bias, weightScaleVector, params);
          INTERNAL::CheckCudaStatus(cudaGetLastError(), "QuantizedGemmCudaBiasOutputOffsetKernel launch");
          fBiasOutputOffsetSource = bias;
          fBiasOutputOffsetN = params.n;
@@ -617,6 +755,8 @@ struct QuantizedGemmCudaLtState {
          fBiasOutputOffsetOutputZeroPoint = params.outputZeroPoint;
          fBiasOutputOffsetBiasQMin = params.biasQMin;
          fBiasOutputOffsetBiasQMax = params.biasQMax;
+         fBiasOutputOffsetWeightScaleVector = weightScaleVector;
+         fBiasOutputOffsetWeightScaleMode = params.weightScaleMode;
       }
 
       return fBiasOutputOffset;
@@ -624,6 +764,7 @@ struct QuantizedGemmCudaLtState {
 
    std::int8_t *InputQuantizedBuffer() const { return fInputQuantized; }
    std::int32_t *AccumulatorBuffer() const { return fAccumulator; }
+   void *OutputQuantizedBuffer() const { return fOutputQuantized; }
    std::size_t AccumulatorBytes() const { return fAccumulatorBytes; }
    std::size_t WorkspaceSize() const { return fWorkspaceSize; }
    int HeuristicResultCount() const { return fHeuristicResultCount; }
@@ -747,9 +888,11 @@ private:
       fSelectedCandidateMs = other.fSelectedCandidateMs;
       fInputQuantized = other.fInputQuantized;
       fAccumulator = other.fAccumulator;
+      fOutputQuantized = other.fOutputQuantized;
       fBiasOutputOffset = other.fBiasOutputOffset;
       fInputQuantizedBytes = other.fInputQuantizedBytes;
       fAccumulatorBytes = other.fAccumulatorBytes;
+      fOutputQuantizedBytes = other.fOutputQuantizedBytes;
       fBiasOutputOffsetBytes = other.fBiasOutputOffsetBytes;
       fBiasOutputOffsetSource = other.fBiasOutputOffsetSource;
       fBiasOutputOffsetBiasScale = other.fBiasOutputOffsetBiasScale;
@@ -759,6 +902,8 @@ private:
       fBiasOutputOffsetBiasQMin = other.fBiasOutputOffsetBiasQMin;
       fBiasOutputOffsetBiasQMax = other.fBiasOutputOffsetBiasQMax;
       fBiasOutputOffsetN = other.fBiasOutputOffsetN;
+      fBiasOutputOffsetWeightScaleVector = other.fBiasOutputOffsetWeightScaleVector;
+      fBiasOutputOffsetWeightScaleMode = other.fBiasOutputOffsetWeightScaleMode;
       fM = other.fM;
       fN = other.fN;
       fK = other.fK;
@@ -785,9 +930,11 @@ private:
       other.fSelectedCandidateMs = 0.0f;
       other.fInputQuantized = nullptr;
       other.fAccumulator = nullptr;
+      other.fOutputQuantized = nullptr;
       other.fBiasOutputOffset = nullptr;
       other.fInputQuantizedBytes = 0;
       other.fAccumulatorBytes = 0;
+      other.fOutputQuantizedBytes = 0;
       other.fBiasOutputOffsetBytes = 0;
       other.fBiasOutputOffsetSource = nullptr;
       other.fBiasOutputOffsetBiasScale = 0.0;
@@ -797,6 +944,8 @@ private:
       other.fBiasOutputOffsetBiasQMin = 0;
       other.fBiasOutputOffsetBiasQMax = 0;
       other.fBiasOutputOffsetN = 0;
+      other.fBiasOutputOffsetWeightScaleVector = nullptr;
+      other.fBiasOutputOffsetWeightScaleMode = EQuantizedCudaScaleMode::PerTensor;
       other.fM = 0;
       other.fN = 0;
       other.fK = 0;
@@ -806,6 +955,7 @@ private:
 
 inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &state, QuantizedGemmCudaStream stream,
                                      void *output, const void *input, const void *weight, const float *bias,
+                                     const float *weightScaleVector,
                                      const QuantizedGemmCudaLtParams &params)
 {
    if (output == nullptr || input == nullptr || weight == nullptr) {
@@ -820,6 +970,9 @@ inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &state, QuantizedG
    if (params.inputZeroPoint != 0 || params.weightZeroPoint != 0) {
       throw std::runtime_error("SOFIE cuBLASLt quantized GEMM currently requires input and weight zero points to be 0");
    }
+   if (params.weightScaleMode == EQuantizedCudaScaleMode::PerOutputChannel && weightScaleVector == nullptr) {
+      throw std::runtime_error("SOFIE cuBLASLt quantized GEMM per-channel weight scale mode requires a scale vector");
+   }
    if (params.epilogueMode == EQuantizedCudaEpilogueMode::Quantized &&
        params.outputCarrier == EQuantizedCudaOutputCarrier::Float) {
       throw std::runtime_error("SOFIE cuBLASLt quantized GEMM quantized epilogue requires an integer output carrier");
@@ -830,12 +983,24 @@ inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &state, QuantizedG
    }
 
    QuantizedGemmCudaLtParams effectiveParams = params;
+   if (effectiveParams.logicalM == 0)
+      effectiveParams.logicalM = effectiveParams.m;
+   if (effectiveParams.logicalN == 0)
+      effectiveParams.logicalN = effectiveParams.n;
+   if (effectiveParams.logicalK == 0)
+      effectiveParams.logicalK = effectiveParams.k;
+   if (effectiveParams.paddedExecution &&
+       (effectiveParams.logicalM > effectiveParams.m || effectiveParams.logicalN > effectiveParams.n ||
+        effectiveParams.logicalK > effectiveParams.k)) {
+      throw std::runtime_error("SOFIE cuBLASLt quantized GEMM padded execution received logical dimensions larger than physical dimensions");
+   }
    if (effectiveParams.accumulatorToOutputScale == 0.0)
       effectiveParams.accumulatorToOutputScale =
          (effectiveParams.inputScale * effectiveParams.weightScale) / effectiveParams.outputScale;
 
    const std::size_t inputElements = effectiveParams.m * effectiveParams.k;
    const std::size_t outputElements = effectiveParams.m * effectiveParams.n;
+   const std::size_t logicalOutputElements = effectiveParams.logicalM * effectiveParams.logicalN;
    state.Initialize(effectiveParams);
    state.EnsureTemporaryBuffers(effectiveParams);
    QuantizedGemmCudaLtEventTimer profileTimer(QuantizedGemmCudaLt_ProfilingEnabled());
@@ -845,7 +1010,16 @@ inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &state, QuantizedG
    const std::int8_t *inputQuantized = nullptr;
    if (effectiveParams.inputCarrier == EQuantizedCudaInputCarrier::Int8) {
       inputQuantized = static_cast<const std::int8_t *>(input);
+      if (effectiveParams.paddedExecution) {
+         QuantizedGemmCudaPadInt8Matrix(stream, inputQuantized, state.InputQuantizedBuffer(),
+                                                  effectiveParams.logicalM, effectiveParams.logicalK,
+                                                  effectiveParams.m, effectiveParams.k, 0);
+         inputQuantized = state.InputQuantizedBuffer();
+      }
    } else {
+      if (effectiveParams.paddedExecution) {
+         throw std::runtime_error("SOFIE cuBLASLt quantized GEMM padded execution currently requires int8 input carriers");
+      }
       const int inputBlocks = static_cast<int>((inputElements + threads - 1) / threads);
       const float *inputFloat = static_cast<const float *>(input);
       INTERNAL::QuantizedGemmCudaQuantizeInputKernel<<<inputBlocks, threads, 0, stream>>>(
@@ -865,42 +1039,62 @@ inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &state, QuantizedG
    bool directOutputCarrier = false;
    if (effectiveParams.epilogueMode == EQuantizedCudaEpilogueMode::Quantized) {
       directOutputCarrier = true;
-      const float *biasOutputOffset = state.EnsureBiasOutputOffsetBuffer(effectiveParams, bias, stream);
+      const float *biasOutputOffset = state.EnsureBiasOutputOffsetBuffer(effectiveParams, bias, weightScaleVector, stream);
       
-      outputBytes = outputElements * (effectiveParams.outputCarrier == EQuantizedCudaOutputCarrier::UInt8 ? sizeof(std::uint8_t) : sizeof(std::int8_t));
+      outputBytes = logicalOutputElements * (effectiveParams.outputCarrier == EQuantizedCudaOutputCarrier::UInt8 ? sizeof(std::uint8_t) : sizeof(std::int8_t));
+      void *epilogueOutput = effectiveParams.paddedExecution ? state.OutputQuantizedBuffer() : output;
+      if (epilogueOutput == nullptr) {
+         throw std::runtime_error("SOFIE cuBLASLt quantized GEMM padded execution did not allocate an output scratch buffer");
+      }
       if (effectiveParams.outputCarrier == EQuantizedCudaOutputCarrier::UInt8) {
-         auto *quantizedOutput = static_cast<std::uint8_t *>(output);
+         auto *quantizedOutput = static_cast<std::uint8_t *>(epilogueOutput);
          if (effectiveParams.hasBias && bias != nullptr) {
             if (effectiveParams.hasRelu) {
-               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::uint8_t, true, true><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), biasOutputOffset, effectiveParams);
+               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::uint8_t, true, true><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), biasOutputOffset, weightScaleVector, effectiveParams);
             } else {
-               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::uint8_t, true, false><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), biasOutputOffset, effectiveParams);
+               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::uint8_t, true, false><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), biasOutputOffset, weightScaleVector, effectiveParams);
             }
          } else {
             if (effectiveParams.hasRelu) {
-               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::uint8_t, false, true><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), nullptr, effectiveParams);
+               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::uint8_t, false, true><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), nullptr, weightScaleVector, effectiveParams);
             } else {
-               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::uint8_t, false, false><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), nullptr, effectiveParams);
+               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::uint8_t, false, false><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), nullptr, weightScaleVector, effectiveParams);
             }
          }
       } else {
-         auto *quantizedOutput = static_cast<std::int8_t *>(output);
+         auto *quantizedOutput = static_cast<std::int8_t *>(epilogueOutput);
          if (effectiveParams.hasBias && bias != nullptr) {
             if (effectiveParams.hasRelu) {
-               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::int8_t, true, true><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), biasOutputOffset, effectiveParams);
+               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::int8_t, true, true><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), biasOutputOffset, weightScaleVector, effectiveParams);
             } else {
-               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::int8_t, true, false><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), biasOutputOffset, effectiveParams);
+               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::int8_t, true, false><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), biasOutputOffset, weightScaleVector, effectiveParams);
             }
          } else {
             if (effectiveParams.hasRelu) {
-               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::int8_t, false, true><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), nullptr, effectiveParams);
+               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::int8_t, false, true><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), nullptr, weightScaleVector, effectiveParams);
             } else {
-               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::int8_t, false, false><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), nullptr, effectiveParams);
+               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::int8_t, false, false><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), nullptr, weightScaleVector, effectiveParams);
             }
          }
       }
       INTERNAL::CheckCudaStatus(cudaGetLastError(), "QuantizedGemmCudaQuantizedEpilogueKernel launch");
+      if (effectiveParams.paddedExecution) {
+         if (effectiveParams.outputCarrier == EQuantizedCudaOutputCarrier::UInt8) {
+            QuantizedGemmCudaUnpadUInt8Matrix(stream, static_cast<const std::uint8_t *>(state.OutputQuantizedBuffer()),
+                                                        static_cast<std::uint8_t *>(output),
+                                                        effectiveParams.logicalM, effectiveParams.logicalN,
+                                                        effectiveParams.m, effectiveParams.n);
+         } else {
+            QuantizedGemmCudaUnpadInt8Matrix(stream, static_cast<const std::int8_t *>(state.OutputQuantizedBuffer()),
+                                                       static_cast<std::int8_t *>(output),
+                                                       effectiveParams.logicalM, effectiveParams.logicalN,
+                                                       effectiveParams.m, effectiveParams.n);
+         }
+      }
    } else {
+      if (effectiveParams.paddedExecution) {
+         throw std::runtime_error("SOFIE cuBLASLt quantized GEMM padded execution currently requires quantized output mode");
+      }
       auto *floatOutput = static_cast<float *>(output);
       INTERNAL::QuantizedGemmCudaEpilogueKernel<<<outputBlocks, threads, 0, stream>>>(floatOutput, state.AccumulatorBuffer(), bias, effectiveParams);
       INTERNAL::CheckCudaStatus(cudaGetLastError(), "QuantizedGemmCudaEpilogueKernel launch");

@@ -5,6 +5,7 @@
 #include "SOFIE/ROperator.hxx"
 #include "SOFIE/SOFIE_common.hxx"
 #include "SOFIE/RQuantization.hxx"
+#include "SOFIE/RQuantization_Parameters.hxx"
 
 #include <cmath>
 #include <limits>
@@ -34,12 +35,22 @@ private:
    double fScale = 1.0;
    std::int64_t fZeroPoint = 0;
    unsigned fBitWidth = 0;
+   bool fHasVectorParameters = false;
    double fQMin = 0.0;
    double fQMax = 0.0;
 
-   static float GetScalarFloat(RModel &model, const std::string &tensorName)
+   static std::vector<float> GetFloatInitializer(RModel &model, const std::string &tensorName)
    {
       auto values = model.GetTensorData<float>(tensorName);
+      if (values.empty()) {
+         throw std::runtime_error("SOFIE QONNX Quant expected non-empty FLOAT initializer " + tensorName);
+      }
+      return values;
+   }
+
+   static float GetScalarFloat(RModel &model, const std::string &tensorName)
+   {
+      auto values = GetFloatInitializer(model, tensorName);
       if (values.size() != 1) {
          throw std::runtime_error("SOFIE QONNX Quant expected scalar FLOAT initializer " + tensorName);
       }
@@ -72,6 +83,7 @@ public:
    }
 
    bool IsQuantizationBoundary() const override { return true; }
+   std::string GetQuantizationSourceTensor() const override { return fNX; }
 
    std::vector<ETensorType> TypeInference(std::vector<ETensorType> input) override
    {
@@ -95,40 +107,38 @@ public:
          throw std::runtime_error("SOFIE QONNX Quant scale, zero-point, and bit-width must be initialized tensors");
       }
 
-      fScale = static_cast<double>(GetScalarFloat(model, fNScale));
-      const double zeroPointFloat = static_cast<double>(GetScalarFloat(model, fNZeroPoint));
+      const auto scaleValues = GetFloatInitializer(model, fNScale);
+      const auto zeroPointValues = GetFloatInitializer(model, fNZeroPoint);
       const double bitWidthFloat = static_cast<double>(GetScalarFloat(model, fNBitWidth));
 
-      if (!(fScale > 0.0)) {
-         throw std::runtime_error("SOFIE QONNX Quant scale must be positive for tensor " + fNY);
-      }
-      if (std::round(zeroPointFloat) != zeroPointFloat) {
-         throw std::runtime_error("SOFIE QONNX Quant zero-point must be integral for tensor " + fNY);
-      }
-      if (std::round(bitWidthFloat) != bitWidthFloat || bitWidthFloat <= 0.0) {
-         throw std::runtime_error("SOFIE QONNX Quant bit-width must be a positive integer for tensor " + fNY);
+      if (std::round(bitWidthFloat) != bitWidthFloat || bitWidthFloat <= 0.0 || bitWidthFloat > 32.0) {
+         throw std::runtime_error("SOFIE QONNX Quant bit-width must be an integer in [1, 32] for tensor " + fNY);
       }
 
-      fZeroPoint = static_cast<std::int64_t>(zeroPointFloat);
       fBitWidth = static_cast<unsigned>(bitWidthFloat);
-
-      QuantizationInfo info;
-      info.bitWidth = fBitWidth;
-      info.isSigned = fIsSigned;
-      info.narrow = fNarrow;
-      info.scale = fScale;
-      info.zeroPoint = fZeroPoint;
-      info.rounding = fRounding;
-      info.overflow = fOverflow;
-      info.granularity = EQuantizationGranularity::PerTensor;
-      info.axis = -1;
+      fShape = model.GetTensorShape(fNX);
+      QuantizationParameterSpec spec;
+      spec.scales.assign(scaleValues.begin(), scaleValues.end());
+      spec.zeroPoints = ValidateIntegralZeroPoints(zeroPointValues, "SOFIE QONNX Quant " + fNY);
+      spec.bitWidth = fBitWidth;
+      spec.isSigned = fIsSigned;
+      spec.narrow = fNarrow;
+      spec.rounding = fRounding;
+      spec.overflow = fOverflow;
+      spec.scaleTensor = fNScale;
+      spec.zeroPointTensor = fNZeroPoint;
+      spec.tensorShape = fShape;
+      spec.context = "SOFIE QONNX Quant " + fNY;
+      auto info = MakeValidatedQuantizationInfo(spec);
+      fScale = info.scale;
+      fZeroPoint = info.zeroPoint;
+      fHasVectorParameters = info.granularity == EQuantizationGranularity::PerChannel;
 
       auto [qMin, qMax] = QuantizedIntegerRange(info);
       fQMin = static_cast<double>(qMin);
       fQMax = static_cast<double>(qMax);
       model.AddQuantizationInfo(fNY, std::move(info));
 
-      fShape = model.GetTensorShape(fNX);
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShape);
       model.AddNeededStdLib("cmath");
    }
@@ -138,6 +148,9 @@ public:
       OpName = "op_" + OpName;
       if (fBitWidth == 0) {
          throw std::runtime_error("SOFIE QONNX Quant called to Generate without being initialized first");
+      }
+      if (fHasVectorParameters) {
+         throw std::runtime_error("SOFIE QONNX Quant literal code generation supports scalar parameters only; vector parameters require a fused quantized lowering");
       }
       const auto length = ConvertShapeToLength(fShape);
       const std::string scaledValue = "((static_cast<double>(tensor_" + fNX + "[id]) / " + std::to_string(fScale) + ") + " + std::to_string(fZeroPoint) + ")";
