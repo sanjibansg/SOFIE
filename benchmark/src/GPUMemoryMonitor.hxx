@@ -28,15 +28,17 @@ public:
 
     void Start(std::chrono::microseconds interval = std::chrono::microseconds(50))
     {
+        Start(static_cast<unsigned int>(getpid()), interval);
+    }
+
+    void Start(unsigned int pid, std::chrono::microseconds interval = std::chrono::microseconds(50)) {
         if (fRunning)
             return;
 
         fPeakBytes = 0;
         fRunning = true;
 
-        fThread = std::thread([this, interval]() {
-
-            const unsigned int pid = static_cast<unsigned int>(getpid());
+        fThread = std::thread([this, pid, interval]() {
 
             while (fRunning) {
 

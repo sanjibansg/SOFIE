@@ -21,6 +21,8 @@ option(SOFIE_BENCHMARK_ORT
     "Also benchmark ONNX Runtime GPU alongside SOFIE (requires ORT ≥ 1.18)"
     OFF)
 
+option(SOFIE_BENCHMARK_TRT "Enable TensorRT benchmark comparison" OFF)
+
 option(SOFIE_BENCHMARK_PROFILE
     "Enable per-operator GPU profiling (per-op timing + memory breakdown). \
 Mutually exclusive with throughput benchmarking — rebuild without this flag \
@@ -206,6 +208,11 @@ if(SOFIE_BENCHMARK_ORT AND NOT SOFIE_ORT_FOUND)
     message(STATUS "SOFIE Benchmark: ORT benchmarking disabled (library not found)")
 endif()
 
+if(SOFIE_BENCHMARK_TRT)
+    find_library(NVINFER_LIBRARY nvinfer REQUIRED)
+    find_library(NVONNXPARSER_LIBRARY nvonnxparser REQUIRED)
+endif()
+
 ################################################################################
 # Build per-model strings for configure_file
 ################################################################################
@@ -255,7 +262,12 @@ foreach(ONNX_FILE ${BENCHMARK_ONNX_MODELS})
         "    if (model == \"${MODEL_CPPNAME}\") {\n"
         "        Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir);\n"
         "#ifdef SOFIE_BENCHMARK_ORT\n"
-        "        if (run_ort) BenchmarkORT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations);\n"
+        "        if (run_ort)\n"
+        "            BenchmarkORT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations);\n"
+        "#endif\n"
+        "#ifdef SOFIE_BENCHMARK_TRT\n"
+        "        if (run_trt)\n"
+        "            BenchmarkTRT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations);\n"
         "#endif\n"
         "        return 0;\n"
         "    }\n"
@@ -419,6 +431,7 @@ target_compile_definitions(sofie_benchmark PRIVATE
     ${_SOFIE_BENCH_BACKEND_DEFINE}
     ALPAKA_HAS_STD_ATOMIC_REF
     $<$<BOOL:${SOFIE_ORT_FOUND}>:SOFIE_BENCHMARK_ORT>
+    $<$<BOOL:${SOFIE_BENCHMARK_TRT}>:SOFIE_BENCHMARK_TRT>
     $<$<BOOL:${SOFIE_BENCHMARK_PROFILE}>:SOFIE_BENCHMARK_PROFILE>
 )
 
@@ -446,14 +459,15 @@ target_compile_options(sofie_benchmark PRIVATE
 )
 
 target_link_libraries(sofie_benchmark PRIVATE
-        SOFIE_core
-        CUDA::cudart
-        CUDA::cublas
-        CUDA::cublasLt
-        ${NVML_LIBRARY}
-        $<$<BOOL:${SOFIE_ORT_FOUND}>:${SOFIE_ORT_TARGET}>
+    SOFIE_core
+    CUDA::cudart
+    CUDA::cublas
+    CUDA::cublasLt
+    ${NVML_LIBRARY}
+    $<$<BOOL:${SOFIE_ORT_FOUND}>:${SOFIE_ORT_TARGET}>
+    $<$<BOOL:${SOFIE_BENCHMARK_TRT}>:${NVINFER_LIBRARY}>
+    $<$<BOOL:${SOFIE_BENCHMARK_TRT}>:${NVONNXPARSER_LIBRARY}>
 )
-
 if(SOFIE_ORT_FOUND)
     message(STATUS "SOFIE Benchmark: target 'sofie_benchmark' configured "
                    "(${N_MODELS} model(s), CUDA backend + ORT-GPU)")

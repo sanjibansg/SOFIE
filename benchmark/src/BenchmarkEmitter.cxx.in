@@ -302,7 +302,7 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         << "    double avg_out_ms    = std::chrono::duration<double, std::milli>"
            "(t1_out   - t0_out  ).count() / iterations;\n"
         << "    double throughput    = (avg_infer_ms > 0.0) ? 1000.0 / avg_infer_ms : 0.0;\n\n"
-        << "    std::printf(\"%-40s %12.4f %14.4f %15.4f %16.1f %10.2f %10.2f %10.2f %10.2f %10.2f %12.2f\\n\", "
+        << "    std::printf(\"%-50s %12.4f %14.4f %15.4f %16.1f %10.2f %10.2f %10.2f %10.2f %10.2f %12.2f\\n\", "
         << "                \"" << modelName << "\",\n"
         << "                avg_infer_ms,\n"
         << "                avg_in_ms,\n"

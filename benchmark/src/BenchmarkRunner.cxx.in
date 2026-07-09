@@ -27,6 +27,11 @@
 #include "ONNXRuntimeBenchmark.hxx"
 #endif
 
+// Optional TensorRT comparison
+#ifdef SOFIE_BENCHMARK_TRT
+#include "TensorRTBenchmark.hxx"
+#endif
+
 // Forward-declare one per-model benchmark function (defined in <model>_bench.cu)
 @BENCHMARK_FWD_DECLS@
 
@@ -34,9 +39,11 @@
 // Dispatch table: called when --single-model <name> is given.
 // ---------------------------------------------------------------------------
 static int run_single_model(const std::string& model,
-                             int warmup, int iterations,
-                             const std::string& weightsDir,
-                             bool run_ort)
+                            int warmup,
+                            int iterations,
+                            const std::string& weightsDir,
+                            bool run_ort,
+                            bool run_trt)
 {
 @BENCHMARK_SINGLE_MODEL_CASES@
     std::fprintf(stderr, "Unknown model: %s\n", model.c_str());
@@ -48,7 +55,8 @@ int main(int argc, char *argv[]) {
     int iterations = 100;
     std::string weightsDir = ".";
     bool run_ort   = false;
-    bool profile = false;
+    bool run_trt   = false;
+    bool profile   = false;
     std::string ncuPath;
     std::string singleModel;
 
@@ -59,6 +67,7 @@ int main(int argc, char *argv[]) {
         else if  (a == "--weights-dir"                 && i + 1 < argc) weightsDir = argv[++i];
         else if  (a == "--single-model"                && i + 1 < argc) singleModel = argv[++i];
         else if  (a == "--onnxruntime"   || a == "--ort")               run_ort    = true;
+        else if (a == "--tensorrt" || a == "--trt")                     run_trt = true;
         else if (a == "--profile")                                      profile = true;
         else if (a == "--ncu" && i + 1 < argc)                          ncuPath = argv[++i];
         else if  (a == "--help"          || a == "-h") {
@@ -123,7 +132,7 @@ int main(int argc, char *argv[]) {
     // All GPU memory is freed when this process exits.
     // -----------------------------------------------------------------------
     if (!singleModel.empty())
-        return run_single_model(singleModel, warmup, iterations, weightsDir, run_ort);
+        return run_single_model(singleModel, warmup, iterations, weightsDir, run_ort, run_trt);
 
     // -----------------------------------------------------------------------
     // Orchestrator mode: spawn one child process per model so every model
@@ -151,7 +160,7 @@ int main(int argc, char *argv[]) {
 #endif
     std::printf("\n\n");
 
-    std::printf("%-40s %12s %14s %15s %16s %10s %10s %10s %10s %10s %12s\n",
+    std::printf("%-50s %12s %14s %15s %16s %10s %10s %10s %10s %10s %12s\n",
                 "Model",
                 "infer(ms)",
                 "in_xfer(ms)",
@@ -187,12 +196,17 @@ int main(int argc, char *argv[]) {
 
     // Store filename in environment so child processes can use it
     std::string resultsFile = resultsDir + "/benchmark.csv";
+    std::string ortResultsFile = resultsDir + "/ort_benchmark.csv";
+    std::string trtResultsFile = resultsDir + "/trt_benchmark.csv";
 
     #ifdef _WIN32
     _putenv_s("SOFIE_BENCHMARK_RESULTS", resultsFile.c_str());
+    _putenv_s("SOFIE_ORT_RESULTS", ortResultsFile.c_str());
     _putenv_s("SOFIE_BENCHMARK_RESULTS_DIR", resultsDir.c_str());
     #else
     setenv("SOFIE_BENCHMARK_RESULTS", resultsFile.c_str(), 1);
+    setenv("SOFIE_ORT_RESULTS", ortResultsFile.c_str(), 1);
+    setenv("SOFIE_TRT_RESULTS", trtResultsFile.c_str(), 1);
     setenv("SOFIE_BENCHMARK_RESULTS_DIR", resultsDir.c_str(), 1);
     #endif
 
@@ -209,6 +223,24 @@ int main(int argc, char *argv[]) {
             << "sofie_fragmentation_percent,"
             << "gpu_peak_mem_mb\n";
 
+    {
+        std::ofstream ortResults(ortResultsFile, std::ios::trunc);
+
+        ortResults
+            << "Model,"
+            << "infer_ms,"
+            << "throughput_inf_s,"
+            << "gpu_peak_mem_mb\n";
+    }
+
+    {
+        std::ofstream trtResults(trtResultsFile, std::ios::trunc);
+        trtResults << "Model,"
+                   << "infer_ms,"
+                   << "throughput_inf_s,"
+                   << "gpu_peak_mem_mb\n";
+    }
+
     results.flush();
     results.close();
 
@@ -222,6 +254,7 @@ int main(int argc, char *argv[]) {
            << " --weights-dir \"" << weightsDir << "\"";
 
     if (run_ort) common << " --ort";
+    if (run_trt) common << " --trt";
     if (profile) common << " --profile";
     if (!ncuPath.empty()) common << " --ncu \"" << ncuPath << "\"";
 
