@@ -737,6 +737,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
             fileName += ".dat";
          if (fWeightFile == WeightFileType::RootBinary)
             fileName += ".root";
+         if (fWeightFile == WeightFileType::Binary)
+            fileName += ".bin";
 
          fGC += sessionName + "(std::string filename =\"" + fileName + "\"";
       } else {
@@ -850,6 +852,18 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
       fUseWeightFile = true;
       fWeightFile = WeightFileType::RootBinary;
    }
+   if (static_cast<std::underlying_type_t<Options>>(Options::kBinaryWeightFile) & options) {
+      fUseWeightFile = true;
+      fWeightFile = WeightFileType::Binary;
+   }
+   if (static_cast<std::underlying_type_t<Options>>(Options::kTextWeightFile) & options) {
+      fUseWeightFile = true;
+      fWeightFile = WeightFileType::Text;
+   }
+   const auto explicitWeightPolicy = static_cast<std::underlying_type_t<Options>>(Options::kNoWeightFile) |
+                                     static_cast<std::underlying_type_t<Options>>(Options::kRootBinaryWeightFile) |
+                                     static_cast<std::underlying_type_t<Options>>(Options::kBinaryWeightFile) |
+                                     static_cast<std::underlying_type_t<Options>>(Options::kTextWeightFile);
    if (fUseWeightFile && !fUseSession) {
       throw std::runtime_error(
           "sofie: RModel::Generate: cannot use a separate weight file without generating a Session class");
@@ -860,6 +874,12 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
       throw std::runtime_error("SOFIE GPU does not yet supports GNN Inference.");
 
    Initialize(batchSize, verbose);
+   if ((options & explicitWeightPolicy) == 0 && !fQuantizationState.tensorInfos.empty()) {
+      fUseWeightFile = true;
+      fWeightFile = WeightFileType::Binary;
+   }
+   if (fWeightFile == WeightFileType::Binary)
+      AddNeededCustomHeader("SOFIE/RWeightFile.hxx");
    BuildLoweredOperatorView(EQuantizedBackend::ALPAKA);
    AddQuantizedGeneratedHeaders(EQuantizedBackend::ALPAKA);
    FuseGemmActivations_GPU();   // must run before elementwise fusion (redirects tensors)

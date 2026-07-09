@@ -103,6 +103,14 @@ if (ENABLE_ALPAKA_TESTS)
     FIXTURES_SETUP sofie-compile-models-onnx-alpaka
   )
 
+  ROOTTEST_ADD_TEST(
+    SofieQuantizedStorageExternalized_ONNX_Alpaka
+    COMMAND ${CMAKE_COMMAND}
+            -DGENERATED_DIR=${CMAKE_CURRENT_BINARY_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/CheckQuantizedStorageExternalized.cmake
+    FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka
+  )
+
   ##########################################################################
   # CUDA backend
   ##########################################################################

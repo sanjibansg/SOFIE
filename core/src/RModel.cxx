@@ -12,6 +12,7 @@
 
 #include "SOFIE/RModel.hxx"
 #include "SOFIE/RModelProfiler.hxx"
+#include "SOFIE/RWeightFile.hxx"
 #include "SOFIE/SOFIE_common.hxx"
 
 namespace SOFIE {
@@ -1375,6 +1376,9 @@ void RModel::GenerateSessionCode()
          if (fWeightFile == WeightFileType::RootBinary) {
             fileName += ".root";
          }
+         if (fWeightFile == WeightFileType::Binary) {
+            fileName += ".bin";
+         }
          fGC += sessionName + "(std::string filename =\"" + fileName + "\"";
       } else {
          // no need to pass weight file since it is not used
@@ -1525,6 +1529,18 @@ void RModel::Generate(std::underlying_type_t<Options> options, int batchSize, lo
       fUseWeightFile = true;
       fWeightFile = WeightFileType::RootBinary;
    }
+   if (static_cast<std::underlying_type_t<Options>>(Options::kBinaryWeightFile) & options) {
+      fUseWeightFile = true;
+      fWeightFile = WeightFileType::Binary;
+   }
+   if (static_cast<std::underlying_type_t<Options>>(Options::kTextWeightFile) & options) {
+      fUseWeightFile = true;
+      fWeightFile = WeightFileType::Text;
+   }
+   const auto explicitWeightPolicy = static_cast<std::underlying_type_t<Options>>(Options::kNoWeightFile) |
+                                     static_cast<std::underlying_type_t<Options>>(Options::kRootBinaryWeightFile) |
+                                     static_cast<std::underlying_type_t<Options>>(Options::kBinaryWeightFile) |
+                                     static_cast<std::underlying_type_t<Options>>(Options::kTextWeightFile);
    if (fUseWeightFile && !fUseSession) {
       throw std::runtime_error(
          "sofie: RModel::Generate: cannot use a separate weight file without generating a Session class");
@@ -1540,6 +1556,12 @@ void RModel::Generate(std::underlying_type_t<Options> options, int batchSize, lo
 
    // initialize the model including all operators and sub-graphs
    Initialize(batchSize, verbose);
+   if ((options & explicitWeightPolicy) == 0 && !fQuantizationState.tensorInfos.empty()) {
+      fUseWeightFile = true;
+      fWeightFile = WeightFileType::Binary;
+   }
+   if (fWeightFile == WeightFileType::Binary)
+      AddNeededCustomHeader("SOFIE/RWeightFile.hxx");
    BuildLoweredOperatorView(EQuantizedBackend::CPU);
 
    AddQuantizedGeneratedHeaders(EQuantizedBackend::CPU);
@@ -1613,6 +1635,29 @@ void RModel::ReadInitializedTensorsFromFile(long pos) {
         fGC += "   f.close();\n";
     }
 
+    if (fWeightFile == WeightFileType::Binary) {
+        if (!fUseWeightFile) return;
+        if (fIsGNNComponent || pos != 0)
+            throw std::runtime_error("SOFIE binary weight files do not support appended GNN component offsets");
+
+        const auto binaryWeights = CollectBinaryWeightTensors(fInitializedTensors);
+        fGC += "   std::ifstream f(filename, std::ios::binary);\n";
+        fGC += "   if (!f.is_open()) throw std::runtime_error(\"sofie failed to open binary weight file \" + filename);\n";
+        fGC += "   SOFIE::ReadBinaryWeightFileHeader(f, " + std::to_string(binaryWeights.size()) + ");\n";
+        for (const auto &[name, tensor] : binaryWeights) {
+            const auto type = tensor->type();
+            if (!IsBinaryWeightTensorType(type))
+                throw std::runtime_error("sofie tensor " + name + " has a type unsupported by binary weights");
+            std::string shape = "{";
+            for (auto dim : tensor->shape()) shape += std::to_string(dim) + ",";
+            shape += "}";
+            fGC += "   SOFIE::ReadTensorFromBinaryStream(f, tensor_" + name + ", \"tensor_" + name +
+                   "\", static_cast<SOFIE::ETensorType>(" + std::to_string(static_cast<int>(type)) +
+                   "), std::vector<std::size_t>" + shape + ");\n";
+        }
+        fGC += "   f.close();\n";
+    }
+
     // generate the code to read initialized tensors from a ROOT data file
     if(fWeightFile == WeightFileType::RootBinary) {
 #ifdef SOFIE_SUPPORT_ROOT_BINARY
@@ -1666,6 +1711,9 @@ long RModel::WriteInitializedTensorsToFile(std::string filename) {
     case WeightFileType::Text:
         fileExtension = ".dat";
         break;
+    case WeightFileType::Binary:
+        fileExtension = ".bin";
+        break;
     }
 
     // If filename is empty, use the model name as the base filename
@@ -1674,7 +1722,16 @@ long RModel::WriteInitializedTensorsToFile(std::string filename) {
     }
 
     // Write the initialized tensors to the file
-    if (fWeightFile == WeightFileType::RootBinary) {
+    if (fWeightFile == WeightFileType::Binary) {
+        if (fIsGNNComponent || fIsGNN)
+            throw std::runtime_error("SOFIE binary weight files do not support appended GNN components");
+        std::ofstream f(filename, std::ios::binary | std::ios::trunc);
+        if (!f.is_open())
+            throw std::runtime_error("sofie failed to open binary weight file " + filename);
+        const auto position = WriteBinaryWeightFile(f, fInitializedTensors);
+        f.close();
+        return position;
+    } else if (fWeightFile == WeightFileType::RootBinary) {
 #ifdef SOFIE_SUPPORT_ROOT_BINARY
         if(fIsGNNComponent || fIsGNN) {
             throw std::runtime_error("SOFIE-GNN yet not supports writing to a ROOT file.");
@@ -2034,9 +2091,13 @@ void RModel::OutputGenerated(std::string filename, bool append) {
                 filename = filename.erase(pos, 4);
                 filename += ".root";
             }
+            if (fWeightFile == WeightFileType::Binary)
+                filename.replace(pos, 4, ".bin");
         } else {
             filename = fName;
-            filename += fWeightFile == WeightFileType::Text ? ".dat" : ".root";
+            if (fWeightFile == WeightFileType::Text) filename += ".dat";
+            else if (fWeightFile == WeightFileType::RootBinary) filename += ".root";
+            else if (fWeightFile == WeightFileType::Binary) filename += ".bin";
         }
         WriteInitializedTensorsToFile(filename);
     }

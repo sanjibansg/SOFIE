@@ -19,6 +19,7 @@ set(sources_headers
    SOFIE/RModel.hxx
    SOFIE/RModelProfiler.hxx
    SOFIE/RModelProfilerGPU.hxx
+   SOFIE/RWeightFile.hxx
    SOFIE/ROperator.hxx
    SOFIE/ROperator_BasicUnary.hxx
    SOFIE/ROperator_BasicBinary.hxx
@@ -91,6 +92,7 @@ set(sources_cxx
     src/RModel_Base.cxx
     src/RModel.cxx
     src/RModel_Quantization.cxx
+    src/RWeightFile.cxx
     src/RQuantization_Analysis.cxx
     src/RQuantization_DenseLinear.cxx
     src/RQuantization_Parameters.cxx

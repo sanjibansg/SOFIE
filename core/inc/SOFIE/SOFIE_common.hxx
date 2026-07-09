@@ -303,7 +303,7 @@ public:
    void SetNotWritable() { fIsNotWritable = true;}
    // set writable initialized tensors - i.e. tensor that must be written in a file
    void SetWritable() { fIsNotWritable = false;}
-   // set as constant (needed for non-float initialized tensors)
+   // embed an initialized tensor in generated code instead of the weight file
    void SetConstant() { fConstant = true;}
 
    template <class T = void>
