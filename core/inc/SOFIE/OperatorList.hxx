@@ -2,6 +2,7 @@
 #include "SOFIE/ROperator_Gemm.hxx"
 #include "SOFIE/ROperator_QuantizedGemm.hxx"
 #include "SOFIE/ROperator_QuantizedMatMul.hxx"
+#include "SOFIE/ROperator_ONNXQuantizeLinear.hxx"
 #include "SOFIE/ROperator_Relu.hxx"
 #include "SOFIE/ROperator_Tanh.hxx"
 #include "SOFIE/ROperator_LeakyRelu.hxx"

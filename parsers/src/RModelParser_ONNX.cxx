@@ -74,6 +74,8 @@ extern ParserFuncSignature ParseSelu;
 extern ParserFuncSignature ParseSigmoid;
 extern ParserFuncSignature ParseGemm;
 extern ParserFuncSignature ParseQONNXQuant;
+extern ParserFuncSignature ParseQuantizeLinear;
+extern ParserFuncSignature ParseDequantizeLinear;
 extern ParserFuncSignature ParseRNN;
 extern ParserFuncSignature ParseLSTM;
 extern ParserFuncSignature ParsePool;
@@ -202,6 +204,46 @@ struct ExtractDataFromTP<int32_t> {
    }
 };
 template<>
+struct ExtractDataFromTP<int8_t> {
+   static void Copy(onnx::TensorProto * tensor, void * data) {
+      auto *out = static_cast<int8_t *>(data);
+      for (int i = 0; i < tensor->int32_data_size(); ++i)
+         out[i] = static_cast<int8_t>(tensor->int32_data(i));
+   }
+};
+template<>
+struct ExtractDataFromTP<uint8_t> {
+   static void Copy(onnx::TensorProto * tensor, void * data) {
+      auto *out = static_cast<uint8_t *>(data);
+      for (int i = 0; i < tensor->int32_data_size(); ++i)
+         out[i] = static_cast<uint8_t>(tensor->int32_data(i));
+   }
+};
+template<>
+struct ExtractDataFromTP<int16_t> {
+   static void Copy(onnx::TensorProto * tensor, void * data) {
+      auto *out = static_cast<int16_t *>(data);
+      for (int i = 0; i < tensor->int32_data_size(); ++i)
+         out[i] = static_cast<int16_t>(tensor->int32_data(i));
+   }
+};
+template<>
+struct ExtractDataFromTP<uint16_t> {
+   static void Copy(onnx::TensorProto * tensor, void * data) {
+      auto *out = static_cast<uint16_t *>(data);
+      for (int i = 0; i < tensor->int32_data_size(); ++i)
+         out[i] = static_cast<uint16_t>(tensor->int32_data(i));
+   }
+};
+template<>
+struct ExtractDataFromTP<uint32_t> {
+   static void Copy(onnx::TensorProto * tensor, void * data) {
+      auto *out = static_cast<uint32_t *>(data);
+      for (int i = 0; i < tensor->uint64_data_size(); ++i)
+         out[i] = static_cast<uint32_t>(tensor->uint64_data(i));
+   }
+};
+template<>
 struct ExtractDataFromTP<int64_t> {
    static void Copy(onnx::TensorProto * tensor, void * data) {
       tensor->mutable_int64_data()->ExtractSubrange(0, tensor->int64_data_size(),
@@ -293,6 +335,8 @@ RModelParser_ONNX::RModelParser_ONNX() noexcept : fOperatorsMapImpl(std::make_un
    RegisterOperator("Conv", ParseConv);
    RegisterOperator("ConvTranspose", ParseConvTranspose);
    RegisterOperator("Gemm", ParseGemm);
+   RegisterOperator("QuantizeLinear", ParseQuantizeLinear);
+   RegisterOperator("DequantizeLinear", ParseDequantizeLinear);
    RegisterOperator("qonnx.custom_op.general", "Quant", ParseQONNXQuant);
    RegisterOperator("GRU", ParseGRU);
    RegisterOperator("Identity", ParseIdentity);
@@ -713,10 +757,45 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
          allInitializedTensors[input_name] = i;
          break;
       }
+      case ETensorType::INT8: {
+         std::shared_ptr<void> data = GetInitializedTensorData<int8_t>(tensorproto, fLength);
+         if (verbose) std::cout << "add INT8 initialized tensor " << input_name << " shape " << ConvertShapeToString(shape) << std::endl;
+         rmodel.AddInitializedTensor(input_name, ETensorType::INT8, shape, data);
+         allInitializedTensors[input_name] = i;
+         break;
+      }
+      case ETensorType::UINT8: {
+         std::shared_ptr<void> data = GetInitializedTensorData<uint8_t>(tensorproto, fLength);
+         if (verbose) std::cout << "add UINT8 initialized tensor " << input_name << " shape " << ConvertShapeToString(shape) << std::endl;
+         rmodel.AddInitializedTensor(input_name, ETensorType::UINT8, shape, data);
+         allInitializedTensors[input_name] = i;
+         break;
+      }
+      case ETensorType::INT16: {
+         std::shared_ptr<void> data = GetInitializedTensorData<int16_t>(tensorproto, fLength);
+         if (verbose) std::cout << "add INT16 initialized tensor " << input_name << " shape " << ConvertShapeToString(shape) << std::endl;
+         rmodel.AddInitializedTensor(input_name, ETensorType::INT16, shape, data);
+         allInitializedTensors[input_name] = i;
+         break;
+      }
+      case ETensorType::UINT16: {
+         std::shared_ptr<void> data = GetInitializedTensorData<uint16_t>(tensorproto, fLength);
+         if (verbose) std::cout << "add UINT16 initialized tensor " << input_name << " shape " << ConvertShapeToString(shape) << std::endl;
+         rmodel.AddInitializedTensor(input_name, ETensorType::UINT16, shape, data);
+         allInitializedTensors[input_name] = i;
+         break;
+      }
       case ETensorType::INT32: {
          std::shared_ptr<void> data = GetInitializedTensorData<int32_t>(tensorproto, fLength);
          if (verbose) std::cout << "add INT32 initialized tensor " << input_name << " shape " << ConvertShapeToString(shape) << std::endl;
          rmodel.AddInitializedTensor(input_name, ETensorType::INT32, shape, data);
+         allInitializedTensors[input_name] = i;
+         break;
+      }
+      case ETensorType::UINT32: {
+         std::shared_ptr<void> data = GetInitializedTensorData<uint32_t>(tensorproto, fLength);
+         if (verbose) std::cout << "add UINT32 initialized tensor " << input_name << " shape " << ConvertShapeToString(shape) << std::endl;
+         rmodel.AddInitializedTensor(input_name, ETensorType::UINT32, shape, data);
          allInitializedTensors[input_name] = i;
          break;
       }

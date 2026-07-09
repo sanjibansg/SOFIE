@@ -68,6 +68,7 @@ set(sources_headers
    SOFIE/ROperator_SubGraph.hxx
    SOFIE/ROperator_Pad.hxx
    SOFIE/ROperator_QONNXQuant.hxx
+   SOFIE/ROperator_ONNXQuantizeLinear.hxx
    SOFIE/ROperator_Where.hxx
    SOFIE/ROperator_Einsum.hxx
    SOFIE/ROperator_Random.hxx
