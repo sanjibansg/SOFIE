@@ -179,6 +179,8 @@ int main(int argc, char *argv[]) {
     namespace fs = std::filesystem;
 
     // Create results directory if it doesn't exist
+    namespace fs = std::filesystem;
+
     fs::create_directories("../../results");
 
     // Create timestamp
@@ -194,24 +196,69 @@ int main(int argc, char *argv[]) {
 
     fs::create_directories(resultsDir);
 
-    // Store filename in environment so child processes can use it
-    std::string resultsFile = resultsDir + "/benchmark.csv";
-    std::string ortResultsFile = resultsDir + "/ort_benchmark.csv";
-    std::string trtResultsFile = resultsDir + "/trt_benchmark.csv";
+    // Create only the framework directories that are actually enabled
+
+    std::string sofieDir = resultsDir + "/sofie";
+    fs::create_directories(sofieDir);
+
+    std::string ortDir;
+    std::string trtDir;
+
+    if (run_ort) {
+        ortDir = resultsDir + "/ort";
+        fs::create_directories(ortDir);
+    }
+
+    if (run_trt) {
+        trtDir = resultsDir + "/tensorrt";
+        fs::create_directories(trtDir);
+    }
+
+    // Result files
+
+    std::string resultsFile = sofieDir + "/benchmark.csv";
+    std::string ortResultsFile;
+    std::string trtResultsFile;
+
+    if (run_ort)
+        ortResultsFile = ortDir + "/benchmark.csv";
+
+    if (run_trt)
+        trtResultsFile = trtDir + "/benchmark.csv";
+
+    // Environment variables
 
     #ifdef _WIN32
+
     _putenv_s("SOFIE_BENCHMARK_RESULTS", resultsFile.c_str());
-    _putenv_s("SOFIE_ORT_RESULTS", ortResultsFile.c_str());
-    _putenv_s("SOFIE_BENCHMARK_RESULTS_DIR", resultsDir.c_str());
+    _putenv_s("SOFIE_BENCHMARK_RESULTS_DIR", sofieDir.c_str());
+
+    if (run_ort)
+        _putenv_s("SOFIE_ORT_RESULTS", ortResultsFile.c_str());
+
+    if (run_trt)
+        _putenv_s("SOFIE_TRT_RESULTS", trtResultsFile.c_str());
+
     #else
+
     setenv("SOFIE_BENCHMARK_RESULTS", resultsFile.c_str(), 1);
-    setenv("SOFIE_ORT_RESULTS", ortResultsFile.c_str(), 1);
-    setenv("SOFIE_TRT_RESULTS", trtResultsFile.c_str(), 1);
-    setenv("SOFIE_BENCHMARK_RESULTS_DIR", resultsDir.c_str(), 1);
+    setenv("SOFIE_BENCHMARK_RESULTS_DIR", sofieDir.c_str(), 1);
+
+    if (run_ort)
+        setenv("SOFIE_ORT_RESULTS", ortResultsFile.c_str(), 1);
+
+    if (run_trt)
+        setenv("SOFIE_TRT_RESULTS", trtResultsFile.c_str(), 1);
+
     #endif
 
-    std::ofstream results(resultsFile);
-    results << "Model,"
+    // Create SOFIE benchmark.csv
+
+    {
+        std::ofstream results(resultsFile);
+
+        results
+            << "Model,"
             << "infer_ms,"
             << "in_xfer_ms,"
             << "out_xfer_ms,"
@@ -222,9 +269,13 @@ int main(int argc, char *argv[]) {
             << "sofie_largest_free_mb,"
             << "sofie_fragmentation_percent,"
             << "gpu_peak_mem_mb\n";
+    }
 
-    {
-        std::ofstream ortResults(ortResultsFile, std::ios::trunc);
+    // Create ORT benchmark.csv only if enabled
+
+    if (run_ort) {
+
+        std::ofstream ortResults(ortResultsFile);
 
         ortResults
             << "Model,"
@@ -233,16 +284,18 @@ int main(int argc, char *argv[]) {
             << "gpu_peak_mem_mb\n";
     }
 
-    {
-        std::ofstream trtResults(trtResultsFile, std::ios::trunc);
-        trtResults << "Model,"
-                   << "infer_ms,"
-                   << "throughput_inf_s,"
-                   << "gpu_peak_mem_mb\n";
-    }
+    // Create TensorRT benchmark.csv only if enabled
 
-    results.flush();
-    results.close();
+    if (run_trt) {
+
+        std::ofstream trtResults(trtResultsFile);
+
+        trtResults
+            << "Model,"
+            << "infer_ms,"
+            << "throughput_inf_s,"
+            << "gpu_peak_mem_mb\n";
+    }
 
 #endif  // SOFIE_BENCHMARK_PROFILE
     std::fflush(stdout);
