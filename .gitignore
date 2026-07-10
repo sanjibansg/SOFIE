@@ -40,3 +40,4 @@ install/
 
 # Benchmark results
 benchmark/results/
+benchmark/cache/
