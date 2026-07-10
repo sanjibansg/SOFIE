@@ -42,6 +42,7 @@ static int run_single_model(const std::string& model,
                             int warmup,
                             int iterations,
                             const std::string& weightsDir,
+                            bool run_sofie,
                             bool run_ort,
                             bool run_trt)
 {
@@ -56,6 +57,7 @@ int main(int argc, char *argv[]) {
     std::string weightsDir = ".";
     bool run_ort   = false;
     bool run_trt   = false;
+    bool run_sofie = true;
     bool profile   = false;
     std::string ncuPath;
     std::string singleModel;
@@ -99,11 +101,35 @@ int main(int argc, char *argv[]) {
 #endif
             return 0;
         }
+
+        // Inline flags
+        else if (a == "--sofie-only") {
+            run_sofie = true;
+            run_ort = false;
+            run_trt = false;
+        }
+        else if (a == "--ort-only") {
+            run_sofie = false;
+            run_ort = true;
+            run_trt = false;
+        }
+        else if (a == "--trt-only") {
+            run_sofie = false;
+            run_ort = false;
+            run_trt = true;
+        }
     }
 
     if (profile) {
         warmup = 0;
         iterations = 1;
+
+        #ifdef _WIN32
+            _putenv_s("SOFIE_TRT_PROFILE_ACTIVE", "1");
+        #else
+            setenv("SOFIE_TRT_PROFILE_ACTIVE", "1", 1);
+        #endif
+
         if (ncuPath.empty()) {
             std::cerr
                 << "Profiling requested, but no Nsight Compute executable was provided.\n"
@@ -132,7 +158,7 @@ int main(int argc, char *argv[]) {
     // All GPU memory is freed when this process exits.
     // -----------------------------------------------------------------------
     if (!singleModel.empty())
-        return run_single_model(singleModel, warmup, iterations, weightsDir, run_ort, run_trt);
+        return run_single_model(singleModel, warmup, iterations, weightsDir, run_sofie, run_ort, run_trt);
 
     // -----------------------------------------------------------------------
     // Orchestrator mode: spawn one child process per model so every model
@@ -242,7 +268,7 @@ int main(int argc, char *argv[]) {
     #else
 
     setenv("SOFIE_BENCHMARK_RESULTS", resultsFile.c_str(), 1);
-    setenv("SOFIE_BENCHMARK_RESULTS_DIR", sofieDir.c_str(), 1);
+    setenv("SOFIE_BENCHMARK_RESULTS_DIR", resultsDir.c_str(), 1);
 
     if (run_ort)
         setenv("SOFIE_ORT_RESULTS", ortResultsFile.c_str(), 1);
@@ -306,8 +332,6 @@ int main(int argc, char *argv[]) {
            << " -n " << iterations
            << " --weights-dir \"" << weightsDir << "\"";
 
-    if (run_ort) common << " --ort";
-    if (run_trt) common << " --trt";
     if (profile) common << " --profile";
     if (!ncuPath.empty()) common << " --ncu \"" << ncuPath << "\"";
 

@@ -211,6 +211,7 @@ endif()
 if(SOFIE_BENCHMARK_TRT)
     find_library(NVINFER_LIBRARY nvinfer REQUIRED)
     find_library(NVONNXPARSER_LIBRARY nvonnxparser REQUIRED)
+    find_library(NVINFER_PLUGIN_LIBRARY nvinfer_plugin REQUIRED)
 endif()
 
 ################################################################################
@@ -260,7 +261,8 @@ foreach(ONNX_FILE ${BENCHMARK_ONNX_MODELS})
     # Single-model dispatch: one if-branch per model (used in --single-model mode)
     string(APPEND BENCHMARK_SINGLE_MODEL_CASES
         "    if (model == \"${MODEL_CPPNAME}\") {\n"
-        "        Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir);\n"
+        "        if (run_sofie)\n"
+        "            Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir);\n"
         "#ifdef SOFIE_BENCHMARK_ORT\n"
         "        if (run_ort)\n"
         "            BenchmarkORT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations);\n"
@@ -278,33 +280,61 @@ foreach(ONNX_FILE ${BENCHMARK_ONNX_MODELS})
     # model is completely freed before the next one allocates.
     string(APPEND BENCHMARK_SPAWN_CALLS
             "    {\n"
-            "        std::string cmd;\n"
-            "        if (profile) {\n"
-            "            const char* resultsDir = std::getenv(\"SOFIE_BENCHMARK_RESULTS_DIR\");\n"
-            "            cmd = ncuPath;\n"
-            "            cmd += \" --target-processes all\";\n"
-            "            cmd += \" --quiet\";\n"
-            "            cmd += \" --csv\";\n"
-            "            cmd += \" --force-overwrite\";\n"
-            "            cmd += \" --export \";\n"
-            "            cmd += std::string(resultsDir);\n"
-            "            cmd += \"/${MODEL_NAME}\";\n"
-            "            cmd += \" --section LaunchStats\";\n"
-            "            cmd += \" --section Occupancy\";\n"
-            "            cmd += \" --section MemoryWorkloadAnalysis\";\n"
-            "            cmd += \" --section SpeedOfLight\";\n"
+
+            "        auto RunBackend = [&](const std::string& flag,\n"
+            "                              const std::string& suffix)\n"
+            "        {\n"
+            "            std::string cmd;\n"
+
+            "            if (profile) {\n"
+            "                const char* resultsDir = std::getenv(\"SOFIE_BENCHMARK_RESULTS_DIR\");\n"
+
+            "                cmd = ncuPath;\n"
+            "                cmd += \" --target-processes all\";\n"
+            "                cmd += \" --quiet\";\n"
+            "                cmd += \" --csv\";\n"
+            "                cmd += \" --force-overwrite\";\n"
+            "                cmd += \" --export \";\n"
+            "                cmd += std::string(resultsDir);\n"
+            "                cmd += \"/\" + suffix + \"/${MODEL_NAME}\";\n"
+            "                cmd += \" --section LaunchStats\";\n"
+            "                cmd += \" --section Occupancy\";\n"
+            "                cmd += \" --section MemoryWorkloadAnalysis\";\n"
+            "                cmd += \" --section SpeedOfLight\";\n"
+            "                cmd += \" \";\n"
+            "                cmd += std::string(argv[0]);\n"
+            "            }\n"
+            "            else {\n"
+            "                cmd = std::string(argv[0]);\n"
+            "            }\n"
+
+            "            cmd += \" --single-model ${MODEL_CPPNAME}\";\n"
             "            cmd += \" \";\n"
-            "            cmd += std::string(argv[0]);\n"
-            "        } else {\n"
-            "            cmd = std::string(argv[0]);\n"
-            "        }\n"
-            "        cmd += \" --single-model ${MODEL_CPPNAME}\";\n"
-            "        cmd += commonArgs;\n"
-            "        int rc = std::system(cmd.c_str());\n"
-            "        if (rc != 0) {\n"
-            "            std::fprintf(stderr, \"[ERROR] ${MODEL_NAME}: subprocess exited %d\\n\", rc);\n"
-            "            ++totalFailed;\n"
-            "        }\n"
+            "            cmd += flag;\n"
+            "            cmd += commonArgs;\n"
+
+            "            int rc = std::system(cmd.c_str());\n"
+
+            "            if (rc != 0) {\n"
+            "                std::fprintf(stderr,\n"
+            "                    \"[ERROR] ${MODEL_NAME} (%s): subprocess exited %d\\n\",\n"
+            "                    suffix.c_str(), rc);\n"
+            "                ++totalFailed;\n"
+            "            }\n"
+            "        };\n"
+
+            "        RunBackend(\"--sofie-only\", \"sofie\");\n"
+
+            "#ifdef SOFIE_BENCHMARK_ORT\n"
+            "        if (run_ort)\n"
+            "            RunBackend(\"--ort-only\", \"ort\");\n"
+            "#endif\n"
+
+            "#ifdef SOFIE_BENCHMARK_TRT\n"
+            "        if (run_trt)\n"
+            "            RunBackend(\"--trt-only\", \"tensorrt\");\n"
+            "#endif\n"
+
             "    }\n"
     )
 
@@ -467,6 +497,7 @@ target_link_libraries(sofie_benchmark PRIVATE
     $<$<BOOL:${SOFIE_ORT_FOUND}>:${SOFIE_ORT_TARGET}>
     $<$<BOOL:${SOFIE_BENCHMARK_TRT}>:${NVINFER_LIBRARY}>
     $<$<BOOL:${SOFIE_BENCHMARK_TRT}>:${NVONNXPARSER_LIBRARY}>
+    $<$<BOOL:${SOFIE_BENCHMARK_TRT}>:${NVINFER_PLUGIN_LIBRARY}>
 )
 if(SOFIE_ORT_FOUND)
     message(STATUS "SOFIE Benchmark: target 'sofie_benchmark' configured "
@@ -597,7 +628,8 @@ if(SOFIE_BENCHMARK_LARGE)
 
             string(APPEND LARGE_SINGLE_MODEL_CASES
                 "    if (model == \"${MODEL_CPPNAME}\") {\n"
-                "        Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir);\n"
+                "        if (run_sofie)\n"
+                "            Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir);\n"
                 "#ifdef SOFIE_BENCHMARK_ORT\n"
                 "        if (run_ort) BenchmarkORT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations);\n"
                 "#endif\n"
