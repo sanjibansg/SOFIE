@@ -81,8 +81,10 @@ inline void BenchmarkTRT_GPU(const std::string& onnxPath, const std::string& mod
      * TensorRT's builder while Nsight Compute is attached.
      */
     fs::path onnxFile(onnxPath);
-    std::filesystem::path planPath = std::filesystem::path("cache") /
-                                 (std::filesystem::path(onnxPath).stem().string() + ".plan");
+    fs::path planDir = fs::path("../../cache/tensorrt");
+    fs::create_directories(planDir);
+
+    fs::path planPath = planDir / (fs::path(onnxPath).stem().string() + ".trt.plan");
 
     const bool profiling = std::getenv("SOFIE_TRT_PROFILE_ACTIVE") != nullptr;
 
