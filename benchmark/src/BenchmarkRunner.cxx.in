@@ -344,7 +344,7 @@ int main(int argc, char *argv[]) {
 
         std::cout << "\nConverting Nsight Compute reports to CSV...\n";
 
-        for (const auto& entry : std::filesystem::directory_iterator(resultsDir)) {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(resultsDir)) {
 
             if (entry.path().extension() != ".ncu-rep")
                 continue;
