@@ -28,9 +28,9 @@ private:
     std::string fNX;
     std::string fNAxes;
     std::string fNY;
-    std::vector<size_t> fShapeX;
-    std::vector<size_t> fShapeY;
-    std::vector<size_t> fShapeYNotPruned; // needed for fKeepdims=0
+    std::vector<Dim> fShapeX;
+    std::vector<Dim> fShapeY;
+    std::vector<Dim> fShapeYNotPruned; // needed for fKeepdims=0
 
 
 public:
@@ -82,7 +82,6 @@ public:
          // set to 1 the reduced dims
          outputShape[fAttrAxes[j]] = 1;
       }
-      fShapeYNotPruned = outputShape;
       // in case of pruning dimension we need to sort axes attributes
       if (fkeepdims == 0) {
          auto ax = fAttrAxes;
@@ -98,6 +97,32 @@ public:
       }
       return ret;
    }
+
+   // dynamic (Dim) shape inference, mirrors the size_t version above
+   std::vector<Dim> DoShapeInference(const std::vector<Dim> & input) {
+      auto ret = input;
+      auto & outputShape = ret;
+      for (size_t j = 0; j < fAttrAxes.size(); j++) {
+         if (fAttrAxes[j] < 0) fAttrAxes[j] += outputShape.size();
+         if (fAttrAxes[j] < 0 || (size_t) fAttrAxes[j] >= outputShape.size())
+            throw std::runtime_error("SOFIE Reduce Op - invalid axes values " + std::to_string(fAttrAxes[j]));
+         outputShape[fAttrAxes[j]] = Dim{1};
+      }
+      fShapeYNotPruned = outputShape;
+      if (fkeepdims == 0) {
+         auto ax = fAttrAxes;
+         std::sort(ax.begin(), ax.end());
+         for (size_t j = 0; j < ax.size(); j++) {
+            if (outputShape.size() > 0) {
+               outputShape.erase(outputShape.begin() + ax[j]);
+               for (size_t k = j+1; k < ax.size(); k++)
+                  ax[k] -= 1;
+            }
+         }
+      }
+      return ret;
+   }
+
    void Initialize(RModel& model) override {
 
       fUseSession = model.UseSession();
@@ -106,7 +131,7 @@ public:
          // input must be a graph input, or already initialized intermediate tensor
          throw std::runtime_error("SOFIE Reduce Op Input Tensor " + fNX + " is not found in model");
       }
-      fShapeX = model.GetTensorShape(fNX);
+      fShapeX = model.GetDimTensorShape(fNX);
       // check if tensor with axes is provided
       if (!fNAxes.empty()) {
          auto ax_shptr = model.GetInitializedTensorData(fNAxes);
@@ -121,10 +146,10 @@ public:
             fAttrAxes[i] = i;
       }
       // find shape of Y and add it in the list of intermediate tensors
-      fShapeY = ShapeInference({fShapeX})[0];
+      fShapeY = DoShapeInference(fShapeX);
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShapeY);
       if (model.Verbose()){
-         std::cout << Name() << " : " << fNX << " -> " << fNY << " shape " << ConvertShapeToString(fShapeY) << std::endl;
+         std::cout << Name() << " : " << fNX << " -> " << fNY << " shape " << ConvertDimShapeToString(fShapeY) << std::endl;
       }
       model.AddNeededStdLib("algorithm");
    }
@@ -135,8 +160,8 @@ public:
          throw std::runtime_error("SOFIE Reduce Op called to Generate without being initialized first");
       }
 
-      size_t inputLength = SOFIE::ConvertShapeToLength(fShapeX);
-      size_t outputLength = SOFIE::ConvertShapeToLength(fShapeY);
+      std::string inputLength = SOFIE::ConvertDimShapeToLength(fShapeX);
+      std::string outputLength = SOFIE::ConvertDimShapeToLength(fShapeY);
 
       auto inputStrides = SOFIE::UTILITY::ComputeStrideFromShape(fShapeX);
       // output stride (or not pruned vector)
@@ -174,7 +199,7 @@ public:
             }
          }
       }
-      size_t reducedLength = inputLength / outputLength;
+      std::string reducedLength = "((" + inputLength + ") / (" + outputLength + "))";
       if (reduceDims == kLast) {
          //std::cout << "reduction for operator " << opName << " is last" << std::endl;
          // new faster implementation using a single loop
@@ -267,8 +292,8 @@ public:
          for (size_t k = 0; k < dim; k++) {
             if (std::find(fAttrAxes.begin(), fAttrAxes.end(), k) == fAttrAxes.end()) {
                // do for not reducing axes
-               out << SP << SP << "size_t i_" << k << " = i / " << inputStrides[k] << " % " << fShapeX[k] << ";\n";
-               out << SP << SP << "outputIndex += i_" << k << " * " << outputStrides[k] << ";\n";
+               out << SP << SP << "size_t i_" << k << " = i / (" << inputStrides[k].GetVal() << ") % (" << fShapeX[k].GetVal() << ");\n";
+               out << SP << SP << "outputIndex += i_" << k << " * (" << outputStrides[k].GetVal() << ");\n";
             }
          }
          // now compute reduction
@@ -313,9 +338,6 @@ public:
       const std::size_t Dx        = fShapeX.size();
       auto inputStrides            = UTILITY::ComputeStrideFromShape(fShapeX);
       auto outputStrides           = UTILITY::ComputeStrideFromShape(fShapeYNotPruned);
-      std::size_t inputLength      = ConvertShapeToLength(fShapeX);
-      std::size_t outputLength     = ConvertShapeToLength(fShapeY);
-      std::size_t reducedLength    = inputLength / outputLength;
 
       // Partition axes into keep (non-reduced) and reduce sets.
       std::vector<std::size_t> redAxes, keepAxes;
@@ -326,12 +348,21 @@ public:
             keepAxes.push_back(d);
       }
 
-      // Row-major strides for decomposing the flat reduction index r into
-      // per-axis coordinates.
+      // Row-major strides (as runtime expressions) for decomposing the flat
+      // reduction index r into per-axis coordinates.
       // redStrides[i] = product of fShapeX[redAxes[j]] for j > i
-      std::vector<std::size_t> redStrides(redAxes.size(), 1);
+      std::vector<std::string> redStrides(redAxes.size(), "1");
       for (int ri = (int)redAxes.size() - 2; ri >= 0; --ri)
-         redStrides[ri] = redStrides[ri + 1] * fShapeX[redAxes[ri + 1]];
+         redStrides[ri] = "(" + redStrides[ri + 1] + " * " + fShapeX[redAxes[ri + 1]].GetVal() + ")";
+
+      // dynamic shape params referenced by the baked index math, passed as size_t kernel args
+      std::vector<std::string> dynParams;
+      for (auto &d : fShapeX)
+         if (d.isParam) {
+            bool seen = false;
+            for (auto &q : dynParams) if (q == d.param) seen = true;
+            if (!seen) dynParams.push_back(d.param);
+         }
 
       std::string kname = "ReduceKernel_" + Name() + "_" + fNY;
 
@@ -344,7 +375,10 @@ public:
       op += SP + SP + SP + "T const* __restrict__ input,\n";
       op += SP + SP + SP + "T* __restrict__ output,\n";
       op += SP + SP + SP + "std::size_t const reducedLength,\n";
-      op += SP + SP + SP + "std::size_t const outputLength) const {\n\n";
+      op += SP + SP + SP + "std::size_t const outputLength";
+      for (auto &p : dynParams)
+         op += ",\n" + SP + SP + SP + "std::size_t const " + p;
+      op += ") const {\n\n";
 
       // ---- shared memory (fixed 256 slots, matches block size) ----
       op += SP + SP + SP + "auto& shmem = alpaka::declareSharedVar<T[256], __COUNTER__>(acc);\n\n";
@@ -359,8 +393,8 @@ public:
       for (std::size_t d = 0; d < Dx; ++d) {
          if (std::find(redAxes.begin(), redAxes.end(), d) == redAxes.end()) {
             op += SP + SP + SP + "std::size_t const oy_" + std::to_string(d)
-                  + " = (out_idx / " + std::to_string(outputStrides[d]) + "u) % "
-                  + std::to_string(fShapeYNotPruned[d]) + "u;\n";
+                  + " = (out_idx / (" + outputStrides[d].GetVal() + ")) % ("
+                  + fShapeYNotPruned[d].GetVal() + ");\n";
          }
       }
       op += "\n";
@@ -377,8 +411,8 @@ public:
       for (std::size_t ri = 0; ri < redAxes.size(); ++ri) {
          std::size_t rd = redAxes[ri];
          op += SP + SP + SP + SP + "std::size_t const r_" + std::to_string(rd)
-               + " = (r / " + std::to_string(redStrides[ri]) + "u) % "
-               + std::to_string(fShapeX[rd]) + "u;\n";
+               + " = (r / (" + redStrides[ri] + ")) % ("
+               + fShapeX[rd].GetVal() + ");\n";
       }
 
       // Compute flat input index.
@@ -386,7 +420,7 @@ public:
       for (std::size_t d = 0; d < Dx; ++d) {
          bool isReduced = std::find(redAxes.begin(), redAxes.end(), d) != redAxes.end();
          std::string coord = isReduced ? "r_" + std::to_string(d) : "oy_" + std::to_string(d);
-         op += SP + SP + SP + SP + SP + coord + " * " + std::to_string(inputStrides[d]) + "u";
+         op += SP + SP + SP + SP + SP + coord + " * (" + inputStrides[d].GetVal() + ")";
          op += (d + 1 < Dx) ? " +\n" : ";\n";
       }
 
@@ -423,7 +457,7 @@ public:
       op += SP + SP + SP + "if (thread_id == 0u) {\n";
       op += SP + SP + SP + SP + "T result = shmem[0];\n";
       if (Op == ReduceMean)
-         op += SP + SP + SP + SP + "result /= static_cast<T>(" + std::to_string(reducedLength) + "u);\n";
+         op += SP + SP + SP + SP + "result /= static_cast<T>(reducedLength);\n";
       else if (Op == ReduceL2)
          op += SP + SP + SP + SP + "result = std::sqrt(result);\n";
       op += SP + SP + SP + SP + "output[out_idx] = result;\n";
@@ -443,25 +477,36 @@ public:
       if (fShapeX.empty() || fShapeY.empty())
          throw std::runtime_error("SOFIE Reduce Op called to Generate without being initialized first");
 
-      std::size_t inputLength   = ConvertShapeToLength(fShapeX);
-      std::size_t outputLength  = ConvertShapeToLength(fShapeY);
-      std::size_t reducedLength = inputLength / outputLength;
+      std::string inputLength   = ConvertDimShapeToLength(fShapeX);
+      std::string outputLength  = ConvertDimShapeToLength(fShapeY);
+      std::string reducedLength = "(" + inputLength + ") / (" + outputLength + ")";
       std::string kname = "reduceKernel_" + Name() + "_" + fNY;
+
+      std::vector<std::string> dynParams;
+      for (auto &d : fShapeX)
+         if (d.isParam) {
+            bool seen = false;
+            for (auto &q : dynParams) if (q == d.param) seen = true;
+            if (!seen) dynParams.push_back(d.param);
+         }
+      std::string dynArgs;
+      for (auto &p : dynParams) dynArgs += ", static_cast<std::size_t>(" + p + ")";
 
       std::stringstream out;
       out << "\n//------ " << Name() << "_GPU_ALPAKA\n";
       // Grid: one block per output element; Block: 256 threads cooperate to
       // reduce the corresponding slice.
       out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_" << fNY << "(\n";
-      out << SP << SP << "Vec::all(Idx{" << outputLength << "u}),\n";
+      out << SP << SP << "Vec::all(Idx{" << outputLength << "}),\n";
       out << SP << SP << "Vec::all(Idx{256u}),\n";
       out << SP << SP << "Vec::all(Idx{1u}));\n";
       out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNY
           << ", " << kname
           << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
           << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
-          << ", static_cast<std::size_t>(" << reducedLength << "u)"
-          << ", static_cast<std::size_t>(" << outputLength << "u));\n";
+          << ", static_cast<std::size_t>(" << reducedLength << ")"
+          << ", static_cast<std::size_t>(" << outputLength << ")"
+          << dynArgs << ");\n";
 
       return out.str();
    }

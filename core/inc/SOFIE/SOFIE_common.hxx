@@ -584,6 +584,9 @@ void UnidirectionalBroadcast(const T* data, const std::vector<size_t>& shape, co
 std::vector<size_t> ComputeStrideFromShape(const std::vector<size_t> & shape);
 std::vector<Dim> ComputeStrideFromShape(const std::vector<Dim> & shape);
 
+/// collect the symbolic identifiers used in the dims, deduplicated in first-seen order
+void CollectDimParams(const std::vector<Dim> & dims, std::vector<std::string> & params);
+
 /// function to check if a >> 0 and a < MAX using a single comparison
 //// use trick casting to unsigned values so it becomes a single comparison
 inline bool is_a_ge_zero_and_a_lt_b(int a, int b) {
