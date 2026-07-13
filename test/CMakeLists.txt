@@ -135,6 +135,12 @@ if (ENABLE_ALPAKA_TESTS)
       ${CMAKE_CURRENT_SOURCE_DIR}
     )
 
+    if(CMAKE_CUDA_ARCHITECTURES)
+        set(_cuda_archs "${CMAKE_CUDA_ARCHITECTURES}")
+    else()
+        set(_cuda_archs "70;80;86")
+    endif()
+
     set_target_properties(
             TestCustomModelsFromONNXForAlpakaCuda
             PROPERTIES
