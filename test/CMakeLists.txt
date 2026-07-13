@@ -136,12 +136,12 @@ if (ENABLE_ALPAKA_TESTS)
     )
 
     set_target_properties(
-      TestCustomModelsFromONNXForAlpakaCuda
-      PROPERTIES
-        CUDA_SEPARABLE_COMPILATION OFF
-        CUDA_ARCHITECTURES 70 80 86
-        CUDA_STANDARD 20
-        CUDA_STANDARD_REQUIRED ON
+            TestCustomModelsFromONNXForAlpakaCuda
+            PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF
+            CUDA_ARCHITECTURES "${_cuda_archs}"
+            CUDA_STANDARD 20
+            CUDA_STANDARD_REQUIRED ON
     )
 
     target_compile_definitions(
