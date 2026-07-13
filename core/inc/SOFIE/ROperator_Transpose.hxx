@@ -173,17 +173,6 @@ public:
       return out.str();
    }
 
-   // symbolic names used by the kernel stride expressions, shared by the kernel signature and the launch call
-
-   std::vector<std::string> GetGPUDynParams() const {
-      auto dimShapeData   = fDimShapeData.empty()   ? ConvertShapeToDim(fShapeData)   : fDimShapeData;
-      auto dimShapeOutput = fDimShapeOutput.empty() ? ConvertShapeToDim(fShapeOutput) : fDimShapeOutput;
-      std::vector<std::string> params;
-      UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(dimShapeOutput), params);
-      UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(dimShapeData), params);
-      return params;
-   }
-
    std::string Generate_GPU_Kernel_ALPAKA(std::string OpName) {
       std::string op;
       OpName = "op_" + OpName;
@@ -191,8 +180,6 @@ public:
       op += SP + "struct TransposeKernel_" + OpName + " {\n";
       op += SP + SP + "template<typename TAcc, typename T>\n";
       op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc, T const* input, T* output,";
-      for (auto &p : GetGPUDynParams())
-         op += "const std::size_t " + p + ",";
       op += "const std::size_t totalElements) const {\n";
       op += SP + SP + SP + SP + "auto const idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
       op += SP + SP + SP + SP + "if(idx >= totalElements) return;\n";
@@ -206,12 +193,12 @@ public:
       auto outputStrides = UTILITY::ComputeStrideFromShape(dimShapeOutput);
 
       for (size_t k = 0; k < dimShapeData.size(); k++) {
-         op += SP + SP + SP + SP + "coord = remaining / ("
-               + outputStrides[k].GetVal() + ");\n";
-         op += SP + SP + SP + SP + "remaining = remaining - coord * ("
-               + outputStrides[k].GetVal() + ");\n";
-         op += SP + SP + SP + SP + "input_idx += coord * ("
-               + inputStrides[fAttrPerm[k]].GetVal() + ");\n";
+         op += SP + SP + SP + SP + "coord = remaining / "
+               + outputStrides[k].GetVal() + "u;\n";
+         op += SP + SP + SP + SP + "remaining = remaining - coord * "
+               + outputStrides[k].GetVal() + "u;\n";
+         op += SP + SP + SP + SP + "input_idx += coord * "
+               + inputStrides[fAttrPerm[k]].GetVal() + "u;\n";
       }
 
       op += SP + SP + SP + SP + "output[idx] = input[input_idx];\n";
@@ -239,10 +226,7 @@ public:
       out << SP << "auto const workDiv_" << fNOutput << " = sofie_workdiv(elementsPerGrid_" << fNOutput << ");\n";
       out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNOutput
          << ", transposeKernel_" << OpName << ", alpaka::getPtrNative(deviceBuf_" << fNData
-         << "), alpaka::getPtrNative(deviceBuf_" << fNOutput << ")";
-      for (auto &p : GetGPUDynParams())
-         out << ", static_cast<std::size_t>(" << p << ")";
-      out << ", static_cast<Idx>(" << length << "));\n";
+         << "), alpaka::getPtrNative(deviceBuf_" << fNOutput << "), static_cast<Idx>(" << length << "));\n";
       out << SP <<"alpaka::enqueue(queue, task_" << OpName << ");\n";
       return out.str();
    }

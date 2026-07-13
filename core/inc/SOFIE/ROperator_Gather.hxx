@@ -276,18 +276,6 @@ public:
       return out.str();
    }
 
-// symbolic names used by the kernel index expressions, shared by the kernel
-// signature and the launch call
-std::vector<std::string> GetGPUDynParams() const {
-    std::vector<std::string> params;
-    UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fShapeY), params);
-    UTILITY::CollectDimParams(fShapeY, params);
-    UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fShapeIndices), params);
-    UTILITY::CollectDimParams({fShapeX[fAttrAxis]}, params);
-    UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fShapeX), params);
-    return params;
-}
-
 std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
     if (fIsOutputConstant) return "";
     opName = "op_" + opName;
@@ -313,8 +301,6 @@ std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
     op += SP + SP + SP + "T const* __restrict__ input,\n";
     op += SP + SP + SP + "int64_t const* __restrict__ indices,\n";
     op += SP + SP + SP + "T* __restrict__ output,\n";
-    for (auto &p : GetGPUDynParams())
-        op += SP + SP + SP + "std::size_t const " + p + ",\n";
     op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
 
     op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
@@ -325,8 +311,8 @@ std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
 
     for (std::size_t d = 0; d < D; ++d) {
         op += SP + SP + SP + SP + "std::size_t const out_" + std::to_string(d)
-            + " = (elem_idx / (" + stridesY[d].GetVal() + ")) % ("
-            + fShapeY[d].GetVal() + ");\n";
+            + " = (elem_idx / " + stridesY[d].GetVal() + "u) % "
+            + fShapeY[d].GetVal() + "u;\n";
     }
     op += "\n";
 
@@ -339,14 +325,14 @@ std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
         for (std::size_t i = 0; i < q; ++i) {
             op += SP + SP + SP + SP + SP
                 + "out_" + std::to_string(fAttrAxis + i)
-                + " * (" + stridesIndices[i].GetVal() + ")";
+                + " * " + stridesIndices[i].GetVal() + "u";
             op += (i + 1 < q) ? " +\n" : ";\n";
         }
     }
     op += "\n";
 
     op += SP + SP + SP + SP + "int64_t k = indices[i_index];\n";
-    op += SP + SP + SP + SP + "if (k < 0) k += (" + fShapeX[fAttrAxis].GetVal() + ");\n";
+    op += SP + SP + SP + SP + "if (k < 0) k += " + fShapeX[fAttrAxis].GetVal() + ";\n";
     op += SP + SP + SP + SP + "if (k < 0) k = 0;\n";
     op += SP + SP + SP + SP + "if (k >= static_cast<int64_t>(" + fShapeX[fAttrAxis].GetVal() + ")) "
         + "k = static_cast<int64_t>(" + fShapeX[fAttrAxis].GetVal() + ") - 1;\n\n";
@@ -356,15 +342,15 @@ std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
     //         + sum over j in [axis+1, r): out_{j-1+q}    * stridesX[j]
     // (the dims after axis in Y are shifted by q-1 relative to X)
     op += SP + SP + SP + SP + "std::size_t const input_idx =\n";
-    op += SP + SP + SP + SP + SP + "static_cast<std::size_t>(k) * (" + stridesX[fAttrAxis].GetVal() + ")";
+    op += SP + SP + SP + SP + SP + "static_cast<std::size_t>(k) * " + stridesX[fAttrAxis].GetVal() + "u";
     for (std::size_t j = 0; j < static_cast<std::size_t>(fAttrAxis); ++j) {
         op += " +\n" + SP + SP + SP + SP + SP
-            + "out_" + std::to_string(j) + " * (" + stridesX[j].GetVal() + ")";
+            + "out_" + std::to_string(j) + " * " + stridesX[j].GetVal() + "u";
     }
     for (std::size_t j = fAttrAxis + 1; j < r; ++j) {
         // in Y, the coord for X's dim j lives at output dim q + j - 1
         op += " +\n" + SP + SP + SP + SP + SP
-            + "out_" + std::to_string(q + j - 1) + " * (" + stridesX[j].GetVal() + ")";
+            + "out_" + std::to_string(q + j - 1) + " * " + stridesX[j].GetVal() + "u";
     }
     op += ";\n\n";
 
@@ -401,10 +387,8 @@ std::string Generate_GPU_ALPAKA(std::string opName) override {
         << ", " << kname
         << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
         << ", alpaka::getPtrNative(deviceBuf_" << fNIndices << ")"
-        << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")";
-    for (auto &p : GetGPUDynParams())
-        out << ", static_cast<std::size_t>(" << p << ")";
-    out << ", static_cast<Idx>(" << totalElements << "));\n";
+        << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+        << ", static_cast<Idx>(" << totalElements << "));\n";
     out << SP << "alpaka::enqueue(queue, task_" << opName << ");\n";
     return out.str();
 }

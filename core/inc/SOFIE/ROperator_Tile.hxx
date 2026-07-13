@@ -19,8 +19,8 @@ private:
    std::string fNRepeats;
    std::string fNInput;
    std::string fNY;
-   std::vector<Dim> fShapeInput;
-   std::vector<Dim> fShapeY;
+   std::vector<size_t> fShapeInput;
+   std::vector<size_t> fShapeY;
    std::vector<size_t> fRepeats;
 
 public:
@@ -50,7 +50,7 @@ public:
       if (model.CheckIfTensorAlreadyExist(fNRepeats) == false)
          throw std::runtime_error("SOFIE Tile Op Repeats Tensor is not found in model");
 
-      fShapeInput = model.GetDimTensorShape(fNInput);
+      fShapeInput = model.GetTensorShape(fNInput);
 
       if (!model.IsInitializedTensor(fNRepeats))
          throw std::runtime_error("SOFIE Tile Op: non-initialized repeats input is not supported");
@@ -75,19 +75,13 @@ public:
       if (fRepeats.size()){
          model.RemoveInitializedTensor(fNRepeats);
       }
-      fShapeY = fShapeInput;
-      for (size_t i = 0; i < fRepeats.size(); i++) {
-         if (fShapeInput[i].isParam)
-            fShapeY[i] = Dim{fShapeInput[i].GetVal() + " * " + std::to_string(fRepeats[i]), static_cast<size_t>(-1)};
-         else
-            fShapeY[i] = Dim{fShapeInput[i].dim * fRepeats[i]};
-      }
+      fShapeY = ShapeInference({fShapeInput, fRepeats})[0];
 
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNInput), fShapeY);
 
       if (model.Verbose())
-         std::cout << "Tile: " << fNInput << " " << ConvertDimShapeToString(fShapeInput)
-                   << " -> " << fNY << " with shape " << ConvertDimShapeToString(fShapeY)
+         std::cout << "Tile: " << fNInput << " " << ConvertShapeToString(fShapeInput)
+                   << " -> " << fNY << " with shape " << ConvertShapeToString(fShapeY)
                    << " given repeats " << ConvertShapeToString(fRepeats) << std::endl;
    }
 
@@ -107,11 +101,11 @@ public:
       out << SP << "const int input_shape[" << fShapeInput.size() << "] = {";
       for (size_t i = 0; i < fShapeInput.size(); ++i) {
          if (i > 0) out << ", ";
-         out << fShapeInput[i].GetVal();
+         out << fShapeInput[i];
       }
       out << "};\n";
 
-      out << SP << "int inputLength = " << ConvertDimShapeToLength(fShapeInput) << ";\n";
+      out << SP << "int inputLength = " << ConvertShapeToLength(fShapeInput) << ";\n";
       out << SP << "int s = 1;\n";
 
       // Read repeats from the tensor at runtime so the generated code remains
@@ -158,25 +152,12 @@ public:
 
       auto inputStrides  = UTILITY::ComputeStrideFromShape(fShapeInput);
       auto outputStrides = UTILITY::ComputeStrideFromShape(fShapeY);
+      std::size_t totalElements = ConvertShapeToLength(fShapeY);
 
       // If fRepeats is populated, repeats were known at generation time and
       // we can bake fShapeInput[d] as literals — no runtime repeats pointer needed.
       // If fRepeats is empty (future: runtime repeats), pass repeats as a kernel arg.
       bool repeatsKnown = !fRepeats.empty();
-
-      auto isIdent = [](const std::string &s){
-         if (s.empty() || (s[0] >= '0' && s[0] <= '9')) return false;
-         for (char c : s)
-            if (!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_')) return false;
-         return true;
-      };
-      std::vector<std::string> dynParams;
-      for (auto &d : fShapeInput)
-         if (d.isParam && isIdent(d.param)) {
-            bool seen = false;
-            for (auto &q : dynParams) if (q == d.param) seen = true;
-            if (!seen) dynParams.push_back(d.param);
-         }
 
       std::string kname = "TileKernel_" + opName;
 
@@ -190,8 +171,6 @@ public:
       op += SP + SP + SP + "T* __restrict__ output,\n";
       if (!repeatsKnown)
          op += SP + SP + SP + "int64_t const* __restrict__ repeats,\n";
-      for (auto &p : dynParams)
-         op += SP + SP + SP + "std::size_t const " + p + ",\n";
       op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
 
       op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
@@ -203,8 +182,8 @@ public:
       // Decompose output linear index — output strides always compile-time
       for (std::size_t d = 0; d < D; ++d) {
          op += SP + SP + SP + SP + "std::size_t const out_" + std::to_string(d)
-             + " = (elem_idx / (" + outputStrides[d].GetVal() + ")) % ("
-             + fShapeY[d].GetVal() + ");\n";
+             + " = (elem_idx / " + std::to_string(outputStrides[d]) + "u) % "
+             + std::to_string(fShapeY[d]) + "u;\n";
       }
       op += "\n";
 
@@ -216,8 +195,8 @@ public:
       op += SP + SP + SP + SP + "std::size_t const input_idx =\n";
       for (std::size_t d = 0; d < D; ++d) {
          op += SP + SP + SP + SP + SP
-             + "(out_" + std::to_string(d) + " % (" + fShapeInput[d].GetVal() + "))"
-             + " * (" + inputStrides[d].GetVal() + ")";
+             + "(out_" + std::to_string(d) + " % " + std::to_string(fShapeInput[d]) + "u)"
+             + " * " + std::to_string(inputStrides[d]) + "u";
          op += (d + 1 < D) ? " +\n" : ";\n\n";
       }
 
@@ -241,22 +220,8 @@ public:
          throw std::runtime_error("SOFIE Operator Tile called to Generate without being initialized first");
 
       bool repeatsKnown = !fRepeats.empty();
-      std::string totalElements = ConvertDimShapeToLength(fShapeY);
+      std::size_t totalElements = ConvertShapeToLength(fShapeY);
       std::string kname = "tileKernel_" + opName;
-
-      auto isIdent = [](const std::string &s){
-         if (s.empty() || (s[0] >= '0' && s[0] <= '9')) return false;
-         for (char c : s)
-            if (!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_')) return false;
-         return true;
-      };
-      std::vector<std::string> dynParams;
-      for (auto &d : fShapeInput)
-         if (d.isParam && isIdent(d.param)) {
-            bool seen = false;
-            for (auto &q : dynParams) if (q == d.param) seen = true;
-            if (!seen) dynParams.push_back(d.param);
-         }
 
       // Build argument list once, reused for both getValidWorkDiv and exec
       std::string args =
@@ -264,9 +229,7 @@ public:
           + "alpaka::getPtrNative(deviceBuf_" + fNY + ")";
       if (!repeatsKnown)
          args += ", alpaka::getPtrNative(deviceBuf_" + fNRepeats + ")";
-      for (auto &p : dynParams)
-         args += ", static_cast<std::size_t>(" + p + ")";
-      args += ", static_cast<Idx>(" + totalElements + ")";
+      args += ", static_cast<Idx>(" + std::to_string(totalElements) + ")";
 
       std::stringstream out;
       out << "\n//------ TILE_GPU_ALPAKA\n";
