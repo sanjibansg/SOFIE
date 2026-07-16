@@ -3,6 +3,7 @@
 
 #include "SOFIE/RModel_Base.hxx"
 #include "SOFIE/SOFIE_common.hxx"
+#include "SOFIE/RQuantization.hxx"
 #include "SOFIE/ROperator.hxx"
 
 
@@ -32,6 +33,7 @@ private:
    std::unordered_map<std::string, InitializedTensor> fInitializedTensors;
    std::unordered_map<std::string, TensorInfo> fIntermediateTensorInfos;
    std::unordered_map<std::string, DynamicTensorInfo> fDynamicTensorInfos;
+   QuantizationModelState fQuantizationState; // quantization metadata, regions, storage, and backend lowering plans
    std::unordered_map<std::string, std::pair<std::vector<Dim>, bool>> fShapeTensors; // constant tensors describing a shape
    std::unordered_map<std::string, std::string> fAliasTensors; // alias tensors (name -> original tensor name)
    std::unordered_map<std::string, std::string>
@@ -41,6 +43,11 @@ private:
    std::vector<std::string> fInputTensorNames; // input tensor names using ONNX order
 
    std::vector<std::unique_ptr<ROperator>> fOperators;
+
+   // transient lowered operator view while the parsed fOperators graph remains intact.
+   // let code generation use synthetic operators for proven regions.
+   std::unordered_map<std::size_t, std::unique_ptr<ROperator>> fLoweredOperators;
+   std::set<std::size_t> fLoweredConsumedOperatorIndices;
 
    std::vector<std::shared_ptr<RModel>> fSubGraphs;    ///<!  sub-graph models (transient)
    RModel * fParentGraph = nullptr;
@@ -74,6 +81,10 @@ private:
    /// GPU-only pass: fuse GEMM→LeakyReLU (and GEMM→ReLU where not already
    /// handled by the ONNX parser) into a single in-place kernel sequence.
    void FuseGemmActivations_GPU();
+   void BuildLoweredOperatorView(EQuantizedBackend backend = EQuantizedBackend::CPU);
+   void PrepareQuantizedTensorStorage(EQuantizedBackend backend);
+   void AddQuantizedGeneratedHeaders(EQuantizedBackend backend = EQuantizedBackend::CPU);
+   void AddLoweredQuantizedOperators(EQuantizedBackend backend = EQuantizedBackend::CPU);
 
 public:
    // Rule of five: explicitly define move semantics, disallow copy
@@ -99,6 +110,21 @@ public:
    std::vector<Dim> GetDimTensorShape(const std::string & name) const;
    ETensorType GetTensorType(std::string name) const;
    std::vector<Dim> GetDynamicTensorShape(const std::string & name) const ;
+
+   void AddQuantizationInfo(const std::string & tensor_name, QuantizationInfo info);
+   bool HasQuantizationInfo(const std::string & tensor_name) const;
+   const QuantizationInfo & GetQuantizationInfo(const std::string & tensor_name) const;
+
+   void AddLowPrecisionTensorInfo(const std::string & tensor_name, LowPrecisionTensorInfo info);
+   bool HasLowPrecisionTensorInfo(const std::string & tensor_name) const;
+   const LowPrecisionTensorInfo & GetLowPrecisionTensorInfo(const std::string & tensor_name) const;
+
+   void RegisterQuantizedTensorStorage(QuantizedTensorStorage storage);
+   bool HasQuantizedTensorStorage(const std::string & storage_tensor_name) const;
+   const QuantizedTensorStorage & GetQuantizedTensorStorage(const std::string & storage_tensor_name) const;
+
+   void AnalyzeQuantizedRegions();
+   const QuantizationModelState & GetQuantizationState() const { return fQuantizationState; }
 
    // get the values for the tensor representing a shape
    const std::vector<Dim> & GetShapeTensorValues(const std::string & tensor_name) const;
@@ -143,6 +169,18 @@ public:
       std::shared_ptr<void> data(malloc(size * sizeof(T)), free);
       std::memcpy(data.get(), raw_data, size * sizeof(T));
       AddInitializedTensor(tensor_name,  GetTemplatedType(T()), shape, data);
+   }
+
+   template <typename T>
+   void AddInitializedTensor(const std::string & tensor_name, const std::vector<std::size_t> & shape, const std::vector<T> &values)
+   {
+      size_t size = ConvertShapeToLength(shape);
+      if (values.size() != size) {
+         throw std::runtime_error("sofie: initialized tensor " + tensor_name + " data length does not match shape");
+      }
+      std::shared_ptr<void> data(malloc(size * sizeof(T)), free);
+      std::copy(values.begin(), values.end(), static_cast<T *>(data.get()));
+      AddInitializedTensor(tensor_name, GetTemplatedType(T()), shape, data);
    }
 
    void AddShapeTensor(const std::string & name, const std::vector<Dim> & shapeValues, bool scalar = false);

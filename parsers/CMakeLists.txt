@@ -41,6 +41,8 @@ set(sources_cxx
     src/ParseConv.cxx
     src/ParseConvTranspose.cxx
     src/ParseGemm.cxx
+    src/ParseQONNXQuant.cxx
+    src/ParseONNXQuantization.cxx
     src/ParseGRU.cxx
     src/ParseIdentity.cxx
     src/ParseLeakyRelu.cxx

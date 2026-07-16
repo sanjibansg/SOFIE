@@ -38,12 +38,16 @@ enum class OperatorKind {
    UNARY_COS=22,
    UNARY_ABS=23,
    CLIP=24,
-   NOT=25
+   NOT=25,
+   QUANTIZED_GEMM=26,
+   QUANTIZED_MATMUL=27
 };
 
 inline const char* toString(OperatorKind kind) {
    switch (kind) {
        case OperatorKind::GEMM:       return "GEMM";
+       case OperatorKind::QUANTIZED_GEMM: return "QUANTIZED_GEMM";
+       case OperatorKind::QUANTIZED_MATMUL: return "QUANTIZED_MATMUL";
        case OperatorKind::LAYERNORM:  return "LAYERNORM";
        case OperatorKind::RELU:       return "RELU";
        case OperatorKind::CONSTANT:        return "CONSTANT";
@@ -81,6 +85,42 @@ public:
    virtual std::string GetFusableOutputTensorName() { return "";}
    virtual std::string GetBlasConfig() { return ""; }
    virtual void UpdateFusableTensorName(std::string, const std::function<void(const std::string&)>& removal_func){ return;};
+
+   // Semantic graph-analysis hooks
+   virtual bool IsQuantizationBoundary() const { return false; }
+   virtual std::string GetQuantizationSourceTensor() const
+   {
+      if (fInputTensorNames.empty())
+         return {};
+      return std::string(fInputTensorNames.front());
+   }
+
+   // Value-preserving graph-analysis hook used by first-class quantization metadata.
+   virtual bool PropagatesQuantizationMetadata() const { return false; }
+   virtual std::string GetQuantizationMetadataSourceTensor() const
+   {
+      if (fInputTensorNames.empty())
+         return {};
+      return std::string(fInputTensorNames.front());
+   }
+   virtual std::vector<std::string> GetQuantizationMetadataSourceTensors() const
+   {
+      auto source = GetQuantizationMetadataSourceTensor();
+      if (source.empty())
+         return {};
+      return {source};
+   }
+   virtual std::string GetQuantizationMetadataTargetTensor() const
+   {
+      if (fOutputTensorNames.empty())
+         return {};
+      return std::string(fOutputTensorNames.front());
+   }
+   virtual std::vector<int_t> GetQuantizationMetadataPermutation(std::size_t /*rank*/) const
+   {
+      return {};
+   }
+   virtual bool RequiresCompatibleQuantizationMetadataInputs() const { return false; }
 
    // Elementwise kernel fusion interface
    virtual bool IsElementwise() const { return false; }

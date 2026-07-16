@@ -105,6 +105,21 @@ std::string ConvertTypeToString(ETensorType type){
       case ETensorType::BOOL : {
          return "uint8_t";
       }
+      case ETensorType::FLOAT8E4M3FN : {
+         return "uint8_t";
+      }
+      case ETensorType::FLOAT8E4M3FNUZ : {
+         return "uint8_t";
+      }
+      case ETensorType::FLOAT8E5M2 : {
+         return "uint8_t";
+      }
+      case ETensorType::FLOAT8E5M2FNUZ : {
+         return "uint8_t";
+      }
+      case ETensorType::FLOAT8E8M0 : {
+         return "uint8_t";
+      }
       default:{
          return "other_" + std::to_string( (int) type);
       }

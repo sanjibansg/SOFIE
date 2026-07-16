@@ -10,8 +10,14 @@ int EmitModel(std::string filename, std::string outname) {
 
    RModelParser_ONNX parser;
    RModel model = parser.Parse(filename);
-   model.GenerateGPU_ALPAKA();
+   model.GenerateGPU_ALPAKA(Options::kTextWeightFile);
    model.OutputGenerated(outname+"_FromONNX_GPU_ALPAKA.hxx");
+
+   if (outname == "QONNX_QuantGemm") {
+      RModel binaryModel = parser.Parse(filename);
+      binaryModel.GenerateGPU_ALPAKA();
+      binaryModel.OutputGenerated(outname+"_Binary_FromONNX_GPU_ALPAKA.hxx");
+   }
 
    return 0;
 }

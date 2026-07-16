@@ -19,6 +19,7 @@ set(sources_headers
    SOFIE/RModel.hxx
    SOFIE/RModelProfiler.hxx
    SOFIE/RModelProfilerGPU.hxx
+   SOFIE/RWeightFile.hxx
    SOFIE/ROperator.hxx
    SOFIE/ROperator_BasicUnary.hxx
    SOFIE/ROperator_BasicBinary.hxx
@@ -27,6 +28,16 @@ set(sources_headers
    SOFIE/ROperator_Conv.hxx
    SOFIE/ROperator_ConvTranspose.hxx
    SOFIE/ROperator_Gemm.hxx
+   SOFIE/ROperator_QuantizedGemm.hxx
+   SOFIE/ROperator_QuantizedMatMul.hxx
+   SOFIE/ROperator_QuantizedMatrix.hxx
+   SOFIE/SOFIE_Quantized.hxx
+   SOFIE/SOFIE_QuantizedAlpaka.hxx
+   SOFIE/RQuantization.hxx
+   SOFIE/RQuantization_Analysis.hxx
+   SOFIE/RQuantization_DenseLinear.hxx
+   SOFIE/RQuantization_Parameters.hxx
+   SOFIE/RQuantization_Storage.hxx
    SOFIE/ROperator_Relu.hxx
    SOFIE/ROperator_Tanh.hxx
    SOFIE/ROperator_LeakyRelu.hxx
@@ -57,6 +68,8 @@ set(sources_headers
    SOFIE/ROperator_Split.hxx
    SOFIE/ROperator_SubGraph.hxx
    SOFIE/ROperator_Pad.hxx
+   SOFIE/ROperator_QONNXQuant.hxx
+   SOFIE/ROperator_ONNXQuantizeLinear.hxx
    SOFIE/ROperator_Where.hxx
    SOFIE/ROperator_Einsum.hxx
    SOFIE/ROperator_Random.hxx
@@ -78,6 +91,12 @@ list(TRANSFORM sources_headers PREPEND "inc/")
 set(sources_cxx
     src/RModel_Base.cxx
     src/RModel.cxx
+    src/RModel_Quantization.cxx
+    src/RWeightFile.cxx
+    src/RQuantization_Analysis.cxx
+    src/RQuantization_DenseLinear.cxx
+    src/RQuantization_Parameters.cxx
+    src/RQuantization_Storage.cxx
     src/RModelProfiler.cxx
     src/RModelProfilerGPU.cxx
     src/RModel_ALPAKA.cxx
@@ -120,4 +139,3 @@ install(TARGETS SOFIE_core
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/inc/"
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
-

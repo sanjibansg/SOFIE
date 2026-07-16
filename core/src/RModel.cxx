@@ -3,6 +3,8 @@
 #include <cctype>
 #include <memory>
 #include <string>
+#include <utility>
+#include <set>
 
 #ifdef SOFIE_SUPPORT_ROOT_BINARY
 #include "TFile.h"
@@ -10,6 +12,7 @@
 
 #include "SOFIE/RModel.hxx"
 #include "SOFIE/RModelProfiler.hxx"
+#include "SOFIE/RWeightFile.hxx"
 #include "SOFIE/SOFIE_common.hxx"
 
 namespace SOFIE {
@@ -51,6 +54,14 @@ std::string TensorMember(std::string const &name)
 }
 
 } // namespace
+
+void RModel::BuildLoweredOperatorView(EQuantizedBackend backend)
+{
+   fLoweredOperators.clear();
+   fLoweredConsumedOperatorIndices.clear();
+   PrepareQuantizedTensorStorage(backend);
+   AddLoweredQuantizedOperators(backend);
+}
 
 std::vector<size_t> RModel::GetTensorShape(const std::string & name) const {
     auto f = fReadyInputTensorInfos.find(name);
@@ -677,9 +688,11 @@ void RModel::Initialize(const std::map<std::string, size_t> & inputParams, bool 
       i++;
    }
 
-   // loop on initialized tensors and make the integers as constant to be
-   // not written in a weight file and check if the tensors flagged as not writable are really not writable,
-   // i.e. are not used by non constant operators
+   AnalyzeQuantizedRegions();
+
+   // Check whether tensors flagged as not writable are used by runtime operators.
+   // Integer initializers remain embedded for compatibility, except for physical
+   // quantized storage explicitly registered as file-backed model weights.
    for (auto &it : fInitializedTensors) {
       // check if not-writable tensors are really not writable, i.e. are not used by non constant operators
       if (it.second.IsNotWritable() && runtimeInitializedInputs.find(it.first) != runtimeInitializedInputs.end()) {
@@ -688,9 +701,8 @@ void RModel::Initialize(const std::map<std::string, size_t> & inputParams, bool 
             std::cout << "Initialized tensor " << it.first << " is flagged as not writable but is used by non constant operators, set it as writable \n";
          }
       }
-      // if the tensor is an integer we can flag it as constant since it will not be written in a weight file and it is considered equivalent as being created from a Constant operator
-      // only FLOAT tensors are written in a weight file
-      if (it.second.type() !=  ETensorType::FLOAT) {
+      const bool isFileBackedQuantizedStorage = HasQuantizedTensorStorage(it.first);
+      if (it.second.type() != ETensorType::FLOAT && !isFileBackedQuantizedStorage) {
          it.second.SetConstant();
       }
    }
@@ -800,7 +812,7 @@ void RModel::GenerateInitializedTensorInfo()
    for (auto &i : fInitializedTensors) {
       if (i.second.IsNotWritable())  continue;
       size_t length = ConvertShapeToLength(i.second.shape());
-      if (!fUseWeightFile || i.second.IsConstantTensor() || !i.second.IsWeightTensor() || i.second.type() != ETensorType::FLOAT ) {
+      if (!fUseWeightFile || i.second.IsConstantTensor() || !i.second.IsWeightTensor()) {
          if (i.second.type() == ETensorType::FLOAT) {
             // check if NaN of Inf are inside tensor data
             bool hasInfOrNaN = false;
@@ -823,19 +835,31 @@ void RModel::GenerateInitializedTensorInfo()
          } else if (i.second.type() == ETensorType::INT32) {
             fGC += GenerateConstantTensorCode<int32_t>(i);
             fConstantTensorSize += length * sizeof(int32_t);
-         }  else if (i.second.type() == ETensorType::BOOL || i.second.type() == ETensorType::UINT8 ) {
+         } else if (i.second.type() == ETensorType::INT8) {
+            fGC += GenerateConstantTensorCode<int8_t>(i);
+            fConstantTensorSize += length * sizeof(int8_t);
+         } else if (i.second.type() == ETensorType::BOOL || i.second.type() == ETensorType::UINT8 ||
+                    i.second.type() == ETensorType::FLOAT8E4M3FN ||
+                    i.second.type() == ETensorType::FLOAT8E4M3FNUZ ||
+                    i.second.type() == ETensorType::FLOAT8E5M2 ||
+                    i.second.type() == ETensorType::FLOAT8E5M2FNUZ ||
+                    i.second.type() == ETensorType::FLOAT8E8M0) {
             fGC += GenerateConstantTensorCode<uint8_t>(i);
             fConstantTensorSize += length * sizeof(uint8_t);
          }
 
 
       } else {
-         // case of tensors which are read from a file
-         if (i.second.type() == ETensorType::FLOAT) {
-            fGC += "std::vector<float> fTensor_" + i.first + " = std::vector<float>(" + std::to_string(length) + ");\n";
-            fGC += "float * " + TensorMember(i.first) + " = fTensor_" + i.first + ".data();\n";
-            fWeightsTensorSize += length * sizeof(float);
-         }
+         const auto typeName = ConvertTypeToString(i.second.type());
+         if (i.second.type() != ETensorType::FLOAT && i.second.type() != ETensorType::INT8 &&
+             i.second.type() != ETensorType::UINT8 && i.second.type() != ETensorType::INT32 &&
+             i.second.type() != ETensorType::INT64 && i.second.type() != ETensorType::FLOAT8E4M3FN &&
+             i.second.type() != ETensorType::FLOAT8E4M3FNUZ && i.second.type() != ETensorType::FLOAT8E5M2 &&
+             i.second.type() != ETensorType::FLOAT8E5M2FNUZ && i.second.type() != ETensorType::FLOAT8E8M0)
+            throw std::runtime_error("sofie initialized tensor " + i.first + " has a type unsupported by weight files");
+         fGC += "std::vector<" + typeName + "> fTensor_" + i.first + " = std::vector<" + typeName + ">(" + std::to_string(length) + ");\n";
+         fGC += typeName + " * " + TensorMember(i.first) + " = fTensor_" + i.first + ".data();\n";
+         fWeightsTensorSize += length * GetTypeSize(i.second.type());
       }
    }
 }
@@ -1359,6 +1383,9 @@ void RModel::GenerateSessionCode()
          if (fWeightFile == WeightFileType::RootBinary) {
             fileName += ".root";
          }
+         if (fWeightFile == WeightFileType::Binary) {
+            fileName += ".bin";
+         }
          fGC += sessionName + "(std::string filename =\"" + fileName + "\"";
       } else {
          // no need to pass weight file since it is not used
@@ -1439,8 +1466,13 @@ void RModel::GenerateSessionCode()
    for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
       if (fVerbose)
          std::cout << "Generating code for operator .... " << op_idx << std::endl;
+      if (!fProfile && fLoweredConsumedOperatorIndices.count(op_idx) != 0) {
+         continue;
+      }
       if (fProfile) {
          allOperatorCode += RModelProfiler::GenerateOperatorCode(*fOperators[op_idx], op_idx);
+      } else if (auto lowered = fLoweredOperators.find(op_idx); lowered != fLoweredOperators.end()) {
+         allOperatorCode += lowered->second->Generate(std::to_string(op_idx));
       } else {
          allOperatorCode += fOperators[op_idx]->Generate(std::to_string(op_idx));
       }
@@ -1504,6 +1536,18 @@ void RModel::Generate(std::underlying_type_t<Options> options, int batchSize, lo
       fUseWeightFile = true;
       fWeightFile = WeightFileType::RootBinary;
    }
+   if (static_cast<std::underlying_type_t<Options>>(Options::kBinaryWeightFile) & options) {
+      fUseWeightFile = true;
+      fWeightFile = WeightFileType::Binary;
+   }
+   if (static_cast<std::underlying_type_t<Options>>(Options::kTextWeightFile) & options) {
+      fUseWeightFile = true;
+      fWeightFile = WeightFileType::Text;
+   }
+   const auto explicitWeightPolicy = static_cast<std::underlying_type_t<Options>>(Options::kNoWeightFile) |
+                                     static_cast<std::underlying_type_t<Options>>(Options::kRootBinaryWeightFile) |
+                                     static_cast<std::underlying_type_t<Options>>(Options::kBinaryWeightFile) |
+                                     static_cast<std::underlying_type_t<Options>>(Options::kTextWeightFile);
    if (fUseWeightFile && !fUseSession) {
       throw std::runtime_error(
          "sofie: RModel::Generate: cannot use a separate weight file without generating a Session class");
@@ -1519,6 +1563,15 @@ void RModel::Generate(std::underlying_type_t<Options> options, int batchSize, lo
 
    // initialize the model including all operators and sub-graphs
    Initialize(batchSize, verbose);
+   if ((options & explicitWeightPolicy) == 0 && !fQuantizationState.tensorInfos.empty()) {
+      fUseWeightFile = true;
+      fWeightFile = WeightFileType::Binary;
+   }
+   if (fWeightFile == WeightFileType::Binary)
+      AddNeededCustomHeader("SOFIE/RWeightFile.hxx");
+   BuildLoweredOperatorView(EQuantizedBackend::CPU);
+
+   AddQuantizedGeneratedHeaders(EQuantizedBackend::CPU);
 
    // if having dynamic tensor we need to have a Session
    if (!fDynamicTensorInfos.empty()) {
@@ -1577,12 +1630,37 @@ void RModel::ReadInitializedTensorsFromFile(long pos) {
             // skip Constant and shape tensors (not written in a file)
             if (!i.second.IsWeightTensor()) continue;
             std::string tensor_name = "tensor_" + i.first;
-            if (i.second.type() == ETensorType::FLOAT) {
+            if (i.second.type() == ETensorType::FLOAT || i.second.type() == ETensorType::INT8 ||
+                i.second.type() == ETensorType::UINT8 || i.second.type() == ETensorType::INT32 ||
+                i.second.type() == ETensorType::INT64) {
                std::string length = std::to_string(ConvertShapeToLength(i.second.shape()));
                fGC += "   ReadTensorFromStream(f, " + tensor_name + ", \"" + tensor_name + "\", " + length + ");\n";
             } else {
                throw std::runtime_error("sofie tensor " + tensor_name + " with type " + ConvertTypeToString(i.second.type()) + " cannot be read from a file");
             }
+        }
+        fGC += "   f.close();\n";
+    }
+
+    if (fWeightFile == WeightFileType::Binary) {
+        if (!fUseWeightFile) return;
+        if (fIsGNNComponent || pos != 0)
+            throw std::runtime_error("SOFIE binary weight files do not support appended GNN component offsets");
+
+        const auto binaryWeights = CollectBinaryWeightTensors(fInitializedTensors);
+        fGC += "   std::ifstream f(filename, std::ios::binary);\n";
+        fGC += "   if (!f.is_open()) throw std::runtime_error(\"sofie failed to open binary weight file \" + filename);\n";
+        fGC += "   SOFIE::ReadBinaryWeightFileHeader(f, " + std::to_string(binaryWeights.size()) + ");\n";
+        for (const auto &[name, tensor] : binaryWeights) {
+            const auto type = tensor->type();
+            if (!IsBinaryWeightTensorType(type))
+                throw std::runtime_error("sofie tensor " + name + " has a type unsupported by binary weights");
+            std::string shape = "{";
+            for (auto dim : tensor->shape()) shape += std::to_string(dim) + ",";
+            shape += "}";
+            fGC += "   SOFIE::ReadTensorFromBinaryStream(f, tensor_" + name + ", \"tensor_" + name +
+                   "\", static_cast<SOFIE::ETensorType>(" + std::to_string(static_cast<int>(type)) +
+                   "), std::vector<std::size_t>" + shape + ");\n";
         }
         fGC += "   f.close();\n";
     }
@@ -1640,6 +1718,9 @@ long RModel::WriteInitializedTensorsToFile(std::string filename) {
     case WeightFileType::Text:
         fileExtension = ".dat";
         break;
+    case WeightFileType::Binary:
+        fileExtension = ".bin";
+        break;
     }
 
     // If filename is empty, use the model name as the base filename
@@ -1648,7 +1729,16 @@ long RModel::WriteInitializedTensorsToFile(std::string filename) {
     }
 
     // Write the initialized tensors to the file
-    if (fWeightFile == WeightFileType::RootBinary) {
+    if (fWeightFile == WeightFileType::Binary) {
+        if (fIsGNNComponent || fIsGNN)
+            throw std::runtime_error("SOFIE binary weight files do not support appended GNN components");
+        std::ofstream f(filename, std::ios::binary | std::ios::trunc);
+        if (!f.is_open())
+            throw std::runtime_error("sofie failed to open binary weight file " + filename);
+        const auto position = WriteBinaryWeightFile(f, fInitializedTensors);
+        f.close();
+        return position;
+    } else if (fWeightFile == WeightFileType::RootBinary) {
 #ifdef SOFIE_SUPPORT_ROOT_BINARY
         if(fIsGNNComponent || fIsGNN) {
             throw std::runtime_error("SOFIE-GNN yet not supports writing to a ROOT file.");
@@ -1729,6 +1819,30 @@ long RModel::WriteInitializedTensorsToFile(std::string filename) {
                   else
                      f << std::setprecision(std::numeric_limits<float>::max_digits10) << value;
                   f <<  ( (idx < length-1) ? " " : "\n" );
+               }
+            }
+            else if (i.second.type() == ETensorType::INT8) {
+               const int8_t * data = i.second.data<int8_t>();
+               for (size_t idx = 0; idx < length; idx++) {
+                  f << static_cast<int>(data[idx]) <<  ( (idx < length-1) ? " " : "\n" );
+               }
+            }
+            else if (i.second.type() == ETensorType::UINT8) {
+               const uint8_t * data = i.second.data<uint8_t>();
+               for (size_t idx = 0; idx < length; idx++) {
+                  f << static_cast<unsigned int>(data[idx]) <<  ( (idx < length-1) ? " " : "\n" );
+               }
+            }
+            else if (i.second.type() == ETensorType::INT32) {
+               const int32_t * data = i.second.data<int32_t>();
+               for (size_t idx = 0; idx < length; idx++) {
+                  f << data[idx] <<  ( (idx < length-1) ? " " : "\n" );
+               }
+            }
+            else if (i.second.type() == ETensorType::INT64) {
+               const int64_t * data = i.second.data<int64_t>();
+               for (size_t idx = 0; idx < length; idx++) {
+                  f << data[idx] <<  ( (idx < length-1) ? " " : "\n" );
                }
             }
             else {
@@ -1984,9 +2098,13 @@ void RModel::OutputGenerated(std::string filename, bool append) {
                 filename = filename.erase(pos, 4);
                 filename += ".root";
             }
+            if (fWeightFile == WeightFileType::Binary)
+                filename.replace(pos, 4, ".bin");
         } else {
             filename = fName;
-            filename += fWeightFile == WeightFileType::Text ? ".dat" : ".root";
+            if (fWeightFile == WeightFileType::Text) filename += ".dat";
+            else if (fWeightFile == WeightFileType::RootBinary) filename += ".root";
+            else if (fWeightFile == WeightFileType::Binary) filename += ".bin";
         }
         WriteInitializedTensorsToFile(filename);
     }

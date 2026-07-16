@@ -30,6 +30,15 @@ ParserFuncSignature ParseMatMul = [](RModelParser_ONNX &parser, const onnx::Node
       op.reset(new ROperator_Gemm<float>(attr_alpha, attr_beta, attr_transA, attr_transB, matmulnode.input(0),
                                           matmulnode.input(1), matmulnode.output(0)));
       break;
+   case ETensorType::FLOAT8E4M3FN:
+   case ETensorType::FLOAT8E4M3FNUZ:
+   case ETensorType::FLOAT8E5M2:
+   case ETensorType::FLOAT8E5M2FNUZ:
+   case ETensorType::FLOAT8E8M0:
+      op.reset(new ROperator_Gemm<float>(attr_alpha, attr_beta, attr_transA, attr_transB, matmulnode.input(0),
+                                          matmulnode.input(1), matmulnode.output(0), EActivationType::UNDEFINED,
+                                          true));
+      break;
    default:
       throw std::runtime_error(
          "TMVA::SOFIE - Unsupported - Operator for fusing MatMul and Add to Gemm does not yet support input type " +
@@ -38,11 +47,10 @@ ParserFuncSignature ParseMatMul = [](RModelParser_ONNX &parser, const onnx::Node
 
    std::string output_name = matmulnode.output(0);
    if (!parser.IsRegisteredTensorType(output_name)) {
-      parser.RegisterTensorType(output_name, input_type);
+      parser.RegisterTensorType(output_name, DenseLinearOutputTensorType(input_type));
    }
 
    return op;
 };
 
 } // namespace SOFIE
-
