@@ -1,6 +1,7 @@
 #include "SOFIE/RQuantization_Storage.hxx"
 #include "SOFIE/RQuantization_DenseLinear.hxx"
 
+#include <cstring>
 #include <stdexcept>
 #include <utility>
 
@@ -17,6 +18,12 @@ ETensorType TensorTypeForQuantizedStorage(EQuantizedStorageType storage)
       return ETensorType::UINT8;
    case EQuantizedStorageType::Int32Accumulator:
       return ETensorType::INT32;
+   case EQuantizedStorageType::FP8E4M3:
+      return ETensorType::FLOAT8E4M3FN;
+   case EQuantizedStorageType::FP8E5M2:
+      return ETensorType::FLOAT8E5M2;
+   case EQuantizedStorageType::Float16Carrier:
+      return ETensorType::FLOAT16;
    default:
       throw std::runtime_error("SOFIE quantized lowering plan has no physical tensor type for this storage");
    }
@@ -40,6 +47,50 @@ QuantizedTensorStorage MakeQuantizedTensorStorage(std::string logicalTensor,
    storage.shape = std::move(shape);
    storage.residentBackend = backend;
    return storage;
+}
+
+QuantizedTensorStorage MakeLowPrecisionTensorStorage(std::string logicalTensor,
+                                                     std::string sourceTensor,
+                                                     std::string storageTensor,
+                                                     const LowPrecisionTensorInfo &lowPrecision,
+                                                     EQuantizedLayout layout,
+                                                     std::vector<std::size_t> shape,
+                                                     EQuantizedBackend backend)
+{
+   const auto storageType = QuantizedStorageTypeForLowPrecisionCarrier(lowPrecision.carrier);
+   if (!IsPhysicalQuantizedStorage(storageType))
+      throw std::runtime_error("SOFIE low-precision storage requires a physical carrier type");
+   QuantizedTensorStorage storage;
+   storage.logicalTensor = std::move(logicalTensor);
+   storage.sourceTensor = std::move(sourceTensor);
+   storage.storageTensor = std::move(storageTensor);
+   storage.storageType = storageType;
+   storage.layout = layout;
+   storage.shape = std::move(shape);
+   storage.residentBackend = backend;
+   return storage;
+}
+
+MaterializedLowPrecisionWeight MaterializeLowPrecisionWeightBytes(
+   std::string logicalTensor, std::string sourceTensor, std::string storageTensor,
+   const LowPrecisionTensorInfo &lowPrecision, EQuantizedLayout layout,
+   EQuantizedBackend backend, const void *sourceData,
+   const std::vector<std::size_t> &sourceShape)
+{
+   const auto storage = MakeLowPrecisionTensorStorage(std::move(logicalTensor), std::move(sourceTensor),
+                                                      std::move(storageTensor), lowPrecision,
+                                                      layout, std::move(sourceShape), backend);
+   const auto byteCount = QuantizedStorageByteSize(storage.storageType, storage.shape);
+   if (byteCount == 0)
+      throw std::runtime_error("SOFIE low-precision storage has zero byte size");
+   if (sourceData == nullptr)
+      throw std::runtime_error("SOFIE low-precision storage materialization received null source data");
+   MaterializedLowPrecisionWeight result;
+   result.storage = storage;
+   result.rawBytes.resize(byteCount);
+   std::memcpy(result.rawBytes.data(), sourceData, byteCount);
+   result.tensorType = TensorTypeForQuantizedStorage(result.storage.storageType);
+   return result;
 }
 
 template <class T>

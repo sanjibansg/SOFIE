@@ -96,7 +96,8 @@ enum class EQuantizedBackend {
 };
 
 enum class EQuantizedStorageType {
-   UNDEFINED = 0, FloatCarrier = 1, Int8 = 2, UInt8 = 3, Int32Accumulator = 4, MetadataOnly = 5
+   UNDEFINED = 0, FloatCarrier = 1, Int8 = 2, UInt8 = 3, Int32Accumulator = 4, MetadataOnly = 5,
+   FP8E4M3 = 6, FP8E5M2 = 7, Float16Carrier = 8
 };
 
 enum class EQuantizedCarrierMode {
@@ -104,8 +105,67 @@ enum class EQuantizedCarrierMode {
    Float = 1,
    Int8 = 2,
    UInt8 = 3,
-   Int32Accumulator = 4
+   Int32Accumulator = 4,
+   FP8E4M3 = 5,
+   FP8E5M2 = 6,
+   Float16 = 7
 };
+
+enum class ELowPrecisionCarrier {
+   UNDEFINED = 0,
+   AffineInt8 = 1,
+   AffineUInt8 = 2,
+   FP8E4M3 = 3,
+   FP8E5M2 = 4,
+   Float16 = 5,
+   Float32 = 6
+};
+
+enum class ELowPrecisionAccumulation {
+   UNDEFINED = 0,
+   Int32 = 1,
+   Float16 = 2,
+   Float32 = 3
+};
+
+struct LowPrecisionTensorInfo {
+   ELowPrecisionCarrier carrier = ELowPrecisionCarrier::UNDEFINED;
+   ELowPrecisionAccumulation accumulation = ELowPrecisionAccumulation::UNDEFINED;
+   std::optional<QuantizationInfo> affineQuantization;
+   std::string sourceTensor;
+   std::string reason;
+};
+
+inline bool IsAffineIntegerCarrier(ELowPrecisionCarrier carrier)
+{
+   return carrier == ELowPrecisionCarrier::AffineInt8 || carrier == ELowPrecisionCarrier::AffineUInt8;
+}
+
+inline bool IsFP8Carrier(ELowPrecisionCarrier carrier)
+{
+   return carrier == ELowPrecisionCarrier::FP8E4M3 || carrier == ELowPrecisionCarrier::FP8E5M2;
+}
+
+inline LowPrecisionTensorInfo LowPrecisionTensorInfoFromFP8Carrier(ELowPrecisionCarrier carrier,
+                                                                   const std::string &sourceTensor,
+                                                                   const std::string &reason)
+{
+   LowPrecisionTensorInfo lowPrecision;
+   lowPrecision.carrier = carrier;
+   lowPrecision.accumulation = ELowPrecisionAccumulation::Float32;
+   lowPrecision.sourceTensor = sourceTensor;
+   lowPrecision.reason = reason;
+   return lowPrecision;
+}
+
+inline LowPrecisionTensorInfo LowPrecisionTensorInfoFromAffineQuantization(const QuantizationInfo &info)
+{
+   LowPrecisionTensorInfo lowPrecision;
+   lowPrecision.carrier = info.isSigned ? ELowPrecisionCarrier::AffineInt8 : ELowPrecisionCarrier::AffineUInt8;
+   lowPrecision.accumulation = ELowPrecisionAccumulation::Int32;
+   lowPrecision.affineQuantization = info;
+   return lowPrecision;
+}
 
 enum class EQuantizedOutputMode {
    UNDEFINED = 0,
@@ -122,7 +182,10 @@ enum class EQuantizedComputeProfile {
    UnsignedInt8ActivationSignedInt8WeightRank2 = 4,
    UnsignedInt8SymmetricRank2 = 5,
    AsymmetricZeroPointRank2 = 6,
-   UnsupportedDenseLinearRank2 = 7
+   UnsupportedDenseLinearRank2 = 7,
+   FP8E4M3DenseLinearRank2 = 8,
+   FP8E5M2DenseLinearRank2 = 9,
+   FP8DenseLinearBackendUnsupported = 10
 };
 
 enum class EQuantizedLayout {
@@ -161,171 +224,8 @@ struct QuantizedEpilogue {
    std::optional<std::size_t> addOpIndex;
 };
 
-enum class EQuantizedShapePolicy {
-   UNDEFINED = 0,
-   Exact = 1,
-   ExactTooSmall = 2,
-   PaddedCandidate = 3,
-   Padded = 4,
-   Fallback = 5,
-   Unsupported = 6
-};
+#include "SOFIE/RQuantization_DenseLinearTypes.hxx"
 
-inline bool QuantizedShapePolicyUsesPadding(EQuantizedShapePolicy policy)
-{
-   return policy == EQuantizedShapePolicy::PaddedCandidate || policy == EQuantizedShapePolicy::Padded;
-}
-
-inline bool QuantizedShapePolicyIsExecutable(EQuantizedShapePolicy policy)
-{
-   return policy == EQuantizedShapePolicy::Exact || policy == EQuantizedShapePolicy::Padded;
-}
-
-struct QuantizedDenseLinearShapePolicy {
-   EQuantizedShapePolicy policy = EQuantizedShapePolicy::UNDEFINED;
-   std::size_t logicalM = 0;
-   std::size_t logicalK = 0;
-   std::size_t logicalN = 0;
-   std::size_t physicalM = 0;
-   std::size_t physicalK = 0;
-   std::size_t physicalN = 0;
-   std::size_t logicalMacs = 0;
-   std::size_t physicalMacs = 0;
-   std::size_t minimumOptimizedMacs = 0;
-   bool belowMinimumWork = false;
-   double paddingWorkRatio = 1.0;
-   std::string reason;
-};
-
-enum class EQuantizedMatMulShapeKind {
-   UNDEFINED = 0,
-   Unsupported = 1,
-   Rank2 = 2,
-   FlattenableProjection = 3,
-   TrueBatched = 4
-};
-
-struct QuantizedMatMulShapeAssessment {
-   EQuantizedMatMulShapeKind kind = EQuantizedMatMulShapeKind::UNDEFINED;
-   std::size_t logicalM = 0;
-   std::size_t logicalK = 0;
-   std::size_t logicalN = 0;
-   std::vector<std::size_t> flattenedInputShape;
-   std::vector<std::size_t> flattenedOutputShape;
-   std::string reason;
-   std::vector<std::string> unsupportedReasons;
-};
-
-inline bool QuantizedMatMulShapeIsRecognized(const QuantizedMatMulShapeAssessment &assessment)
-{
-   return assessment.kind == EQuantizedMatMulShapeKind::Rank2 ||
-          assessment.kind == EQuantizedMatMulShapeKind::FlattenableProjection ||
-          assessment.kind == EQuantizedMatMulShapeKind::TrueBatched;
-}
-
-inline bool QuantizedMatMulShapeIsRank2Executable(const QuantizedMatMulShapeAssessment &assessment)
-{
-   return assessment.kind == EQuantizedMatMulShapeKind::Rank2;
-}
-
-struct QuantizedTensorStorage {
-   std::string logicalTensor;
-   std::string sourceTensor;
-   std::string storageTensor;
-   EQuantizedStorageType storageType = EQuantizedStorageType::UNDEFINED;
-   EQuantizedLayout layout = EQuantizedLayout::UNDEFINED;
-   QuantizationInfo quantization;
-   std::vector<std::size_t> shape;
-
-   EQuantizedBackend residentBackend = EQuantizedBackend::UNDEFINED;
-};
-
-inline std::size_t QuantizedStorageElementSize(EQuantizedStorageType type)
-{
-   switch (type) {
-   case EQuantizedStorageType::FloatCarrier:
-      return sizeof(float);
-   case EQuantizedStorageType::Int8:
-      return sizeof(std::int8_t);
-   case EQuantizedStorageType::UInt8:
-      return sizeof(std::uint8_t);
-   case EQuantizedStorageType::Int32Accumulator:
-      return sizeof(std::int32_t);
-   default:
-      return 0;
-   }
-}
-
-inline std::size_t QuantizedStorageElementCount(const std::vector<std::size_t> &shape)
-{
-   if (shape.empty())
-      return 0;
-   std::size_t count = 1;
-   for (auto dim : shape)
-      count *= dim;
-   return count;
-}
-
-inline std::size_t QuantizedStorageByteSize(EQuantizedStorageType type, const std::vector<std::size_t> &shape)
-{
-   return QuantizedStorageElementSize(type) * QuantizedStorageElementCount(shape);
-}
-
-inline bool IsPhysicalQuantizedStorage(EQuantizedStorageType type)
-{
-   return type == EQuantizedStorageType::Int8 || type == EQuantizedStorageType::UInt8 ||
-          type == EQuantizedStorageType::Int32Accumulator;
-}
-
-inline EQuantizedStorageType QuantizedStorageTypeForCarrier(const QuantizationInfo &info)
-{
-   return info.isSigned ? EQuantizedStorageType::Int8 : EQuantizedStorageType::UInt8;
-}
-
-inline EQuantizedCarrierMode QuantizedCarrierModeForStorage(EQuantizedStorageType type)
-{
-   switch (type) {
-   case EQuantizedStorageType::FloatCarrier:
-      return EQuantizedCarrierMode::Float;
-   case EQuantizedStorageType::Int8:
-      return EQuantizedCarrierMode::Int8;
-   case EQuantizedStorageType::UInt8:
-      return EQuantizedCarrierMode::UInt8;
-   case EQuantizedStorageType::Int32Accumulator:
-      return EQuantizedCarrierMode::Int32Accumulator;
-   default:
-      return EQuantizedCarrierMode::UNDEFINED;
-   }
-}
-
-struct QuantizedLoweringPlan {
-   EQuantizedBackend backend = EQuantizedBackend::UNDEFINED;
-   EQuantizedLoweringStatus status = EQuantizedLoweringStatus::UNDEFINED;
-   std::string reason;
-
-   EQuantizedStorageType inputStorage = EQuantizedStorageType::UNDEFINED;
-   EQuantizedStorageType weightStorage = EQuantizedStorageType::UNDEFINED;
-   EQuantizedStorageType biasStorage = EQuantizedStorageType::UNDEFINED;
-   EQuantizedStorageType accumulatorStorage = EQuantizedStorageType::UNDEFINED;
-   EQuantizedStorageType outputStorage = EQuantizedStorageType::UNDEFINED;
-
-   EQuantizedCarrierMode inputCarrierMode = EQuantizedCarrierMode::UNDEFINED;
-   EQuantizedOutputMode outputMode = EQuantizedOutputMode::UNDEFINED;
-   EQuantizedComputeProfile computeProfile = EQuantizedComputeProfile::UNDEFINED;
-   std::string capabilityTag;
-   QuantizedDenseLinearShapePolicy shapePolicy;
-
-   std::string weightStorageTensor;
-   EQuantizedLayout weightLayout = EQuantizedLayout::UNDEFINED;
-   EQuantizedParameterMode weightScaleMode = EQuantizedParameterMode::Scalar;
-   std::string weightScaleTensor;
-   std::string weightZeroPointTensor;
-
-   std::vector<std::size_t> consumedOperatorIndices;
-   bool preservesQuantizationSemantics = false;
-   bool isMetadataOnly = false;
-   bool suppressesGraphOperators = false;
-};
 
 inline bool QuantizedPlanUsesInt32Accumulator(const QuantizedLoweringPlan &plan)
 {
@@ -337,10 +237,20 @@ inline bool QuantizedPlanUsesPrequantizedWeights(const QuantizedLoweringPlan &pl
    return !plan.weightStorageTensor.empty();
 }
 
+inline bool QuantizedPlanUsesFP8DenseLinear(const QuantizedLoweringPlan &plan)
+{
+   return plan.computeProfile == EQuantizedComputeProfile::FP8E4M3DenseLinearRank2 ||
+          plan.computeProfile == EQuantizedComputeProfile::FP8E5M2DenseLinearRank2;
+}
+
 inline bool QuantizedPlanExposesQuantizedInputCarrier(const QuantizedLoweringPlan &plan)
 {
-   return plan.inputCarrierMode == EQuantizedCarrierMode::Int8 ||
-          plan.inputCarrierMode == EQuantizedCarrierMode::UInt8;
+   const auto mode = QuantizedCarrierModeForStorage(plan.inputStorage);
+   return mode == EQuantizedCarrierMode::Int8 ||
+          mode == EQuantizedCarrierMode::UInt8 ||
+          mode == EQuantizedCarrierMode::FP8E4M3 ||
+          mode == EQuantizedCarrierMode::FP8E5M2 ||
+          mode == EQuantizedCarrierMode::Float16;
 }
 
 inline bool QuantizedPlanExposesQuantizedOutputCarrier(const QuantizedLoweringPlan &plan)
@@ -424,6 +334,7 @@ struct QuantizedGemmRegion {
 
 struct QuantizationModelState {
    std::unordered_map<std::string, QuantizationInfo> tensorInfos;
+   std::unordered_map<std::string, LowPrecisionTensorInfo> lowPrecisionTensorInfos;
    std::unordered_map<std::string, QuantizedTensorStorage> tensorStorages;
    std::unordered_map<std::size_t, QuantizedGemmRegion> gemmRegions;
    std::unordered_map<std::size_t, QuantizedMatMulRegion> matmulRegions;

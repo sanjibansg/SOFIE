@@ -60,6 +60,10 @@
 #include "ONNX_QDQ_QuantMatMul_FromONNX_GPU_ALPAKA.hxx"
 #include "ONNX_QDQ_QuantGemm_PerChannelWeight_FromONNX_GPU_ALPAKA.hxx"
 #include "ONNX_QDQ_QuantMatMul_PerChannelWeight_FromONNX_GPU_ALPAKA.hxx"
+// Deferred to the quantization-preserving layout PR.
+// #include "ONNX_QDQ_QuantMatMul_Layout_FromONNX_GPU_ALPAKA.hxx"
+#include "ONNX_QDQ_QuantMatMul_RankNProjection_FromONNX_GPU_ALPAKA.hxx"
+#include "ONNX_QDQ_QuantMatMul_RankNProjection_Add_FromONNX_GPU_ALPAKA.hxx"
 
 #include "AddBroadcast1_FromONNX_GPU_ALPAKA.hxx"
 #include "input_models/references/AddBroadcast1.ref.hxx"
@@ -267,39 +271,48 @@ protected:
     alpaka::Queue<alpaka::DevCudaRt, alpaka::NonBlocking> queue;
 
     template <typename TModel>
-    void RunQuantizedLinearInt8(const char *weightFile, const QuantizedLinearTest &test)
+    void ExpectQuantizedLinearInt8Output(TModel &model, const std::vector<std::int8_t> &expectedOutput,
+                                         auto &&...inputs)
     {
-        const auto input = MakeQuantizedLinearTestInput(test);
-        const auto expectedOutput = MakeQuantizedLinearTestExpected(test, input);
-        const Idx inputSize = input.size();
         const Idx outputSize = expectedOutput.size();
-        auto input_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(inputSize));
-        std::int8_t *input_ptr = reinterpret_cast<std::int8_t *>(alpaka::getPtrNative(input_h));
-        for (Idx i = 0; i < inputSize; ++i) {
-            input_ptr[i] = input[i];
-        }
-
-        auto input_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(inputSize));
-        alpaka::memcpy(queue, input_d, input_h);
-        alpaka::wait(queue);
-
         auto result_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(outputSize));
+        auto result = model.infer(std::forward<decltype(inputs)>(inputs)...);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
 
-        {
-            TModel model(weightFile);
-            auto result = model.infer(input_d);
-            alpaka::wait(queue);
-            cudaDeviceSynchronize();
-
-            alpaka::memcpy(queue, result_h, result);
-            alpaka::wait(queue);
-        }
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
 
         const auto *res_ptr = reinterpret_cast<const std::int8_t *>(alpaka::getPtrNative(result_h));
         for (Idx i = 0; i < outputSize; ++i) {
             EXPECT_EQ(static_cast<int>(res_ptr[i]), static_cast<int>(expectedOutput[i])) << "i=" << i;
         }
     }
+
+    auto CopyQuantizedInputToDevice(const std::vector<std::int8_t> &input)
+    {
+        const Idx inputSize = input.size();
+        auto input_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(inputSize));
+        std::int8_t *input_ptr = reinterpret_cast<std::int8_t *>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < inputSize; ++i)
+            input_ptr[i] = input[i];
+
+        auto input_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(inputSize));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+        return input_d;
+    }
+
+    template <typename TModel>
+    void RunQuantizedLinearInt8(const char *weightFile, const QuantizedLinearTest &test)
+    {
+        const auto input = MakeQuantizedLinearTestInput(test);
+        const auto expectedOutput = MakeQuantizedLinearTestExpected(test, input);
+        auto input_d = CopyQuantizedInputToDevice(input);
+        TModel model(weightFile);
+        ExpectQuantizedLinearInt8Output(model, expectedOutput, input_d);
+    }
+
 
     SofieAlpakaTest() 
         : hostPlatform{}
@@ -362,6 +375,9 @@ TEST_F(SofieAlpakaTest, QuantizedMatMulFrontends)
    RunQuantizedLinearInt8<SOFIE_ONNX_QDQ_QuantMatMul::Session<alpaka::TagGpuCudaRt>>(
       "ONNX_QDQ_QuantMatMul_FromONNX_GPU_ALPAKA.dat",
       QuantizedLinearTest{256, 64, 64, true, false, false});
+   RunQuantizedLinearInt8<SOFIE_ONNX_QDQ_QuantMatMul_RankNProjection::Session<alpaka::TagGpuCudaRt>>(
+      "ONNX_QDQ_QuantMatMul_RankNProjection_FromONNX_GPU_ALPAKA.dat",
+      QuantizedLinearTest{256, 64, 64, true, false, false});
 }
 
 TEST_F(SofieAlpakaTest, QuantizedMatMulPadded)
@@ -378,6 +394,9 @@ TEST_F(SofieAlpakaTest, QuantizedMatMulAdd)
    RunQuantizedLinearInt8<SOFIE_QONNX_QuantMatMul_Add::Session<alpaka::TagGpuCudaRt>>(
       "QONNX_QuantMatMul_Add_FromONNX_GPU_ALPAKA.dat",
       QuantizedLinearTest{256, 64, 64, true, true, false});
+   RunQuantizedLinearInt8<SOFIE_ONNX_QDQ_QuantMatMul_RankNProjection_Add::Session<alpaka::TagGpuCudaRt>>(
+      "ONNX_QDQ_QuantMatMul_RankNProjection_Add_FromONNX_GPU_ALPAKA.dat",
+      QuantizedLinearTest{256, 64, 64, true, true, false});
 }
 
 TEST_F(SofieAlpakaTest, StandardQDQPerChannelDenseLinear)
@@ -390,6 +409,15 @@ TEST_F(SofieAlpakaTest, StandardQDQPerChannelDenseLinear)
       "ONNX_QDQ_QuantMatMul_PerChannelWeight_FromONNX_GPU_ALPAKA.dat",
       QuantizedLinearTest{256, 64, 64, true, false, true});
 }
+
+// Deferred to the quantization-preserving layout PR.
+// TEST_F(SofieAlpakaTest, QuantizedMatMulLayoutAliases)
+// {
+//    // Identity/Reshape preserve the quantized value grid before MatMul.
+//    RunQuantizedLinearInt8<SOFIE_ONNX_QDQ_QuantMatMul_Layout::Session<alpaka::TagGpuCudaRt>>(
+//       "ONNX_QDQ_QuantMatMul_Layout_FromONNX_GPU_ALPAKA.dat",
+//       QuantizedLinearTest{256, 64, 64, true, false, false});
+// }
 
 TEST_F(SofieAlpakaTest, Linear64)
 {

@@ -22,6 +22,26 @@ QuantizedTensorStorage MakeQuantizedTensorStorage(std::string logicalTensor,
                                                   std::vector<std::size_t> shape,
                                                   EQuantizedBackend backend);
 
+QuantizedTensorStorage MakeLowPrecisionTensorStorage(std::string logicalTensor,
+                                                     std::string sourceTensor,
+                                                     std::string storageTensor,
+                                                     const LowPrecisionTensorInfo &lowPrecision,
+                                                     EQuantizedLayout layout,
+                                                     std::vector<std::size_t> shape,
+                                                     EQuantizedBackend backend);
+
+struct MaterializedLowPrecisionWeight {
+   QuantizedTensorStorage storage;
+   std::vector<std::uint8_t> rawBytes;
+   ETensorType tensorType = ETensorType::UNDEFINED;
+};
+
+MaterializedLowPrecisionWeight MaterializeLowPrecisionWeightBytes(
+   std::string logicalTensor, std::string sourceTensor, std::string storageTensor,
+   const LowPrecisionTensorInfo &lowPrecision, EQuantizedLayout layout,
+   EQuantizedBackend backend, const void *sourceData,
+   const std::vector<std::size_t> &sourceShape);
+
 std::vector<std::int8_t> PackQuantizedGemmWeightsInt8(const float *data,
                                                        std::size_t n,
                                                        std::size_t k,

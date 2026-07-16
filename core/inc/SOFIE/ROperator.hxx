@@ -95,6 +95,33 @@ public:
       return std::string(fInputTensorNames.front());
    }
 
+   // Value-preserving graph-analysis hook used by first-class quantization metadata.
+   virtual bool PropagatesQuantizationMetadata() const { return false; }
+   virtual std::string GetQuantizationMetadataSourceTensor() const
+   {
+      if (fInputTensorNames.empty())
+         return {};
+      return std::string(fInputTensorNames.front());
+   }
+   virtual std::vector<std::string> GetQuantizationMetadataSourceTensors() const
+   {
+      auto source = GetQuantizationMetadataSourceTensor();
+      if (source.empty())
+         return {};
+      return {source};
+   }
+   virtual std::string GetQuantizationMetadataTargetTensor() const
+   {
+      if (fOutputTensorNames.empty())
+         return {};
+      return std::string(fOutputTensorNames.front());
+   }
+   virtual std::vector<int_t> GetQuantizationMetadataPermutation(std::size_t /*rank*/) const
+   {
+      return {};
+   }
+   virtual bool RequiresCompatibleQuantizationMetadataInputs() const { return false; }
+
    // Elementwise kernel fusion interface
    virtual bool IsElementwise() const { return false; }
    // Returns the C++ expression applying this op to inputVar (a local T variable) for fused kernel generation

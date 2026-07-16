@@ -838,7 +838,12 @@ void RModel::GenerateInitializedTensorInfo()
          } else if (i.second.type() == ETensorType::INT8) {
             fGC += GenerateConstantTensorCode<int8_t>(i);
             fConstantTensorSize += length * sizeof(int8_t);
-         } else if (i.second.type() == ETensorType::BOOL || i.second.type() == ETensorType::UINT8 ) {
+         } else if (i.second.type() == ETensorType::BOOL || i.second.type() == ETensorType::UINT8 ||
+                    i.second.type() == ETensorType::FLOAT8E4M3FN ||
+                    i.second.type() == ETensorType::FLOAT8E4M3FNUZ ||
+                    i.second.type() == ETensorType::FLOAT8E5M2 ||
+                    i.second.type() == ETensorType::FLOAT8E5M2FNUZ ||
+                    i.second.type() == ETensorType::FLOAT8E8M0) {
             fGC += GenerateConstantTensorCode<uint8_t>(i);
             fConstantTensorSize += length * sizeof(uint8_t);
          }
@@ -848,7 +853,9 @@ void RModel::GenerateInitializedTensorInfo()
          const auto typeName = ConvertTypeToString(i.second.type());
          if (i.second.type() != ETensorType::FLOAT && i.second.type() != ETensorType::INT8 &&
              i.second.type() != ETensorType::UINT8 && i.second.type() != ETensorType::INT32 &&
-             i.second.type() != ETensorType::INT64)
+             i.second.type() != ETensorType::INT64 && i.second.type() != ETensorType::FLOAT8E4M3FN &&
+             i.second.type() != ETensorType::FLOAT8E4M3FNUZ && i.second.type() != ETensorType::FLOAT8E5M2 &&
+             i.second.type() != ETensorType::FLOAT8E5M2FNUZ && i.second.type() != ETensorType::FLOAT8E8M0)
             throw std::runtime_error("sofie initialized tensor " + i.first + " has a type unsupported by weight files");
          fGC += "std::vector<" + typeName + "> fTensor_" + i.first + " = std::vector<" + typeName + ">(" + std::to_string(length) + ");\n";
          fGC += typeName + " * " + TensorMember(i.first) + " = fTensor_" + i.first + ".data();\n";

@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -50,6 +51,7 @@ QuantizedMatrixCodegenContext MakeQuantizedMatMulCodegenContext(const ROperator_
 }
 
 
+
 } // namespace
 
 void RModel::AddQuantizationInfo(const std::string & tensor_name, QuantizationInfo info)
@@ -76,6 +78,32 @@ const QuantizationInfo & RModel::GetQuantizationInfo(const std::string & tensor_
    if (fIsSubGraph && fParentGraph)
       return fParentGraph->GetQuantizationInfo(clean_name);
    throw std::runtime_error("SOFIE tensor [" + clean_name + "] has no quantization information");
+}
+
+void RModel::AddLowPrecisionTensorInfo(const std::string & tensor_name, LowPrecisionTensorInfo info)
+{
+   fQuantizationState.lowPrecisionTensorInfos[UTILITY::Clean_name(tensor_name)] = std::move(info);
+}
+
+bool RModel::HasLowPrecisionTensorInfo(const std::string & tensor_name) const
+{
+   auto clean_name = UTILITY::Clean_name(tensor_name);
+   if (fQuantizationState.lowPrecisionTensorInfos.find(clean_name) != fQuantizationState.lowPrecisionTensorInfos.end())
+      return true;
+   if (fIsSubGraph && fParentGraph)
+      return fParentGraph->HasLowPrecisionTensorInfo(clean_name);
+   return false;
+}
+
+const LowPrecisionTensorInfo & RModel::GetLowPrecisionTensorInfo(const std::string & tensor_name) const
+{
+   auto clean_name = UTILITY::Clean_name(tensor_name);
+   auto f = fQuantizationState.lowPrecisionTensorInfos.find(clean_name);
+   if (f != fQuantizationState.lowPrecisionTensorInfos.end())
+      return f->second;
+   if (fIsSubGraph && fParentGraph)
+      return fParentGraph->GetLowPrecisionTensorInfo(clean_name);
+   throw std::runtime_error("SOFIE tensor [" + clean_name + "] has no low-precision carrier information");
 }
 
 void RModel::RegisterQuantizedTensorStorage(QuantizedTensorStorage storage)
@@ -110,6 +138,155 @@ void RModel::AnalyzeQuantizedRegions()
    for (const auto &[name, storage] : fQuantizationState.tensorStorages)
       fInitializedTensors.erase(name);
    fQuantizationState.ClearDerivedAnalysis();
+
+   // Value-preserving operators carry quantization metadata forward without
+   // changing the numerical interpretation of the tensor. Single-input aliases
+   // copy metadata directly; layout permutations remap per-axis metadata. Multi-
+   // input aliases, such as Concat, propagate only when all inputs describe the
+   // same quantization contract.
+   auto sameQuantizationInfo = [](const QuantizationInfo &lhs, const QuantizationInfo &rhs) {
+      return lhs.bitWidth == rhs.bitWidth && lhs.isSigned == rhs.isSigned && lhs.narrow == rhs.narrow &&
+             lhs.scale == rhs.scale && lhs.zeroPoint == rhs.zeroPoint && lhs.scaleTensor == rhs.scaleTensor &&
+             lhs.zeroPointTensor == rhs.zeroPointTensor && lhs.rounding == rhs.rounding &&
+             lhs.overflow == rhs.overflow && lhs.granularity == rhs.granularity && lhs.axis == rhs.axis;
+   };
+
+   auto sameLowPrecisionTensorInfo = [&sameQuantizationInfo](const LowPrecisionTensorInfo &lhs,
+                                                             const LowPrecisionTensorInfo &rhs) {
+      if (lhs.carrier != rhs.carrier || lhs.accumulation != rhs.accumulation ||
+          lhs.affineQuantization.has_value() != rhs.affineQuantization.has_value())
+         return false;
+      if (lhs.affineQuantization)
+         return sameQuantizationInfo(*lhs.affineQuantization, *rhs.affineQuantization);
+      return true;
+   };
+
+   auto remapQuantization = [](QuantizationInfo info, const std::vector<int_t> &permutation)
+      -> std::optional<QuantizationInfo> {
+      if (permutation.empty() || info.granularity == EQuantizationGranularity::PerTensor || info.axis < 0)
+         return info;
+
+      auto axis = static_cast<std::size_t>(info.axis);
+      for (std::size_t outputAxis = 0; outputAxis < permutation.size(); ++outputAxis) {
+         if (permutation[outputAxis] < 0)
+            return std::nullopt;
+         if (static_cast<std::size_t>(permutation[outputAxis]) == axis) {
+            info.axis = static_cast<int>(outputAxis);
+            return info;
+         }
+      }
+      return std::nullopt;
+   };
+
+   auto isValidPermutation = [](const std::vector<int_t> &permutation, std::size_t rank) {
+      if (permutation.empty())
+         return true;
+      if (permutation.size() != rank)
+         return false;
+      std::vector<bool> seen(permutation.size(), false);
+      for (auto axis : permutation) {
+         if (axis < 0 || static_cast<std::size_t>(axis) >= permutation.size() || seen[static_cast<std::size_t>(axis)])
+            return false;
+         seen[static_cast<std::size_t>(axis)] = true;
+      }
+      return true;
+   };
+
+   auto propagateSingleSourceMetadata = [&](const std::string &source, const std::string &target,
+                                            const std::vector<int_t> &permutation) {
+      if (!HasQuantizationInfo(target) && HasQuantizationInfo(source)) {
+         if (auto info = remapQuantization(GetQuantizationInfo(source), permutation))
+            AddQuantizationInfo(target, *info);
+      }
+
+      if (!HasLowPrecisionTensorInfo(target) && HasLowPrecisionTensorInfo(source)) {
+         auto info = GetLowPrecisionTensorInfo(source);
+         if (info.affineQuantization) {
+            auto remapped = remapQuantization(*info.affineQuantization, permutation);
+            if (!remapped)
+               return;
+            info.affineQuantization = *remapped;
+         }
+         AddLowPrecisionTensorInfo(target, std::move(info));
+      }
+   };
+
+   auto propagateCompatibleSourceMetadata = [&](const std::vector<std::string> &sources, const std::string &target) {
+      if (sources.empty())
+         return;
+
+      if (!HasQuantizationInfo(target)) {
+         bool compatible = true;
+         std::optional<QuantizationInfo> candidate;
+         for (const auto &source : sources) {
+            if (!HasQuantizationInfo(source)) {
+               compatible = false;
+               break;
+            }
+            const auto &info = GetQuantizationInfo(source);
+            if (!candidate)
+               candidate = info;
+            else if (!sameQuantizationInfo(*candidate, info)) {
+               compatible = false;
+               break;
+            }
+         }
+         if (compatible && candidate)
+            AddQuantizationInfo(target, *candidate);
+      }
+
+      if (!HasLowPrecisionTensorInfo(target)) {
+         bool compatible = true;
+         std::optional<LowPrecisionTensorInfo> candidate;
+         for (const auto &source : sources) {
+            if (!HasLowPrecisionTensorInfo(source)) {
+               compatible = false;
+               break;
+            }
+            const auto &info = GetLowPrecisionTensorInfo(source);
+            if (!candidate)
+               candidate = info;
+            else if (!sameLowPrecisionTensorInfo(*candidate, info)) {
+               compatible = false;
+               break;
+            }
+         }
+         if (compatible && candidate)
+            AddLowPrecisionTensorInfo(target, std::move(*candidate));
+      }
+   };
+
+   for (const auto &op : fOperators) {
+      if (!op || !op->PropagatesQuantizationMetadata())
+         continue;
+
+      const auto target = UTILITY::Clean_name(op->GetQuantizationMetadataTargetTensor());
+      if (target.empty())
+         continue;
+
+      auto rawSources = op->GetQuantizationMetadataSourceTensors();
+      std::vector<std::string> sources;
+      sources.reserve(rawSources.size());
+      for (const auto &rawSource : rawSources) {
+         auto source = UTILITY::Clean_name(rawSource);
+         if (!source.empty() && source != target)
+            sources.push_back(std::move(source));
+      }
+      if (sources.empty())
+         continue;
+
+      if (op->RequiresCompatibleQuantizationMetadataInputs()) {
+         propagateCompatibleSourceMetadata(sources, target);
+         continue;
+      }
+
+      const auto &source = sources.front();
+      auto sourceShape = GetTensorShape(source);
+      auto permutation = op->GetQuantizationMetadataPermutation(sourceShape.size());
+      if (!isValidPermutation(permutation, sourceShape.size()))
+         continue;
+      propagateSingleSourceMetadata(source, target, permutation);
+   }
 
    const auto graph = BuildQuantizationGraphIndex(fOperators);
    auto readZeroPointTensor = [this](const std::string &tensorName) {
@@ -157,6 +334,15 @@ void RModel::AnalyzeQuantizedRegions()
       return values;
    };
 
+   auto registerLowPrecisionSourceStorage = [this](const std::string &logicalTensor,
+                                                   const std::string &sourceTensor,
+                                                   EQuantizedLayout layout) {
+      const auto shape = GetTensorShape(sourceTensor);
+      RegisterQuantizedTensorStorage(MakeLowPrecisionTensorStorage(logicalTensor, sourceTensor, sourceTensor,
+                                                                   GetLowPrecisionTensorInfo(sourceTensor),
+                                                                   layout, shape, EQuantizedBackend::ALPAKA));
+   };
+
    for (std::size_t opIndex = 0; opIndex < fOperators.size(); ++opIndex) {
       if (fOperators[opIndex]->GetKind() != OperatorKind::GEMM)
          continue;
@@ -173,6 +359,135 @@ void RModel::AnalyzeQuantizedRegions()
       const bool isMatMulAddSpelling = pattern.hasInlineMatMulBias;
       const bool isMatMulSpelling = pattern.isMatMul && !pattern.hasInlineMatMulBias;
       auto matmulShape = std::move(pattern.matmulShape);
+
+      const bool hasNativeLowPrecisionOperands =
+         !info.inputTensor.empty() && !info.weightTensor.empty() &&
+         HasLowPrecisionTensorInfo(info.inputTensor) && HasLowPrecisionTensorInfo(info.weightTensor);
+      if (hasNativeLowPrecisionOperands) {
+         std::vector<std::string> fp8Reasons;
+         info.inputSourceTensor = info.inputTensor;
+         info.weightSourceTensor = info.weightTensor;
+         info.outputTensor = info.gemmOutputTensor;
+
+         const auto &inputLowPrecision = GetLowPrecisionTensorInfo(info.inputTensor);
+         const auto &weightLowPrecision = GetLowPrecisionTensorInfo(info.weightTensor);
+         if (inputLowPrecision.carrier != ELowPrecisionCarrier::FP8E4M3)
+            fp8Reasons.push_back("native FP8 dense-linear input carrier is not E4M3");
+         if (weightLowPrecision.carrier != ELowPrecisionCarrier::FP8E4M3)
+            fp8Reasons.push_back("native FP8 dense-linear weight carrier is not E4M3");
+         if (!IsInitializedTensor(info.weightSourceTensor))
+            fp8Reasons.push_back("native FP8 dense-linear weight tensor must be initialized");
+
+         if (isQuantizedMatMulSpelling) {
+            if (isMatMulAddSpelling || !info.biasTensor.empty())
+               fp8Reasons.push_back("native FP8 MatMul lowering does not support fused bias");
+            if (info.alpha != 1.0f || info.beta != 0.0f || info.transA != 0 || info.transB != 0)
+               fp8Reasons.push_back("native FP8 MatMul lowering requires alpha=1, beta=0, transA=0, transB=0");
+            if (!QuantizedMatMulShapeIsSingleGemmExecutable(matmulShape))
+               fp8Reasons.push_back(matmulShape.reason.empty()
+                                      ? "native FP8 MatMul lowering requires rank-2 or flattenable X[...,M,K] @ W[K,N] -> Y[...,M,N]"
+                                      : matmulShape.reason);
+
+            auto matmul = MakeQuantizedMatMulRegionFromGemmLikeRegion(info);
+            matmul.shape = matmulShape;
+            auto &plans = fQuantizationState.loweringPlans[opIndex];
+            if (fp8Reasons.empty()) {
+               const auto m = matmulShape.logicalM;
+               const auto k = matmulShape.logicalK;
+               const auto n = matmulShape.logicalN;
+               matmul.status = EQuantizedLoweringStatus::SemanticRecognized;
+               matmul.reason = "recognized native FP8 MatMul region; " + matmulShape.reason + "; output carrier is FLOAT";
+               auto shapePolicy = MakeExactFP8DenseLinearShapePolicy(m, k, n);
+               auto capability = MakeNativeFP8E4M3TNF32Capability(m, n, k);
+               capability.reason = "SOFIE cuBLASLt FP8 E4M3 TN FP32 path selected for native FP8 MatMul";
+               auto alpakaPlan = MakeAlpakaCublasLtFP8Plan(matmul, matmul.weightSourceTensor, capability, shapePolicy);
+               alpakaPlan.reason = matmul.reason + "; " + capability.reason;
+               registerLowPrecisionSourceStorage(matmul.weightTensor, matmul.weightSourceTensor, alpakaPlan.weightLayout);
+               plans[EQuantizedBackend::CPU] = MakeUnsupportedLowPrecisionDenseLinearPlan(
+                  EQuantizedBackend::CPU, matmul.reason + "; CPU FP8 MatMul lowering is not implemented", true,
+                  capability.inputCarrier, capability.weightCarrier, capability.outputCarrier, capability.accumulation,
+                  capability.profile, "fp8_dense_linear_cpu_backend_unsupported");
+               plans[EQuantizedBackend::ALPAKA] = std::move(alpakaPlan);
+            } else {
+               matmul.status = EQuantizedLoweringStatus::SemanticUnsupported;
+               matmul.reason = JoinQuantizationReasons(fp8Reasons);
+               plans[EQuantizedBackend::CPU] = MakeUnsupportedLowPrecisionDenseLinearPlan(
+                  EQuantizedBackend::CPU, matmul.reason, false,
+                  inputLowPrecision.carrier, weightLowPrecision.carrier, ELowPrecisionCarrier::Float32,
+                  ELowPrecisionAccumulation::Float32, EQuantizedComputeProfile::FP8E4M3DenseLinearRank2,
+                  "fp8_dense_linear_semantic_unsupported");
+               plans[EQuantizedBackend::ALPAKA] = MakeUnsupportedLowPrecisionDenseLinearPlan(
+                  EQuantizedBackend::ALPAKA, matmul.reason, false,
+                  inputLowPrecision.carrier, weightLowPrecision.carrier, ELowPrecisionCarrier::Float32,
+                  ELowPrecisionAccumulation::Float32, EQuantizedComputeProfile::FP8E4M3DenseLinearRank2,
+                  "fp8_dense_linear_semantic_unsupported");
+            }
+            fQuantizationState.matmulRegions[opIndex] = std::move(matmul);
+            if (fVerbose > 0) {
+               std::cout << "SOFIE native FP8 MatMul candidate at operator " << opIndex << ": "
+                         << fQuantizationState.matmulRegions[opIndex].reason << std::endl;
+            }
+            continue;
+         }
+
+         if (!info.biasTensor.empty()) {
+            if (!IsInitializedTensor(info.biasTensor)) {
+               fp8Reasons.push_back("native FP8 Gemm fused bias must be an initialized constant tensor");
+            } else if (GetTensorType(info.biasTensor) != ETensorType::FLOAT) {
+               fp8Reasons.push_back("native FP8 Gemm fused bias must be stored as FLOAT");
+            } else {
+               info.biasSourceTensor = info.biasTensor;
+            }
+         }
+         if (info.transA != 1 || info.transB != 0)
+            fp8Reasons.push_back("native FP8 Gemm lowering requires transA=1 and transB=0");
+
+         const auto inputShape = GetTensorShape(info.inputSourceTensor);
+         const auto weightShape = GetTensorShape(info.weightSourceTensor);
+         const auto outputShape = GetTensorShape(info.outputTensor);
+         if (inputShape.size() != 2 || weightShape.size() != 2 || outputShape.size() != 2) {
+            fp8Reasons.push_back("native FP8 Gemm lowering requires rank-2 input, weight, and output tensors");
+         } else {
+            const auto k = inputShape[0];
+            const auto m = inputShape[1];
+            const auto n = weightShape[1];
+            if (weightShape[0] != k)
+               fp8Reasons.push_back("native FP8 Gemm weight K dimension does not match input K dimension");
+            if (outputShape[0] != m || outputShape[1] != n)
+               fp8Reasons.push_back("native FP8 Gemm output shape is not [M, N] for A[K, M]^T * B[K, N]");
+            if (!info.biasSourceTensor.empty() &&
+                !IsDenseLinearBiasLikeShape(GetTensorShape(info.biasSourceTensor), outputShape))
+               fp8Reasons.push_back("native FP8 Gemm fused bias is not broadcastable to [M, N]");
+         }
+
+         auto &plans = fQuantizationState.loweringPlans[opIndex];
+         if (fp8Reasons.empty()) {
+            const auto k = inputShape[0];
+            const auto m = inputShape[1];
+            const auto n = weightShape[1];
+            info.status = EQuantizedLoweringStatus::SemanticRecognized;
+            info.reason = "recognized native FP8 Gemm region; alpha * A[K,M]^T * B[K,N] + beta * C -> FLOAT[M,N]";
+            auto shapePolicy = MakeExactFP8DenseLinearShapePolicy(m, k, n);
+            auto capability = MakeNativeFP8E4M3TNF32Capability(m, n, k);
+            auto alpakaPlan = MakeAlpakaCublasLtFP8Plan(info, info.weightSourceTensor, capability, shapePolicy);
+            alpakaPlan.reason = info.reason + "; " + capability.reason;
+            registerLowPrecisionSourceStorage(info.weightTensor, info.weightSourceTensor, alpakaPlan.weightLayout);
+            plans[EQuantizedBackend::CPU] = MakeUnsupportedQuantizedGemmPlan(
+               EQuantizedBackend::CPU, info.reason + "; CPU FP8 Gemm lowering is not implemented", true);
+            plans[EQuantizedBackend::ALPAKA] = std::move(alpakaPlan);
+         } else {
+            info.status = EQuantizedLoweringStatus::SemanticUnsupported;
+            info.reason = JoinQuantizationReasons(fp8Reasons);
+            plans[EQuantizedBackend::CPU] = MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend::CPU, info.reason, true);
+            plans[EQuantizedBackend::ALPAKA] = MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend::ALPAKA, info.reason, true);
+         }
+         fQuantizationState.gemmRegions[opIndex] = std::move(info);
+         if (fVerbose > 0) {
+            std::cout << "SOFIE native FP8 Gemm candidate at operator " << opIndex << ": "
+                      << fQuantizationState.gemmRegions[opIndex].reason << std::endl;
+         }
+         continue;
+      }
 
       if (!info.inputTensor.empty()) {
          if (auto producer = MatchQuantizationBoundaryProducer(graph, fOperators, info.inputTensor, "input", reasons)) {
@@ -347,7 +662,7 @@ void RModel::AnalyzeQuantizedRegions()
                const auto capability = AssessCublasLtDenseLinearCapability(
                   MakeDenseLinearOperands(matmul, inputShape, weightShape, outputShape));
                const auto selectedCapability = SelectExecutableDenseLinearCapability(capability);
-               if (!selectedCapability.optimized) {
+               if (!selectedCapability.executable) {
                   storageReasons.push_back("MatMul cuBLASLt optimized profile unavailable: " + selectedCapability.reason);
                }
 
@@ -379,8 +694,8 @@ void RModel::AnalyzeQuantizedRegions()
                if (storageReasons.empty()) {
                   const bool paddedStorage = selectedCapability.shapePolicy.policy == EQuantizedShapePolicy::Padded;
                   const auto deviceStorageTensor = matmul.weightSourceTensor +
-                                                   (paddedStorage ? "_s22_matmul_transposed_padded_plain_device_storage"
-                                                                  : "_s19_matmul_transposed_plain_device_storage");
+                                                   (paddedStorage ? "_quantized_transposed_padded_device_storage"
+                                                                  : "_quantized_transposed_device_storage");
                   auto alpakaPlan = MakeMatMulAlpakaTransposedWeightStoragePlan(matmul, deviceStorageTensor, selectedCapability.shapePolicy);
                   alpakaPlan.computeProfile = selectedCapability.profile;
                   alpakaPlan.capabilityTag = selectedCapability.tag;
@@ -418,11 +733,11 @@ void RModel::AnalyzeQuantizedRegions()
          auto currentLoweringUnsupportedReasons = QuantizedGemmLoweringUnsupportedReasons(info);
          std::vector<float> perChannelWeightScales;
          if (IsPerChannelAxis(info.weightQuant, 0)) {
+            const auto weightShape = GetTensorShape(info.weightSourceTensor);
             if (!IsInitializedTensor(info.weightQuant.scaleTensor)) {
                currentLoweringUnsupportedReasons.push_back("per-channel weight scale tensor is not initialized");
             } else {
                perChannelWeightScales = GetTensorData<float>(info.weightQuant.scaleTensor);
-               const auto weightShape = GetTensorShape(info.weightSourceTensor);
                if (weightShape.size() != 2 || perChannelWeightScales.size() != weightShape[0]) {
                   currentLoweringUnsupportedReasons.push_back("per-channel weight scale length does not match GEMM output channels");
                }
@@ -431,6 +746,9 @@ void RModel::AnalyzeQuantizedRegions()
                currentLoweringUnsupportedReasons.push_back("per-channel weight zero-point tensor is not initialized");
             } else {
                const auto zeroPoints = readZeroPointTensor(info.weightQuant.zeroPointTensor);
+               if (weightShape.size() != 2 || zeroPoints.size() != weightShape[0]) {
+                  currentLoweringUnsupportedReasons.push_back("per-channel weight zero-point length does not match GEMM output channels");
+               }
                for (std::int64_t zeroPoint : zeroPoints) {
                   if (zeroPoint != 0) {
                      currentLoweringUnsupportedReasons.push_back("per-channel weight zero-points must all be 0");
@@ -453,7 +771,9 @@ void RModel::AnalyzeQuantizedRegions()
          }
 
          auto cpuPlan = MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend::CPU, "CPU quantized Gemm lowering requires constant pre-quantized weight storage", true);
-         auto alpakaPlan = MakeAlpakaFakeQuantPlan(info);
+         auto alpakaPlan = MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend::ALPAKA,
+                                                     "ALPAKA quantized Gemm lowering requires an optimized cuBLASLt dense-linear profile",
+                                                     true);
 
          if (!IsPerChannelAxis(info.weightQuant, 0) && !info.weightSourceTensor.empty() && IsInitializedTensor(info.weightSourceTensor)) {
             const auto storageTensor = info.weightSourceTensor + "_s11_packed_cpu_storage";
@@ -466,7 +786,7 @@ void RModel::AnalyzeQuantizedRegions()
          }
 
          if (!info.weightSourceTensor.empty() && IsInitializedTensor(info.weightSourceTensor)) {
-            const auto deviceStorageTensor = info.weightSourceTensor + "_s17g3_plain_device_storage";
+            const auto deviceStorageTensor = info.weightSourceTensor + "_quantized_plain_device_storage";
             const auto weightShape = GetTensorShape(info.weightSourceTensor);
 
             try {
@@ -475,10 +795,10 @@ void RModel::AnalyzeQuantizedRegions()
                auto capability = AssessCublasLtDenseLinearCapability(
                   MakeDenseLinearOperands(info, inputShape, weightShape, outputShape));
                auto selectedCapability = SelectExecutableDenseLinearCapability(capability);
-               if (selectedCapability.optimized) {
+               if (selectedCapability.executable) {
                   std::string selectedStorageTensor = deviceStorageTensor;
                   if (selectedCapability.shapePolicy.policy == EQuantizedShapePolicy::Padded) {
-                     const auto paddedStorageTensor = info.weightSourceTensor + "_s22_gemm_padded_plain_device_storage";
+                     const auto paddedStorageTensor = info.weightSourceTensor + "_quantized_padded_plain_device_storage";
                      selectedStorageTensor = paddedStorageTensor;
                   }
                   alpakaPlan = MakeAlpakaCublasLtCorePlan(info, selectedStorageTensor, selectedCapability);
@@ -516,7 +836,8 @@ void RModel::AnalyzeQuantizedRegions()
 void RModel::PrepareQuantizedTensorStorage(EQuantizedBackend backend)
 {
    for (const auto &[name, storage] : fQuantizationState.tensorStorages)
-      fInitializedTensors.erase(name);
+      if (storage.sourceTensor != storage.storageTensor)
+         fInitializedTensors.erase(name);
    fQuantizationState.tensorStorages.clear();
 
    auto restoreSource = [this](const std::string &name) {
@@ -538,6 +859,17 @@ void RModel::PrepareQuantizedTensorStorage(EQuantizedBackend backend)
       RegisterQuantizedTensorStorage(std::move(materialized.storage));
    };
 
+   auto registerLowPrecisionStorage = [this, backend](const std::string &logicalTensor,
+                                                      const std::string &sourceTensor,
+                                                      EQuantizedLayout layout) {
+      const auto shape = GetTensorShape(sourceTensor);
+      if (shape.size() != 2 || !IsInitializedTensor(sourceTensor))
+         throw std::runtime_error("SOFIE low-precision dense-linear storage requires an initialized rank-2 weight tensor");
+      RegisterQuantizedTensorStorage(MakeLowPrecisionTensorStorage(logicalTensor, sourceTensor, sourceTensor,
+                                                                   GetLowPrecisionTensorInfo(sourceTensor),
+                                                                   layout, shape, backend));
+   };
+
    for (auto opIndex : SortedQuantizedRegionOperatorIndices(fQuantizationState.gemmRegions)) {
       const auto *plan = FindQuantizedLoweringPlan(fQuantizationState, opIndex, backend);
       if (plan == nullptr || !IsQuantizedLoweringAvailable(plan->status) || plan->weightStorageTensor.empty())
@@ -550,6 +882,10 @@ void RModel::PrepareQuantizedTensorStorage(EQuantizedBackend backend)
       const auto weightShape = GetTensorShape(region.weightSourceTensor);
       if (weightShape.size() != 2 || !IsInitializedTensor(region.weightSourceTensor))
          throw std::runtime_error("SOFIE quantized Gemm storage requires an initialized rank-2 weight tensor");
+      if (QuantizedPlanUsesFP8DenseLinear(*plan)) {
+         registerLowPrecisionStorage(region.weightTensor, region.weightSourceTensor, plan->weightLayout);
+         continue;
+      }
       const auto *weightData = fInitializedTensors.at(region.weightSourceTensor).data<float>();
 
       std::vector<float> perChannelScales;
@@ -573,6 +909,10 @@ void RModel::PrepareQuantizedTensorStorage(EQuantizedBackend backend)
       const auto weightShape = GetTensorShape(region.weightSourceTensor);
       if (weightShape.size() != 2 || !IsInitializedTensor(region.weightSourceTensor))
          throw std::runtime_error("SOFIE quantized MatMul storage requires an initialized rank-2 weight tensor");
+      if (QuantizedPlanUsesFP8DenseLinear(*plan)) {
+         registerLowPrecisionStorage(region.weightTensor, region.weightSourceTensor, plan->weightLayout);
+         continue;
+      }
 
       const auto *weightData = fInitializedTensors.at(region.weightSourceTensor).data<float>();
       std::vector<float> perChannelScales;
@@ -600,11 +940,15 @@ void RModel::PrepareQuantizedTensorStorage(EQuantizedBackend backend)
          protectedTensors.insert(planIt->second.weightZeroPointTensor);
       if (auto gemm = fQuantizationState.gemmRegions.find(opIndex); gemm != fQuantizationState.gemmRegions.end()) {
          pruneCandidates.insert(gemm->second.weightSourceTensor);
+         if (QuantizedPlanUsesFP8DenseLinear(planIt->second))
+            protectedTensors.insert(gemm->second.weightSourceTensor);
          if (!gemm->second.biasSourceTensor.empty())
             protectedTensors.insert(gemm->second.biasSourceTensor);
       }
       if (auto matmul = fQuantizationState.matmulRegions.find(opIndex); matmul != fQuantizationState.matmulRegions.end()) {
          pruneCandidates.insert(matmul->second.weightSourceTensor);
+         if (QuantizedPlanUsesFP8DenseLinear(planIt->second))
+            protectedTensors.insert(matmul->second.weightSourceTensor);
          if (!matmul->second.epilogue.biasSourceTensor.empty())
             protectedTensors.insert(matmul->second.epilogue.biasSourceTensor);
       }
@@ -669,6 +1013,8 @@ void RModel::AddLoweredQuantizedOperators(EQuantizedBackend backend)
                                                              std::unique_ptr<ROperator> lowered) {
       if (QuantizedPlanExposesQuantizedInputCarrier(plan))
          setKnownTensorType(inputSourceTensor, TensorTypeForQuantizedStorage(plan.inputStorage));
+      if (plan.outputLowPrecisionCarrier == ELowPrecisionCarrier::Float32)
+         setKnownTensorType(outputTensor, ETensorType::FLOAT);
       if (QuantizedPlanExposesQuantizedOutputCarrier(plan))
          setKnownTensorType(outputTensor, TensorTypeForQuantizedStorage(plan.outputStorage));
 

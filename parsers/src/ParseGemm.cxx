@@ -54,13 +54,29 @@ ParserFuncSignature ParseGemm = [](RModelParser_ONNX &parser, const onnx::NodePr
                                             nodeproto.input(1), nodeproto.input(2), output_name));
       }
       break;
+   case ETensorType::FLOAT8E4M3FN:
+   case ETensorType::FLOAT8E4M3FNUZ:
+   case ETensorType::FLOAT8E5M2:
+   case ETensorType::FLOAT8E5M2FNUZ:
+   case ETensorType::FLOAT8E8M0:
+      if (nodeproto.input_size() == 2) {
+         op.reset(new ROperator_Gemm<float>(attr_alpha, attr_beta, attr_transA, attr_transB, nodeproto.input(0),
+                                            nodeproto.input(1), output_name, EActivationType::UNDEFINED, true));
+      } else if (nodeproto.input_size() == 3) {
+         op.reset(new ROperator_Gemm<float>(attr_alpha, attr_beta, attr_transA, attr_transB, nodeproto.input(0),
+                                            nodeproto.input(1), nodeproto.input(2), output_name,
+                                            EActivationType::UNDEFINED, true));
+      } else {
+         throw std::runtime_error("TMVA::SOFIE - Unsupported - native FP8 Gemm lowering requires two or three inputs");
+      }
+      break;
    default:
       throw std::runtime_error("TMVA::SOFIE - Unsupported - Operator Gemm does not yet support input type " +
                                std::to_string(static_cast<int>(input_type)));
    }
 
    if (!parser.IsRegisteredTensorType(output_name)) {
-      parser.RegisterTensorType(output_name, input_type);
+      parser.RegisterTensorType(output_name, DenseLinearOutputTensorType(input_type));
    }
 
    return op;

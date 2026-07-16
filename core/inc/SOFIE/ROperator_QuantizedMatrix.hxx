@@ -107,7 +107,49 @@ struct QuantizedCudaLtMatMulCall {
    bool hasBias = false;
    bool hasRelu = false;
    bool weightIsSigned = true;
+   float alpha = 1.0f;
+   float beta = 1.0f;
 };
+
+inline QuantizedCudaLtMatMulCall MakeQuantizedCudaLtInt8DenseLinearCall(
+   std::string boundaryName, std::string stateName, std::string paramsName,
+   std::string outputTensor, std::string inputTensor, std::string weightStorageTensor,
+   std::string biasTensor, std::string weightScaleTensor,
+   std::string m, std::string n, std::string k,
+   const QuantizedLoweringPlan &plan, const QuantizationInfo &inputQuant,
+   const QuantizationInfo &weightQuant, std::optional<QuantizationInfo> biasQuant,
+   const QuantizationInfo &outputQuant, bool hasBias, bool hasRelu, bool weightIsSigned,
+   float alpha = 1.0f, float beta = 1.0f)
+{
+   QuantizedCudaLtMatMulCall call;
+   call.boundaryName = std::move(boundaryName);
+   call.stateName = std::move(stateName);
+   call.paramsName = std::move(paramsName);
+   call.outputTensor = std::move(outputTensor);
+   call.inputTensor = std::move(inputTensor);
+   call.weightStorageTensor = std::move(weightStorageTensor);
+   call.biasTensor = std::move(biasTensor);
+   call.weightScaleTensor = std::move(weightScaleTensor);
+   call.m = std::move(m);
+   call.n = std::move(n);
+   call.k = std::move(k);
+   call.shapePolicy = plan.shapePolicy;
+   call.inputQuant = inputQuant;
+   call.weightQuant = weightQuant;
+   call.biasQuant = std::move(biasQuant);
+   call.outputQuant = outputQuant;
+   call.outputMode = plan.outputMode;
+   call.inputCarrierMode = QuantizedCarrierModeForStorage(plan.inputStorage);
+   call.weightScaleMode = plan.weightScaleMode;
+   call.capabilityTag = plan.capabilityTag;
+   call.reason = plan.reason;
+   call.hasBias = hasBias;
+   call.hasRelu = hasRelu;
+   call.weightIsSigned = weightIsSigned;
+   call.alpha = alpha;
+   call.beta = beta;
+   return call;
+}
 
 inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMulCall &call)
 {
@@ -151,6 +193,11 @@ inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMul
    out << "      " << call.paramsName << ".weightScale = " << call.weightQuant.scale << ";\n";
    out << "      " << call.paramsName << ".biasScale = " << (call.biasQuant ? call.biasQuant->scale : 1.0) << ";\n";
    out << "      " << call.paramsName << ".outputScale = " << call.outputQuant.scale << ";\n";
+   out << "      " << call.paramsName << ".alpha = "
+       << std::setprecision(std::numeric_limits<double>::max_digits10) << static_cast<double>(call.alpha) << ";\n";
+   out << "      " << call.paramsName << ".beta = "
+       << std::setprecision(std::numeric_limits<double>::max_digits10) << static_cast<double>(call.beta) << ";\n";
+   out << std::setprecision(std::numeric_limits<double>::max_digits10);
    out << "      " << call.paramsName << ".inputZeroPoint = " << call.inputQuant.zeroPoint << ";\n";
    out << "      " << call.paramsName << ".weightZeroPoint = " << call.weightQuant.zeroPoint << ";\n";
    out << "      " << call.paramsName << ".biasZeroPoint = " << (call.biasQuant ? call.biasQuant->zeroPoint : 0) << ";\n";
@@ -187,6 +234,149 @@ inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMul
    }
    if (call.weightScaleMode == EQuantizedParameterMode::PerOutputChannel) {
       out << ", alpaka::getPtrNative(deviceBuf_" << call.weightScaleTensor << ")";
+   } else {
+      out << ", static_cast<const float *>(nullptr)";
+   }
+   out << ", " << call.paramsName << ");\n";
+   out << "   }\n";
+   return out.str();
+}
+
+struct QuantizedCudaLtFP8DenseLinearCall {
+   std::string boundaryName;
+   std::string stateName;
+   std::string paramsName;
+   std::string outputTensor;
+   std::string inputTensor;
+   std::string weightStorageTensor;
+   std::string biasTensor;
+   bool hasBias = false;
+   float alpha = 1.0f;
+   float beta = 0.0f;
+   std::string m;
+   std::string n;
+   std::string k;
+   EQuantizedComputeProfile computeProfile = EQuantizedComputeProfile::UNDEFINED;
+   ELowPrecisionCarrier inputCarrier = ELowPrecisionCarrier::UNDEFINED;
+   ELowPrecisionCarrier weightCarrier = ELowPrecisionCarrier::UNDEFINED;
+   ELowPrecisionCarrier outputCarrier = ELowPrecisionCarrier::UNDEFINED;
+   ELowPrecisionAccumulation accumulation = ELowPrecisionAccumulation::UNDEFINED;
+   std::string capabilityTag;
+   std::string reason;
+};
+
+inline QuantizedCudaLtFP8DenseLinearCall MakeQuantizedCudaLtFP8DenseLinearCall(
+   std::string boundaryName, std::string stateName, std::string paramsName,
+   std::string outputTensor, std::string inputTensor, std::string weightStorageTensor,
+   std::string biasTensor, bool hasBias, float alpha, float beta,
+   std::string m, std::string n, std::string k, const QuantizedLoweringPlan &plan)
+{
+   QuantizedCudaLtFP8DenseLinearCall call;
+   call.boundaryName = std::move(boundaryName);
+   call.stateName = std::move(stateName);
+   call.paramsName = std::move(paramsName);
+   call.outputTensor = std::move(outputTensor);
+   call.inputTensor = std::move(inputTensor);
+   call.weightStorageTensor = std::move(weightStorageTensor);
+   call.biasTensor = std::move(biasTensor);
+   call.hasBias = hasBias;
+   call.alpha = alpha;
+   call.beta = beta;
+   call.m = std::move(m);
+   call.n = std::move(n);
+   call.k = std::move(k);
+   call.computeProfile = plan.computeProfile;
+   call.inputCarrier = plan.inputLowPrecisionCarrier;
+   call.weightCarrier = plan.weightLowPrecisionCarrier;
+   call.outputCarrier = plan.outputLowPrecisionCarrier;
+   call.accumulation = plan.lowPrecisionAccumulation;
+   call.capabilityTag = plan.capabilityTag;
+   call.reason = plan.reason;
+   return call;
+}
+
+inline const char *QuantizedCudaFP8FormatName(ELowPrecisionCarrier carrier, const std::string &pathName)
+{
+   switch (carrier) {
+   case ELowPrecisionCarrier::FP8E4M3:
+      return "E4M3";
+   case ELowPrecisionCarrier::FP8E5M2:
+      return "E5M2";
+   default:
+      throw std::runtime_error("SOFIE " + pathName + " received a non-FP8 carrier");
+   }
+}
+
+inline const char *QuantizedCudaFP8OutputCarrierName(ELowPrecisionCarrier carrier, const std::string &pathName)
+{
+   switch (carrier) {
+   case ELowPrecisionCarrier::FP8E4M3:
+      return "FP8E4M3";
+   case ELowPrecisionCarrier::FP8E5M2:
+      return "FP8E5M2";
+   case ELowPrecisionCarrier::Float16:
+      return "Float16";
+   case ELowPrecisionCarrier::Float32:
+      return "Float32";
+   default:
+      throw std::runtime_error("SOFIE " + pathName + " received an unsupported FP8 output carrier");
+   }
+}
+
+inline const char *QuantizedCudaFP8AccumulationName(ELowPrecisionAccumulation accumulation,
+                                                    const std::string &pathName)
+{
+   switch (accumulation) {
+   case ELowPrecisionAccumulation::Float16:
+      return "Float16";
+   case ELowPrecisionAccumulation::Float32:
+      return "Float32";
+   default:
+      throw std::runtime_error("SOFIE " + pathName + " received an unsupported FP8 accumulation carrier");
+   }
+}
+
+inline std::string GenerateQuantizedCudaLtFP8DenseLinearCall(const QuantizedCudaLtFP8DenseLinearCall &call)
+{
+   if (call.outputTensor.empty() || call.inputTensor.empty() || call.weightStorageTensor.empty()) {
+      throw std::runtime_error("SOFIE " + call.boundaryName + " is missing input/output/weight-storage tensors");
+   }
+   if (call.computeProfile != EQuantizedComputeProfile::FP8E4M3DenseLinearRank2 &&
+       call.computeProfile != EQuantizedComputeProfile::FP8E5M2DenseLinearRank2) {
+      throw std::runtime_error("SOFIE " + call.boundaryName + " requires an FP8 dense-linear lowering plan");
+   }
+
+   std::stringstream out;
+   out << "\n//--------- " << call.boundaryName << "\n";
+   out << "   // Low-precision GPU boundary: stream-ordered cuBLASLt FP8 dense-linear call selected by the lowering plan.\n";
+   out << "   {\n";
+   out << "      // Low-precision lowering capability: " << call.capabilityTag << "\n";
+   out << "      // Low-precision lowering reason: " << call.reason << "\n";
+   out << "      SOFIE::QuantizedGemmCudaLtFP8Params " << call.paramsName << "{};\n";
+   out << "      " << call.paramsName << ".m = static_cast<std::size_t>(" << call.m << ");\n";
+   out << "      " << call.paramsName << ".n = static_cast<std::size_t>(" << call.n << ");\n";
+   out << "      " << call.paramsName << ".k = static_cast<std::size_t>(" << call.k << ");\n";
+   out << "      " << call.paramsName << ".inputFormat = SOFIE::EQuantizedCudaFP8Format::"
+       << QuantizedCudaFP8FormatName(call.inputCarrier, call.boundaryName) << ";\n";
+   out << "      " << call.paramsName << ".weightFormat = SOFIE::EQuantizedCudaFP8Format::"
+       << QuantizedCudaFP8FormatName(call.weightCarrier, call.boundaryName) << ";\n";
+   out << "      " << call.paramsName << ".outputCarrier = SOFIE::EQuantizedCudaFP8OutputCarrier::"
+       << QuantizedCudaFP8OutputCarrierName(call.outputCarrier, call.boundaryName) << ";\n";
+   out << "      " << call.paramsName << ".accumulation = SOFIE::EQuantizedCudaFP8Accumulation::"
+       << QuantizedCudaFP8AccumulationName(call.accumulation, call.boundaryName) << ";\n";
+   out << "      " << call.paramsName << ".alpha = static_cast<float>("
+       << std::setprecision(std::numeric_limits<float>::max_digits10) << call.alpha << ");\n";
+   out << "      " << call.paramsName << ".beta = static_cast<float>("
+       << std::setprecision(std::numeric_limits<float>::max_digits10) << call.beta << ");\n";
+   out << "      " << call.paramsName << ".hasBias = " << (call.hasBias ? "true" : "false") << ";\n";
+   out << "      " << call.paramsName << ".maxWorkspaceBytes = 32ULL * 1024ULL * 1024ULL;\n";
+   out << "      SOFIE::QuantizedGemmCudaLtFP8_Call(" << call.stateName
+       << ", alpaka::getNativeHandle(queue)"
+       << ", alpaka::getPtrNative(deviceBuf_" << call.outputTensor << ")"
+       << ", alpaka::getPtrNative(deviceBuf_" << call.inputTensor << ")"
+       << ", alpaka::getPtrNative(deviceBuf_" << call.weightStorageTensor << ")";
+   if (call.hasBias) {
+      out << ", alpaka::getPtrNative(deviceBuf_" << call.biasTensor << ")";
    } else {
       out << ", static_cast<const float *>(nullptr)";
    }

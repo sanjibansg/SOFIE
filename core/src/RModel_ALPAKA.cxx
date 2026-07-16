@@ -19,6 +19,18 @@
 
 namespace SOFIE {
 
+namespace {
+
+bool IsByteBackedAlpakaTensorType(ETensorType type)
+{
+   return type == ETensorType::BOOL || type == ETensorType::UINT8 ||
+          type == ETensorType::FLOAT8E4M3FN || type == ETensorType::FLOAT8E4M3FNUZ ||
+          type == ETensorType::FLOAT8E5M2 || type == ETensorType::FLOAT8E5M2FNUZ ||
+          type == ETensorType::FLOAT8E8M0;
+}
+
+} // namespace
+
 void RModel::ComputeEltwiseFusionGroups() {
    fEltwiseFusionGroups.clear();
    fOpToFusionGroupIdx.clear();
@@ -160,8 +172,7 @@ void RModel::GenerateInitializedTensorInfo_GPU_ALPAKA() {
          else if (i.second.type() == ETensorType::INT8)
             fGC += GenerateConstantTensorCode<int8_t>(i);
 
-         else if (i.second.type() == ETensorType::BOOL ||
-                  i.second.type() == ETensorType::UINT8)
+         else if (IsByteBackedAlpakaTensorType(i.second.type()))
             fGC += GenerateConstantTensorCode<uint8_t>(i);
       }
 
@@ -182,8 +193,7 @@ void RModel::GenerateInitializedTensorInfo_GPU_ALPAKA() {
             fGC += "BufI641D deviceBuf_" + i.first +
                    " = alpaka::allocBuf<int64_t, Idx>(devAcc, Ext1D::all(Idx{" +
                    std::to_string(length) + "}));\n";
-         } else if (i.second.type() == ETensorType::BOOL ||
-                    i.second.type() == ETensorType::UINT8) {
+         } else if (IsByteBackedAlpakaTensorType(i.second.type())) {
             fGC += "BufUI81D deviceBuf_" + i.first +
                    " = alpaka::allocBuf<uint8_t, Idx>(devAcc, Ext1D::all(Idx{" +
                    std::to_string(length) + "}));\n";
@@ -211,8 +221,7 @@ void RModel::GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA()
             fGC += "std::vector<int8_t> tensor_" + i.first + "(" + std::to_string(length) + ");\n";
          } else if (i.second.type() == ETensorType::INT64) {
             fGC += "std::vector<int64_t> tensor_" + i.first + "(" + std::to_string(length) + ");\n";
-         } else if (i.second.type() == ETensorType::BOOL ||
-                    i.second.type() == ETensorType::UINT8) {
+         } else if (IsByteBackedAlpakaTensorType(i.second.type())) {
             fGC += "std::vector<uint8_t> tensor_" + i.first + "(" + std::to_string(length) + ");\n";
          }
       }
@@ -249,7 +258,7 @@ void RModel::GenerateGPU_ALPAKA_Buffers() {
             tensor_declaration_block += "BufI641D deviceBuf_" + i.first +
                                           " = alpaka::allocBuf<int64_t, size_t>(devAcc, Ext1D::all(Idx{" +
                                           std::to_string(length) + "}));\n";
-         } else if (i.second.type == ETensorType::BOOL || i.second.type == ETensorType::UINT8) {
+         } else if (IsByteBackedAlpakaTensorType(i.second.type)) {
             tensor_declaration_block += "BufUI81D deviceBuf_" + i.first +
                                           " = alpaka::allocBuf<std::uint8_t, size_t>(devAcc, Ext1D::all(Idx{" +
                                           std::to_string(length) + "}));\n";
@@ -303,7 +312,7 @@ std::string RModel::GenerateInferSignature_GPU_ALPAKA(bool isdecl) {
       if (type == ETensorType::INT32)  return "BufI321D";
       if (type == ETensorType::INT64)  return "BufI641D";
       if (type == ETensorType::INT8)   return "BufI81D";
-      if (type == ETensorType::BOOL || type == ETensorType::UINT8)  return "BufUI81D";
+      if (IsByteBackedAlpakaTensorType(type))  return "BufUI81D";
       throw std::runtime_error("sofie: input tensor " + name +
                                " is of a data type which is not yet supported.");
    };
@@ -344,7 +353,7 @@ std::string RModel::GenerateImplSignature_GPU_ALPAKA(bool isdecl) {
       if (type == ETensorType::INT32)  return "ViewConstI321D";
       if (type == ETensorType::INT64)  return "ViewConstI641D";
       if (type == ETensorType::INT8)   return "ViewConstI81D";
-      if (type == ETensorType::BOOL || type == ETensorType::UINT8)   return "ViewConstUI81D";
+      if (IsByteBackedAlpakaTensorType(type))   return "ViewConstUI81D";
       throw std::runtime_error("sofie: input tensor " + name +
                                " is of a data type which is not yet supported.");
    };
@@ -397,7 +406,7 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
       if (type == ETensorType::INT32)  return "ViewConstI321D";
       if (type == ETensorType::INT64)  return "ViewConstI641D";
       if (type == ETensorType::INT8)   return "ViewConstI81D";
-      if (type == ETensorType::BOOL || type == ETensorType::UINT8)   return "ViewConstUI81D";
+      if (IsByteBackedAlpakaTensorType(type))   return "ViewConstUI81D";
       throw std::runtime_error("sofie: input tensor " + name + " is of an unsupported data type.");
    };
 
@@ -913,7 +922,7 @@ void RModel::MoveInitializedTensorsToBuffers_ALPAKA(){
          }
          const auto type = i.second.type();
          if (type != ETensorType::FLOAT && type != ETensorType::INT32 && type != ETensorType::INT64 &&
-             type != ETensorType::BOOL && type != ETensorType::INT8 && type != ETensorType::UINT8)
+             type != ETensorType::INT8 && !IsByteBackedAlpakaTensorType(type))
             continue;
          std::string tensor_name = "tensor_" + i.first;
          auto length = ConvertShapeToLength(i.second.shape());

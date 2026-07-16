@@ -135,6 +135,32 @@ std::string FormatQualifiedOperatorName(const std::string &domain, const std::st
    return normalizedDomain.empty() ? opType : normalizedDomain + "::" + opType;
 }
 
+std::optional<ELowPrecisionCarrier> LowPrecisionCarrierFromONNXTensorType(ETensorType type)
+{
+   switch (type) {
+   case ETensorType::FLOAT8E4M3FN:
+   case ETensorType::FLOAT8E4M3FNUZ:
+      return ELowPrecisionCarrier::FP8E4M3;
+   case ETensorType::FLOAT8E5M2:
+   case ETensorType::FLOAT8E5M2FNUZ:
+      return ELowPrecisionCarrier::FP8E5M2;
+   default:
+      return std::nullopt;
+   }
+}
+
+void RegisterLowPrecisionTensorInfoFromONNXType(RModel &model,
+                                                const std::string &tensorName,
+                                                ETensorType tensorType,
+                                                const std::string &reason)
+{
+   auto carrier = LowPrecisionCarrierFromONNXTensorType(tensorType);
+   if (!carrier)
+      return;
+   model.AddLowPrecisionTensorInfo(tensorName,
+      LowPrecisionTensorInfoFromFP8Carrier(*carrier, UTILITY::Clean_name(tensorName), reason));
+}
+
 
 void PopulateOpsetVersionMap(const onnx::ModelProto &model, std::unordered_map<std::string, int> &opsetVersionMap)
 {
@@ -670,6 +696,7 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
       std::string input_name = valueinfoproto.name();
 
       ETensorType type = static_cast<ETensorType>(valueinfoproto.type().tensor_type().elem_type());
+      RegisterLowPrecisionTensorInfoFromONNXType(rmodel, input_name, type, "native ONNX FP8 graph input");
 
       std::vector<Dim> fShape;
       bool existParam = false;
@@ -741,6 +768,7 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
       // register also the initialized tensors
       auto tensor_type = static_cast<ETensorType>(graph.initializer(i).data_type());
       RegisterTensorType(input_name, tensor_type);
+      RegisterLowPrecisionTensorInfoFromONNXType(rmodel, input_name, tensor_type, "native ONNX FP8 initializer");
 
       switch (tensor_type) {
       case ETensorType::FLOAT: {
@@ -768,6 +796,17 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
          std::shared_ptr<void> data = GetInitializedTensorData<uint8_t>(tensorproto, fLength);
          if (verbose) std::cout << "add UINT8 initialized tensor " << input_name << " shape " << ConvertShapeToString(shape) << std::endl;
          rmodel.AddInitializedTensor(input_name, ETensorType::UINT8, shape, data);
+         allInitializedTensors[input_name] = i;
+         break;
+      }
+      case ETensorType::FLOAT8E4M3FN:
+      case ETensorType::FLOAT8E4M3FNUZ:
+      case ETensorType::FLOAT8E5M2:
+      case ETensorType::FLOAT8E5M2FNUZ:
+      case ETensorType::FLOAT8E8M0: {
+         std::shared_ptr<void> data = GetInitializedTensorData<uint8_t>(tensorproto, fLength);
+         if (verbose) std::cout << "add FP8 initialized tensor " << input_name << " shape " << ConvertShapeToString(shape) << std::endl;
+         rmodel.AddInitializedTensor(input_name, tensor_type, shape, data);
          allInitializedTensors[input_name] = i;
          break;
       }

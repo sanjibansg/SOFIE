@@ -12,8 +12,8 @@ namespace {
 constexpr std::size_t kCublasLtInt8Alignment = 16;
 constexpr std::size_t kCublasLtMinOptimizedMacs = 1'000'000;
 constexpr double kCublasLtPaddingCandidateMaxWorkRatio = 1.50;
-constexpr std::size_t kCublasLtMinProfitablePaddedMacs = 100'000;
-constexpr double kCublasLtProfitablePaddedMaxWorkRatio = 1.10;
+constexpr std::size_t kCublasLtMinProfitablePaddedMacs = kCublasLtMinOptimizedMacs;
+constexpr double kCublasLtProfitablePaddedMaxWorkRatio = kCublasLtPaddingCandidateMaxWorkRatio;
 constexpr std::size_t kCublasLtMinProfitablePaddedK = 64;
 constexpr std::size_t kCublasLtMinProfitablePaddedN = 64;
 
@@ -35,6 +35,40 @@ bool IsScalarZeroPointZero(const QuantizationInfo &info)
 }
 
 } // namespace
+
+QuantizedDenseLinearShapePolicy MakeExactFP8DenseLinearShapePolicy(std::size_t m, std::size_t k, std::size_t n)
+{
+   QuantizedDenseLinearShapePolicy policy;
+   policy.policy = EQuantizedShapePolicy::Exact;
+   policy.logicalM = m;
+   policy.logicalK = k;
+   policy.logicalN = n;
+   policy.physicalM = m;
+   policy.physicalK = k;
+   policy.physicalN = n;
+   policy.logicalMacs = m * k * n;
+   policy.physicalMacs = policy.logicalMacs;
+   policy.reason = "native FP8 dense-linear shape is exact";
+   return policy;
+}
+
+QuantizedDenseLinearBackendCapability MakeNativeFP8E4M3TNF32Capability(std::size_t m, std::size_t n, std::size_t k)
+{
+   (void)m;
+   (void)n;
+   (void)k;
+   QuantizedDenseLinearBackendCapability capability;
+   capability.backend = EQuantizedBackend::ALPAKA;
+   capability.executable = true;
+   capability.profile = EQuantizedComputeProfile::FP8E4M3DenseLinearRank2;
+   capability.inputCarrier = ELowPrecisionCarrier::FP8E4M3;
+   capability.weightCarrier = ELowPrecisionCarrier::FP8E4M3;
+   capability.outputCarrier = ELowPrecisionCarrier::Float32;
+   capability.accumulation = ELowPrecisionAccumulation::Float32;
+   capability.tag = "fp8_dense_linear_cublaslt_e4m3_tn_f32";
+   capability.reason = "SOFIE cuBLASLt FP8 E4M3 TN FP32 path selected for native FP8 Gemm";
+   return capability;
+}
 
 std::vector<std::int8_t> QuantizeTensorToInt8(const float *data, std::size_t length, const QuantizationInfo &info)
 {
@@ -346,6 +380,23 @@ std::size_t DenseLinearLeadingElementCount(const std::vector<std::size_t> &shape
    return count;
 }
 
+std::size_t DenseLinearBatchElementCount(const std::vector<std::size_t> &shape)
+{
+   if (shape.size() <= 2)
+      return 1;
+   std::size_t count = 1;
+   for (std::size_t i = 0; i + 2 < shape.size(); ++i)
+      count *= shape[i];
+   return count;
+}
+
+std::vector<std::size_t> DenseLinearBatchShape(const std::vector<std::size_t> &shape)
+{
+   if (shape.size() <= 2)
+      return {};
+   return {shape.begin(), shape.end() - 2};
+}
+
 bool DenseLinearShapeMatches(const std::vector<std::size_t> &lhs, const std::vector<std::size_t> &rhs)
 {
    return lhs.size() == rhs.size() && std::equal(lhs.begin(), lhs.end(), rhs.begin());
@@ -367,6 +418,17 @@ std::string DenseLinearShapeToString(const std::vector<std::size_t> &shape)
 void AddCapabilityReason(std::vector<std::string> &reasons, std::string reason)
 {
    reasons.push_back(std::move(reason));
+}
+
+void SetAffineLowPrecisionCarriers(QuantizedLoweringPlan &plan,
+                                   const QuantizationInfo &inputQuant,
+                                   const QuantizationInfo &weightQuant,
+                                   const QuantizationInfo &outputQuant)
+{
+   plan.inputLowPrecisionCarrier = LowPrecisionTensorInfoFromAffineQuantization(inputQuant).carrier;
+   plan.weightLowPrecisionCarrier = LowPrecisionTensorInfoFromAffineQuantization(weightQuant).carrier;
+   plan.outputLowPrecisionCarrier = LowPrecisionTensorInfoFromAffineQuantization(outputQuant).carrier;
+   plan.lowPrecisionAccumulation = ELowPrecisionAccumulation::Int32;
 }
 
 } // namespace
@@ -400,10 +462,9 @@ QuantizedMatMulShapeAssessment AssessQuantizedMatMulShape(
    if (inputK != weightK)
       assessment.unsupportedReasons.push_back("MatMul input K does not match weight K");
 
-   std::vector<std::size_t> expectedOutput = inputShape;
-   expectedOutput.back() = weightN;
-
    if (weightShape.size() == 2) {
+      std::vector<std::size_t> expectedOutput = inputShape;
+      expectedOutput.back() = weightN;
       if (!outputShape.empty() && !DenseLinearShapeMatches(outputShape, expectedOutput)) {
          assessment.unsupportedReasons.push_back(
             "MatMul output shape does not match X" + DenseLinearShapeToString(inputShape) +
@@ -419,6 +480,7 @@ QuantizedMatMulShapeAssessment AssessQuantizedMatMulShape(
       assessment.logicalM = inputShape.size() == 2 ? inputShape[0] : DenseLinearLeadingElementCount(inputShape);
       assessment.logicalK = inputK;
       assessment.logicalN = weightN;
+      assessment.batchCount = 1;
       assessment.flattenedInputShape = { assessment.logicalM, assessment.logicalK };
       assessment.flattenedOutputShape = { assessment.logicalM, assessment.logicalN };
       if (inputShape.size() == 2) {
@@ -426,6 +488,7 @@ QuantizedMatMulShapeAssessment AssessQuantizedMatMulShape(
          assessment.reason = "rank-2 MatMul shape X[M,K] @ W[K,N] -> Y[M,N]";
       } else {
          assessment.kind = EQuantizedMatMulShapeKind::FlattenableProjection;
+         assessment.batchShape = DenseLinearBatchShape(inputShape);
          assessment.reason = "flattenable projection MatMul shape " + DenseLinearShapeToString(inputShape) +
                              " @ " + DenseLinearShapeToString(weightShape) +
                              " can be viewed as [prod(prefix),K] @ [K,N]";
@@ -434,53 +497,82 @@ QuantizedMatMulShapeAssessment AssessQuantizedMatMulShape(
    }
 
    if (inputShape.size() >= 3 && weightShape.size() >= 3) {
+      const auto inputBatch = DenseLinearBatchShape(inputShape);
+      const auto weightBatch = DenseLinearBatchShape(weightShape);
+      std::vector<std::size_t> expectedOutput = inputBatch;
+      expectedOutput.push_back(inputShape[inputShape.size() - 2]);
+      expectedOutput.push_back(weightN);
+
+      if (!DenseLinearShapeMatches(inputBatch, weightBatch)) {
+         assessment.unsupportedReasons.push_back(
+            "MatMul broadcasted batch dimensions are not yet supported for quantized dense-linear lowering");
+      }
+      if (!outputShape.empty() && !DenseLinearShapeMatches(outputShape, expectedOutput)) {
+         assessment.unsupportedReasons.push_back(
+            "MatMul output shape does not match batched X" + DenseLinearShapeToString(inputShape) +
+            " @ W" + DenseLinearShapeToString(weightShape) +
+            " -> Y" + DenseLinearShapeToString(expectedOutput));
+      }
       if (!assessment.unsupportedReasons.empty()) {
          assessment.kind = EQuantizedMatMulShapeKind::Unsupported;
          assessment.reason = JoinCapabilityReasons(assessment.unsupportedReasons);
          return assessment;
       }
+
       assessment.logicalM = inputShape[inputShape.size() - 2];
       assessment.logicalK = inputK;
       assessment.logicalN = weightN;
+      assessment.batchShape = inputBatch;
+      assessment.batchCount = DenseLinearBatchElementCount(inputShape);
       assessment.kind = EQuantizedMatMulShapeKind::TrueBatched;
-      assessment.reason = "true batched MatMul requires strided-batched quantized lowering";
+      assessment.reason = "true batched MatMul shape with batch=" + DenseLinearShapeToString(inputBatch) +
+                          " requires strided-batched quantized lowering";
       return assessment;
    }
 
    assessment.kind = EQuantizedMatMulShapeKind::Unsupported;
-   assessment.unsupportedReasons.push_back("MatMul broadcasted shape family is not a dense projection or true batched MatMul");
+   assessment.unsupportedReasons.push_back("MatMul broadcasted shape family is not a dense projection or exact-batch MatMul");
    assessment.reason = JoinCapabilityReasons(assessment.unsupportedReasons);
    return assessment;
 }
 
-QuantizedDenseLinearCublasLtCapability AssessCublasLtDenseLinearCapability(
+QuantizedDenseLinearBackendCapability AssessCublasLtDenseLinearCapability(
    const QuantizedDenseLinearOperands &operands)
 {
-   QuantizedDenseLinearCublasLtCapability capability;
+   QuantizedDenseLinearBackendCapability capability;
    std::vector<std::string> semanticReasons;
 
-   if (operands.inputShape.size() != 2)
-      AddCapabilityReason(semanticReasons, operands.operatorName + " input rank is not 2");
-   if (operands.weightShape.size() != 2)
-      AddCapabilityReason(semanticReasons, operands.operatorName + " weight rank is not 2");
-   if (!operands.outputShape.empty() && operands.outputShape.size() != 2)
-      AddCapabilityReason(semanticReasons, operands.operatorName + " output rank is not 2");
+   if (operands.requiresBatchedLowering) {
+      AddCapabilityReason(semanticReasons, operands.operatorName + " true batched shape requires strided-batched cuBLASLt lowering");
+   } else if (operands.hasLogicalShape) {
+      if (operands.logicalM == 0 || operands.logicalN == 0 || operands.logicalK == 0)
+         AddCapabilityReason(semanticReasons, operands.operatorName + " logical M, N, and K must be nonzero");
+      else
+         capability.shapePolicy = MakeCublasLtShapePolicy(operands.logicalM, operands.logicalK, operands.logicalN);
+   } else {
+      if (operands.inputShape.size() != 2)
+         AddCapabilityReason(semanticReasons, operands.operatorName + " input rank is not 2");
+      if (operands.weightShape.size() != 2)
+         AddCapabilityReason(semanticReasons, operands.operatorName + " weight rank is not 2");
+      if (!operands.outputShape.empty() && operands.outputShape.size() != 2)
+         AddCapabilityReason(semanticReasons, operands.operatorName + " output rank is not 2");
 
-   if (operands.inputShape.size() == 2 && operands.weightShape.size() == 2) {
-      const auto m = operands.inputShape[0];
-      const auto k = operands.inputShape[1];
-      const auto n = operands.weightOutputChannelAxis == 0 ? operands.weightShape[0] : operands.weightShape[1];
-      const auto weightK = operands.weightOutputChannelAxis == 0 ? operands.weightShape[1] : operands.weightShape[0];
-      if (m == 0 || n == 0 || k == 0)
-         AddCapabilityReason(semanticReasons, operands.operatorName + " M, N, and K must be nonzero");
-      if (k != weightK)
-         AddCapabilityReason(semanticReasons, operands.operatorName + " input K does not match weight K");
-      if (!operands.outputShape.empty() && operands.outputShape.size() == 2 &&
-          (operands.outputShape[0] != m || operands.outputShape[1] != n)) {
-         AddCapabilityReason(semanticReasons, operands.operatorName + " output shape does not match X[M,K] @ W -> Y[M,N]");
+      if (operands.inputShape.size() == 2 && operands.weightShape.size() == 2) {
+         const auto m = operands.inputShape[0];
+         const auto k = operands.inputShape[1];
+         const auto n = operands.weightOutputChannelAxis == 0 ? operands.weightShape[0] : operands.weightShape[1];
+         const auto weightK = operands.weightOutputChannelAxis == 0 ? operands.weightShape[1] : operands.weightShape[0];
+         if (m == 0 || n == 0 || k == 0)
+            AddCapabilityReason(semanticReasons, operands.operatorName + " M, N, and K must be nonzero");
+         if (k != weightK)
+            AddCapabilityReason(semanticReasons, operands.operatorName + " input K does not match weight K");
+         if (!operands.outputShape.empty() && operands.outputShape.size() == 2 &&
+             (operands.outputShape[0] != m || operands.outputShape[1] != n)) {
+            AddCapabilityReason(semanticReasons, operands.operatorName + " output shape does not match X[M,K] @ W -> Y[M,N]");
+         }
+         if (m != 0 && n != 0 && k != 0 && k == weightK)
+            capability.shapePolicy = MakeCublasLtShapePolicy(m, k, n);
       }
-      if (m != 0 && n != 0 && k != 0 && k == weightK)
-         capability.shapePolicy = MakeCublasLtShapePolicy(m, k, n);
    }
 
    const auto computeProfile = AssessDenseLinearComputeProfile(operands.inputQuant, operands.weightQuant,
@@ -504,16 +596,18 @@ QuantizedDenseLinearCublasLtCapability AssessCublasLtDenseLinearCapability(
 
    if (!semanticReasons.empty()) {
       capability.shapePolicy.policy = EQuantizedShapePolicy::Unsupported;
-      capability.shapePolicy.reason = "cuBLASLt semantic requirements are not met";
+      capability.shapePolicy.reason = operands.shapeReason.empty() ? "cuBLASLt semantic requirements are not met"
+                                                                   : operands.shapeReason;
       capability.profile = computeProfile.profile;
       capability.reason = JoinCapabilityReasons(semanticReasons);
-      capability.tag = "cublaslt_dense_linear_profile_unsupported";
+      capability.tag = operands.requiresBatchedLowering ? "cublaslt_dense_linear_strided_batched_not_implemented"
+                                                        : "cublaslt_dense_linear_profile_unsupported";
       return capability;
    }
 
    capability.profile = computeProfile.profile;
    if (capability.shapePolicy.policy == EQuantizedShapePolicy::Exact) {
-      capability.optimized = true;
+      capability.executable = true;
       capability.tag = perChannelWeight ? "cublaslt_i8i8_per_channel_weight_rank2_exact"
                                         : "cublaslt_i8i8_symmetric_per_tensor_rank2_exact";
       capability.reason = perChannelWeight ?
@@ -535,6 +629,8 @@ QuantizedDenseLinearCublasLtCapability AssessCublasLtDenseLinearCapability(
       capability.reason = capability.shapePolicy.reason.empty() ?
                           "cuBLASLt shape policy is unavailable" : capability.shapePolicy.reason;
    }
+   if (!operands.shapeReason.empty())
+      capability.reason += "; " + operands.shapeReason;
    return capability;
 }
 
@@ -553,11 +649,46 @@ QuantizedLoweringPlan MakeUnsupportedQuantizedMatMulPlan(const QuantizedMatMulRe
    plan.biasStorage = EQuantizedStorageType::UNDEFINED;
    plan.accumulatorStorage = EQuantizedStorageType::UNDEFINED;
    plan.outputStorage = preservesSemantics ? EQuantizedStorageType::MetadataOnly : EQuantizedStorageType::UNDEFINED;
-   plan.inputCarrierMode = preservesSemantics ? EQuantizedCarrierMode::Float : EQuantizedCarrierMode::UNDEFINED;
    plan.outputMode = preservesSemantics ? EQuantizedOutputMode::ExactFakeQuantFloat : EQuantizedOutputMode::UNDEFINED;
    plan.computeProfile = preservesSemantics ? EQuantizedComputeProfile::GenericRecognized : EQuantizedComputeProfile::UNDEFINED;
    plan.capabilityTag = preservesSemantics ? "matmul_recognized_backend_unsupported" : "matmul_semantic_unsupported";
-   plan.consumedOperatorIndices = QuantizedMatMulConsumedOperatorIndices(region);
+   plan.consumedOperatorIndices = { region.matmulOpIndex };
+   plan.preservesQuantizationSemantics = preservesSemantics;
+   plan.isMetadataOnly = preservesSemantics;
+   plan.suppressesGraphOperators = false;
+   if (preservesSemantics) {
+      SetAffineLowPrecisionCarriers(plan, region.inputQuant, region.weightQuant, region.outputQuant);
+   }
+   return plan;
+}
+
+QuantizedLoweringPlan MakeUnsupportedLowPrecisionDenseLinearPlan(
+   EQuantizedBackend backend, std::string reason, bool preservesSemantics,
+   ELowPrecisionCarrier inputCarrier, ELowPrecisionCarrier weightCarrier,
+   ELowPrecisionCarrier outputCarrier, ELowPrecisionAccumulation accumulation,
+   EQuantizedComputeProfile profile, std::string capabilityTag)
+{
+   QuantizedLoweringPlan plan;
+   plan.backend = backend;
+   plan.status = preservesSemantics ? EQuantizedLoweringStatus::BackendUnsupported
+                                    : EQuantizedLoweringStatus::SemanticUnsupported;
+   plan.reason = std::move(reason);
+   plan.inputStorage = preservesSemantics ? QuantizedStorageTypeForLowPrecisionCarrier(inputCarrier)
+                                          : EQuantizedStorageType::UNDEFINED;
+   plan.weightStorage = preservesSemantics ? QuantizedStorageTypeForLowPrecisionCarrier(weightCarrier)
+                                           : EQuantizedStorageType::UNDEFINED;
+   plan.biasStorage = EQuantizedStorageType::UNDEFINED;
+   plan.accumulatorStorage = preservesSemantics ? QuantizedStorageTypeForLowPrecisionCarrier(ELowPrecisionCarrier::Float32)
+                                                : EQuantizedStorageType::UNDEFINED;
+   plan.outputStorage = preservesSemantics ? QuantizedStorageTypeForLowPrecisionCarrier(outputCarrier)
+                                           : EQuantizedStorageType::UNDEFINED;
+   plan.outputMode = preservesSemantics ? EQuantizedOutputMode::ExactFakeQuantFloat : EQuantizedOutputMode::UNDEFINED;
+   plan.computeProfile = preservesSemantics ? profile : EQuantizedComputeProfile::UNDEFINED;
+   plan.capabilityTag = preservesSemantics ? std::move(capabilityTag) : "low_precision_dense_linear_semantic_unsupported";
+   plan.inputLowPrecisionCarrier = inputCarrier;
+   plan.weightLowPrecisionCarrier = weightCarrier;
+   plan.outputLowPrecisionCarrier = outputCarrier;
+   plan.lowPrecisionAccumulation = accumulation;
    plan.preservesQuantizationSemantics = preservesSemantics;
    plan.isMetadataOnly = preservesSemantics;
    plan.suppressesGraphOperators = false;
@@ -565,13 +696,13 @@ QuantizedLoweringPlan MakeUnsupportedQuantizedMatMulPlan(const QuantizedMatMulRe
 }
 
 
-QuantizedDenseLinearCublasLtCapability SelectExecutableDenseLinearCapability(QuantizedDenseLinearCublasLtCapability capability)
+QuantizedDenseLinearBackendCapability SelectExecutableDenseLinearCapability(QuantizedDenseLinearBackendCapability capability)
 {
    if (capability.shapePolicy.policy == EQuantizedShapePolicy::PaddedCandidate) {
       if (IsProfitableCublasLtPaddedDenseLinearPolicy(capability.shapePolicy)) {
          capability.shapePolicy.policy = EQuantizedShapePolicy::Padded;
          capability.shapePolicy.reason = "padded cuBLASLt int8 execution selected by profitability policy; " + capability.shapePolicy.reason;
-         capability.optimized = true;
+         capability.executable = true;
          auto pos = capability.tag.find("padded_candidate");
          if (pos != std::string::npos) {
             capability.tag.replace(pos, std::string("padded_candidate").size(), "padded");
@@ -582,7 +713,7 @@ QuantizedDenseLinearCublasLtCapability SelectExecutableDenseLinearCapability(Qua
          capability.shapePolicy.reason = "padded cuBLASLt candidate rejected by profitability policy; " +
                                          ExplainCublasLtPaddedDenseLinearProfitability(capability.shapePolicy) +
                                          "; " + capability.shapePolicy.reason;
-         capability.optimized = false;
+         capability.executable = false;
          auto pos = capability.tag.find("padded_candidate");
          if (pos != std::string::npos) {
             capability.tag.replace(pos, std::string("padded_candidate").size(), "padded_unprofitable");
@@ -621,11 +752,11 @@ QuantizedLoweringPlan MakeMatMulAlpakaTransposedWeightStoragePlan(const Quantize
    plan.biasStorage = EQuantizedStorageType::UNDEFINED;
    plan.accumulatorStorage = EQuantizedStorageType::Int32Accumulator;
    plan.outputStorage = QuantizedStorageTypeForCarrier(region.outputQuant);
-   plan.inputCarrierMode = QuantizedCarrierModeForStorage(plan.inputStorage);
    plan.outputMode = EQuantizedOutputMode::Quantized;
    plan.computeProfile = IsPerChannelAxis(region.weightQuant, 1)
                             ? EQuantizedComputeProfile::SignedInt8PerTensorActivationPerChannelWeightRank2
                             : EQuantizedComputeProfile::SignedInt8SymmetricPerTensorRank2;
+   SetAffineLowPrecisionCarriers(plan, region.inputQuant, region.weightQuant, region.outputQuant);
    plan.shapePolicy = shapePolicy;
    plan.weightStorageTensor = weightStorageTensor;
    plan.weightLayout = EQuantizedLayout::PlainDevice;
@@ -669,9 +800,9 @@ QuantizedLoweringPlan MakeCPUPackedWeightBaselinePlan(const QuantizedGemmRegion 
    plan.biasStorage = EQuantizedStorageType::FloatCarrier;
    plan.accumulatorStorage = EQuantizedStorageType::Int32Accumulator;
    plan.outputStorage = EQuantizedStorageType::FloatCarrier;
-   plan.inputCarrierMode = EQuantizedCarrierMode::Float;
    plan.outputMode = EQuantizedOutputMode::ExactFakeQuantFloat;
    plan.computeProfile = EQuantizedComputeProfile::GenericRecognized;
+   SetAffineLowPrecisionCarriers(plan, region.inputQuant, region.weightQuant, region.outputQuant);
    plan.weightStorageTensor = weightStorageTensor;
    plan.weightLayout = EQuantizedLayout::PackedCPU;
    return plan;
@@ -689,7 +820,6 @@ QuantizedLoweringPlan MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend backend
    plan.biasStorage = preservesSemantics ? EQuantizedStorageType::MetadataOnly : EQuantizedStorageType::UNDEFINED;
    plan.accumulatorStorage = EQuantizedStorageType::UNDEFINED;
    plan.outputStorage = preservesSemantics ? EQuantizedStorageType::MetadataOnly : EQuantizedStorageType::UNDEFINED;
-   plan.inputCarrierMode = preservesSemantics ? EQuantizedCarrierMode::Float : EQuantizedCarrierMode::UNDEFINED;
    plan.outputMode = preservesSemantics ? EQuantizedOutputMode::ExactFakeQuantFloat : EQuantizedOutputMode::UNDEFINED;
    plan.computeProfile = preservesSemantics ? EQuantizedComputeProfile::GenericRecognized : EQuantizedComputeProfile::UNDEFINED;
    plan.capabilityTag = preservesSemantics ? "recognized_backend_unsupported" : "semantic_unsupported";
@@ -698,24 +828,6 @@ QuantizedLoweringPlan MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend backend
    plan.suppressesGraphOperators = false;
    return plan;
 }
-
-QuantizedLoweringPlan MakeAlpakaFakeQuantPlan(const QuantizedGemmRegion &region)
-{
-   auto plan = MakeAvailableQuantizedGemmPlan(region, EQuantizedBackend::ALPAKA, EQuantizedLoweringStatus::Baseline,
-                                              "Alpaka fake-quant lowering over float carrier tensors",
-                                              "alpaka_fake_quant_baseline");
-   plan.inputStorage = EQuantizedStorageType::FloatCarrier;
-   plan.weightStorage = EQuantizedStorageType::FloatCarrier;
-   plan.biasStorage = EQuantizedStorageType::FloatCarrier;
-   plan.accumulatorStorage = EQuantizedStorageType::Int32Accumulator;
-   plan.outputStorage = EQuantizedStorageType::FloatCarrier;
-   plan.inputCarrierMode = EQuantizedCarrierMode::Float;
-   plan.outputMode = EQuantizedOutputMode::ExactFakeQuantFloat;
-   plan.computeProfile = EQuantizedComputeProfile::GenericRecognized;
-   plan.weightLayout = EQuantizedLayout::Plain;
-   return plan;
-}
-
 
 QuantizedDenseLinearOperands MakeDenseLinearOperands(const QuantizedGemmRegion &region,
                                                        const std::vector<std::size_t> &inputShape,
@@ -750,12 +862,21 @@ QuantizedDenseLinearOperands MakeDenseLinearOperands(const QuantizedMatMulRegion
    operands.outputShape = outputShape;
    operands.weightOutputChannelAxis = 1;
    operands.operatorName = "MatMul";
+   if (QuantizedMatMulShapeIsRecognized(region.shape)) {
+      operands.hasLogicalShape = true;
+      operands.requiresBatchedLowering = region.shape.kind == EQuantizedMatMulShapeKind::TrueBatched;
+      operands.logicalM = region.shape.logicalM;
+      operands.logicalK = region.shape.logicalK;
+      operands.logicalN = region.shape.logicalN;
+      operands.batchCount = region.shape.batchCount;
+      operands.shapeReason = region.shape.reason;
+   }
    return operands;
 }
 
 QuantizedLoweringPlan MakeAlpakaCublasLtCorePlan(const QuantizedGemmRegion &region,
                                                  const std::string &weightStorageTensor,
-                                                 const QuantizedDenseLinearCublasLtCapability &capability)
+                                                 const QuantizedDenseLinearBackendCapability &capability)
 {
    auto plan = MakeAvailableQuantizedGemmPlan(region, EQuantizedBackend::ALPAKA, EQuantizedLoweringStatus::Optimized,
                                               capability.reason, capability.tag);
@@ -764,9 +885,9 @@ QuantizedLoweringPlan MakeAlpakaCublasLtCorePlan(const QuantizedGemmRegion &regi
    plan.biasStorage = EQuantizedStorageType::FloatCarrier;
    plan.accumulatorStorage = EQuantizedStorageType::Int32Accumulator;
    plan.outputStorage = QuantizedStorageTypeForCarrier(region.outputQuant);
-   plan.inputCarrierMode = QuantizedCarrierModeForStorage(plan.inputStorage);
    plan.outputMode = EQuantizedOutputMode::Quantized;
    plan.computeProfile = capability.profile;
+   SetAffineLowPrecisionCarriers(plan, region.inputQuant, region.weightQuant, region.outputQuant);
    plan.shapePolicy = capability.shapePolicy;
    plan.weightStorageTensor = weightStorageTensor;
    plan.weightLayout = EQuantizedLayout::PlainDevice;
@@ -775,6 +896,68 @@ QuantizedLoweringPlan MakeAlpakaCublasLtCorePlan(const QuantizedGemmRegion &regi
       plan.weightScaleTensor = region.weightQuant.scaleTensor;
       plan.weightZeroPointTensor = region.weightQuant.zeroPointTensor;
    }
+   return plan;
+}
+
+QuantizedLoweringPlan MakeAlpakaCublasLtFP8Plan(
+   const QuantizedGemmRegion &region, const std::string &weightStorageTensor,
+   const QuantizedDenseLinearBackendCapability &capability,
+   const QuantizedDenseLinearShapePolicy &shapePolicy)
+{
+   QuantizedLoweringPlan plan;
+   plan.backend = EQuantizedBackend::ALPAKA;
+   plan.status = capability.executable ? EQuantizedLoweringStatus::Optimized
+                                       : EQuantizedLoweringStatus::BackendUnsupported;
+   plan.reason = capability.reason;
+   plan.inputStorage = QuantizedStorageTypeForLowPrecisionCarrier(capability.inputCarrier);
+   plan.weightStorage = QuantizedStorageTypeForLowPrecisionCarrier(capability.weightCarrier);
+   plan.outputStorage = QuantizedStorageTypeForLowPrecisionCarrier(capability.outputCarrier);
+   plan.accumulatorStorage = QuantizedStorageTypeForLowPrecisionCarrier(ELowPrecisionCarrier::Float32);
+   plan.inputLowPrecisionCarrier = capability.inputCarrier;
+   plan.weightLowPrecisionCarrier = capability.weightCarrier;
+   plan.outputLowPrecisionCarrier = capability.outputCarrier;
+   plan.lowPrecisionAccumulation = capability.accumulation;
+   plan.outputMode = EQuantizedOutputMode::ExactFakeQuantFloat;
+   plan.computeProfile = capability.profile;
+   plan.capabilityTag = capability.tag;
+   plan.weightStorageTensor = weightStorageTensor;
+   plan.weightLayout = EQuantizedLayout::PlainDevice;
+   plan.shapePolicy = shapePolicy;
+   plan.consumedOperatorIndices = { region.gemmOpIndex };
+   plan.preservesQuantizationSemantics = capability.executable;
+   plan.isMetadataOnly = !capability.executable;
+   plan.suppressesGraphOperators = capability.executable;
+   return plan;
+}
+
+QuantizedLoweringPlan MakeAlpakaCublasLtFP8Plan(
+   const QuantizedMatMulRegion &region, const std::string &weightStorageTensor,
+   const QuantizedDenseLinearBackendCapability &capability,
+   const QuantizedDenseLinearShapePolicy &shapePolicy)
+{
+   QuantizedLoweringPlan plan;
+   plan.backend = EQuantizedBackend::ALPAKA;
+   plan.status = capability.executable ? EQuantizedLoweringStatus::Optimized
+                                       : EQuantizedLoweringStatus::BackendUnsupported;
+   plan.reason = capability.reason;
+   plan.inputStorage = QuantizedStorageTypeForLowPrecisionCarrier(capability.inputCarrier);
+   plan.weightStorage = QuantizedStorageTypeForLowPrecisionCarrier(capability.weightCarrier);
+   plan.outputStorage = QuantizedStorageTypeForLowPrecisionCarrier(capability.outputCarrier);
+   plan.accumulatorStorage = QuantizedStorageTypeForLowPrecisionCarrier(ELowPrecisionCarrier::Float32);
+   plan.inputLowPrecisionCarrier = capability.inputCarrier;
+   plan.weightLowPrecisionCarrier = capability.weightCarrier;
+   plan.outputLowPrecisionCarrier = capability.outputCarrier;
+   plan.lowPrecisionAccumulation = capability.accumulation;
+   plan.outputMode = EQuantizedOutputMode::ExactFakeQuantFloat;
+   plan.computeProfile = capability.profile;
+   plan.capabilityTag = capability.tag;
+   plan.weightStorageTensor = weightStorageTensor;
+   plan.weightLayout = EQuantizedLayout::PlainDevice;
+   plan.shapePolicy = shapePolicy;
+   plan.consumedOperatorIndices = QuantizedMatMulConsumedOperatorIndices(region);
+   plan.preservesQuantizationSemantics = capability.executable;
+   plan.isMetadataOnly = !capability.executable;
+   plan.suppressesGraphOperators = capability.executable;
    return plan;
 }
 

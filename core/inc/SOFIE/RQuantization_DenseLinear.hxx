@@ -27,17 +27,18 @@ struct QuantizedDenseLinearOperands {
    std::vector<std::size_t> weightShape;
    std::vector<std::size_t> outputShape;
 
+   bool hasLogicalShape = false;
+   bool requiresBatchedLowering = false;
+   std::size_t logicalM = 0;
+   std::size_t logicalK = 0;
+   std::size_t logicalN = 0;
+   std::size_t batchCount = 1;
+   std::string shapeReason;
+
    int weightOutputChannelAxis = -1;
    std::string operatorName;
 };
 
-struct QuantizedDenseLinearCublasLtCapability {
-   bool optimized = false;
-   EQuantizedComputeProfile profile = EQuantizedComputeProfile::GenericRecognized;
-   std::string tag = "recognized_not_cublaslt_optimized";
-   std::string reason;
-   QuantizedDenseLinearShapePolicy shapePolicy;
-};
 
 bool IsScalarPerTensor(const QuantizationInfo &info);
 bool IsPerChannelAxis(const QuantizationInfo &info, int axis);
@@ -77,6 +78,8 @@ QuantizedDenseLinearProfileAssessment AssessDenseLinearComputeProfile(
    const std::string &operatorName);
 
 QuantizedDenseLinearShapePolicy MakeCublasLtShapePolicy(std::size_t m, std::size_t k, std::size_t n);
+QuantizedDenseLinearShapePolicy MakeExactFP8DenseLinearShapePolicy(std::size_t m, std::size_t k, std::size_t n);
+QuantizedDenseLinearBackendCapability MakeNativeFP8E4M3TNF32Capability(std::size_t m, std::size_t n, std::size_t k);
 
 bool IsProfitableCublasLtPaddedDenseLinearPolicy(const QuantizedDenseLinearShapePolicy &policy);
 std::string ExplainCublasLtPaddedDenseLinearProfitability(const QuantizedDenseLinearShapePolicy &policy);
@@ -86,11 +89,11 @@ QuantizedMatMulShapeAssessment AssessQuantizedMatMulShape(
    const std::vector<std::size_t> &weightShape,
    const std::vector<std::size_t> &outputShape);
 
-QuantizedDenseLinearCublasLtCapability AssessCublasLtDenseLinearCapability(
+QuantizedDenseLinearBackendCapability AssessCublasLtDenseLinearCapability(
    const QuantizedDenseLinearOperands &operands);
 
-QuantizedDenseLinearCublasLtCapability
-SelectExecutableDenseLinearCapability(QuantizedDenseLinearCublasLtCapability capability);
+QuantizedDenseLinearBackendCapability
+SelectExecutableDenseLinearCapability(QuantizedDenseLinearBackendCapability capability);
 
 QuantizedDenseLinearOperands MakeDenseLinearOperands(const QuantizedGemmRegion &region,
                                                       const std::vector<std::size_t> &inputShape,
@@ -105,6 +108,11 @@ QuantizedLoweringPlan MakeUnsupportedQuantizedMatMulPlan(const QuantizedMatMulRe
                                                          EQuantizedBackend backend,
                                                          std::string reason,
                                                          bool preservesSemantics);
+QuantizedLoweringPlan MakeUnsupportedLowPrecisionDenseLinearPlan(
+   EQuantizedBackend backend, std::string reason, bool preservesSemantics,
+   ELowPrecisionCarrier inputCarrier, ELowPrecisionCarrier weightCarrier,
+   ELowPrecisionCarrier outputCarrier, ELowPrecisionAccumulation accumulation,
+   EQuantizedComputeProfile profile, std::string capabilityTag);
 QuantizedLoweringPlan MakeMatMulAlpakaTransposedWeightStoragePlan(
    const QuantizedMatMulRegion &region, const std::string &weightStorageTensor,
    const QuantizedDenseLinearShapePolicy &shapePolicy);
@@ -113,10 +121,18 @@ QuantizedLoweringPlan MakeCPUPackedWeightBaselinePlan(const QuantizedGemmRegion 
 QuantizedLoweringPlan MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend backend,
                                                        std::string reason,
                                                        bool preservesSemantics);
-QuantizedLoweringPlan MakeAlpakaFakeQuantPlan(const QuantizedGemmRegion &region);
 QuantizedLoweringPlan MakeAlpakaCublasLtCorePlan(
    const QuantizedGemmRegion &region, const std::string &weightStorageTensor,
-   const QuantizedDenseLinearCublasLtCapability &capability);
+   const QuantizedDenseLinearBackendCapability &capability);
+
+QuantizedLoweringPlan MakeAlpakaCublasLtFP8Plan(
+   const QuantizedGemmRegion &region, const std::string &weightStorageTensor,
+   const QuantizedDenseLinearBackendCapability &capability,
+   const QuantizedDenseLinearShapePolicy &shapePolicy);
+QuantizedLoweringPlan MakeAlpakaCublasLtFP8Plan(
+   const QuantizedMatMulRegion &region, const std::string &weightStorageTensor,
+   const QuantizedDenseLinearBackendCapability &capability,
+   const QuantizedDenseLinearShapePolicy &shapePolicy);
 
 } // namespace SOFIE
 

@@ -74,6 +74,8 @@ struct QuantizedGemmParams {
    double scaleW = 1.0;
    double scaleY = 1.0;
    double scaleB = 1.0;
+   double alpha = 1.0;
+   double beta = 1.0;
 
    std::int32_t zeroX = 0;
    std::int32_t zeroW = 0;
@@ -216,11 +218,11 @@ inline float QuantizedGemmFinalizeAccumulator(std::int32_t accumulator, std::siz
       return static_cast<float>(static_cast<double>(yq - params.zeroY) * params.scaleY);
    }
 
-   double real = static_cast<double>(accumulator) * params.scaleX * params.scaleW;
+   double real = params.alpha * static_cast<double>(accumulator) * params.scaleX * params.scaleW;
    if (hasRuntimeBias) {
       const auto bq = QuantizedGemmQuantizeClamp(static_cast<double>(bias[col]), params.scaleB, params.zeroB,
                                                  params.qminB, params.qmaxB);
-      real += static_cast<double>(bq - params.zeroB) * params.scaleB;
+      real += params.beta * static_cast<double>(bq - params.zeroB) * params.scaleB;
    }
 
    const auto yq = QuantizedGemmFinalizeY(

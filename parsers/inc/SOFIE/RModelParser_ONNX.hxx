@@ -24,6 +24,11 @@ using ParserFuncSignature =
 using ParserFuseFuncSignature =
    std::function<std::unique_ptr<ROperator> (RModelParser_ONNX& /*parser*/, const onnx::NodeProto& /*firstnode*/, const onnx::NodeProto& /*secondnode*/)>;
 
+inline ETensorType DenseLinearOutputTensorType(ETensorType inputType)
+{
+   return IsFP8TensorType(inputType) ? ETensorType::FLOAT : inputType;
+}
+
 class RModelParser_ONNX {
 public:
    struct OperatorsMapImpl;

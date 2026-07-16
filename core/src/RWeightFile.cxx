@@ -8,7 +8,10 @@ namespace SOFIE {
 bool IsBinaryWeightTensorType(ETensorType type)
 {
    return type == ETensorType::FLOAT || type == ETensorType::INT8 || type == ETensorType::UINT8 ||
-          type == ETensorType::INT32 || type == ETensorType::INT64;
+          type == ETensorType::INT32 || type == ETensorType::INT64 ||
+          type == ETensorType::FLOAT8E4M3FN || type == ETensorType::FLOAT8E4M3FNUZ ||
+          type == ETensorType::FLOAT8E5M2 || type == ETensorType::FLOAT8E5M2FNUZ ||
+          type == ETensorType::FLOAT8E8M0;
 }
 
 std::vector<BinaryWeightTensorEntry>

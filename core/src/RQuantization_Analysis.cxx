@@ -76,16 +76,37 @@ std::optional<std::size_t> MatchQuantizationBoundaryProducer(
    const QuantizationGraphIndex &graph, const std::vector<std::unique_ptr<ROperator>> &operators,
    const std::string &tensor, const std::string &role, std::vector<std::string> &reasons)
 {
-   auto producer = graph.producerByTensor.find(tensor);
-   if (producer == graph.producerByTensor.end()) {
-      reasons.push_back(role + " tensor has no producer quantization boundary");
-      return std::nullopt;
+   std::string currentTensor = tensor;
+   std::vector<std::string> visited;
+   while (true) {
+      if (std::find(visited.begin(), visited.end(), currentTensor) != visited.end()) {
+         reasons.push_back(role + " tensor quantization-boundary search found an alias cycle");
+         return std::nullopt;
+      }
+      visited.push_back(currentTensor);
+
+      auto producer = graph.producerByTensor.find(currentTensor);
+      if (producer == graph.producerByTensor.end()) {
+         reasons.push_back(role + " tensor has no producer quantization boundary");
+         return std::nullopt;
+      }
+
+      const auto &op = operators[producer->second];
+      if (op->IsQuantizationBoundary())
+         return producer->second;
+
+      if (!op->PropagatesQuantizationMetadata() || op->RequiresCompatibleQuantizationMetadataInputs()) {
+         reasons.push_back(role + " tensor producer is not a quantization boundary");
+         return std::nullopt;
+      }
+
+      auto sources = op->GetQuantizationMetadataSourceTensors();
+      if (sources.size() != 1 || sources.front().empty()) {
+         reasons.push_back(role + " tensor producer does not have a single quantization-metadata source");
+         return std::nullopt;
+      }
+      currentTensor = sources.front();
    }
-   if (!operators[producer->second]->IsQuantizationBoundary()) {
-      reasons.push_back(role + " tensor producer is not a quantization boundary");
-      return std::nullopt;
-   }
-   return producer->second;
 }
 
 std::optional<std::size_t> MatchSingleTensorConsumer(const QuantizationGraphIndex &graph,
@@ -126,10 +147,10 @@ void CheckQuantizationInfo(const QuantizationInfo &info, const std::string &role
 void CheckQuantizedGemmAttributes(const QuantizedGemmRegion &region,
                                   std::vector<std::string> &reasons)
 {
-   if (std::fabs(region.alpha - 1.0f) > 0.0f)
-      reasons.push_back("Gemm alpha is not 1");
-   if (std::fabs(region.beta - 1.0f) > 0.0f)
-      reasons.push_back("Gemm beta is not 1");
+   if (!std::isfinite(region.alpha))
+      reasons.push_back("Gemm alpha is not finite");
+   if (!std::isfinite(region.beta))
+      reasons.push_back("Gemm beta is not finite");
    if (region.transA != 0)
       reasons.push_back("Gemm transA is not 0");
    if (region.transB != 1)

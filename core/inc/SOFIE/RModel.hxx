@@ -115,6 +115,10 @@ public:
    bool HasQuantizationInfo(const std::string & tensor_name) const;
    const QuantizationInfo & GetQuantizationInfo(const std::string & tensor_name) const;
 
+   void AddLowPrecisionTensorInfo(const std::string & tensor_name, LowPrecisionTensorInfo info);
+   bool HasLowPrecisionTensorInfo(const std::string & tensor_name) const;
+   const LowPrecisionTensorInfo & GetLowPrecisionTensorInfo(const std::string & tensor_name) const;
+
    void RegisterQuantizedTensorStorage(QuantizedTensorStorage storage);
    bool HasQuantizedTensorStorage(const std::string & storage_tensor_name) const;
    const QuantizedTensorStorage & GetQuantizedTensorStorage(const std::string & storage_tensor_name) const;
