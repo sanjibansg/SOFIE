@@ -331,6 +331,18 @@ public:
    // This replaces the previous naive "one thread per output element" approach
    // which serialised the entire reduction loop inside a single thread.
    // ---------------------------------------------------------------------------
+   // base dynamic identifiers (e.g. n_pf, n_sv) inside the baked index math,
+   // passed to the kernel as size_t args. CollectDimParams extracts identifiers,
+   // so this stays valid even when a dim is a compound expression like std::max(...)
+   std::vector<std::string> GetGPUDynParams() const {
+      std::vector<std::string> params;
+      UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fShapeX), params);
+      UTILITY::CollectDimParams(fShapeX, params);
+      UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fShapeYNotPruned), params);
+      UTILITY::CollectDimParams(fShapeYNotPruned, params);
+      return params;
+   }
+
    std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) override {
       if (fShapeX.empty() || fShapeY.empty())
          throw std::runtime_error("SOFIE Reduce Op called to Generate without being initialized first");
@@ -355,15 +367,6 @@ public:
       for (int ri = (int)redAxes.size() - 2; ri >= 0; --ri)
          redStrides[ri] = "(" + redStrides[ri + 1] + " * " + fShapeX[redAxes[ri + 1]].GetVal() + ")";
 
-      // dynamic shape params referenced by the baked index math, passed as size_t kernel args
-      std::vector<std::string> dynParams;
-      for (auto &d : fShapeX)
-         if (d.isParam) {
-            bool seen = false;
-            for (auto &q : dynParams) if (q == d.param) seen = true;
-            if (!seen) dynParams.push_back(d.param);
-         }
-
       std::string kname = "ReduceKernel_" + Name() + "_" + fNY;
 
       std::string op;
@@ -376,7 +379,7 @@ public:
       op += SP + SP + SP + "T* __restrict__ output,\n";
       op += SP + SP + SP + "std::size_t const reducedLength,\n";
       op += SP + SP + SP + "std::size_t const outputLength";
-      for (auto &p : dynParams)
+      for (auto &p : GetGPUDynParams())
          op += ",\n" + SP + SP + SP + "std::size_t const " + p;
       op += ") const {\n\n";
 
@@ -482,15 +485,8 @@ public:
       std::string reducedLength = "(" + inputLength + ") / (" + outputLength + ")";
       std::string kname = "reduceKernel_" + Name() + "_" + fNY;
 
-      std::vector<std::string> dynParams;
-      for (auto &d : fShapeX)
-         if (d.isParam) {
-            bool seen = false;
-            for (auto &q : dynParams) if (q == d.param) seen = true;
-            if (!seen) dynParams.push_back(d.param);
-         }
       std::string dynArgs;
-      for (auto &p : dynParams) dynArgs += ", static_cast<std::size_t>(" + p + ")";
+      for (auto &p : GetGPUDynParams()) dynArgs += ", static_cast<std::size_t>(" + p + ")";
 
       std::stringstream out;
       out << "\n//------ " << Name() << "_GPU_ALPAKA\n";

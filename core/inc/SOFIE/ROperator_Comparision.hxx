@@ -247,21 +247,8 @@ public:
       auto stridesX2 = UTILITY::ComputeStrideFromShape(shapeX2_padded);
       auto stridesY  = UTILITY::ComputeStrideFromShape(dimY);
 
-      auto isIdent = [](const std::string &s){
-         if (s.empty() || (s[0] >= '0' && s[0] <= '9')) return false;
-         for (char c : s)
-            if (!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_')) return false;
-         return true;
-      };
       std::vector<std::string> dynParams;
-      auto collect = [&](const std::vector<Dim>& v){
-         for (auto &d : v)
-            if (d.isParam && isIdent(d.param)) {
-               bool seen = false;
-               for (auto &q : dynParams) if (q == d.param) seen = true;
-               if (!seen) dynParams.push_back(d.param);
-            }
-      };
+      auto collect = [&](const std::vector<Dim>& v){ UTILITY::CollectDimParams(v, dynParams); };
       collect(dimX1); collect(dimX2);
 
       auto isOne = [](const Dim &d){ return !d.isParam && d.dim == 1; };
@@ -346,21 +333,8 @@ public:
       std::string totalElements = ConvertDimShapeToLength(dimY);
       std::string kname = "comparisonKernel_" + opName;
 
-      auto isIdent = [](const std::string &s){
-         if (s.empty() || (s[0] >= '0' && s[0] <= '9')) return false;
-         for (char c : s)
-            if (!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_')) return false;
-         return true;
-      };
       std::vector<std::string> dynParams;
-      auto collect = [&](const std::vector<Dim>& v){
-         for (auto &d : v)
-            if (d.isParam && isIdent(d.param)) {
-               bool seen = false;
-               for (auto &q : dynParams) if (q == d.param) seen = true;
-               if (!seen) dynParams.push_back(d.param);
-            }
-      };
+      auto collect = [&](const std::vector<Dim>& v){ UTILITY::CollectDimParams(v, dynParams); };
       collect(dimX1); collect(dimX2);
       std::string dynArgs;
       for (auto &p : dynParams) dynArgs += ", static_cast<std::size_t>(" + p + ")";

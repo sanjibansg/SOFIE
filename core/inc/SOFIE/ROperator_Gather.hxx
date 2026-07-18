@@ -28,6 +28,8 @@ private:
 
    std::vector<int64_t> fIndices;  // indices vector in case they are known at initialization
 
+   std::vector<Dim> fOutputShapeData; // in case output is a shape tensor we store here the shape value data (can be parametric)
+
    std::string fType;
 
 public:
@@ -120,17 +122,17 @@ public:
       else if (model.IsShapeTensor(fNX) && q <=1  && fIndices.size() > 0) {
          auto inputData = model.GetShapeTensorValues(fNX);
          // if r == 1 and q<=1 then output length is 1 (is a scalar or tensor of size1)
-         std::vector<Dim> outputData(1);
-         outputData[0] = inputData[fIndices[0]];
-         if (outputData[0].isParam) {
-            fIsOutputConstant = true;
+         fOutputShapeData.resize(1);
+         fOutputShapeData[0] = inputData[fIndices[0]];
+         if (fOutputShapeData[0].isParam) {
+            fIsOutputParamShape = true;
             // shapeY can be scalar or vector of size1
-            model.AddShapeTensor(fNY, outputData, fShapeY.size() == 0);
+            model.AddShapeTensor(fNY, fOutputShapeData, fShapeY.size() == 0);
             if (model.Verbose())
                std::cout << "Gather: " << fNX << " " << ConvertDimShapeToString(fShapeX) << " -> " << fNY << " with shape " << ConvertDimShapeToString(fShapeY)
-                   << " and values " << ConvertDimShapeToString(outputData) << " (shape) " << std::endl;
+                   << " and values " << ConvertDimShapeToString(fOutputShapeData) << " (shape) " << std::endl;
          } else {
-            int64_t value = static_cast<int64_t>(outputData[0].dim);
+            int64_t value = static_cast<int64_t>(fOutputShapeData[0].dim);
             auto shapeY = ConvertShapeToInt(fShapeY);
             model.AddConstantTensor(fNY, shapeY, &value);
             fIsOutputConstant = true;
@@ -139,7 +141,7 @@ public:
                    << " and values {" << value <<  "} (constant) " << std::endl;
          }
       }
-      if (!fIsOutputConstant) {
+      if (!fIsOutputConstant && !fIsOutputParamShape) {
          // Add output tensor
          model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShapeY);
          fType = ConvertTypeToString(model.GetTensorType(fNX));
@@ -156,6 +158,14 @@ public:
       if (fIsOutputConstant) {
          // no code to generate here for constant output. Tensor output is defined in Session constructor
          out << "//--------------------(constant)----------\n";
+         return out.str();
+      }
+      if (fIsOutputParamShape) {
+         // output is a shape tensor with symbolic values
+         out << "//--------------------(shape)----------\n";
+         for (int i = 0; i < static_cast<int>(fOutputShapeData.size()); i++) {
+            out << SP << "tensor_" << fNY << "[" << i << " ] = " << fOutputShapeData[i].GetVal() << ";\n";
+         }
          return out.str();
       }
       // The shape of the output is q + r - 1
@@ -289,7 +299,7 @@ std::vector<std::string> GetGPUDynParams() const {
 }
 
 std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
-    if (fIsOutputConstant) return "";
+    if (fIsOutputConstant || fIsOutputParamShape) return "";
     opName = "op_" + opName;
     if (fShapeY.empty())
         throw std::runtime_error("SOFIE Gather Op called to Generate without being initialized first");
@@ -377,7 +387,7 @@ std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
 }
 
 std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
-    if (fIsOutputConstant) return "";
+    if (fIsOutputConstant || fIsOutputParamShape) return "";
     opName = "op_" + opName;
     std::string kname = "GatherKernel_" + opName;
     return SP + kname + " gatherKernel_" + opName + ";\n";
@@ -385,6 +395,18 @@ std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override 
 
 std::string Generate_GPU_ALPAKA(std::string opName) override {
     if (fIsOutputConstant) return "";
+    if (fIsOutputParamShape) {
+        // shape tensor output: fill the host-side values and copy them to the device buffer
+        std::stringstream out;
+        out << "\n//------ GATHER (shape) GPU\n";
+        for (int i = 0; i < static_cast<int>(fOutputShapeData.size()); i++) {
+            out << SP << "tensor_" << fNY << "[" << i << "] = " << fOutputShapeData[i].GetVal() << ";\n";
+        }
+        out << SP << "auto hostBuf_" << fNY << " = alpaka::createView(hostAcc, tensor_" << fNY
+            << ", " << fOutputShapeData.size() << ");\n";
+        out << SP << "alpaka::memcpy(queue, deviceBuf_" << fNY << ", hostBuf_" << fNY << ");\n";
+        return out.str();
+    }
     opName = "op_" + opName;
     if (fShapeY.empty())
         throw std::runtime_error("SOFIE Gather Op called to Generate without being initialized first");

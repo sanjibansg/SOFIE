@@ -185,6 +185,69 @@ public:
       return out.str();
    }
 
+   // device-side accumulation expression for the current op
+   std::string GetGPUCombine(const std::string& acc_v, const std::string& val) const {
+      if (Op == EBasicNaryOperator::Max)
+         return acc_v + " = (" + acc_v + " > " + val + ") ? " + acc_v + " : " + val + ";";
+      if (Op == EBasicNaryOperator::Min)
+         return acc_v + " = (" + acc_v + " < " + val + ") ? " + acc_v + " : " + val + ";";
+      return acc_v + " = " + acc_v + " + " + val + ";"; // Sum and Mean both accumulate
+   }
+
+   std::string Generate_GPU_Kernel_ALPAKA(std::string OpName) override {
+      if (fBroadcast) return "";
+      OpName = "op_" + OpName;
+      size_t nIn = fNInputs.size();
+      std::string op;
+      op += "\n//------ BASICNARY_KERNEL_ALPAKA\n";
+      op += SP + "struct BasicNaryKernel_" + OpName + " {\n";
+      op += SP + SP + "template<typename TAcc, typename TOut";
+      for (size_t i = 0; i < nIn; i++)
+         op += ", typename Tin" + std::to_string(i);
+      op += ">\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc";
+      for (size_t i = 0; i < nIn; i++)
+         op += ", Tin" + std::to_string(i) + " const* in" + std::to_string(i);
+      op += ", TOut* out, std::size_t n) const {\n";
+      op += SP + SP + SP + "auto const idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (idx >= n) return;\n";
+      op += SP + SP + SP + "TOut v = static_cast<TOut>(in0[idx]);\n";
+      for (size_t i = 1; i < nIn; i++)
+         op += SP + SP + SP + "{ TOut w = static_cast<TOut>(in" + std::to_string(i) + "[idx]); " + GetGPUCombine("v", "w") + " }\n";
+      if (Op == EBasicNaryOperator::Mean)
+         op += SP + SP + SP + "v = v / static_cast<TOut>(" + std::to_string(nIn) + ");\n";
+      op += SP + SP + SP + "out[idx] = v;\n";
+      op += SP + SP + "}\n";
+      op += SP + "};\n";
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string OpName) override {
+      if (fBroadcast) return "";
+      OpName = "op_" + OpName;
+      return SP + "BasicNaryKernel_" + OpName + " basicNaryKernel_" + OpName + ";\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string OpName) override {
+      if (fBroadcast) return SP + "// BasicNary broadcast not yet supported on the alpaka backend (op skipped)\n";
+      if (fShapeY.empty())
+         throw std::runtime_error("SOFIE BasicNary Op called to Generate without being initialized first");
+      OpName = "op_" + OpName;
+      std::stringstream out;
+      std::string length = ConvertDimShapeToLength(fShapeY);
+      out << "\n//------ BASICNARY_GPU_ALPAKA\n";
+      out << SP << "auto const elementsPerGrid_" << OpName << " = Vec::all(Idx{" << length << "});\n";
+      out << SP << "auto const workDiv_" << OpName << " = sofie_workdiv(elementsPerGrid_" << OpName << ");\n";
+      out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << OpName
+          << ", basicNaryKernel_" << OpName;
+      for (auto &in : fNInputs)
+         out << ", alpaka::getPtrNative(deviceBuf_" << in << ")";
+      out << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")";
+      out << ", static_cast<std::size_t>(" << length << "));\n";
+      out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";
+      return out.str();
+   }
+
    std::vector<std::string> GetStdLibs() override {return { std::string("cmath") }; }
 };
 

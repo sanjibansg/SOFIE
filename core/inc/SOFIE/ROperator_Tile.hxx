@@ -171,12 +171,7 @@ public:
          return true;
       };
       std::vector<std::string> dynParams;
-      for (auto &d : fShapeInput)
-         if (d.isParam && isIdent(d.param)) {
-            bool seen = false;
-            for (auto &q : dynParams) if (q == d.param) seen = true;
-            if (!seen) dynParams.push_back(d.param);
-         }
+      UTILITY::CollectDimParams(fShapeInput, dynParams);
 
       std::string kname = "TileKernel_" + opName;
 
@@ -251,12 +246,7 @@ public:
          return true;
       };
       std::vector<std::string> dynParams;
-      for (auto &d : fShapeInput)
-         if (d.isParam && isIdent(d.param)) {
-            bool seen = false;
-            for (auto &q : dynParams) if (q == d.param) seen = true;
-            if (!seen) dynParams.push_back(d.param);
-         }
+      UTILITY::CollectDimParams(fShapeInput, dynParams);
 
       // Build argument list once, reused for both getValidWorkDiv and exec
       std::string args =

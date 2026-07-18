@@ -271,6 +271,19 @@ void RModel::GenerateGPU_ALPAKA_Buffers() {
          }
       }
    }
+
+   // shape tensors: small INT64 arrays. Host array is filled by the producing operator,
+   // device buffer is used when a shape tensor feeds a compute kernel.
+   if (!fShapeTensors.empty()) {
+      fGC += "//--- declare the shape tensors\n";
+      for (auto &i : fShapeTensors) {
+         size_t len = i.second.first.size();
+         if (len == 0) continue;
+         fGC += "int64_t tensor_" + i.first + "[" + std::to_string(len) + "];\n";
+         fGC += "BufI641D deviceBuf_" + i.first + " = alpaka::allocBuf<int64_t, Idx>(devAcc, Ext1D::all(Idx{" +
+                std::to_string(len) + "}));\n";
+      }
+   }
 }
 
 void RModel::GenerateDynamicTensorInfo_GPU_ALPAKA() {
@@ -499,14 +512,23 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    fGC += "void infer(std::span<ViewConstF1D const> inputs, std::span<ViewF1D> outputs" + spanDynDecl + "){\n";
 
    {
+      // Interleave dynamic params with inputs in the exact order _infer_impl declares them
+      // (each symbol emitted just before the first input whose shape introduces it).
       fGC += SP + "_infer_impl(";
+      std::unordered_map<std::string, int> seen;
       bool first = true;
-      for (auto &p : dynParamNames) {
-         if (!first) fGC += ", ";
-         fGC += p;
-         first = false;
-      }
       for (size_t i = 0; i < fInputTensorNames.size(); i++) {
+         auto &name = fInputTensorNames[i];
+         if (IsDimInputTensor(name)) {
+            for (auto &d : GetDynamicTensorShape(name)) {
+               if (d.isParam && seen.count(d.param) == 0) {
+                  seen[d.param] = 1;
+                  if (!first) fGC += ", ";
+                  fGC += d.param;
+                  first = false;
+               }
+            }
+         }
          if (!first) fGC += ", ";
          fGC += "inputs[" + std::to_string(i) + "]";
          first = false;
@@ -543,15 +565,25 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    fGC += GenerateInferSignature_GPU_ALPAKA();
    fGC += "){\n";
 
-   // Wrap each typed input buffer in a ViewConstXX, then call _infer_impl
+   // Wrap each typed input buffer in a ViewConstXX, then call _infer_impl. Interleave the
+   // dynamic params with the views in the same order _infer_impl declares them.
    std::vector<std::string> typedImplArgs;
-   for (auto &p : dynParamNames)
-      typedImplArgs.push_back(p);
-   for (auto &name : fInputTensorNames) {
-      std::string viewType = GetViewConstType(name);
-      fGC += SP + viewType + " const view_" + name +
-             "{alpaka::getPtrNative(deviceBuf_" + name + "), devAcc, alpaka::getExtents(deviceBuf_" + name + ")};\n";
-      typedImplArgs.push_back("view_" + name);
+   {
+      std::unordered_map<std::string, int> seen;
+      for (auto &name : fInputTensorNames) {
+         if (IsDimInputTensor(name)) {
+            for (auto &d : GetDynamicTensorShape(name)) {
+               if (d.isParam && seen.count(d.param) == 0) {
+                  seen[d.param] = 1;
+                  typedImplArgs.push_back(d.param);
+               }
+            }
+         }
+         std::string viewType = GetViewConstType(name);
+         fGC += SP + viewType + " const view_" + name +
+                "{alpaka::getPtrNative(deviceBuf_" + name + "), devAcc, alpaka::getExtents(deviceBuf_" + name + ")};\n";
+         typedImplArgs.push_back("view_" + name);
+      }
    }
 
    fGC += SP + "_infer_impl(";

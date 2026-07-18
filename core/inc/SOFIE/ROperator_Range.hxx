@@ -35,6 +35,8 @@ public:
       }
       static_assert( (std::is_same_v<T, float> || std::is_same_v<T, int64_t>),
                   "TMVA::SOFIE - Unsupported type by Range operator");
+      fInputTensorNames = { fNStart, fNLimit, fNDelta };
+      fOutputTensorNames = { fNOutput };
    }
 
    std::vector<ETensorType> TypeInference(std::vector<ETensorType> input) override {
@@ -61,32 +63,83 @@ public:
             std::runtime_error("SOFIE Range Op Input Tensor " + fNDelta + "is not found in model");
       }
       ETensorType type = ConvertStringToType(fType);
-      if (model.IsInitializedTensor(fNStart) && model.IsInitializedTensor(fNDelta) && model.IsInitializedTensor(fNLimit)) {
-         T * start = static_cast<T*>(model.GetInitializedTensorData(fNStart).get());
-         T * limit = static_cast<T*>(model.GetInitializedTensorData(fNLimit).get());
-         T * delta = static_cast<T*>(model.GetInitializedTensorData(fNDelta).get());
-         if (!start || !delta || !limit)
-            std::runtime_error("SOFIE Range Op Input Tensor has invalid input data");
-         T a = *start;
-         T b = *limit;
-         T d = *delta;
-         int number_of_elements = std::max( static_cast<double>(std::ceil( (b - a) / d )) , 0. );
-         std::vector<T> output(number_of_elements);
-         for (int i=0; i<number_of_elements; ++i) {
-            output[i] =  a + (i * d);
+
+      // classify each input: 0 = intermediate (runtime), 1 = constant/initialized, 2 = shape tensor (symbolic)
+      auto analyzeInput = [&](const std::string & tName, T & value, Dim & dim) {
+         int ftype = 0;
+         if (model.IsInitializedTensor(tName)) {
+            T * data = static_cast<T*>(model.GetInitializedTensorData(tName).get());
+            if (!data)
+               throw std::runtime_error("SOFIE Range Op Input Tensor has invalid input data");
+            value = *data;
+            ftype = 1;
+         } else if (model.IsShapeTensor(tName)) {
+            auto data = model.GetShapeTensorValues(tName);
+            dim = data[0];
+            if (!dim.isParam) {
+               value = static_cast<T>(dim.dim);
+               ftype = 1;
+            } else
+               ftype = 2;
          }
-         std::vector<size_t> shape = {static_cast<size_t>(number_of_elements)};
-         model.AddConstantTensor(fNOutput,shape, output.data());
-         fIsOutputConstant = true;
-         // set the input tensor not writable
-         model.SetNotWritableInitializedTensor(fNStart);
-         model.SetNotWritableInitializedTensor(fNDelta);
-         model.SetNotWritableInitializedTensor(fNLimit);
-      }
-      else {
-         fShape = {Dim{"range_size"}};
+         return ftype;
+      };
+
+      T start_value{};
+      T limit_value{};
+      T delta_value{};
+      Dim start_dim{};
+      Dim limit_dim{};
+      Dim delta_dim{};
+      int res1 = analyzeInput(fNStart, start_value, start_dim);
+      int res2 = analyzeInput(fNLimit, limit_value, limit_dim);
+      int res3 = analyzeInput(fNDelta, delta_value, delta_dim);
+      if (res1 == 0 || res2 == 0 || res3 == 0) {
+         // cannot know size at compile time - need to compute fully at run time
+         fShape = {Dim{"range_size_" + fNStart + "_" + fNLimit}};
          model.AddDynamicTensor(fNOutput, type, fShape);
+      } else if (res1 == 1 && res2 == 1 && res3 == 1) {
+         // all inputs known: output is a constant tensor
+         size_t number_of_elements = std::max(static_cast<int>(std::ceil((limit_value - start_value) / delta_value )) , 0 );
+         fIsOutputConstant = true;
+         std::vector<T> output(number_of_elements);
+         for (size_t i=0; i<number_of_elements; ++i) {
+            output[i] =  start_value + (i * delta_value);
+         }
+         std::vector<size_t> shape = {number_of_elements};
+         model.AddConstantTensor(fNOutput,shape, output.data());
+         fShape = ConvertShapeToDim(shape);
+      } else {
+         // mix of constant and shape-tensor inputs: derive the output length symbolically
+         std::string start = (res1 == 1) ? std::to_string(start_value) : start_dim.GetVal();
+         std::string limit = (res2 == 1) ? std::to_string(limit_value) : limit_dim.GetVal();
+         std::string delta = (res3 == 1) ? std::to_string(delta_value) : delta_dim.GetVal();
+         std::stringstream s;
+         if (type == ETensorType::FLOAT ) {
+            if (delta_value == 1)
+               s <<  "std::max(std::ceil("<< limit << " - " << start << "),0.0f)";
+            else
+               s <<  "std::max(std::ceil(("<< limit << " - " << start << ")/" << delta << "),0.0f)";
+         } else if (type == ETensorType::INT64 ) {
+            if (delta == "1") {
+               if (start == "0")
+                  s <<  limit;
+               else
+                  s << "std::max((" << limit << " - " << start << "),0L)";
+            } else {
+               if (start == "0")
+                  s <<  "((" << limit << ")/" << delta << ")";
+               else
+                  s << "std::max((" << limit << " - " << start << ")/"<< delta << "),0L)";
+            }
+         } else {
+            throw
+               std::runtime_error("SOFIE Range Op Input Tensor " + ConvertTypeToString(type) + "is not supported");
+         }
+         fShape = { Dim {s.str(), static_cast<size_t>(-1)} };
+         model.AddDynamicTensor(fNOutput,type, fShape);
       }
+
       if (model.Verbose()) {
          std::cout << "Range -> output is " << fNOutput << " : " << ConvertDimShapeToString(fShape);
          if (fIsOutputConstant) std::cout << " : " << ConvertValuesToString(model.GetTensorData<T>(fNOutput));
@@ -94,31 +147,96 @@ public:
       }
    }
 
-   std::string Generate(std::string OpName) override {
+   // Resolve the output-length variable name and its defining expression, shared by the
+   // CPU and GPU code generators.
+   void GetRangeSize(std::string & outputSizeVar, std::string & outputSize) const {
+      outputSize = fShape[0].param;
+      if (outputSize.find("range_size") != std::string::npos) {
+         // fully run-time: read the scalar input tensors at run time
+         outputSizeVar = outputSize;
+         outputSize = "static_cast<size_t>(std::max(std::ceil((static_cast<float>(*tensor_" + fNLimit +
+                ") - static_cast<float>(*tensor_" + fNStart + ")) / static_cast<float>(*tensor_" + fNDelta + ")), 0.0f))";
+      } else {
+         outputSizeVar = "range_op_" + fNOutput;
+      }
+   }
+
+   std::string Generate(std::string opName) override {
 
       std::stringstream out;
-      out << "\n//------ Range\n";
+      out << "\n//------ Range " << opName << "---> " << ConvertDimShapeToString(fShape) << "\n";
       if (fIsOutputConstant) return out.str();
 
-      OpName = "op_" + OpName;
       if (fShape.empty()) {
          throw std::runtime_error("SOFIE Range operator called to Generate without being initialized first");
       }
 
-      std::string sizeName = fShape[0].param;
-      out << SP << "size_t " << sizeName << " = static_cast<size_t>(std::max(std::ceil((static_cast<float>(*tensor_" << fNLimit << ") - static_cast<float>(*tensor_" << fNStart << ")) / static_cast<float>(*tensor_" << fNDelta << ")), 0.0f));\n";
-      out << SP << "if (" << sizeName << " > " << "fTensor_" << fNOutput << ".size() ){\n";
-      out << SP << SP << "fTensor_" << fNOutput << ".resize(" << sizeName << ");\n";
-      // need to re-initialized pointer to tensor data
-      out << SP << SP << "tensor_" << fNOutput << " = fTensor_" << fNOutput << ".data();\n";
+      std::string outputSizeVar;
+      std::string outputSize;
+      GetRangeSize(outputSizeVar, outputSize);
+      out << SP << "size_t " << outputSizeVar <<  " = " << outputSize << ";\n";
+      out << SP << "for (size_t i = 0; i < " << outputSizeVar << "; i++) {\n";
+      out << SP << SP << "tensor_" << fNOutput << "[i] = *tensor_" << fNStart << " + i * (*tensor_" << fNDelta << ");\n";
       out << SP << "}\n";
-      out << SP << "for (size_t i = 0; i < " << sizeName << "; i++) {\n";
-      out << SP << SP << "fTensor_" << fNOutput << "[i] = *tensor_" << fNStart << " + i * (*tensor_" << fNDelta << ");\n";
+
+      return out.str();
+   }
+
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+      if (fIsOutputConstant) return "";
+      opName = "op_" + opName;
+      std::string op;
+      op += "\n//------ RANGE_KERNEL_ALPAKA\n";
+      op += SP + "struct RangeKernel_" + opName + " {\n";
+      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc, T const* start, T const* delta, T* output, std::size_t n) const {\n";
+      op += SP + SP + SP + "auto const idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (idx >= n) return;\n";
+      op += SP + SP + SP + "output[idx] = start[0] + static_cast<T>(idx) * delta[0];\n";
+      op += SP + SP + "}\n";
+      op += SP + "};\n";
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
+      if (fIsOutputConstant) return "";
+      opName = "op_" + opName;
+      return SP + "RangeKernel_" + opName + " rangeKernel_" + opName + ";\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string opName) override {
+      std::stringstream out;
+      out << "\n//------ Range (GPU) " << opName << " ---> " << ConvertDimShapeToString(fShape) << "\n";
+      if (fIsOutputConstant) return out.str();
+      if (fShape.empty()) {
+         throw std::runtime_error("SOFIE Range operator called to Generate without being initialized first");
+      }
+
+      std::string outputSize = fShape[0].param;
+      if (outputSize.find("range_size") != std::string::npos) {
+         // fully run-time size (all-runtime scalar limits) needs a device->host scalar read;
+         // not yet supported on the alpaka backend. Skip GPU codegen for this case - the
+         // symbolic/shape-tensor case below (what ParticleNet needs) is fully handled.
+         out << SP << "// Range: fully run-time size not supported on alpaka backend (op skipped)\n";
+         return out.str();
+      }
+
+      opName = "op_" + opName;
+      out << SP << "{\n";
+      out << SP << SP << "auto const elementsPerGrid_" << opName << " = Vec::all(Idx{" << outputSize << "});\n";
+      out << SP << SP << "auto const workDiv_" << opName << " = sofie_workdiv(elementsPerGrid_" << opName << ");\n";
+      out << SP << SP << "auto task_" << opName << " = alpaka::createTaskKernel<Acc>(workDiv_" << opName
+          << ", rangeKernel_" << opName
+          << ", alpaka::getPtrNative(deviceBuf_" << fNStart << ")"
+          << ", alpaka::getPtrNative(deviceBuf_" << fNDelta << ")"
+          << ", alpaka::getPtrNative(deviceBuf_" << fNOutput << ")"
+          << ", static_cast<std::size_t>(" << outputSize << "));\n";
+      out << SP << SP << "alpaka::enqueue(queue, task_" << opName << ");\n";
       out << SP << "}\n";
       return out.str();
    }
 };
 
 }//SOFIE
-   
+
 #endif //SOFIE_ROPERATOR_RANGE

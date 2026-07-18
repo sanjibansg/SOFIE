@@ -173,6 +173,17 @@ public:
       return out.str();
    }
 
+   // base dynamic identifiers in the spatial dims (e.g. n_pf, n_sv), passed as
+   // size_t kernel args; CollectDimParams handles compound dims like std::max(...)
+   std::vector<std::string> GetGPUDynParams() const {
+      std::vector<std::string> params;
+      if (fShapeX.size() > 2) {
+         std::vector<Dim> spatialShape(fShapeX.begin() + 2, fShapeX.end());
+         UTILITY::CollectDimParams(spatialShape, params);
+      }
+      return params;
+   }
+
    std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
       opName = "op_" + opName;
       if (fShapeX.empty())
@@ -188,15 +199,6 @@ public:
          spatialShape.assign(fShapeX.begin() + 2, fShapeX.end());
          spatial_dim = ConvertDimShapeToLength(spatialShape);
       }
-      // symbolic dims inside spatial_dim -> passed as size_t kernel args (kernel-arg convention)
-      std::vector<std::string> dynParams;
-      for (auto &d : spatialShape)
-         if (d.isParam) {
-            bool seen = false;
-            for (auto &q : dynParams) if (q == d.param) seen = true;
-            if (!seen) dynParams.push_back(d.param);
-         }
-
       std::string kname = "BatchNormKernel_" + opName;
       std::string op;
       op  = "\n//------ BATCHNORM_KERNEL_ALPAKA\n";
@@ -209,7 +211,7 @@ public:
       op += SP + SP + SP + "T const* __restrict__ bias,\n";
       op += SP + SP + SP + "T const* __restrict__ mean,\n";
       op += SP + SP + SP + "T* __restrict__ Y,\n";
-      for (auto &p : dynParams)
+      for (auto &p : GetGPUDynParams())
          op += SP + SP + SP + "std::size_t const " + p + ",\n";
       op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
 
@@ -246,18 +248,8 @@ public:
       std::string totalElements = ConvertDimShapeToLength(fShapeY);
       std::string kname = "batchNormKernel_" + opName;
 
-      // symbolic spatial dims -> passed after the buffers, matching the kernel signature order.
-      std::vector<std::string> dynParams;
-      if (fShapeX.size() > 2) {
-         for (auto it = fShapeX.begin() + 2; it != fShapeX.end(); ++it)
-            if (it->isParam) {
-               bool seen = false;
-               for (auto &q : dynParams) if (q == it->param) seen = true;
-               if (!seen) dynParams.push_back(it->param);
-            }
-      }
       std::string dynArgs;
-      for (auto &p : dynParams) dynArgs += ", static_cast<std::size_t>(" + p + ")";
+      for (auto &p : GetGPUDynParams()) dynArgs += ", static_cast<std::size_t>(" + p + ")";
 
       std::stringstream out;
       out << "\n//------ BATCHNORM_GPU_ALPAKA\n";
