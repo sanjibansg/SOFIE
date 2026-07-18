@@ -648,25 +648,12 @@ void RModel::Initialize(const std::map<std::string, size_t> & inputParams, bool 
 
    // Build set of initialized tensors consumed by at least one runtime operator (need for later)
    std::unordered_set<std::string> runtimeInitializedInputs;
-   std::vector<std::string> initFailures;   // diagnostic: collect every Initialize failure in one pass
    for(size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx){
       if (verbose) {
          auto& r = *fOperators[op_idx].get();
          std::cout << "Initializing operator " << i << "  " << typeid(r).name() << std::endl;
       }
-      try {
-         fOperators[op_idx]->Initialize(*this);
-      } catch (const std::exception &e) {
-         std::string msg = "op#" + std::to_string(op_idx) + " kind="
-                         + std::to_string(static_cast<int>(fOperators[op_idx]->GetKind())) + " in[";
-         for (auto &t : fOperators[op_idx]->GetOpInputTensors()) msg += std::string{t} + " ";
-         msg += "] out[";
-         for (auto &t : fOperators[op_idx]->GetOpOutputTensors()) msg += std::string{t} + " ";
-         msg += "] : " + std::string(e.what());
-         std::cerr << "[SOFIE][init-fail] " << msg << std::endl;
-         initFailures.push_back(msg);
-         continue;   // keep going so one run reports all failures, not just the first
-      }
+      fOperators[op_idx]->Initialize(*this);
       for(auto &it:fOperators[op_idx]->GetOpOutputTensors()){
          std::string name = std::string{it};
          // check if tensor is not an initialized or output tensor and it is not already in the list
@@ -688,16 +675,6 @@ void RModel::Initialize(const std::map<std::string, size_t> & inputParams, bool 
       }
 
       i++;
-   }
-
-   if (!initFailures.empty()) {
-      std::cerr << "\n[SOFIE] ===== " << initFailures.size()
-                << " operator(s) failed to initialize =====\n";
-      for (auto &f : initFailures) std::cerr << "  " << f << "\n";
-      std::cerr << "[SOFIE] note: \"not found\" errors are usually cascades from an earlier failed op; "
-                   "the real gaps are the \"dynamic\"/\"not supported\" ones\n" << std::endl;
-      throw std::runtime_error("SOFIE: " + std::to_string(initFailures.size())
-                               + " operator(s) failed to initialize (see list above)");
    }
 
    // loop on initialized tensors and make the integers as constant to be
