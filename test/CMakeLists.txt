@@ -113,14 +113,25 @@ if (ENABLE_ALPAKA_TESTS)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
 
+    set(ALPAKA_CUDA_TEST_SOURCES
+      alpaka/TestAlpakaLinear.cxx
+      alpaka/TestAlpakaConv.cxx
+      alpaka/TestAlpakaNormalization.cxx
+      alpaka/TestAlpakaElementwiseUnary.cxx
+      alpaka/TestAlpakaElementwiseBinaryLogic.cxx
+      alpaka/TestAlpakaReduce.cxx
+      alpaka/TestAlpakaShapeIndexing.cxx
+      alpaka/TestAlpakaGNN.cxx
+    )
+
     set_source_files_properties(
-      TestCustomModelsFromONNXForAlpakaCuda.cxx
+      ${ALPAKA_CUDA_TEST_SOURCES}
       PROPERTIES LANGUAGE CUDA
     )
 
     ROOTTEST_GENERATE_EXECUTABLE(
       TestCustomModelsFromONNXForAlpakaCuda
-      TestCustomModelsFromONNXForAlpakaCuda.cxx
+      ${ALPAKA_CUDA_TEST_SOURCES}
       LIBRARIES SOFIE_core GTest::gtest GTest::gtest_main
       FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka
       FIXTURES_SETUP sofie-test-models-onnx-alpaka-build
@@ -187,5 +198,13 @@ if (ENABLE_ALPAKA_TESTS)
       FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka
     )
 
+  elseif (_alpaka_backend STREQUAL "hip")
+    message(FATAL_ERROR
+      "ALPAKA_BACKEND=hip is not implemented yet (AMD GPU support is planned, "
+      "see test/alpaka/). Use ALPAKA_BACKEND=cuda for now.")
+  elseif (_alpaka_backend STREQUAL "sycl")
+    message(FATAL_ERROR "ALPAKA_BACKEND=sycl is not implemented yet.")
+  elseif (_alpaka_backend STREQUAL "cpu")
+    message(FATAL_ERROR "ALPAKA_BACKEND=cpu is not implemented yet.")
   endif() # cuda backend
 endif()   # ENABLE_ALPAKA_TESTS
