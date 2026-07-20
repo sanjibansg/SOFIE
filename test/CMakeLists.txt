@@ -122,6 +122,7 @@ if (ENABLE_ALPAKA_TESTS)
       alpaka/TestAlpakaReduce.cxx
       alpaka/TestAlpakaShapeIndexing.cxx
       alpaka/TestAlpakaGNN.cxx
+      alpaka/TestAlpakaPool.cxx
     )
 
     set_source_files_properties(
