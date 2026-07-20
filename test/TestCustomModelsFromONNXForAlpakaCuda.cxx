@@ -173,6 +173,15 @@
 #include "ConvBatch8_FromONNX_GPU_ALPAKA.hxx"
 #include "input_models/references/ConvBatch8.ref.hxx"
 
+#include "ConvGroup2_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/ConvGroup2.ref.hxx"
+
+#include "ConvGroup4_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/ConvGroup4.ref.hxx"
+
+#include "ConvBatch4Group2_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/ConvBatch4Group2.ref.hxx"
+
 #include "BatchNorm_FromONNX_GPU_ALPAKA.hxx"
 #include "BatchNormRelu_FromONNX_GPU_ALPAKA.hxx"
 
@@ -2449,6 +2458,108 @@ TEST_F(SofieAlpakaTest, ConvWithAsymmetricPadding)
    for (size_t i = 0; i < nOut_asymPad; ++i) {
       EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
    }
+}
+
+TEST_F(SofieAlpakaTest, ConvGroup2)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+   std::vector<float> input(100);
+   std::iota(input.begin(), input.end(), 0.0f);
+
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
+
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(ConvGroup2_ExpectedOutput::correct) / sizeof(float)}));
+
+   {
+      SOFIE_ConvGroup2::Session<alpaka::TagGpuCudaRt> session("ConvGroup2_FromONNX_GPU_ALPAKA.dat");
+      auto result = session.infer(input_d);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float* correct = ConvGroup2_ExpectedOutput::correct;
+   constexpr size_t nOut = sizeof(ConvGroup2_ExpectedOutput::correct) / sizeof(float);
+
+   for (size_t i = 0; i < nOut; ++i)
+      EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
+}
+
+TEST_F(SofieAlpakaTest, ConvGroup4)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+   std::vector<float> input(100);
+   std::iota(input.begin(), input.end(), 0.0f);
+
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
+
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(ConvGroup4_ExpectedOutput::correct) / sizeof(float)}));
+
+   {
+      SOFIE_ConvGroup4::Session<alpaka::TagGpuCudaRt> session("ConvGroup4_FromONNX_GPU_ALPAKA.dat");
+      auto result = session.infer(input_d);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float* correct = ConvGroup4_ExpectedOutput::correct;
+   constexpr size_t nOut = sizeof(ConvGroup4_ExpectedOutput::correct) / sizeof(float);
+
+   for (size_t i = 0; i < nOut; ++i)
+      EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
+}
+
+TEST_F(SofieAlpakaTest, ConvBatch4Group2)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+   std::vector<float> input(400);
+   std::iota(input.begin(), input.end(), 0.0f);
+
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
+
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(ConvBatch4Group2_ExpectedOutput::correct) / sizeof(float)}));
+
+   {
+      SOFIE_ConvBatch4Group2::Session<alpaka::TagGpuCudaRt> session("ConvBatch4Group2_FromONNX_GPU_ALPAKA.dat");
+      auto result = session.infer(input_d);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float* correct = ConvBatch4Group2_ExpectedOutput::correct;
+   constexpr size_t nOut = sizeof(ConvBatch4Group2_ExpectedOutput::correct) / sizeof(float);
+
+   for (size_t i = 0; i < nOut; ++i)
+      EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
 }
 
 TEST_F(SofieAlpakaTest, BatchNormalization)
