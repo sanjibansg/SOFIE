@@ -1058,14 +1058,16 @@ TEST(ONNX, MaxPool2d_AsymPad)
 {
    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
 
-   // 1x1x4x4 input with values 0..15
-   std::vector<float> input({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15});
+   // Preparing the random input (1x1x4x4)
+   std::vector<float> input({
+       0.3047, -1.0400,  0.7505,  0.9406, -1.9510, -1.3022,  0.1278, -0.3162,
+      -0.0168, -0.8530,  0.8794,  0.7778,  0.0660,  1.1272,  0.4675, -0.8593
+   });
 
    SOFIE_MaxPool2d_AsymPad::Session s("MaxPool2d_AsymPad_FromONNX.dat");
    std::vector<float> output = s.infer(input.data());
 
-   // pads=[0,1,0,1] (width padded, height not) gives a 1x1x3x5 output;
-   // the pre-fix code mis-read the pads and produced a 4x4 grid instead
+   // pads=[0,1,0,1] (width padded, height not) gives a 1x1x3x5 output
    EXPECT_EQ(output.size(), sizeof(MaxPool2d_AsymPad_ExpectedOutput::output) / sizeof(float));
 
    float *correct = MaxPool2d_AsymPad_ExpectedOutput::output;
