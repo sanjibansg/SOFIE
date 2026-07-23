@@ -41,3 +41,5 @@ install/
 # Benchmark results
 benchmark/results/
 benchmark/cache/
+benchmark/build-profile
+benchmark/benchmark
