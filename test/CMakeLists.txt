@@ -121,8 +121,14 @@ if (ENABLE_ALPAKA_TESTS)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
 
+    set(_alpaka_cuda_test_targets
+      TestCustomModelsFromONNXForAlpakaCuda
+      TestQuantizationFromONNXForAlpakaCuda
+    )
+
     set_source_files_properties(
       TestCustomModelsFromONNXForAlpakaCuda.cxx
+      TestQuantizationFromONNXForAlpakaCuda.cxx
       PROPERTIES LANGUAGE CUDA
     )
 
@@ -134,65 +140,80 @@ if (ENABLE_ALPAKA_TESTS)
       FIXTURES_SETUP sofie-test-models-onnx-alpaka-build
     )
 
-    target_include_directories(
-      TestCustomModelsFromONNXForAlpakaCuda PRIVATE
-      ${CMAKE_CURRENT_BINARY_DIR}
-      ${alpaka_SOURCE_DIR}/include
-      ${sofieblas_SOURCE_DIR}/include
-      ${CUDAToolkit_INCLUDE_DIRS}
-      ${CMAKE_CURRENT_SOURCE_DIR}
+    ROOTTEST_GENERATE_EXECUTABLE(
+      TestQuantizationFromONNXForAlpakaCuda
+      TestQuantizationFromONNXForAlpakaCuda.cxx
+      LIBRARIES SOFIE_core GTest::gtest GTest::gtest_main
+      FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka
+      FIXTURES_SETUP sofie-quantization-models-onnx-alpaka-build
     )
 
-    set_target_properties(
-      TestCustomModelsFromONNXForAlpakaCuda
-      PROPERTIES
-        CUDA_SEPARABLE_COMPILATION OFF
-        CUDA_ARCHITECTURES 70 80 86
-        CUDA_STANDARD 20
-        CUDA_STANDARD_REQUIRED ON
-    )
+    foreach(_alpaka_cuda_test_target IN LISTS _alpaka_cuda_test_targets)
+      target_include_directories(
+        ${_alpaka_cuda_test_target} PRIVATE
+        ${CMAKE_CURRENT_BINARY_DIR}
+        ${alpaka_SOURCE_DIR}/include
+        ${sofieblas_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+      )
 
-    target_compile_definitions(
-      TestCustomModelsFromONNXForAlpakaCuda PRIVATE
-      ALPAKA_ACC_GPU_CUDA_ENABLED
-      ALPAKA_HAS_STD_ATOMIC_REF
-      SOFIE_USE_CUBLASLT
-    )
+      set_target_properties(
+        ${_alpaka_cuda_test_target}
+        PROPERTIES
+          CUDA_SEPARABLE_COMPILATION OFF
+          CUDA_ARCHITECTURES 70 80 86
+          CUDA_STANDARD 20
+          CUDA_STANDARD_REQUIRED ON
+      )
 
-    target_compile_options(
-      TestCustomModelsFromONNXForAlpakaCuda PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:
-        --extended-lambda
-        --expt-relaxed-constexpr
-        --generate-line-info
-        --use_fast_math
-        -g
-        -G
-        # -fsanitize=address
-        -O1
-        -Wno-deprecated-gpu-targets
-      >
-      $<$<COMPILE_LANGUAGE:CXX>:
-        -O2
-        -g
-        -G
-        -fPIC
-        -pthread
-      >
-    )
-  # set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+      target_compile_definitions(
+        ${_alpaka_cuda_test_target} PRIVATE
+        ALPAKA_ACC_GPU_CUDA_ENABLED
+        ALPAKA_HAS_STD_ATOMIC_REF
+        SOFIE_USE_CUBLASLT
+      )
 
-    # ROOT-compatible: plain signature only
-    target_link_libraries(
-      TestCustomModelsFromONNXForAlpakaCuda
-      CUDA::cudart
-      CUDA::cublas
-      CUDA::cublasLt
-    )
+      target_compile_options(
+        ${_alpaka_cuda_test_target} PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:
+          --extended-lambda
+          --expt-relaxed-constexpr
+          --generate-line-info
+          --use_fast_math
+          -g
+          -G
+          # -fsanitize=address
+          -O1
+          -Wno-deprecated-gpu-targets
+        >
+        $<$<COMPILE_LANGUAGE:CXX>:
+          -O2
+          -g
+          -G
+          -fPIC
+          -pthread
+        >
+      )
+
+      # ROOT-compatible: plain signature only.
+      target_link_libraries(
+        ${_alpaka_cuda_test_target}
+        CUDA::cudart
+        CUDA::cublas
+        CUDA::cublasLt
+      )
+    endforeach()
 
     ROOTTEST_ADD_TEST(
       TestCustomModelsFromONNXForAlpakaCuda
       EXEC ./TestCustomModelsFromONNXForAlpakaCuda
+      FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka
+    )
+
+    ROOTTEST_ADD_TEST(
+      TestQuantizationFromONNXForAlpakaCuda
+      EXEC ./TestQuantizationFromONNXForAlpakaCuda
       FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka
     )
 

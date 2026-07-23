@@ -73,6 +73,10 @@ check_externalized_storage(
   ONNX_QDQ_QuantGemm weight_dequantized_quantized_plain_device_storage 4096)
 check_externalized_storage(
   ONNX_QDQ_QuantMatMul weight_dequantized_quantized_transposed_device_storage 4096)
+check_externalized_storage(
+  QONNX_QuantConv weight_quantized_conv_matrix_storage 4096)
+check_externalized_storage(
+  ONNX_QDQ_QuantConv weight_quantized_conv_matrix_storage 4096)
 check_storage_absent(
   QONNX_QuantMatMul_Padded weight_fp_quantized_transposed_device_storage)
 check_source_absent(QONNX_QuantGemm weight_fp)
@@ -82,6 +86,10 @@ check_source_absent(ONNX_QDQ_QuantGemm weight_dequantized)
 check_source_absent(ONNX_QDQ_QuantGemm weight_q)
 check_source_absent(ONNX_QDQ_QuantMatMul weight_dequantized)
 check_source_absent(ONNX_QDQ_QuantMatMul weight_q)
+check_source_absent(QONNX_QuantConv weight)
+check_source_absent(QONNX_QuantConv weight_q)
+check_source_absent(ONNX_QDQ_QuantConv weight)
+check_source_absent(ONNX_QDQ_QuantConv weight_dq)
 
 set(binary_weights "${GENERATED_DIR}/QONNX_QuantGemm_Binary_FromONNX_GPU_ALPAKA.bin")
 if(NOT EXISTS "${binary_weights}")
