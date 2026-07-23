@@ -497,48 +497,35 @@ public:
             if (fShapeB[i] != fShapeY[i]) { isBContiguous = false; break; }
       }
 
-      std::string flattened_index_A = "";
-      std::string flattened_index_B = "";
+      auto makeFlattenedIndex = [&](const std::vector<size_t> &inputShape,
+                                    const std::vector<size_t> &inputStrides,
+                                    bool isScalar, bool isContiguous) {
+         if (isScalar)
+            return std::string{"0"};
+         if (isContiguous)
+            return std::string{"idx"};
 
-      if (isAScalar) {
-         // A is a single broadcast value
-         flattened_index_A = "0";
-      } else if (isAContiguous) {
-         // A and Y have identical shapes → direct index
-         flattened_index_A = "idx";
-      } else {
-         // General broadcast case: decompose idx into per-dim coords
-         std::string temp = "idx";
-         for (size_t id_s = 0; id_s < fShapeA.size(); ++id_s) {
-            auto strideY = stridesY[id_s];
-            auto strideA = stridesA[id_s];
-            std::string coord = "(int)(" + temp + " / " + std::to_string(strideY) + ")";
-            flattened_index_A += coord + " * " + std::to_string(strideA) + " + ";
-            temp = temp + " - (" + coord + " * " + std::to_string(strideY) + ")";
+         const auto rankOffset = fShapeY.size() - inputShape.size();
+         std::string index;
+         for (size_t inputAxis = 0; inputAxis < inputShape.size(); ++inputAxis) {
+            if (inputShape[inputAxis] == 1)
+               continue;
+            const auto outputAxis = inputAxis + rankOffset;
+            std::string term = "((idx / " + std::to_string(stridesY[outputAxis]) +
+                               ") % " + std::to_string(fShapeY[outputAxis]) + ")";
+            if (inputStrides[inputAxis] != 1)
+               term += " * " + std::to_string(inputStrides[inputAxis]);
+            if (!index.empty())
+               index += " + ";
+            index += term;
          }
-         if (!flattened_index_A.empty())
-            flattened_index_A.erase(flattened_index_A.size() - 3);
-      }
+         return index.empty() ? std::string{"0"} : index;
+      };
 
-      if (isBScalar) {
-         // B is a single broadcast value
-         flattened_index_B = "0";
-      } else if (isBContiguous) {
-         // B and Y have identical shapes → direct index
-         flattened_index_B = "idx";
-      } else {
-         // General broadcast case
-         std::string temp = "idx";
-         for (size_t id_s = 0; id_s < fShapeB.size(); ++id_s) {
-            auto strideY = stridesY[id_s];
-            auto strideB = stridesB[id_s];
-            std::string coord = "(int)(" + temp + " / " + std::to_string(strideY) + ")";
-            flattened_index_B += coord + " * " + std::to_string(strideB) + " + ";
-            temp = temp + " - (" + coord + " * " + std::to_string(strideY) + ")";
-         }
-         if (!flattened_index_B.empty())
-            flattened_index_B.erase(flattened_index_B.size() - 3);
-      }
+      const auto flattened_index_A =
+         makeFlattenedIndex(fShapeA, stridesA, isAScalar, isAContiguous);
+      const auto flattened_index_B =
+         makeFlattenedIndex(fShapeB, stridesB, isBScalar, isBContiguous);
 
       op += "C[idx] = " + BinaryOperatorTrait<T, Op>::Op("A["+flattened_index_A+"]", "B["+flattened_index_B+"]") + ";\n";
       op += "}\n}\n};\n";

@@ -121,6 +121,15 @@ public:
             case EBasicUnaryOperator::kAbs:
                fKind = OperatorKind::UNARY_ABS;
                break;
+            case EBasicUnaryOperator::kSoftplus:
+               fKind = OperatorKind::UNARY_SOFTPLUS;
+               break;
+            case EBasicUnaryOperator::kAtan:
+               fKind = OperatorKind::UNARY_ATAN;
+               break;
+            case EBasicUnaryOperator::kFloor:
+               fKind = OperatorKind::UNARY_FLOOR;
+               break;
          }
          fInputTensorNames =  { fNX };
          fOutputTensorNames = { fNY };

@@ -40,7 +40,10 @@ enum class OperatorKind {
    CLIP=24,
    NOT=25,
    QUANTIZED_GEMM=26,
-   QUANTIZED_MATMUL=27
+   QUANTIZED_MATMUL=27,
+   UNARY_SOFTPLUS=28,
+   UNARY_ATAN=29,
+   UNARY_FLOOR=30
 };
 
 inline const char* toString(OperatorKind kind) {
@@ -48,6 +51,9 @@ inline const char* toString(OperatorKind kind) {
        case OperatorKind::GEMM:       return "GEMM";
        case OperatorKind::QUANTIZED_GEMM: return "QUANTIZED_GEMM";
        case OperatorKind::QUANTIZED_MATMUL: return "QUANTIZED_MATMUL";
+       case OperatorKind::UNARY_SOFTPLUS: return "UNARY_SOFTPLUS";
+       case OperatorKind::UNARY_ATAN: return "UNARY_ATAN";
+       case OperatorKind::UNARY_FLOOR: return "UNARY_FLOOR";
        case OperatorKind::LAYERNORM:  return "LAYERNORM";
        case OperatorKind::RELU:       return "RELU";
        case OperatorKind::CONSTANT:        return "CONSTANT";

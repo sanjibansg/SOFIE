@@ -609,6 +609,9 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       SOFIE::OperatorKind::UNARY_SIN,
       SOFIE::OperatorKind::UNARY_COS,
       SOFIE::OperatorKind::UNARY_ABS,
+      SOFIE::OperatorKind::UNARY_SOFTPLUS,
+      SOFIE::OperatorKind::UNARY_ATAN,
+      SOFIE::OperatorKind::UNARY_FLOOR,
       SOFIE::OperatorKind::NOT
    };
 

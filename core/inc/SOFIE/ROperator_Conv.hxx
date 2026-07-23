@@ -259,6 +259,12 @@ public:
          throw std::runtime_error("TMVA SOFIE Conv Op input weight tensor" + fNW + " is not of 3,4 or 5 dimensions");
       }
       fShapeY = DoShapeInference(fShapeX, fShapeW);
+      if (fAttrGroup == 0)
+         throw std::runtime_error("TMVA SOFIE Conv Op has an invalid zero group count");
+      if (!fShapeX[1].isParam && fShapeX[1].dim != fShapeW[1] * fAttrGroup)
+         throw std::runtime_error("TMVA SOFIE Conv Op input channels do not match weight channels and groups");
+      if (fShapeW[0] % fAttrGroup != 0)
+         throw std::runtime_error("TMVA SOFIE Conv Op output channels are not divisible by groups");
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShapeY);
       if (fNB != "") {
          if (!model.CheckIfTensorAlreadyExist(fNB)) {
@@ -839,9 +845,8 @@ public:
       size_t colElements = gemm_k * gemm_m;   // colRows * colCols
       size_t wTotal      = ConvertShapeToLength(fShapeW);
 
-      // For group conv: per-group output channels and _f offset
-      // gemm_n stays as total output channels — we divide per group at launch
-      size_t groupFOffset     = gemm_n * gemm_k;  // elements of _f per group
+      size_t groupOutChannels = outChannels / fAttrGroup;
+      size_t groupFOffset     = groupOutChannels * gemm_k;
 
       std::stringstream out;
       out << "\n//------ CONV_GPU_ALPAKA\n";
@@ -924,7 +929,7 @@ public:
          out << SP << SP << SP << "std::size_t const g_in_offset  = x_offset   + g * "
                << fShapeW[1] * iDepth * iHeight * iWidth << "u;\n";
          out << SP << SP << SP << "std::size_t const g_out_offset = out_offset + g * "
-               << gemm_n * gemm_m << "u;\n";
+               << groupOutChannels * gemm_m << "u;\n";
          out << SP << SP << SP << "std::size_t const f_offset     = g * " << groupFOffset << "u;\n\n";
 
          out << SP << SP << SP << "// im2col for group g (reads only this group's input channels)\n";
@@ -940,26 +945,26 @@ public:
          out << SP << SP << SP << "}\n\n";
 
          if (!fNB.empty()) {
-               size_t groupBiasElements = gemm_n * gemm_m;
+               size_t groupBiasElements = groupOutChannels * gemm_m;
                out << SP << SP << SP << "// Broadcast group bias\n";
                out << SP << SP << SP << "{\n";
                out << SP << SP << SP << SP << "auto const elementsPerThread_bias = Vec::all(static_cast<Idx>(1));\n";
                out << SP << SP << SP << SP << "auto const elementsPerGrid_bias   = Vec::all(Idx{" << groupBiasElements << "});\n";
                out << SP << SP << SP << SP << "auto const workDiv_bias = sofie_workdiv(elementsPerGrid_bias);\n";
                out << SP << SP << SP << SP << "alpaka::exec<Acc>(queue, workDiv_bias, biasBroadcastKernel_" << opName
-                  << ", alpaka::getPtrNative(deviceBuf_" << fNB << ") + g * " << gemm_n
+                  << ", alpaka::getPtrNative(deviceBuf_" << fNB << ") + g * " << groupOutChannels
                   << ", alpaka::getPtrNative(deviceBuf_" << fNY << ") + g_out_offset"
                   << ", static_cast<Idx>(" << groupBiasElements << "));\n";
                out << SP << SP << SP << SP << "alpaka::wait(queue);\n";
                out << SP << SP << SP << "}\n\n";
                out << SP << SP << SP << "blas.matmul('n', 'n', "
-                  << gemm_m << ", " << gemm_n << ", " << gemm_k
+                  << gemm_m << ", " << groupOutChannels << ", " << gemm_k
                   << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << imcol << ")"
                   << ", alpaka::getPtrNative(deviceBuf_" << convK << ") + f_offset"
                   << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << fNY << ") + g_out_offset);\n\n";
          } else {
                out << SP << SP << SP << "blas.matmul('n', 'n', "
-                  << gemm_m << ", " << gemm_n << ", " << gemm_k
+                  << gemm_m << ", " << groupOutChannels << ", " << gemm_k
                   << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << imcol << ")"
                   << ", alpaka::getPtrNative(deviceBuf_" << convK << ") + f_offset"
                   << ", 0.0f, alpaka::getPtrNative(deviceBuf_" << fNY << ") + g_out_offset);\n\n";
@@ -983,7 +988,7 @@ public:
       size_t oHeight_ = (fDim > 1) ? fShapeY[fDim].dim : 1;
       size_t oWidth_  = fShapeY[fDim + 1].dim;
       size_t kSize_   = fAttrKernelShape[0] * fAttrKernelShape[1] * fAttrKernelShape[2];
-      size_t gemm_n_  = fShapeW[0];
+      size_t gemm_n_  = fShapeW[0] / fAttrGroup;
       size_t gemm_k_  = fShapeW[1] * kSize_;
       size_t gemm_m_  = oDepth_ * oHeight_ * oWidth_;
       auto lda = std::to_string(gemm_m_);  // ld for xcol^T (gemm_m×gemm_k col-major)
