@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/home/antreas/Documents/SOFIE/benchmark/build-profile/_deps/alpaka-subbuild/CMakeFiles/alpaka-populate"
+		},
+		{
+			"file" : "/home/antreas/Documents/SOFIE/benchmark/build-profile/_deps/alpaka-subbuild/CMakeFiles/alpaka-populate.rule"
+		},
+		{
+			"file" : "/home/antreas/Documents/SOFIE/benchmark/build-profile/_deps/alpaka-subbuild/CMakeFiles/alpaka-populate-complete.rule"
+		},
+		{
+			"file" : "/home/antreas/Documents/SOFIE/benchmark/build-profile/_deps/alpaka-subbuild/alpaka-populate-prefix/src/alpaka-populate-stamp/alpaka-populate-build.rule"
+		},
+		{
+			"file" : "/home/antreas/Documents/SOFIE/benchmark/build-profile/_deps/alpaka-subbuild/alpaka-populate-prefix/src/alpaka-populate-stamp/alpaka-populate-configure.rule"
+		},
+		{
+			"file" : "/home/antreas/Documents/SOFIE/benchmark/build-profile/_deps/alpaka-subbuild/alpaka-populate-prefix/src/alpaka-populate-stamp/alpaka-populate-download.rule"
+		},
+		{
+			"file" : "/home/antreas/Documents/SOFIE/benchmark/build-profile/_deps/alpaka-subbuild/alpaka-populate-prefix/src/alpaka-populate-stamp/alpaka-populate-install.rule"
+		},
+		{
+			"file" : "/home/antreas/Documents/SOFIE/benchmark/build-profile/_deps/alpaka-subbuild/alpaka-populate-prefix/src/alpaka-populate-stamp/alpaka-populate-mkdir.rule"
+		},
+		{
+			"file" : "/home/antreas/Documents/SOFIE/benchmark/build-profile/_deps/alpaka-subbuild/alpaka-populate-prefix/src/alpaka-populate-stamp/alpaka-populate-patch.rule"
+		},
+		{
+			"file" : "/home/antreas/Documents/SOFIE/benchmark/build-profile/_deps/alpaka-subbuild/alpaka-populate-prefix/src/alpaka-populate-stamp/alpaka-populate-test.rule"
+		},
+		{
+			"file" : "/home/antreas/Documents/SOFIE/benchmark/build-profile/_deps/alpaka-subbuild/alpaka-populate-prefix/src/alpaka-populate-stamp/alpaka-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"alpaka-populate"
+		],
+		"name" : "alpaka-populate"
+	}
+}

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "GPUMemoryMonitor.hxx"
+#include "GPUProfiler.hxx"
 
 #include <NvInfer.h>
 #include <NvOnnxParser.h>
@@ -63,8 +64,11 @@ inline std::size_t TRTDimsElements(const nvinfer1::Dims& dims)
     return n;
 }
 
-inline void BenchmarkTRT_GPU(const std::string& onnxPath, const std::string& modelName, int warmup, int iterations)
-{
+inline void BenchmarkTRT_GPU(const std::string& onnxPath,
+                             const std::string& modelName,
+                             int warmup,
+                             int iterations,
+                             bool profile){
     namespace fs = std::filesystem;
 
     TRTLogger logger;
@@ -353,6 +357,24 @@ inline void BenchmarkTRT_GPU(const std::string& onnxPath, const std::string& mod
         return;
     }
 
+    if (profile) {
+        if (!context->enqueueV3(stream)) {
+            std::cerr << "[TensorRT] Priming inference failed for "
+                      << modelName << "\n";
+            releaseResources();
+            return;
+        }
+
+        cudaStatus = cudaStreamSynchronize(stream);
+
+        if (cudaStatus != cudaSuccess) {
+            std::cerr << "[TensorRT] Priming synchronization failed for "
+                      << modelName << ": "
+                      << cudaGetErrorString(cudaStatus) << "\n";
+            releaseResources();
+            return;
+        }
+    }
     GPUMemoryMonitor gpuMonitor;
     gpuMonitor.Start();
 
@@ -372,11 +394,16 @@ inline void BenchmarkTRT_GPU(const std::string& onnxPath, const std::string& mod
         return;
     }
 
+    const int measuredIterations = profile ? 1 : iterations;
+
+    if (profile)
+        sofie_bench::StartGpuProfiler();
+
     const auto start = std::chrono::high_resolution_clock::now();
 
     bool inferenceSucceeded = true;
 
-    for (int i = 0; i < iterations; ++i) {
+    for (int i = 0; i < measuredIterations; ++i) {
         if (!context->enqueueV3(stream)) {
             inferenceSucceeded = false;
             break;
@@ -386,6 +413,9 @@ inline void BenchmarkTRT_GPU(const std::string& onnxPath, const std::string& mod
     cudaStatus = cudaStreamSynchronize(stream);
 
     const auto stop = std::chrono::high_resolution_clock::now();
+
+    if (profile)
+        sofie_bench::StopGpuProfiler();
 
     gpuMonitor.Stop();
 
@@ -399,7 +429,7 @@ inline void BenchmarkTRT_GPU(const std::string& onnxPath, const std::string& mod
         return;
     }
 
-    const double averageMs = std::chrono::duration<double, std::milli>(stop - start).count() / static_cast<double>(iterations);
+    const double averageMs = std::chrono::duration<double, std::milli>(stop - start).count() / static_cast<double>(measuredIterations);
     const double throughput = averageMs > 0.0 ? 1000.0 / averageMs : 0.0;
     const double peakGpuMB = gpuMonitor.PeakMB();
 

@@ -256,20 +256,20 @@ foreach(ONNX_FILE ${BENCHMARK_ONNX_MODELS})
 
     # Forward declaration for the main TU (function defined in per-model .cu)
     string(APPEND BENCHMARK_FWD_DECLS
-        "void Benchmark_${MODEL_CPPNAME}(int warmup, int iterations, const std::string& weightsDir);\n")
+            "void Benchmark_${MODEL_CPPNAME}(int warmup, int iterations, const std::string& weightsDir, bool profile);\n")
 
     # Single-model dispatch: one if-branch per model (used in --single-model mode)
     string(APPEND BENCHMARK_SINGLE_MODEL_CASES
         "    if (model == \"${MODEL_CPPNAME}\") {\n"
         "        if (run_sofie)\n"
-        "            Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir);\n"
+        "            Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir, profile);\n"
         "#ifdef SOFIE_BENCHMARK_ORT\n"
         "        if (run_ort)\n"
-        "            BenchmarkORT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations);\n"
+        "            BenchmarkORT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations, profile);\n"
         "#endif\n"
         "#ifdef SOFIE_BENCHMARK_TRT\n"
         "        if (run_trt)\n"
-        "            BenchmarkTRT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations);\n"
+        "            BenchmarkTRT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations, profile);\n"
         "#endif\n"
         "        return 0;\n"
         "    }\n"
@@ -291,6 +291,7 @@ foreach(ONNX_FILE ${BENCHMARK_ONNX_MODELS})
 
             "                cmd = ncuPath;\n"
             "                cmd += \" --target-processes all\";\n"
+            "                cmd += \" --profile-from-start off\";\n"
             "                cmd += \" --quiet\";\n"
             "                cmd += \" --csv\";\n"
             "                cmd += \" --force-overwrite\";\n"
@@ -623,13 +624,13 @@ if(SOFIE_BENCHMARK_LARGE)
             string(REPLACE "@2@" "${MODEL_NAME}" _ec "${_ec}")
             string(APPEND LARGE_EMIT_CAPTURES "${_ec}")
 
-            string(APPEND LARGE_FWD_DECLS
-                "void Benchmark_${MODEL_CPPNAME}(int warmup, int iterations, const std::string& weightsDir);\n")
+            string(APPEND BENCHMARK_FWD_DECLS
+                    "void Benchmark_${MODEL_CPPNAME}(int warmup, int iterations, const std::string& weightsDir, bool profile);\n")
 
             string(APPEND LARGE_SINGLE_MODEL_CASES
                 "    if (model == \"${MODEL_CPPNAME}\") {\n"
                 "        if (run_sofie)\n"
-                "            Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir);\n"
+                "            Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir, profile);\n"
                 "#ifdef SOFIE_BENCHMARK_ORT\n"
                 "        if (run_ort) BenchmarkORT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations);\n"
                 "#endif\n"

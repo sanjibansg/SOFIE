@@ -132,6 +132,7 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         << "#pragma once\n\n"
         << "#include \"" << modelName << "_GPU_ALPAKA.hxx\"\n"
         << "#include \"BenchmarkBackend.hxx\"\n"
+        << "#include \"GPUProfiler.hxx\"\n"
         << "#include \"GPUMemoryMonitor.hxx\"\n"
         << "#include <chrono>\n"
         << "#include <fstream>\n"
@@ -143,7 +144,7 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         // here would require all 32 models to share one translation unit
         // which OOM-kills the CUDA compiler.
         << "void Benchmark_" << cppName
-        << "(int warmup, int iterations, const std::string& weightsDir) {\n"
+        << "(int warmup, int iterations, const std::string& weightsDir, bool profile) {\n"
         << "    using namespace sofie_bench;\n\n"
         << "    // ---- Device/host setup (mirrors unit-test pattern) ----\n"
         << "    alpaka::PlatformCpu hostPlatform{};\n"
@@ -246,11 +247,15 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
 
     // ---- Profiling path (mutually exclusive with benchmark path) ----
     bench << "#ifdef SOFIE_BENCHMARK_PROFILE\n"
-          << "    // ---- Profiling: reset warmup data, run iterations, print results ----\n"
+          << "    // ---- Profile exactly one steady-state inference ----\n"
           << "    session.ResetProfilingResults();\n"
-          << "    for (int _i = 0; _i < iterations; ++_i)\n"
-          << "        " << inferCall.str() << ";\n"
+          << "    SOFIE_BENCH_DEVICE_SYNC();\n"
+          << "    StartGpuProfiler();\n"
+          << "    auto profiled_out_d = " << inferCall.str() << ";\n"
           << "    alpaka::wait(session.queue);\n"
+          << "    SOFIE_BENCH_DEVICE_SYNC();\n"
+          << "    StopGpuProfiler();\n"
+          << "    (void)profiled_out_d;\n"
           << "    std::printf(\"%s\\n\", std::string(60, '-').c_str());\n"
           << "    std::printf(\"Model: " << modelName << "\\n\");\n"
           << "    session.PrintProfilingResults();\n"
@@ -273,12 +278,18 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
     bench
         << "    // ---- Timed inference ----\n"
         << "    gpuMem.Start();\n"
+        << "    if (profile) {\n"
+        << "        SOFIE_BENCH_DEVICE_SYNC();\n"
+        << "        StartGpuProfiler();\n"
+        << "    }\n"
         << "    auto t0_infer = std::chrono::high_resolution_clock::now();\n"
         << "    for (int _i = 0; _i < iterations; ++_i)\n"
         << "        " << inferCall.str() << ";\n"
         << "    alpaka::wait(session.queue);\n"
         << "    SOFIE_BENCH_DEVICE_SYNC();\n"
         << "    auto t1_infer = std::chrono::high_resolution_clock::now();\n"
+        << "    if (profile)\n"
+        << "        StopGpuProfiler();\n"
         << "    gpuMem.Stop();\n"
         << "    double gpu_peak_mem_mb = gpuMem.PeakMB();\n\n";
 

@@ -12,6 +12,7 @@
 #include <onnxruntime_cxx_api.h>
 #include <cuda_runtime.h>
 #include "GPUMemoryMonitor.hxx"
+#include "GPUProfiler.hxx"
 
 #include <chrono>
 #include <cstdio>
@@ -56,11 +57,12 @@ inline const char* ortTypeName(ONNXTensorElementDataType t) {
 /// @param device_id    CUDA device index (default 0).
 /// @param verbose      If true, print per-input shape/type information.
 inline void BenchmarkORT_GPU(const std::string& model_path,
-                              const std::string& model_name,
-                              int warmup,
-                              int iterations,
-                              int  device_id = 0,
-                              bool verbose   = false)
+                             const std::string& model_name,
+                             int warmup,
+                             int iterations,
+                             bool profile,
+                             int device_id = 0,
+                             bool verbose = false)
 {
     using namespace sofie_ort_bench_detail;
 
@@ -188,18 +190,31 @@ inline void BenchmarkORT_GPU(const std::string& model_path,
     Ort::RunOptions run_opts;
     GPUMemoryMonitor gpuMonitor;
 
-    for (int w = 0; w < warmup; ++w) {
+    if (profile) {
+        // Unprofiled first run for ORT and CUDA lazy initialization.
         session.Run(run_opts,
-                    input_names_ptr.data(),  input_tensors.data(),  num_inputs,
+                    input_names_ptr.data(), input_tensors.data(), num_inputs,
                     output_names_ptr.data(), num_outputs);
+        cudaDeviceSynchronize();
+    } else {
+        for (int w = 0; w < warmup; ++w) {
+            session.Run(run_opts,
+                        input_names_ptr.data(), input_tensors.data(), num_inputs,
+                        output_names_ptr.data(), num_outputs);
+        }
+        cudaDeviceSynchronize();
     }
-    cudaDeviceSynchronize();
+
+    const int measuredIterations = profile ? 1 : iterations;
 
     gpuMonitor.Start();
 
+    if (profile)
+        sofie_bench::StartGpuProfiler();
+
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    for (int it = 0; it < iterations; ++it) {
+    for (int it = 0; it < measuredIterations; ++it) {
         session.Run(run_opts,
                     input_names_ptr.data(), input_tensors.data(), num_inputs,
                     output_names_ptr.data(), num_outputs);
@@ -209,10 +224,14 @@ inline void BenchmarkORT_GPU(const std::string& model_path,
 
     auto t1 = std::chrono::high_resolution_clock::now();
 
+    if (profile)
+        sofie_bench::StopGpuProfiler();
+
     gpuMonitor.Stop();
 
-    double avg_ms   = std::chrono::duration<double, std::milli>(t1 - t0).count()
-                      / iterations;
+    double avg_ms =
+        std::chrono::duration<double, std::milli>(t1 - t0).count() /
+        measuredIterations;
     double throughput = (avg_ms > 0.0) ? 1000.0 / avg_ms : 0.0;
     double peakGpuMB = gpuMonitor.PeakMB();
 

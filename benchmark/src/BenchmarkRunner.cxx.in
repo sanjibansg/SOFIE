@@ -42,6 +42,7 @@ static int run_single_model(const std::string& model,
                             int warmup,
                             int iterations,
                             const std::string& weightsDir,
+                            bool profile,
                             bool run_sofie,
                             bool run_ort,
                             bool run_trt)
@@ -158,8 +159,8 @@ int main(int argc, char *argv[]) {
     // All GPU memory is freed when this process exits.
     // -----------------------------------------------------------------------
     if (!singleModel.empty())
-        return run_single_model(singleModel, warmup, iterations, weightsDir, run_sofie, run_ort, run_trt);
-
+        return run_single_model(singleModel, warmup, iterations, weightsDir, profile, run_sofie, run_ort, run_trt);
+        
     // -----------------------------------------------------------------------
     // Orchestrator mode: spawn one child process per model so every model
     // starts with a fresh CUDA context (avoids cudaErrorMemoryAllocation
@@ -178,6 +179,36 @@ int main(int argc, char *argv[]) {
     std::printf("=== SOFIE Alpaka Profiler ===\n");
     std::printf("Backend: @SOFIE_BENCHMARK_BACKEND@  |  Warmup: %d  |  Iterations: %d\n\n",
                 warmup, iterations);
+
+    namespace fs = std::filesystem;
+
+    fs::create_directories("../../results");
+
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm = *std::localtime(&t);
+
+    char timestamp[32];
+    std::strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &tm);
+
+    std::string resultsDir =
+        std::string("../../results/benchmark_") + timestamp;
+
+    fs::create_directories(resultsDir);
+    fs::create_directories(resultsDir + "/sofie");
+
+    if (run_ort)
+        fs::create_directories(resultsDir + "/ort");
+
+    if (run_trt)
+        fs::create_directories(resultsDir + "/tensorrt");
+
+#ifdef _WIN32
+    _putenv_s("SOFIE_BENCHMARK_RESULTS_DIR", resultsDir.c_str());
+#else
+    setenv("SOFIE_BENCHMARK_RESULTS_DIR", resultsDir.c_str(), 1);
+#endif
+
 #else
     std::printf("=== SOFIE Alpaka Benchmark ===\n");
     std::printf("Backend: @SOFIE_BENCHMARK_BACKEND@  |  Warmup: %d  |  Iterations: %d", warmup, iterations);
@@ -200,9 +231,6 @@ int main(int argc, char *argv[]) {
                 "PeakGPU(MB)");
 
     std::printf("%s\n", std::string(180, '-').c_str());
-
-    // Add results to a file
-    namespace fs = std::filesystem;
 
     // Create results directory if it doesn't exist
     namespace fs = std::filesystem;
