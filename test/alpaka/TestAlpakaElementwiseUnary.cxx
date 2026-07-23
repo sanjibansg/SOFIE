@@ -14,6 +14,8 @@
 #include "input_models/references/Log.ref.hxx"
 #include "input_models/references/Neg.ref.hxx"
 #include "Softplus_FromONNX_GPU_ALPAKA.hxx"
+#include "Elu_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/Elu.ref.hxx"
 
 TEST_F(SofieAlpakaTest, Sin)
 {
@@ -318,6 +320,40 @@ TEST_F(SofieAlpakaTest, Softplus)
     for (size_t i = 0; i < input.size(); ++i){
         double exp_value = std::log(std::exp(input[i])+1);
         EXPECT_LE(std::abs(res_ptr[i] - exp_value), TOLERANCE);
+    }
+}
+
+TEST_F(SofieAlpakaTest, Elu)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+    // same input as the CPU Elu test: spans negative + positive
+    std::vector<float> input({1.0f, -2.0f, 3.0f, 0.5f, -1.0f, 2.0f});
+
+    auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+    float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+    for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
+
+    auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+    alpaka::memcpy(queue, input_d, input_h);
+    alpaka::wait(queue);
+
+    constexpr size_t nOut = sizeof(Elu_ExpectedOutput::outputs) / sizeof(float);
+    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{nOut}));
+
+    {
+        SOFIE_Elu::Session<alpaka::TagGpuCudaRt> session;
+        auto result = session.infer(input_d);
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+    float* correct = Elu_ExpectedOutput::outputs;
+    for (size_t i = 0; i < nOut; ++i) {
+        EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
     }
 }
 
