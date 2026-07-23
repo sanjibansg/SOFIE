@@ -208,6 +208,189 @@ cmake --build build --target sofie_benchmark_large -j$(nproc)
 
 ---
 
+
+## Nsight Compute Cross-Backend Profiling
+
+Nsight Compute can profile SOFIE, ONNX Runtime GPU, and TensorRT using the same models. This mode captures the GPU kernels executed by exactly one steady-state inference for each model and backend.
+
+This is separate from the internal SOFIE profiler described above. For Nsight Compute profiling, configure with:
+
+```text
+SOFIE_BENCHMARK_PROFILE=OFF
+```
+
+The runtime `--profile` flag starts the Nsight workflow. The benchmark performs one unprofiled priming inference, starts Nsight collection immediately before the measured inference, synchronizes the GPU, and then stops collection.
+
+### 1. Configure and build
+
+From the SOFIE repository root:
+
+```bash
+cmake -B benchmark/build \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+  -DSOFIE_BENCHMARK=ON \
+  -DSOFIE_BENCHMARK_ORT=ON \
+  -DSOFIE_BENCHMARK_TRT=ON \
+  -DSOFIE_BENCHMARK_PROFILE=OFF \
+  -DSOFIE_BENCHMARK_CUDA_ARCH=<sm> \
+  -DONNXRUNTIME_ROOT=/path/to/onnxruntime \
+  .
+```
+
+Replace `<sm>` with the CUDA architecture of the target GPU, for example `75`, `80`, `86`, or `100`.
+
+Build the benchmark:
+
+```bash
+cmake --build benchmark/build --target sofie_benchmark -j$(nproc)
+```
+
+### 2. Generate the TensorRT engines first
+
+TensorRT engine construction is slow and should not be performed inside Nsight Compute. It may fail or take an impractically long time because Nsight instruments and replays GPU kernels.
+
+Run TensorRT once without profiling so that its serialized engine plans are generated and cached:
+
+```bash
+cd benchmark/build/benchmark
+
+./sofie_benchmark --tensorrt
+```
+
+Wait for this run to finish before starting Nsight profiling.
+
+The cached TensorRT plans will then be loaded by the profiling run instead of being rebuilt under Nsight.
+
+### 3. Run Nsight Compute profiling
+
+Nsight Compute may require administrator privileges to access GPU performance counters.
+
+From `benchmark/build/benchmark`, run:
+
+```bash
+sudo ./sofie_benchmark \
+  --profile \
+  --onnxruntime \
+  --tensorrt \
+  --ncu /usr/local/cuda/bin/ncu
+```
+
+Use the actual path to `ncu` if it is installed elsewhere.
+
+The profiler runs every model and backend in a separate subprocess. This gives each measurement a fresh CUDA context and prevents memory retained by one model or backend from affecting the next one.
+
+The Nsight command uses:
+
+```text
+--profile-from-start off
+```
+
+so model initialization, backend initialization, TensorRT engine loading, and the priming inference are excluded from the captured statistics.
+
+### 4. Profiling output
+
+Each profiling run creates a timestamped results directory:
+
+```text
+benchmark/results/benchmark_<YYYYMMDD_HHMMSS>/
+```
+
+The directory contains separate results for each backend:
+
+```text
+benchmark_<timestamp>/
+├── sofie/
+│   ├── benchmark.csv
+│   ├── <model>.ncu-rep
+│   └── <model>.csv
+├── ort/
+│   ├── benchmark.csv
+│   ├── <model>.ncu-rep
+│   └── <model>.csv
+└── tensorrt/
+    ├── benchmark.csv
+    ├── <model>.ncu-rep
+    └── <model>.csv
+```
+
+The `.ncu-rep` files contain the complete Nsight Compute reports. The per-model `.csv` files contain the exported kernel metrics used by the summary script.
+
+The conversion from `.ncu-rep` to `.csv` is performed near the end of the profiling workflow. Therefore, the per-model `.csv` files may not appear until all profiling subprocesses have completed.
+
+### 5. Generate the profiling summary
+
+Move to the directory containing the summary script:
+
+```bash
+cd benchmark/src
+```
+
+Then run:
+
+```bash
+sudo python3 summarize_profile.py \
+  ../results/benchmark_<YYYYMMDD_HHMMSS>
+```
+
+Replace `<YYYYMMDD_HHMMSS>` with the timestamp of the profiling run.
+
+The script generates:
+
+```text
+benchmark/results/benchmark_<timestamp>/profile_summary.md
+benchmark/results/benchmark_<timestamp>/profile_summary.json
+```
+
+The Markdown report includes:
+
+- kernel-launch counts;
+- unique kernel-name counts;
+- total GPU kernel time;
+- average and maximum kernel duration;
+- register usage;
+- achieved occupancy;
+- shared-memory usage;
+- DRAM throughput and bandwidth;
+- L1 and L2 cache hit rates;
+- spilling detection;
+- detected Tensor Core activity;
+- likely memory-bound and compute-bound launches;
+- per-model summaries;
+- slowest kernels;
+- highest-register kernels;
+- lowest-occupancy kernels.
+
+The JSON file contains the same results in a machine-readable format.
+
+### 6. Important measurement note
+
+Do not use the latency, throughput, transfer-time, or peak-memory values printed during an Nsight Compute run as normal benchmark results.
+
+Nsight Compute instruments and may replay kernels several times to collect the requested sections. This significantly increases the measured wall-clock execution time.
+
+Use separate runs for normal performance measurements and kernel-level profiling:
+
+```bash
+# Normal latency, throughput, transfers, and memory
+./sofie_benchmark --onnxruntime --tensorrt
+```
+
+```bash
+# Kernel-level Nsight Compute statistics
+sudo ./sofie_benchmark \
+  --profile \
+  --onnxruntime \
+  --tensorrt \
+  --ncu /usr/local/cuda/bin/ncu
+```
+
+The Nsight results represent one captured steady-state inference per model and backend.
+
+The reported total GPU time is the sum of the captured kernel durations and is not necessarily equal to end-to-end inference latency.
+
+
+---
+
 ## Re-running after adding models
 
 ```bash
