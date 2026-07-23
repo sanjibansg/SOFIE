@@ -1,15 +1,19 @@
 #ifndef SOFIE_RQUANTIZATION
 #define SOFIE_RQUANTIZATION
 
+#include "SOFIE/RQuantization_ConvolutionTypes.hxx"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace SOFIE {
@@ -66,139 +70,7 @@ inline std::int64_t QuantizeScalarToIntegerGrid(float value, const QuantizationI
    return quantized;
 }
 
-enum class EQuantizedLoweringStatus {
-   UNDEFINED = 0,
-   Optimized = 1,
-   Baseline = 2,
-   BackendUnsupported = 3,
-   SemanticUnsupported = 4,
-   SemanticRecognized = 5
-};
-
-inline bool IsQuantizedLoweringAvailable(EQuantizedLoweringStatus status)
-{
-   return status == EQuantizedLoweringStatus::Optimized || status == EQuantizedLoweringStatus::Baseline;
-}
-
-inline bool IsQuantizedLoweringUnsupported(EQuantizedLoweringStatus status)
-{
-   return status == EQuantizedLoweringStatus::BackendUnsupported ||
-          status == EQuantizedLoweringStatus::SemanticUnsupported;
-}
-
-inline bool IsQuantizedLoweringOptimized(EQuantizedLoweringStatus status)
-{
-   return status == EQuantizedLoweringStatus::Optimized;
-}
-
-enum class EQuantizedBackend {
-   UNDEFINED = 0, CPU = 1, ALPAKA = 2
-};
-
-enum class EQuantizedStorageType {
-   UNDEFINED = 0, FloatCarrier = 1, Int8 = 2, UInt8 = 3, Int32Accumulator = 4, MetadataOnly = 5,
-   FP8E4M3 = 6, FP8E5M2 = 7, Float16Carrier = 8
-};
-
-enum class EQuantizedCarrierMode {
-   UNDEFINED = 0,
-   Float = 1,
-   Int8 = 2,
-   UInt8 = 3,
-   Int32Accumulator = 4,
-   FP8E4M3 = 5,
-   FP8E5M2 = 6,
-   Float16 = 7
-};
-
-enum class ELowPrecisionCarrier {
-   UNDEFINED = 0,
-   AffineInt8 = 1,
-   AffineUInt8 = 2,
-   FP8E4M3 = 3,
-   FP8E5M2 = 4,
-   Float16 = 5,
-   Float32 = 6
-};
-
-enum class ELowPrecisionAccumulation {
-   UNDEFINED = 0,
-   Int32 = 1,
-   Float16 = 2,
-   Float32 = 3
-};
-
-struct LowPrecisionTensorInfo {
-   ELowPrecisionCarrier carrier = ELowPrecisionCarrier::UNDEFINED;
-   ELowPrecisionAccumulation accumulation = ELowPrecisionAccumulation::UNDEFINED;
-   std::optional<QuantizationInfo> affineQuantization;
-   std::string sourceTensor;
-   std::string reason;
-};
-
-inline bool IsAffineIntegerCarrier(ELowPrecisionCarrier carrier)
-{
-   return carrier == ELowPrecisionCarrier::AffineInt8 || carrier == ELowPrecisionCarrier::AffineUInt8;
-}
-
-inline bool IsFP8Carrier(ELowPrecisionCarrier carrier)
-{
-   return carrier == ELowPrecisionCarrier::FP8E4M3 || carrier == ELowPrecisionCarrier::FP8E5M2;
-}
-
-inline LowPrecisionTensorInfo LowPrecisionTensorInfoFromFP8Carrier(ELowPrecisionCarrier carrier,
-                                                                   const std::string &sourceTensor,
-                                                                   const std::string &reason)
-{
-   LowPrecisionTensorInfo lowPrecision;
-   lowPrecision.carrier = carrier;
-   lowPrecision.accumulation = ELowPrecisionAccumulation::Float32;
-   lowPrecision.sourceTensor = sourceTensor;
-   lowPrecision.reason = reason;
-   return lowPrecision;
-}
-
-inline LowPrecisionTensorInfo LowPrecisionTensorInfoFromAffineQuantization(const QuantizationInfo &info)
-{
-   LowPrecisionTensorInfo lowPrecision;
-   lowPrecision.carrier = info.isSigned ? ELowPrecisionCarrier::AffineInt8 : ELowPrecisionCarrier::AffineUInt8;
-   lowPrecision.accumulation = ELowPrecisionAccumulation::Int32;
-   lowPrecision.affineQuantization = info;
-   return lowPrecision;
-}
-
-enum class EQuantizedOutputMode {
-   UNDEFINED = 0,
-   ExactFakeQuantFloat = 1,
-   Quantized = 2,
-   Int32Accumulator = 3
-};
-
-enum class EQuantizedComputeProfile {
-   UNDEFINED = 0,
-   GenericRecognized = 1,
-   SignedInt8SymmetricPerTensorRank2 = 2,
-   SignedInt8PerTensorActivationPerChannelWeightRank2 = 3,
-   UnsignedInt8ActivationSignedInt8WeightRank2 = 4,
-   UnsignedInt8SymmetricRank2 = 5,
-   AsymmetricZeroPointRank2 = 6,
-   UnsupportedDenseLinearRank2 = 7,
-   FP8E4M3DenseLinearRank2 = 8,
-   FP8E5M2DenseLinearRank2 = 9,
-   FP8DenseLinearBackendUnsupported = 10
-};
-
-enum class EQuantizedLayout {
-   UNDEFINED = 0, Plain = 1, Transposed = 2, PackedCPU = 3, PlainDevice = 4, TiledAlpaka = 5
-};
-
-
-enum class EQuantizedParameterMode {
-   UNDEFINED = 0,
-   Scalar = 1,
-   PerOutputChannel = 2
-};
-
+#include "SOFIE/RQuantization_Lowering.hxx"
 
 enum class EQuantizedEpilogueKind {
    None = 0,
@@ -225,51 +97,6 @@ struct QuantizedEpilogue {
 };
 
 #include "SOFIE/RQuantization_DenseLinearTypes.hxx"
-
-
-inline bool QuantizedPlanUsesInt32Accumulator(const QuantizedLoweringPlan &plan)
-{
-   return plan.accumulatorStorage == EQuantizedStorageType::Int32Accumulator;
-}
-
-inline bool QuantizedPlanUsesPrequantizedWeights(const QuantizedLoweringPlan &plan)
-{
-   return !plan.weightStorageTensor.empty();
-}
-
-inline bool QuantizedPlanUsesFP8DenseLinear(const QuantizedLoweringPlan &plan)
-{
-   return plan.computeProfile == EQuantizedComputeProfile::FP8E4M3DenseLinearRank2 ||
-          plan.computeProfile == EQuantizedComputeProfile::FP8E5M2DenseLinearRank2;
-}
-
-inline bool QuantizedPlanExposesQuantizedInputCarrier(const QuantizedLoweringPlan &plan)
-{
-   const auto mode = QuantizedCarrierModeForStorage(plan.inputStorage);
-   return mode == EQuantizedCarrierMode::Int8 ||
-          mode == EQuantizedCarrierMode::UInt8 ||
-          mode == EQuantizedCarrierMode::FP8E4M3 ||
-          mode == EQuantizedCarrierMode::FP8E5M2 ||
-          mode == EQuantizedCarrierMode::Float16;
-}
-
-inline bool QuantizedPlanExposesQuantizedOutputCarrier(const QuantizedLoweringPlan &plan)
-{
-   return plan.outputMode == EQuantizedOutputMode::Quantized &&
-          (plan.outputStorage == EQuantizedStorageType::Int8 ||
-           plan.outputStorage == EQuantizedStorageType::UInt8);
-}
-
-inline bool IsOptimizedQuantizedPlainDevicePlan(const QuantizedLoweringPlan &plan)
-{
-   return IsQuantizedLoweringOptimized(plan.status) && QuantizedPlanUsesPrequantizedWeights(plan) &&
-          plan.weightLayout == EQuantizedLayout::PlainDevice;
-}
-
-inline bool IsOptimizedQuantizedAlpakaPlainDevicePlan(const QuantizedLoweringPlan &plan)
-{
-   return plan.backend == EQuantizedBackend::ALPAKA && IsOptimizedQuantizedPlainDevicePlan(plan);
-}
 
 struct QuantizedMatMulRegion {
    // Quantized carrier tensors, i.e. outputs of quantization boundaries.
@@ -332,22 +159,185 @@ struct QuantizedGemmRegion {
    std::string reason;
 };
 
+struct QuantizedConvRegion {
+   std::string inputTensor;
+   std::string weightTensor;
+   std::string biasTensor;
+   std::string convOutputTensor;
+   std::string outputTensor;
+
+   std::string inputSourceTensor;
+   std::string weightSourceTensor;
+   std::string biasSourceTensor;
+
+   std::size_t inputQuantOpIndex = static_cast<std::size_t>(-1);
+   std::size_t weightQuantOpIndex = static_cast<std::size_t>(-1);
+   std::optional<std::size_t> biasQuantOpIndex;
+   std::size_t convOpIndex = static_cast<std::size_t>(-1);
+   std::optional<std::size_t> reluOpIndex;
+   std::optional<std::size_t> outputQuantOpIndex;
+
+   QuantizedConvolutionAttributes attributes;
+   EQuantizedEpilogueKind epilogueKind = EQuantizedEpilogueKind::None;
+   std::optional<QuantizationInfo> inputQuant;
+   std::optional<QuantizationInfo> weightQuant;
+   std::optional<QuantizationInfo> biasQuant;
+   std::optional<QuantizationInfo> outputQuant;
+   std::optional<LowPrecisionTensorInfo> inputLowPrecision;
+   std::optional<LowPrecisionTensorInfo> weightLowPrecision;
+   std::optional<LowPrecisionTensorInfo> outputLowPrecision;
+
+   EQuantizedLoweringStatus status = EQuantizedLoweringStatus::UNDEFINED;
+   std::string reason;
+};
+
+using QuantizedRegion = std::variant<QuantizedGemmRegion, QuantizedMatMulRegion, QuantizedConvRegion>;
+
+inline std::size_t QuantizedRegionAnchorIndex(const QuantizedGemmRegion &region) { return region.gemmOpIndex; }
+inline std::size_t QuantizedRegionAnchorIndex(const QuantizedMatMulRegion &region) { return region.matmulOpIndex; }
+inline std::size_t QuantizedRegionAnchorIndex(const QuantizedConvRegion &region) { return region.convOpIndex; }
+
+inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedGemmRegion &region) { return region.inputSourceTensor; }
+inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedMatMulRegion &region) { return region.inputSourceTensor; }
+inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedConvRegion &region) { return region.inputSourceTensor; }
+
+inline const std::string &QuantizedRegionOutputTensor(const QuantizedGemmRegion &region) { return region.outputTensor; }
+inline const std::string &QuantizedRegionOutputTensor(const QuantizedMatMulRegion &region) { return region.outputTensor; }
+inline const std::string &QuantizedRegionOutputTensor(const QuantizedConvRegion &region) { return region.outputTensor; }
+
+inline const std::string &QuantizedRegionWeightSourceTensor(const QuantizedGemmRegion &region) { return region.weightSourceTensor; }
+inline const std::string &QuantizedRegionWeightSourceTensor(const QuantizedMatMulRegion &region) { return region.weightSourceTensor; }
+inline const std::string &QuantizedRegionWeightSourceTensor(const QuantizedConvRegion &region) { return region.weightSourceTensor; }
+
+inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedGemmRegion &region) { return region.biasSourceTensor; }
+inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedMatMulRegion &region) { return region.epilogue.biasSourceTensor; }
+inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedConvRegion &region) { return region.biasSourceTensor; }
+
+std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedGemmRegion &region);
+std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedMatMulRegion &region);
+std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedConvRegion &region);
+
+inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedGemmRegion &region) { return region.status; }
+inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedMatMulRegion &region) { return region.status; }
+inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedConvRegion &region) { return region.status; }
+
+inline const std::string &QuantizedRegionReason(const QuantizedGemmRegion &region) { return region.reason; }
+inline const std::string &QuantizedRegionReason(const QuantizedMatMulRegion &region) { return region.reason; }
+inline const std::string &QuantizedRegionReason(const QuantizedConvRegion &region) { return region.reason; }
+
+
 struct QuantizationModelState {
    std::unordered_map<std::string, QuantizationInfo> tensorInfos;
    std::unordered_map<std::string, LowPrecisionTensorInfo> lowPrecisionTensorInfos;
    std::unordered_map<std::string, QuantizedTensorStorage> tensorStorages;
-   std::unordered_map<std::size_t, QuantizedGemmRegion> gemmRegions;
-   std::unordered_map<std::size_t, QuantizedMatMulRegion> matmulRegions;
+   std::unordered_map<std::size_t, QuantizedRegion> regions;
    std::unordered_map<std::size_t, std::unordered_map<EQuantizedBackend, QuantizedLoweringPlan>> loweringPlans;
+   std::vector<std::string> metadataDiagnostics;
 
    void ClearDerivedAnalysis()
    {
       tensorStorages.clear();
-      gemmRegions.clear();
-      matmulRegions.clear();
+      regions.clear();
       loweringPlans.clear();
+      metadataDiagnostics.clear();
    }
 };
+
+template <class Region>
+inline Region *FindQuantizedRegion(QuantizationModelState &state, std::size_t opIndex)
+{
+   auto found = state.regions.find(opIndex);
+   return found == state.regions.end() ? nullptr : std::get_if<Region>(&found->second);
+}
+
+template <class Region>
+inline const Region *FindQuantizedRegion(const QuantizationModelState &state, std::size_t opIndex)
+{
+   auto found = state.regions.find(opIndex);
+   return found == state.regions.end() ? nullptr : std::get_if<Region>(&found->second);
+}
+
+template <class Region>
+inline Region &StoreQuantizedRegion(QuantizationModelState &state, Region region)
+{
+   const auto opIndex = QuantizedRegionAnchorIndex(region);
+   auto [found, inserted] = state.regions.try_emplace(opIndex, QuantizedRegion{std::move(region)});
+   if (!inserted)
+      throw std::runtime_error("SOFIE quantization analysis produced more than one region for operator " +
+                               std::to_string(opIndex));
+   return std::get<Region>(found->second);
+}
+
+template <class Region>
+inline std::size_t CountQuantizedRegions(const QuantizationModelState &state)
+{
+   return static_cast<std::size_t>(std::count_if(
+      state.regions.begin(), state.regions.end(),
+      [](const auto &entry) { return std::holds_alternative<Region>(entry.second); }));
+}
+
+template <class Region>
+inline const Region *FindFirstQuantizedRegion(const QuantizationModelState &state)
+{
+   for (const auto &[opIndex, region] : state.regions) {
+      (void)opIndex;
+      if (const auto *typed = std::get_if<Region>(&region))
+         return typed;
+   }
+   return nullptr;
+}
+
+inline std::size_t QuantizedRegionAnchorIndex(const QuantizedRegion &region)
+{
+   return std::visit([](const auto &typed) { return QuantizedRegionAnchorIndex(typed); }, region);
+}
+
+inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedRegion &region)
+{
+   return std::visit([](const auto &typed) -> const std::string & {
+      return QuantizedRegionInputSourceTensor(typed);
+   }, region);
+}
+
+inline const std::string &QuantizedRegionOutputTensor(const QuantizedRegion &region)
+{
+   return std::visit([](const auto &typed) -> const std::string & {
+      return QuantizedRegionOutputTensor(typed);
+   }, region);
+}
+
+inline const std::string &QuantizedRegionWeightSourceTensor(const QuantizedRegion &region)
+{
+   return std::visit([](const auto &typed) -> const std::string & {
+      return QuantizedRegionWeightSourceTensor(typed);
+   }, region);
+}
+
+inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedRegion &region)
+{
+   return std::visit([](const auto &typed) -> const std::string & {
+      return QuantizedRegionBiasSourceTensor(typed);
+   }, region);
+}
+
+inline std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedRegion &region)
+{
+   return std::visit([](const auto &typed) {
+      return QuantizedRegionConsumedOperatorIndices(typed);
+   }, region);
+}
+
+inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedRegion &region)
+{
+   return std::visit([](const auto &typed) { return QuantizedRegionStatus(typed); }, region);
+}
+
+inline const std::string &QuantizedRegionReason(const QuantizedRegion &region)
+{
+   return std::visit([](const auto &typed) -> const std::string & {
+      return QuantizedRegionReason(typed);
+   }, region);
+}
 
 template <class RegionMap>
 std::vector<std::size_t> SortedQuantizedRegionOperatorIndices(const RegionMap &regions)

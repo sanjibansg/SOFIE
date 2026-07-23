@@ -11,6 +11,7 @@
  #include <iterator>
  #include <iomanip>
  #include <limits>
+#include <numeric>
 
  namespace SOFIE{
 
@@ -43,6 +44,25 @@
 
          std::vector<ETensorType> TypeInference(std::vector<ETensorType> input) override {
              return input;
+         }
+
+         bool PropagatesQuantizationMetadata() const override { return fnewAxis == 0; }
+
+         std::vector<std::string> GetQuantizationMetadataSourceTensors() const override { return fInputs; }
+
+         bool RequiresCompatibleQuantizationMetadataInputs() const override { return true; }
+
+         std::vector<int_t> GetQuantizationMetadataAxisMap(
+            const std::vector<std::size_t> &sourceShape,
+            const std::vector<std::size_t> &targetShape) const override
+         {
+            if (sourceShape.size() != targetShape.size())
+               return std::vector<int_t>(targetShape.size(), -1);
+            std::vector<int_t> map(targetShape.size());
+            std::iota(map.begin(), map.end(), int_t{0});
+            if (fAxis >= 0 && static_cast<std::size_t>(fAxis) < map.size())
+               map[static_cast<std::size_t>(fAxis)] = -1;
+            return map;
          }
 
          // get shape of output given inputs. It is going to be called after initialized

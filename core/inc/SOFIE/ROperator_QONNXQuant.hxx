@@ -167,7 +167,8 @@ public:
 
    std::string Generate_GPU_ALPAKA(std::string /*OpName*/) override
    {
-      throw std::runtime_error("SOFIE QONNX Quant Alpaka code generation is not available");
+      throw std::runtime_error("SOFIE QONNX Quant Alpaka code generation is not available for tensor " +
+                               fNY);
    }
 };
 

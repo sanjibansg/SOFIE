@@ -183,7 +183,7 @@ std::string JoinQuantizationReasons(const std::vector<std::string> &reasons)
    return out.str();
 }
 
-std::vector<std::size_t> QuantizedGemmConsumedOperatorIndices(const QuantizedGemmRegion &region)
+std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedGemmRegion &region)
 {
    std::vector<std::size_t> indices = {region.inputQuantOpIndex, region.weightQuantOpIndex,
                                        region.gemmOpIndex, region.outputQuantOpIndex};
@@ -193,7 +193,7 @@ std::vector<std::size_t> QuantizedGemmConsumedOperatorIndices(const QuantizedGem
    return indices;
 }
 
-std::vector<std::size_t> QuantizedMatMulConsumedOperatorIndices(const QuantizedMatMulRegion &region)
+std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedMatMulRegion &region)
 {
    std::vector<std::size_t> indices = {region.inputQuantOpIndex, region.weightQuantOpIndex,
                                        region.matmulOpIndex, region.outputQuantOpIndex};

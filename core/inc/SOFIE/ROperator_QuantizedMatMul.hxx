@@ -27,9 +27,11 @@ inline void ValidateQuantizedMatMulContext(const QuantizedMatrixCodegenContext &
    if (!QuantizedMatMulShapeIsSingleGemmExecutable(region.shape)) {
       throw std::runtime_error("SOFIE " + pathName + " requires rank-2 or flattenable-projection MatMul");
    }
-   if (plan.shapePolicy.logicalM != region.shape.logicalM ||
-       plan.shapePolicy.logicalK != region.shape.logicalK ||
-       plan.shapePolicy.logicalN != region.shape.logicalN) {
+   const auto &matrixShape =
+      RequireQuantizedMatrixShapePolicy(plan, pathName);
+   if (matrixShape.logicalM != region.shape.logicalM ||
+       matrixShape.logicalK != region.shape.logicalK ||
+       matrixShape.logicalN != region.shape.logicalN) {
       throw std::runtime_error("SOFIE " + pathName + " lowering plan shape does not match the MatMul region shape");
    }
    if (region.inputSourceTensor.empty() || region.outputTensor.empty()) {
@@ -47,13 +49,15 @@ inline std::string GenerateFusedQuantizedMatMulCublasLtLaunch(std::string opName
 {
    INTERNAL::ValidateQuantizedMatMulContext(context, region, plan, "fused Quantized MatMul cuBLASLt launch");
 
+   const auto &matrixShape =
+      RequireQuantizedMatrixShapePolicy(plan, "fused Quantized MatMul cuBLASLt launch");
    auto call = INTERNAL::MakeQuantizedCudaLtInt8DenseLinearCall(
       "ROperator_QuantizedMatMul cuBLASLt int8 MatMul boundary " + opName,
       "quantizedMatMulCudaLtState_" + opName, "params_quantizedMatMul_" + opName,
       region.outputTensor, region.inputSourceTensor, plan.weightStorageTensor,
       region.epilogue.biasSourceTensor, plan.weightScaleTensor,
-      std::to_string(plan.shapePolicy.logicalM), std::to_string(plan.shapePolicy.logicalN),
-      std::to_string(plan.shapePolicy.logicalK), plan, region.inputQuant, region.weightQuant,
+      std::to_string(matrixShape.logicalM), std::to_string(matrixShape.logicalN),
+      std::to_string(matrixShape.logicalK), plan, region.inputQuant, region.weightQuant,
       region.epilogue.biasQuant, region.outputQuant, QuantizedEpilogueHasBias(region.epilogue.kind),
       QuantizedEpilogueHasRelu(region.epilogue.kind), region.weightQuant.isSigned);
    return INTERNAL::GenerateQuantizedCudaLtMatMulCall(call);
@@ -74,9 +78,12 @@ inline std::string GenerateFusedQuantizedMatMulCublasLtFP8Launch(std::string opN
    if (!QuantizedMatMulShapeIsSingleGemmExecutable(region.shape)) {
       throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch requires rank-2 or flattenable-projection MatMul");
    }
-   if (plan.shapePolicy.logicalM != region.shape.logicalM ||
-       plan.shapePolicy.logicalK != region.shape.logicalK ||
-       plan.shapePolicy.logicalN != region.shape.logicalN) {
+   const auto &matrixShape =
+      RequireQuantizedMatrixShapePolicy(
+         plan, "fused Quantized MatMul cuBLASLt FP8 launch");
+   if (matrixShape.logicalM != region.shape.logicalM ||
+       matrixShape.logicalK != region.shape.logicalK ||
+       matrixShape.logicalN != region.shape.logicalN) {
       throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch lowering plan shape does not match the MatMul region shape");
    }
    if (region.inputSourceTensor.empty() || region.outputTensor.empty()) {
@@ -90,8 +97,8 @@ inline std::string GenerateFusedQuantizedMatMulCublasLtFP8Launch(std::string opN
       "ROperator_QuantizedMatMul cuBLASLt FP8 dense-linear boundary " + opName,
       "quantizedMatMulCudaLtFP8State_" + opName, "params_quantizedMatMulFP8_" + opName,
       region.outputTensor, region.inputSourceTensor, plan.weightStorageTensor,
-      "", false, 1.0f, 0.0f, std::to_string(plan.shapePolicy.logicalM),
-      std::to_string(plan.shapePolicy.logicalN), std::to_string(plan.shapePolicy.logicalK), plan);
+      "", false, 1.0f, 0.0f, std::to_string(matrixShape.logicalM),
+      std::to_string(matrixShape.logicalN), std::to_string(matrixShape.logicalK), plan);
    return INTERNAL::GenerateQuantizedCudaLtFP8DenseLinearCall(call);
 }
 
@@ -132,8 +139,8 @@ public:
          throw std::runtime_error("SOFIE ROperator_QuantizedMatMul Alpaka code generation requires an optimized PlainDevice plan");
       }
       if (QuantizedPlanUsesFP8DenseLinear(fPlan))
-         return "   SOFIE::QuantizedGemmCudaLtFP8State quantizedMatMulCudaLtFP8State_" + opName + "; // owns cuBLASLt FP8 call state\n";
-      return "   SOFIE::QuantizedGemmCudaLtState quantizedMatMulCudaLtState_" + opName + "; // owns cuBLASLt state and CUDA temporaries\n";
+         return "   SOFIE::QuantizedGemmCudaLtFP8State quantizedMatMulCudaLtFP8State_" + opName + "; // persistent cuBLASLt FP8 handle and algorithm state\n";
+      return "   SOFIE::QuantizedGemmCudaLtState quantizedMatMulCudaLtState_" + opName + "; // persistent cuBLASLt handle and algorithm state\n";
    }
 
    std::string Generate_GPU_ALPAKA(std::string opName) override

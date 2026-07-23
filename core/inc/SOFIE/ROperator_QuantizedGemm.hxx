@@ -311,8 +311,8 @@ public:
       if (!IsOptimizedQuantizedAlpakaPlainDevicePlan(fPlan))
          throw std::runtime_error("SOFIE ROperator_QuantizedGemm Alpaka code generation requires an optimized PlainDevice plan");
       if (QuantizedPlanUsesFP8DenseLinear(fPlan))
-         return "   SOFIE::QuantizedGemmCudaLtFP8State quantizedGemmCudaLtFP8State_" + opName + "; // owns cuBLASLt FP8 call state\n";
-      return "   SOFIE::QuantizedGemmCudaLtState quantizedGemmCudaLtState_" + opName + "; // owns cuBLASLt state and CUDA temporaries\n";
+         return "   SOFIE::QuantizedGemmCudaLtFP8State quantizedGemmCudaLtFP8State_" + opName + "; // persistent cuBLASLt FP8 handle and algorithm state\n";
+      return "   SOFIE::QuantizedGemmCudaLtState quantizedGemmCudaLtState_" + opName + "; // persistent cuBLASLt handle and algorithm state\n";
    }
 
    std::string Generate_GPU_ALPAKA(std::string opName) override

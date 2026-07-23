@@ -94,7 +94,7 @@ struct QuantizedCudaLtMatMulCall {
    std::string m;
    std::string n;
    std::string k;
-   QuantizedDenseLinearShapePolicy shapePolicy;
+   QuantizedMatrixShapePolicy shapePolicy;
    QuantizationInfo inputQuant;
    QuantizationInfo weightQuant;
    std::optional<QuantizationInfo> biasQuant;
@@ -133,7 +133,8 @@ inline QuantizedCudaLtMatMulCall MakeQuantizedCudaLtInt8DenseLinearCall(
    call.m = std::move(m);
    call.n = std::move(n);
    call.k = std::move(k);
-   call.shapePolicy = plan.shapePolicy;
+   call.shapePolicy =
+      RequireQuantizedMatrixShapePolicy(plan, "cuBLASLt dense-linear call");
    call.inputQuant = inputQuant;
    call.weightQuant = weightQuant;
    call.biasQuant = std::move(biasQuant);
@@ -174,7 +175,7 @@ inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMul
    out << "   {\n";
    out << "      // Quantized lowering capability: " << call.capabilityTag << "\n";
    out << "      // Quantized lowering reason: " << call.reason << "\n";
-   out << "      SOFIE::QuantizedGemmCudaLtParams " << call.paramsName << "{};\n";
+   out << "      SOFIE::QuantizedDenseLinearInvocation " << call.paramsName << "{};\n";
    out << "      " << call.paramsName << ".logicalM = static_cast<std::size_t>(" << call.m << ");\n";
    out << "      " << call.paramsName << ".logicalN = static_cast<std::size_t>(" << call.n << ");\n";
    out << "      " << call.paramsName << ".logicalK = static_cast<std::size_t>(" << call.k << ");\n";
@@ -210,18 +211,19 @@ inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMul
    out << "      " << call.paramsName << ".outputQMax = static_cast<std::int32_t>(" << outputRange.second << ");\n";
    out << "      " << call.paramsName << ".hasBias = " << (call.hasBias ? "true" : "false") << ";\n";
    out << "      " << call.paramsName << ".hasRelu = " << (call.hasRelu ? "true" : "false") << ";\n";
-   out << "      " << call.paramsName << ".maxWorkspaceBytes = 32ULL * 1024ULL * 1024ULL;\n";
-   out << "      " << call.paramsName << ".epilogueMode = SOFIE::EQuantizedCudaEpilogueMode::"
+   out << "      " << call.paramsName << ".maxWorkspaceBytes = SOFIE::kQuantizedCudaLtMaxWorkspaceBytes;\n";
+   out << "      " << call.paramsName << ".epilogueMode = SOFIE::EQuantizedEpilogueMode::"
        << QuantizedCudaEpilogueModeName(call.outputMode, call.boundaryName) << ";\n";
-   out << "      " << call.paramsName << ".inputCarrier = SOFIE::EQuantizedCudaInputCarrier::"
+   out << "      " << call.paramsName << ".inputCarrier = SOFIE::EQuantizedInputCarrier::"
        << QuantizedCudaInputCarrierName(call.inputCarrierMode, call.boundaryName) << ";\n";
-   out << "      " << call.paramsName << ".outputCarrier = SOFIE::EQuantizedCudaOutputCarrier::"
+   out << "      " << call.paramsName << ".outputCarrier = SOFIE::EQuantizedOutputCarrier::"
        << QuantizedCudaOutputCarrierName(call.outputQuant, call.boundaryName) << ";\n";
-   out << "      " << call.paramsName << ".weightType = SOFIE::EQuantizedCudaWeightType::"
+   out << "      " << call.paramsName << ".weightType = SOFIE::EQuantizedWeightCarrier::"
        << (call.weightIsSigned ? "Int8" : "UInt8") << ";\n";
-   out << "      " << call.paramsName << ".weightScaleMode = SOFIE::EQuantizedCudaScaleMode::"
+   out << "      " << call.paramsName << ".weightScaleMode = SOFIE::EQuantizedScaleMode::"
        << (call.weightScaleMode == EQuantizedParameterMode::PerOutputChannel ? "PerOutputChannel" : "PerTensor") << ";\n";
 
+   out << "      " << call.stateName << ".BindScratch(quantizedCudaScratchArena.View());\n";
    out << "      SOFIE::QuantizedGemmCudaLt_Call(" << call.stateName
        << ", alpaka::getNativeHandle(queue)"
        << ", alpaka::getPtrNative(deviceBuf_" << call.outputTensor << ")"
@@ -352,24 +354,25 @@ inline std::string GenerateQuantizedCudaLtFP8DenseLinearCall(const QuantizedCuda
    out << "   {\n";
    out << "      // Low-precision lowering capability: " << call.capabilityTag << "\n";
    out << "      // Low-precision lowering reason: " << call.reason << "\n";
-   out << "      SOFIE::QuantizedGemmCudaLtFP8Params " << call.paramsName << "{};\n";
+   out << "      SOFIE::QuantizedFP8DenseLinearInvocation " << call.paramsName << "{};\n";
    out << "      " << call.paramsName << ".m = static_cast<std::size_t>(" << call.m << ");\n";
    out << "      " << call.paramsName << ".n = static_cast<std::size_t>(" << call.n << ");\n";
    out << "      " << call.paramsName << ".k = static_cast<std::size_t>(" << call.k << ");\n";
-   out << "      " << call.paramsName << ".inputFormat = SOFIE::EQuantizedCudaFP8Format::"
+   out << "      " << call.paramsName << ".inputFormat = SOFIE::EQuantizedFP8Format::"
        << QuantizedCudaFP8FormatName(call.inputCarrier, call.boundaryName) << ";\n";
-   out << "      " << call.paramsName << ".weightFormat = SOFIE::EQuantizedCudaFP8Format::"
+   out << "      " << call.paramsName << ".weightFormat = SOFIE::EQuantizedFP8Format::"
        << QuantizedCudaFP8FormatName(call.weightCarrier, call.boundaryName) << ";\n";
-   out << "      " << call.paramsName << ".outputCarrier = SOFIE::EQuantizedCudaFP8OutputCarrier::"
+   out << "      " << call.paramsName << ".outputCarrier = SOFIE::EQuantizedFP8OutputCarrier::"
        << QuantizedCudaFP8OutputCarrierName(call.outputCarrier, call.boundaryName) << ";\n";
-   out << "      " << call.paramsName << ".accumulation = SOFIE::EQuantizedCudaFP8Accumulation::"
+   out << "      " << call.paramsName << ".accumulation = SOFIE::EQuantizedFP8Accumulation::"
        << QuantizedCudaFP8AccumulationName(call.accumulation, call.boundaryName) << ";\n";
    out << "      " << call.paramsName << ".alpha = static_cast<float>("
        << std::setprecision(std::numeric_limits<float>::max_digits10) << call.alpha << ");\n";
    out << "      " << call.paramsName << ".beta = static_cast<float>("
        << std::setprecision(std::numeric_limits<float>::max_digits10) << call.beta << ");\n";
    out << "      " << call.paramsName << ".hasBias = " << (call.hasBias ? "true" : "false") << ";\n";
-   out << "      " << call.paramsName << ".maxWorkspaceBytes = 32ULL * 1024ULL * 1024ULL;\n";
+   out << "      " << call.paramsName << ".maxWorkspaceBytes = SOFIE::kQuantizedCudaLtMaxWorkspaceBytes;\n";
+   out << "      " << call.stateName << ".BindScratch(quantizedCudaScratchArena.View());\n";
    out << "      SOFIE::QuantizedGemmCudaLtFP8_Call(" << call.stateName
        << ", alpaka::getNativeHandle(queue)"
        << ", alpaka::getPtrNative(deviceBuf_" << call.outputTensor << ")"

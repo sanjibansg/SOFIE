@@ -43,6 +43,19 @@ public:
          fOutputTensorNames = { fNOutput };
    }
 
+   bool PropagatesQuantizationMetadata() const override { return true; }
+
+   std::vector<int_t> GetQuantizationMetadataPermutation(std::size_t rank) const override
+   {
+      if (!fAttrPerm.empty())
+         return fAttrPerm;
+      std::vector<int_t> perm;
+      perm.reserve(rank);
+      for (std::size_t i = 0; i < rank; ++i)
+         perm.push_back(static_cast<int_t>(rank - 1 - i));
+      return perm;
+   }
+
    std::vector<ETensorType> TypeInference(std::vector<ETensorType> input) override {
       return input;
    }

@@ -47,6 +47,7 @@ constexpr size_t GetTypeSize(ETensorType type) {
         case ETensorType::UINT32:    return sizeof(uint32_t);
         case ETensorType::UINT64:    return sizeof(uint64_t);
         case ETensorType::BOOL:      return sizeof(bool);
+        case ETensorType::FLOAT16: return sizeof(uint16_t);
         case ETensorType::STRING:    return sizeof(std::string);
         case ETensorType::FLOAT8E4M3FN:
         case ETensorType::FLOAT8E4M3FNUZ:

@@ -28,7 +28,8 @@ public:
       size_t intermediateCPUBytes = 0;  // intermediate tensor pool (0 in GPU path)
       // GPU-side
       size_t weightDeviceBytes = 0;     // ALL initialized tensor device buffers (const + weights)
-      size_t intermediateGPUBytes = 0;  // intermediate device buffers (excl. fused intermediates)
+      size_t intermediateGPUBytes = 0;  // live owning buffers plus planned carrier arena
+      QuantizedMemoryDiagnostics quantized;
    };
 
    static MemoryInfo ComputeMemoryInfo(const RModel &model);

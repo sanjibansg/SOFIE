@@ -6,6 +6,7 @@
 #include "SOFIE/RModel.hxx"
 
 #include <sstream>
+#include <numeric>
 
 
 namespace SOFIE{
@@ -42,6 +43,19 @@ public:
 
    std::vector<ETensorType> TypeInference(std::vector<ETensorType> input) override {
       return input;
+   }
+
+   bool PropagatesQuantizationMetadata() const override { return true; }
+
+   std::vector<int_t> GetQuantizationMetadataAxisMap(
+      const std::vector<std::size_t> &sourceShape,
+      const std::vector<std::size_t> &targetShape) const override
+   {
+      std::vector<int_t> map(targetShape.size());
+      std::iota(map.begin(), map.end(), int_t{0});
+      if (fAxis >= 0 && static_cast<std::size_t>(fAxis) < map.size() && sourceShape.size() == targetShape.size())
+         map[static_cast<std::size_t>(fAxis)] = -1;
+      return map;
    }
 
    std::vector<std::vector<size_t>> ShapeInference(std::vector<std::vector<size_t>> input) override {

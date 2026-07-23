@@ -29,6 +29,8 @@ public:
          fOutputTensorNames = { fNY };
       }
 
+   bool PropagatesQuantizationMetadata() const override { return true; }
+
    std::vector<ETensorType> TypeInference(std::vector<ETensorType> input) override {
       return input;
    }

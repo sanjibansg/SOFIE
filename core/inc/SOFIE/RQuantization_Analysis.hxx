@@ -15,9 +15,19 @@
 
 namespace SOFIE {
 
+class RModel;
+
 struct QuantizationGraphIndex {
    std::unordered_map<std::string, std::size_t> producerByTensor;
    std::unordered_map<std::string, std::vector<std::size_t>> consumersByTensor;
+};
+
+struct QuantizationPassContext {
+   RModel &model;
+   const std::vector<std::unique_ptr<ROperator>> &operators;
+   QuantizationModelState &state;
+   const QuantizationGraphIndex &graph;
+   int verbose = 0;
 };
 
 struct QuantizedDenseLinearPatternMatch {
@@ -54,9 +64,6 @@ void CheckQuantizedGemmRank2Shape(const std::vector<std::size_t> &shape,
 std::vector<std::string> QuantizedGemmLoweringUnsupportedReasons(const QuantizedGemmRegion &region);
 
 std::string JoinQuantizationReasons(const std::vector<std::string> &reasons);
-
-std::vector<std::size_t> QuantizedGemmConsumedOperatorIndices(const QuantizedGemmRegion &region);
-std::vector<std::size_t> QuantizedMatMulConsumedOperatorIndices(const QuantizedMatMulRegion &region);
 
 QuantizedMatMulRegion MakeQuantizedMatMulRegionFromGemmLikeRegion(const QuantizedGemmRegion &region);
 

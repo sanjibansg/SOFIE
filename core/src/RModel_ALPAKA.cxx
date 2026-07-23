@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #ifdef SOFIE_SUPPORT_ROOT_BINARY
 #include "TFile.h"
@@ -228,49 +229,178 @@ void RModel::GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA()
    }
 }
 
-void RModel::GenerateGPU_ALPAKA_Buffers() {
+void RModel::GenerateGPU_ALPAKA_Buffers()
+{
+   fQuantizedMemoryDiagnostics.graphValuePeakBytes = 0;
+   fQuantizedMemoryDiagnostics.graphValueUnpooledBytes = 0;
+   fAlpakaIntermediateDeviceBytes = 0;
    if (!fIntermediateTensorInfos.empty()) {
-      std::string tensor_declaration_block = "";
+      struct TensorUse {
+         std::size_t first = 0;
+         std::size_t last = 0;
+      };
+      std::unordered_map<std::string, TensorUse> tensorUses;
+      std::size_t graphStep = 0;
 
-      for (auto &i : fIntermediateTensorInfos) {
-         // Skip tensors that are purely intermediate within a fused kernel chain
-         if (fFusionIntermediateTensors.count(i.first)) continue;
+      auto recordUse = [&](const std::string &rawName, bool isDefinition) {
+         const auto name = UTILITY::Clean_name(rawName);
+         if (fIntermediateTensorInfos.count(name) == 0)
+            return;
+         auto [it, inserted] = tensorUses.emplace(name, TensorUse{graphStep, graphStep});
+         if (!inserted) {
+            if (isDefinition)
+               it->second.first = std::min(it->second.first, graphStep);
+            it->second.last = std::max(it->second.last, graphStep);
+         }
+      };
 
-         size_t length = ConvertShapeToLength(i.second.shape);
+      // Lifetime analysis follows the effective operator view used by code generation.
+      // Outputs of suppressed Q/DQ/QONNX source operators therefore never enter the plan.
+      for (std::size_t opIndex = 0; opIndex < fOperators.size(); ++opIndex) {
+         if (fSkipOperators.count(opIndex) || fLoweredConsumedOperatorIndices.count(opIndex))
+            continue;
+         const auto lowered = fLoweredOperators.find(opIndex);
+         const ROperator *op = lowered == fLoweredOperators.end()
+                                 ? fOperators[opIndex].get()
+                                 : lowered->second.get();
+         for (const auto &input : op->GetOpInputTensors())
+            recordUse(std::string(input), false);
+         for (const auto &output : op->GetOpOutputTensors())
+            recordUse(std::string(output), true);
+         ++graphStep;
+      }
 
-         if (i.second.type == ETensorType::FLOAT) {
-            tensor_declaration_block += "BufF1D deviceBuf_" + i.first +
-                                          " = alpaka::allocBuf<float, size_t>(devAcc, Ext1D::all(Idx{" +
-                                          std::to_string(length) + "}));\n";
-         } else if (i.second.type == ETensorType::DOUBLE) {
-            tensor_declaration_block += "BufD1D deviceBuf_" + i.first +
-                                          " = alpaka::allocBuf<double, size_t>(devAcc, Ext1D::all(Idx{" +
-                                          std::to_string(length) + "}));\n";
-         } else if (i.second.type == ETensorType::INT32) {
-            tensor_declaration_block += "BufI321D deviceBuf_" + i.first +
-                                          " = alpaka::allocBuf<int32_t, size_t>(devAcc, Ext1D::all(Idx{" +
-                                          std::to_string(length) + "}));\n";
-         } else if (i.second.type == ETensorType::INT8) {
-            tensor_declaration_block += "BufI81D deviceBuf_" + i.first +
-                                          " = alpaka::allocBuf<int8_t, size_t>(devAcc, Ext1D::all(Idx{" +
-                                          std::to_string(length) + "}));\n";
-         } else if (i.second.type == ETensorType::INT64) {
-            tensor_declaration_block += "BufI641D deviceBuf_" + i.first +
-                                          " = alpaka::allocBuf<int64_t, size_t>(devAcc, Ext1D::all(Idx{" +
-                                          std::to_string(length) + "}));\n";
-         } else if (IsByteBackedAlpakaTensorType(i.second.type)) {
-            tensor_declaration_block += "BufUI81D deviceBuf_" + i.first +
-                                          " = alpaka::allocBuf<std::uint8_t, size_t>(devAcc, Ext1D::all(Idx{" +
-                                          std::to_string(length) + "}));\n";
+      std::unordered_set<std::string> aliases;
+      for (const auto &[alias, origin] : fAliasTensors) {
+         aliases.insert(alias);
+         aliases.insert(origin);
+      }
+      std::unordered_set<std::string> modelOutputs(fOutputTensorNames.begin(), fOutputTensorNames.end());
+      std::unordered_set<std::string> lowPrecisionValues;
+      for (const auto &[name, info] : fQuantizationState.lowPrecisionTensorInfos) {
+         (void)info;
+         lowPrecisionValues.insert(UTILITY::Clean_name(name));
+      }
+
+      auto storageFor = [&](const std::string &name, ETensorType type) {
+         if (auto info = fQuantizationState.lowPrecisionTensorInfos.find(name);
+             info != fQuantizationState.lowPrecisionTensorInfos.end())
+            return QuantizedStorageTypeForLowPrecisionCarrier(info->second.carrier);
+         switch (type) {
+         case ETensorType::FLOAT: return EQuantizedStorageType::FloatCarrier;
+         case ETensorType::FLOAT16: return EQuantizedStorageType::Float16Carrier;
+         case ETensorType::INT8: return EQuantizedStorageType::Int8;
+         case ETensorType::UINT8: return EQuantizedStorageType::UInt8;
+         case ETensorType::FLOAT8E4M3FN:
+         case ETensorType::FLOAT8E4M3FNUZ: return EQuantizedStorageType::FP8E4M3;
+         case ETensorType::FLOAT8E5M2:
+         case ETensorType::FLOAT8E5M2FNUZ: return EQuantizedStorageType::FP8E5M2;
+         default: return EQuantizedStorageType::UNDEFINED;
+         }
+      };
+      auto isPhysicalCarrier = [](ETensorType type) {
+         return type == ETensorType::INT8 || type == ETensorType::UINT8 ||
+                type == ETensorType::FLOAT16 || type == ETensorType::FLOAT8E4M3FN ||
+                type == ETensorType::FLOAT8E4M3FNUZ || type == ETensorType::FLOAT8E5M2 ||
+                type == ETensorType::FLOAT8E5M2FNUZ;
+      };
+
+      std::vector<QuantizedCarrierLifetime> carrierLifetimes;
+      for (const auto &[name, info] : fIntermediateTensorInfos) {
+         const auto use = tensorUses.find(name);
+         if (use == tensorUses.end() || modelOutputs.count(name) || aliases.count(name) ||
+             fFusionIntermediateTensors.count(name))
+            continue;
+         if (!isPhysicalCarrier(info.type) && lowPrecisionValues.count(name) == 0)
+            continue;
+         const auto elementBytes = GetTypeSize(info.type);
+         if (elementBytes == 0)
+            continue;
+         carrierLifetimes.push_back({
+            name, storageFor(name, info.type), ConvertShapeToLength(info.shape) * elementBytes,
+            256, use->second.first, use->second.last});
+      }
+      const auto carrierPlan = PlanQuantizedCarrierMemory(std::move(carrierLifetimes));
+      fQuantizedMemoryDiagnostics.graphValuePeakBytes = carrierPlan.peakBytes;
+      fQuantizedMemoryDiagnostics.graphValueUnpooledBytes = carrierPlan.unpooledBytes;
+      fAlpakaIntermediateDeviceBytes += carrierPlan.peakBytes;
+      std::unordered_map<std::string, QuantizedCarrierAllocation> carrierAllocations;
+      for (const auto &allocation : carrierPlan.allocations)
+         carrierAllocations.emplace(allocation.lifetime.tensorName, allocation);
+
+      std::string tensorDeclarationBlock;
+      if (carrierPlan.peakBytes != 0) {
+         tensorDeclarationBlock +=
+            "BufUI81D quantizedGraphValueArena = alpaka::allocBuf<std::uint8_t, size_t>"
+            "(devAcc, Ext1D::all(Idx{" + std::to_string(carrierPlan.peakBytes) + "}));\n";
+      }
+
+      for (const auto &[name, info] : fIntermediateTensorInfos) {
+         if (fFusionIntermediateTensors.count(name))
+            continue;
+         const auto use = tensorUses.find(name);
+         if (use == tensorUses.end() && modelOutputs.count(name) == 0)
+            continue;
+
+         const auto length = ConvertShapeToLength(info.shape);
+         if (auto allocation = carrierAllocations.find(name); allocation != carrierAllocations.end()) {
+            const auto offset = std::to_string(allocation->second.offset);
+            const auto extent = "Ext1D::all(Idx{" + std::to_string(length) + "})";
+            const auto pointer = "alpaka::getPtrNative(quantizedGraphValueArena) + " + offset;
+            if (info.type == ETensorType::FLOAT) {
+               tensorDeclarationBlock += "ViewF1D deviceBuf_" + name + "{reinterpret_cast<float *>(" +
+                                         pointer + "), devAcc, " + extent + "};\n";
+            } else if (info.type == ETensorType::INT8) {
+               tensorDeclarationBlock += "ViewI81D deviceBuf_" + name + "{reinterpret_cast<std::int8_t *>(" +
+                                         pointer + "), devAcc, " + extent + "};\n";
+            } else if (info.type == ETensorType::FLOAT16) {
+               tensorDeclarationBlock += "ViewUI161D deviceBuf_" + name + "{reinterpret_cast<std::uint16_t *>(" +
+                                         pointer + "), devAcc, " + extent + "};\n";
+            } else {
+               tensorDeclarationBlock += "ViewUI81D deviceBuf_" + name + "{" + pointer +
+                                         ", devAcc, " + extent + "};\n";
+            }
+            continue;
+         }
+
+         fAlpakaIntermediateDeviceBytes += length * GetTypeSize(info.type);
+         if (info.type == ETensorType::FLOAT) {
+            tensorDeclarationBlock += "BufF1D deviceBuf_" + name +
+                                      " = alpaka::allocBuf<float, size_t>(devAcc, Ext1D::all(Idx{" +
+                                      std::to_string(length) + "}));\n";
+         } else if (info.type == ETensorType::DOUBLE) {
+            tensorDeclarationBlock += "BufD1D deviceBuf_" + name +
+                                      " = alpaka::allocBuf<double, size_t>(devAcc, Ext1D::all(Idx{" +
+                                      std::to_string(length) + "}));\n";
+         } else if (info.type == ETensorType::INT32) {
+            tensorDeclarationBlock += "BufI321D deviceBuf_" + name +
+                                      " = alpaka::allocBuf<int32_t, size_t>(devAcc, Ext1D::all(Idx{" +
+                                      std::to_string(length) + "}));\n";
+         } else if (info.type == ETensorType::INT8) {
+            tensorDeclarationBlock += "BufI81D deviceBuf_" + name +
+                                      " = alpaka::allocBuf<int8_t, size_t>(devAcc, Ext1D::all(Idx{" +
+                                      std::to_string(length) + "}));\n";
+         } else if (info.type == ETensorType::INT64) {
+            tensorDeclarationBlock += "BufI641D deviceBuf_" + name +
+                                      " = alpaka::allocBuf<int64_t, size_t>(devAcc, Ext1D::all(Idx{" +
+                                      std::to_string(length) + "}));\n";
+         } else if (info.type == ETensorType::FLOAT16) {
+            tensorDeclarationBlock += "BufUI161D deviceBuf_" + name +
+                                      " = alpaka::allocBuf<std::uint16_t, size_t>(devAcc, Ext1D::all(Idx{" +
+                                      std::to_string(length) + "}));\n";
+         } else if (IsByteBackedAlpakaTensorType(info.type)) {
+            tensorDeclarationBlock += "BufUI81D deviceBuf_" + name +
+                                      " = alpaka::allocBuf<std::uint8_t, size_t>(devAcc, Ext1D::all(Idx{" +
+                                      std::to_string(length) + "}));\n";
          }
       }
 
-      if (tensor_declaration_block.length()) {
-         fGC += "\n//--- declare and allocate the intermediate tensors\n" + tensor_declaration_block;
-      }
+      if (!tensorDeclarationBlock.empty())
+         fGC += "\n//--- declare and allocate live intermediate tensors\n" + tensorDeclarationBlock;
    }
 
-   // add also the dynamic tensors (only declarations, allocation will be done later)
+   // Dynamic graph values retain independent ownership because their byte sizes
+   // are not known when the static carrier plan is built.
    if (!fDynamicTensorInfos.empty()) {
       fGC += "//--- declare the dynamic tensors\n";
       fGC += "using bufDev_float = alpaka::Buf<devAcc, float, alpaka::DimInt<1u>, size_t>;\n";
@@ -278,13 +408,12 @@ void RModel::GenerateGPU_ALPAKA_Buffers() {
       fGC += "using bufDev_int64  = alpaka::Buf<devAcc, int64_t, alpaka::DimInt<1u>, size_t>;\n";
 
       for (auto &i : fDynamicTensorInfos) {
-         if (i.second.type == ETensorType::FLOAT) {
+         if (i.second.type == ETensorType::FLOAT)
             fGC += "bufDev_float bufDev_" + i.first + ";\n";
-         } else if (i.second.type == ETensorType::DOUBLE) {
+         else if (i.second.type == ETensorType::DOUBLE)
             fGC += "bufDev_double bufDev_" + i.first + ";\n";
-         } else if (i.second.type == ETensorType::INT64) {
+         else if (i.second.type == ETensorType::INT64)
             fGC += "bufDev_int64 bufDev_" + i.first + ";\n";
-         }
       }
    }
 }
@@ -701,7 +830,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
     fGC += "using BufI81D = alpaka::Buf<Acc, int8_t, Dim, Idx>;\n";
     fGC += "using BufI321D = alpaka::Buf<Acc, int32_t, Dim, Idx>;\n";
     fGC += "using BufI641D = alpaka::Buf<Acc, int64_t, Dim, Idx>;\n";
-    fGC += "using BufUI81D = alpaka::Buf<Acc, uint8_t, Dim, Idx>;\n\n";
+    fGC += "using BufUI81D = alpaka::Buf<Acc, uint8_t, Dim, Idx>;\n";
+    fGC += "using BufUI161D = alpaka::Buf<Acc, uint16_t, Dim, Idx>;\n\n";
     fGC += "// Non-owning device view types (ViewPlainPtr) for the span-based infer interface\n";
     fGC += "using ViewF1D = alpaka::ViewPlainPtr<DevAcc, float, Dim, Idx>;\n";
     fGC += "using ViewConstF1D = alpaka::ViewPlainPtr<DevAcc, const float, Dim, Idx>;\n";
@@ -714,7 +844,9 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
     fGC += "using ViewI641D = alpaka::ViewPlainPtr<DevAcc, int64_t, Dim, Idx>;\n";
     fGC += "using ViewConstI641D = alpaka::ViewPlainPtr<DevAcc, const int64_t, Dim, Idx>;\n";
     fGC += "using ViewUI81D = alpaka::ViewPlainPtr<DevAcc, uint8_t, Dim, Idx>;\n";
-    fGC += "using ViewConstUI81D = alpaka::ViewPlainPtr<DevAcc, const uint8_t, Dim, Idx>;\n\n";
+    fGC += "using ViewConstUI81D = alpaka::ViewPlainPtr<DevAcc, const uint8_t, Dim, Idx>;\n";
+    fGC += "using ViewUI161D = alpaka::ViewPlainPtr<DevAcc, uint16_t, Dim, Idx>;\n";
+    fGC += "using ViewConstUI161D = alpaka::ViewPlainPtr<DevAcc, const uint16_t, Dim, Idx>;\n\n";
 
     fGC += "\nalpaka::Platform<Acc> const platform{};\n";
     fGC += "DevAcc devAcc = alpaka::getDevByIdx(platform, 0);\n";
@@ -732,6 +864,35 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    GenerateInitializedTensorInfo_GPU_ALPAKA();
    GenerateGPU_ALPAKA_Buffers();
    GenerateOperatorDeclarations();
+   std::size_t quantizedCudaScratchBytes = 0;
+   std::size_t quantizedWorkspaceCapacityBytes = 0;
+   for (const auto &[opIndex, backendPlans] : fQuantizationState.loweringPlans) {
+      (void)opIndex;
+      const auto planIt = backendPlans.find(EQuantizedBackend::ALPAKA);
+      if (planIt == backendPlans.end() || !IsQuantizedLoweringAvailable(planIt->second.status))
+         continue;
+      quantizedCudaScratchBytes = std::max(
+         quantizedCudaScratchBytes, QuantizedPackedReusableScratchBytes(planIt->second.resources));
+      for (const auto &resource : planIt->second.resources.entries) {
+         if (resource.role == EQuantizedResourceRole::BackendWorkspace)
+            quantizedWorkspaceCapacityBytes = std::max(quantizedWorkspaceCapacityBytes, resource.bytes);
+      }
+   }
+   fQuantizedMemoryDiagnostics.persistentCarrierBytes = 0;
+   for (const auto &[name, storage] : fQuantizationState.tensorStorages) {
+      (void)name;
+      if (storage.residentBackend != EQuantizedBackend::ALPAKA)
+         continue;
+      fQuantizedMemoryDiagnostics.persistentCarrierBytes +=
+         ConvertShapeToLength(storage.shape) * QuantizedStorageElementSize(storage.storageType);
+   }
+   fQuantizedMemoryDiagnostics.reusableScratchPeakBytes = quantizedCudaScratchBytes;
+   fQuantizedMemoryDiagnostics.workspaceCapacityBytes = quantizedWorkspaceCapacityBytes;
+   fQuantizedMemoryDiagnostics.selectedWorkspaceBytes = 0;
+   if (quantizedCudaScratchBytes != 0) {
+      fGC += "SOFIE::QuantizedCudaScratchArena quantizedCudaScratchArena{" +
+             std::to_string(quantizedCudaScratchBytes) + "};\n";
+   }
    // inject profiling session data member
    if (fProfile) {
       fGC += RModelProfilerGPU::GenerateSessionMembers();
@@ -832,6 +993,40 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
    GenerateOutput_GPU_ALPAKA();
 
+   fGC += "\n   SOFIE::QuantizedMemoryDiagnostics GetQuantizedMemoryDiagnostics() const {\n";
+   fGC += "      SOFIE::QuantizedMemoryDiagnostics result{};\n";
+   fGC += "      result.persistentCarrierBytes = " +
+          std::to_string(fQuantizedMemoryDiagnostics.persistentCarrierBytes) + ";\n";
+   fGC += "      result.graphValuePeakBytes = " +
+          std::to_string(fQuantizedMemoryDiagnostics.graphValuePeakBytes) + ";\n";
+   fGC += "      result.graphValueUnpooledBytes = " +
+          std::to_string(fQuantizedMemoryDiagnostics.graphValueUnpooledBytes) + ";\n";
+   fGC += "      result.reusableScratchPeakBytes = " +
+          std::to_string(fQuantizedMemoryDiagnostics.reusableScratchPeakBytes) + ";\n";
+   fGC += "      result.workspaceCapacityBytes = " +
+          std::to_string(fQuantizedMemoryDiagnostics.workspaceCapacityBytes) + ";\n";
+   for (const auto &[opIndex, backendPlans] : fQuantizationState.loweringPlans) {
+      const auto planIt = backendPlans.find(EQuantizedBackend::ALPAKA);
+      if (planIt == backendPlans.end() || !IsOptimizedQuantizedAlpakaPlainDevicePlan(planIt->second))
+         continue;
+      std::string stateName;
+      if (FindQuantizedRegion<QuantizedGemmRegion>(fQuantizationState, opIndex)) {
+         stateName = QuantizedPlanUsesFP8DenseLinear(planIt->second)
+                       ? "quantizedGemmCudaLtFP8State_"
+                       : "quantizedGemmCudaLtState_";
+      } else if (FindQuantizedRegion<QuantizedMatMulRegion>(fQuantizationState, opIndex)) {
+         stateName = QuantizedPlanUsesFP8DenseLinear(planIt->second)
+                       ? "quantizedMatMulCudaLtFP8State_"
+                       : "quantizedMatMulCudaLtState_";
+      }
+      if (!stateName.empty()) {
+         fGC += "      result.selectedWorkspaceBytes = std::max(result.selectedWorkspaceBytes, " +
+                stateName + std::to_string(opIndex) + ".WorkspaceSize());\n";
+      }
+   }
+   fGC += "      return result;\n";
+   fGC += "   }\n\n";
+
    // inject GPU profiling utility functions and memory report inside Session struct
    if (fProfile && fUseSession) {
       fGC += RModelProfilerGPU::GenerateUtilityFunctions();
@@ -886,10 +1081,17 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
       throw std::runtime_error("SOFIE GPU does not yet supports GNN Inference.");
 
    Initialize(batchSize, verbose);
+   const auto explicitFileWeightPolicy =
+      static_cast<std::underlying_type_t<Options>>(Options::kRootBinaryWeightFile) |
+      static_cast<std::underlying_type_t<Options>>(Options::kBinaryWeightFile) |
+      static_cast<std::underlying_type_t<Options>>(Options::kTextWeightFile);
+   if ((options & explicitFileWeightPolicy) != 0)
+      fUseWeightFile = true;
    if ((options & explicitWeightPolicy) == 0 && !fQuantizationState.tensorInfos.empty()) {
       fUseWeightFile = true;
       fWeightFile = WeightFileType::Binary;
    }
+   AddNeededCustomHeader("SOFIE/RQuantization.hxx");
    if (fWeightFile == WeightFileType::Binary)
       AddNeededCustomHeader("SOFIE/RWeightFile.hxx");
    BuildLoweredOperatorView(EQuantizedBackend::ALPAKA);

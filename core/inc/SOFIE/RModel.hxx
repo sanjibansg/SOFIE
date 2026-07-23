@@ -34,6 +34,8 @@ private:
    std::unordered_map<std::string, TensorInfo> fIntermediateTensorInfos;
    std::unordered_map<std::string, DynamicTensorInfo> fDynamicTensorInfos;
    QuantizationModelState fQuantizationState; // quantization metadata, regions, storage, and backend lowering plans
+   QuantizedMemoryDiagnostics fQuantizedMemoryDiagnostics; // transient generated-memory contract
+   std::size_t fAlpakaIntermediateDeviceBytes = 0; // transient live intermediate allocation total
    std::unordered_map<std::string, std::pair<std::vector<Dim>, bool>> fShapeTensors; // constant tensors describing a shape
    std::unordered_map<std::string, std::string> fAliasTensors; // alias tensors (name -> original tensor name)
    std::unordered_map<std::string, std::string>

@@ -6,8 +6,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
-#include <variant>
 #include <vector>
 
 namespace SOFIE {
@@ -30,15 +30,22 @@ QuantizedTensorStorage MakeLowPrecisionTensorStorage(std::string logicalTensor,
                                                      std::vector<std::size_t> shape,
                                                      EQuantizedBackend backend);
 
-struct MaterializedLowPrecisionWeight {
+struct MaterializedQuantizedTensor {
    QuantizedTensorStorage storage;
-   std::vector<std::uint8_t> rawBytes;
    ETensorType tensorType = ETensorType::UNDEFINED;
+   std::vector<std::uint8_t> bytes;
 };
 
-MaterializedLowPrecisionWeight MaterializeLowPrecisionWeightBytes(
+void ValidateMaterializedQuantizedTensor(const MaterializedQuantizedTensor &tensor);
+
+MaterializedQuantizedTensor MaterializeLowPrecisionWeightBytes(
    std::string logicalTensor, std::string sourceTensor, std::string storageTensor,
    const LowPrecisionTensorInfo &lowPrecision, EQuantizedLayout layout,
+   EQuantizedBackend backend, const void *sourceData,
+   const std::vector<std::size_t> &sourceShape);
+
+MaterializedQuantizedTensor MaterializeLowPrecisionConvWeight(
+   const QuantizedConvRegion &region, const QuantizedLoweringPlan &plan,
    EQuantizedBackend backend, const void *sourceData,
    const std::vector<std::size_t> &sourceShape);
 
@@ -54,24 +61,35 @@ std::vector<std::uint8_t> PackQuantizedGemmWeightsUInt8(const float *data,
                                                          std::size_t tileN,
                                                          const QuantizationInfo &info);
 
-using QuantizedWeightBuffer = std::variant<std::vector<std::int8_t>, std::vector<std::uint8_t>>;
-
-struct MaterializedQuantizedWeight {
-   QuantizedTensorStorage storage;
-   QuantizedWeightBuffer buffer;
-};
-
-MaterializedQuantizedWeight MaterializeQuantizedGemmWeight(
+MaterializedQuantizedTensor MaterializeQuantizedGemmWeight(
    const QuantizedGemmRegion &region, const QuantizedLoweringPlan &plan,
    EQuantizedBackend backend, const float *sourceData,
    const std::vector<std::size_t> &sourceShape,
    const std::vector<float> &perChannelScales);
 
-MaterializedQuantizedWeight MaterializeQuantizedMatMulWeight(
+MaterializedQuantizedTensor MaterializeQuantizedMatMulWeight(
    const QuantizedMatMulRegion &region, const QuantizedLoweringPlan &plan,
    EQuantizedBackend backend, const float *sourceData,
    const std::vector<std::size_t> &sourceShape,
    const std::vector<float> &perChannelScales);
+
+MaterializedQuantizedTensor MaterializeQuantizedConvWeight(
+   const QuantizedConvRegion &region, const QuantizedLoweringPlan &plan,
+   EQuantizedBackend backend, const void *sourceData, ETensorType sourceType,
+   const std::vector<std::size_t> &sourceShape,
+   const std::vector<double> &perChannelScales,
+   const std::vector<std::int64_t> &perChannelZeroPoints);
+
+class RModel;
+
+struct QuantizedStoragePassContext {
+   RModel &model;
+   QuantizationModelState &state;
+   EQuantizedBackend backend = EQuantizedBackend::CPU;
+   std::function<void(MaterializedQuantizedTensor)> install;
+   std::function<void(const std::string &, const std::string &, EQuantizedLayout)>
+      registerLowPrecision;
+};
 
 } // namespace SOFIE
 

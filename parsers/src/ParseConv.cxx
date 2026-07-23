@@ -59,13 +59,21 @@ ParserFuncSignature ParseConv = [](RModelParser_ONNX &parser, const onnx::NodePr
       op.reset(new ROperator_Conv<float>(attr_auto_pad, attr_dilations, attr_group, attr_kernel_shape, attr_pads,
                                          attr_strides, nodeproto.input(0), nodeproto.input(1), name_b, output_name));
       break;
+   case ETensorType::FLOAT8E4M3FN:
+   case ETensorType::FLOAT8E4M3FNUZ:
+   case ETensorType::FLOAT8E5M2:
+   case ETensorType::FLOAT8E5M2FNUZ:
+   case ETensorType::FLOAT8E8M0:
+      op.reset(new ROperator_Conv<float>(attr_auto_pad, attr_dilations, attr_group, attr_kernel_shape, attr_pads,
+                                         attr_strides, nodeproto.input(0), nodeproto.input(1), name_b, output_name));
+      break;
    default:
       throw std::runtime_error("TMVA::SOFIE - Unsupported - Operator Conv does not yet support input type " +
                                std::to_string(static_cast<int>(input_type)));
    }
 
    if (!parser.IsRegisteredTensorType(output_name)) {
-      parser.RegisterTensorType(output_name, input_type);
+      parser.RegisterTensorType(output_name, IsFP8TensorType(input_type) ? ETensorType::FLOAT : input_type);
    }
 
    return op;

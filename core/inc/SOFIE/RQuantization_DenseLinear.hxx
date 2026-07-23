@@ -2,6 +2,8 @@
 #define SOFIE_RQUANTIZATION_DENSELINEAR
 
 #include "SOFIE/RQuantization.hxx"
+#include "SOFIE/RQuantization_Analysis.hxx"
+#include "SOFIE/RQuantization_Storage.hxx"
 
 #include <cstddef>
 #include <cstdint>
@@ -77,12 +79,12 @@ QuantizedDenseLinearProfileAssessment AssessDenseLinearComputeProfile(
    int expectedWeightPerChannelAxis,
    const std::string &operatorName);
 
-QuantizedDenseLinearShapePolicy MakeCublasLtShapePolicy(std::size_t m, std::size_t k, std::size_t n);
-QuantizedDenseLinearShapePolicy MakeExactFP8DenseLinearShapePolicy(std::size_t m, std::size_t k, std::size_t n);
+QuantizedMatrixShapePolicy MakeCublasLtShapePolicy(std::size_t m, std::size_t k, std::size_t n);
+QuantizedMatrixShapePolicy MakeExactFP8DenseLinearShapePolicy(std::size_t m, std::size_t k, std::size_t n);
 QuantizedDenseLinearBackendCapability MakeNativeFP8E4M3TNF32Capability(std::size_t m, std::size_t n, std::size_t k);
 
-bool IsProfitableCublasLtPaddedDenseLinearPolicy(const QuantizedDenseLinearShapePolicy &policy);
-std::string ExplainCublasLtPaddedDenseLinearProfitability(const QuantizedDenseLinearShapePolicy &policy);
+bool IsProfitableCublasLtPaddedDenseLinearPolicy(const QuantizedMatrixShapePolicy &policy);
+std::string ExplainCublasLtPaddedDenseLinearProfitability(const QuantizedMatrixShapePolicy &policy);
 
 QuantizedMatMulShapeAssessment AssessQuantizedMatMulShape(
    const std::vector<std::size_t> &inputShape,
@@ -115,7 +117,7 @@ QuantizedLoweringPlan MakeUnsupportedLowPrecisionDenseLinearPlan(
    EQuantizedComputeProfile profile, std::string capabilityTag);
 QuantizedLoweringPlan MakeMatMulAlpakaTransposedWeightStoragePlan(
    const QuantizedMatMulRegion &region, const std::string &weightStorageTensor,
-   const QuantizedDenseLinearShapePolicy &shapePolicy);
+   const QuantizedMatrixShapePolicy &shapePolicy);
 QuantizedLoweringPlan MakeCPUPackedWeightBaselinePlan(const QuantizedGemmRegion &region,
                                                        const std::string &weightStorageTensor);
 QuantizedLoweringPlan MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend backend,
@@ -128,11 +130,23 @@ QuantizedLoweringPlan MakeAlpakaCublasLtCorePlan(
 QuantizedLoweringPlan MakeAlpakaCublasLtFP8Plan(
    const QuantizedGemmRegion &region, const std::string &weightStorageTensor,
    const QuantizedDenseLinearBackendCapability &capability,
-   const QuantizedDenseLinearShapePolicy &shapePolicy);
+   const QuantizedMatrixShapePolicy &shapePolicy);
 QuantizedLoweringPlan MakeAlpakaCublasLtFP8Plan(
    const QuantizedMatMulRegion &region, const std::string &weightStorageTensor,
    const QuantizedDenseLinearBackendCapability &capability,
-   const QuantizedDenseLinearShapePolicy &shapePolicy);
+   const QuantizedMatrixShapePolicy &shapePolicy);
+
+void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context);
+void MaterializeQuantizedDenseLinearWeights(QuantizedStoragePassContext &context);
+
+std::unique_ptr<ROperator> MakeLoweredQuantizedOperator(
+   RModel &model, const ROperator &source, const QuantizedGemmRegion &region,
+   const QuantizedLoweringPlan &plan);
+std::unique_ptr<ROperator> MakeLoweredQuantizedOperator(
+   RModel &model, const ROperator &source, const QuantizedMatMulRegion &region,
+   const QuantizedLoweringPlan &plan);
+
+void PopulateDenseLinearResourceRequirements(QuantizedLoweringPlan &plan, bool hasBias);
 
 } // namespace SOFIE
 

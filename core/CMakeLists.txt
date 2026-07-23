@@ -28,14 +28,22 @@ set(sources_headers
    SOFIE/ROperator_Conv.hxx
    SOFIE/ROperator_ConvTranspose.hxx
    SOFIE/ROperator_Gemm.hxx
+   SOFIE/ROperator_QuantizedConv.hxx
    SOFIE/ROperator_QuantizedGemm.hxx
    SOFIE/ROperator_QuantizedMatMul.hxx
    SOFIE/ROperator_QuantizedMatrix.hxx
    SOFIE/SOFIE_Quantized.hxx
    SOFIE/SOFIE_QuantizedAlpaka.hxx
+   SOFIE/RQuantization_AlpakaCommon.hxx
+   SOFIE/RQuantization_AlpakaDenseLinear.hxx
+   SOFIE/RQuantization_AlpakaConvolution.hxx
    SOFIE/RQuantization.hxx
    SOFIE/RQuantization_Analysis.hxx
+   SOFIE/RQuantization_Convolution.hxx
+   SOFIE/RQuantization_ConvolutionTypes.hxx
    SOFIE/RQuantization_DenseLinear.hxx
+   SOFIE/RQuantization_DenseLinearTypes.hxx
+   SOFIE/RQuantization_Lowering.hxx
    SOFIE/RQuantization_Parameters.hxx
    SOFIE/RQuantization_Storage.hxx
    SOFIE/ROperator_Relu.hxx
@@ -94,7 +102,10 @@ set(sources_cxx
     src/RModel_Quantization.cxx
     src/RWeightFile.cxx
     src/RQuantization_Analysis.cxx
+    src/RQuantization_Convolution.cxx
+    src/RQuantization_ConvolutionLowering.cxx
     src/RQuantization_DenseLinear.cxx
+    src/RQuantization_DenseLinearPass.cxx
     src/RQuantization_Parameters.cxx
     src/RQuantization_Storage.cxx
     src/RModelProfiler.cxx

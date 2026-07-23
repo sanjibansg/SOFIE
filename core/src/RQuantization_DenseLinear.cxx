@@ -36,9 +36,9 @@ bool IsScalarZeroPointZero(const QuantizationInfo &info)
 
 } // namespace
 
-QuantizedDenseLinearShapePolicy MakeExactFP8DenseLinearShapePolicy(std::size_t m, std::size_t k, std::size_t n)
+QuantizedMatrixShapePolicy MakeExactFP8DenseLinearShapePolicy(std::size_t m, std::size_t k, std::size_t n)
 {
-   QuantizedDenseLinearShapePolicy policy;
+   QuantizedMatrixShapePolicy policy;
    policy.policy = EQuantizedShapePolicy::Exact;
    policy.logicalM = m;
    policy.logicalK = k;
@@ -289,9 +289,9 @@ QuantizedDenseLinearProfileAssessment AssessDenseLinearComputeProfile(
    return assessment;
 }
 
-QuantizedDenseLinearShapePolicy MakeCublasLtShapePolicy(std::size_t m, std::size_t k, std::size_t n)
+QuantizedMatrixShapePolicy MakeCublasLtShapePolicy(std::size_t m, std::size_t k, std::size_t n)
 {
-   QuantizedDenseLinearShapePolicy policy;
+   QuantizedMatrixShapePolicy policy;
    policy.logicalM = m;
    policy.logicalK = k;
    policy.logicalN = n;
@@ -334,7 +334,7 @@ QuantizedDenseLinearShapePolicy MakeCublasLtShapePolicy(std::size_t m, std::size
 }
 
 
-bool IsProfitableCublasLtPaddedDenseLinearPolicy(const QuantizedDenseLinearShapePolicy &policy)
+bool IsProfitableCublasLtPaddedDenseLinearPolicy(const QuantizedMatrixShapePolicy &policy)
 {
    return policy.policy == EQuantizedShapePolicy::PaddedCandidate &&
           policy.logicalMacs >= kCublasLtMinProfitablePaddedMacs &&
@@ -343,7 +343,7 @@ bool IsProfitableCublasLtPaddedDenseLinearPolicy(const QuantizedDenseLinearShape
           policy.logicalN >= kCublasLtMinProfitablePaddedN;
 }
 
-std::string ExplainCublasLtPaddedDenseLinearProfitability(const QuantizedDenseLinearShapePolicy &policy)
+std::string ExplainCublasLtPaddedDenseLinearProfitability(const QuantizedMatrixShapePolicy &policy)
 {
    std::ostringstream reason;
    reason << "padded cuBLASLt profitability requires logical MACs >= " << kCublasLtMinProfitablePaddedMacs
@@ -634,6 +634,106 @@ QuantizedDenseLinearBackendCapability AssessCublasLtDenseLinearCapability(
    return capability;
 }
 
+void PopulateDenseLinearResourceRequirements(QuantizedLoweringPlan &plan, bool hasBias)
+{
+   plan.resources.entries.clear();
+   if (!IsQuantizedLoweringAvailable(plan.status))
+      return;
+
+   const auto &shape =
+      RequireQuantizedMatrixShapePolicy(plan, "dense-linear resource planning");
+   if (shape.logicalM == 0 || shape.logicalK == 0 || shape.logicalN == 0)
+      return;
+
+   const std::size_t physicalM = shape.physicalM == 0 ? shape.logicalM : shape.physicalM;
+   const std::size_t physicalK = shape.physicalK == 0 ? shape.logicalK : shape.physicalK;
+   const std::size_t physicalN = shape.physicalN == 0 ? shape.logicalN : shape.physicalN;
+   const auto bytes = [](EQuantizedStorageType storage, std::size_t elements) {
+      return QuantizedStorageElementSize(storage) * elements;
+   };
+
+   AddQuantizedResourceRequirement(
+      plan.resources, EQuantizedResourceCategory::TensorStorage, EQuantizedResourceRole::InputCarrier,
+      EQuantizedResourceLifetime::GraphValue, plan.inputStorage,
+      bytes(plan.inputStorage, shape.logicalM * shape.logicalK),
+      std::max<std::size_t>(QuantizedStorageElementSize(plan.inputStorage), 1), false,
+      "logical dense-linear input carrier");
+   AddQuantizedResourceRequirement(
+      plan.resources, EQuantizedResourceCategory::TensorStorage, EQuantizedResourceRole::WeightCarrier,
+      EQuantizedResourceLifetime::ModelPersistent, plan.weightStorage,
+      bytes(plan.weightStorage, plan.backend == EQuantizedBackend::CPU
+                                      ? ((shape.logicalN + 3) / 4) * 4 * shape.logicalK
+                                      : physicalN * physicalK),
+      std::max<std::size_t>(QuantizedStorageElementSize(plan.weightStorage), 1), false,
+      "physical pre-lowered dense-linear weight carrier");
+   if (hasBias) {
+      AddQuantizedResourceRequirement(
+         plan.resources, EQuantizedResourceCategory::TensorStorage, EQuantizedResourceRole::BiasCarrier,
+         EQuantizedResourceLifetime::ModelPersistent, plan.biasStorage,
+         bytes(plan.biasStorage, shape.logicalN),
+         std::max<std::size_t>(QuantizedStorageElementSize(plan.biasStorage), 1), false,
+         "dense-linear bias carrier");
+   }
+   AddQuantizedResourceRequirement(
+      plan.resources, EQuantizedResourceCategory::TensorStorage, EQuantizedResourceRole::OutputCarrier,
+      EQuantizedResourceLifetime::GraphValue, plan.outputStorage,
+      bytes(plan.outputStorage, shape.logicalM * shape.logicalN),
+      std::max<std::size_t>(QuantizedStorageElementSize(plan.outputStorage), 1), false,
+      "logical dense-linear output carrier");
+
+   if (plan.backend == EQuantizedBackend::CPU) {
+      AddQuantizedResourceRequirement(
+         plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::InputStaging,
+         EQuantizedResourceLifetime::Invocation, EQuantizedStorageType::Int32Accumulator,
+         bytes(EQuantizedStorageType::Int32Accumulator, shape.logicalK), alignof(std::int32_t), true,
+         "thread-local CPU input quantization row");
+      AddQuantizedResourceRequirement(
+         plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::Accumulator,
+         EQuantizedResourceLifetime::Invocation, EQuantizedStorageType::Int32Accumulator,
+         bytes(EQuantizedStorageType::Int32Accumulator, std::min<std::size_t>(shape.logicalN, 4)),
+         alignof(std::int32_t), true, "portable CPU output-channel tile accumulator");
+      return;
+   }
+
+   if (plan.backend != EQuantizedBackend::ALPAKA || !IsQuantizedLoweringOptimized(plan.status))
+      return;
+
+   constexpr std::size_t cudaAlignment = 256;
+   AddQuantizedResourceRequirement(
+      plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::BackendWorkspace,
+      EQuantizedResourceLifetime::Invocation, EQuantizedStorageType::UNDEFINED,
+      kQuantizedCudaLtMaxWorkspaceBytes, cudaAlignment, true,
+      "maximum cuBLASLt heuristic workspace capacity");
+
+   if (QuantizedPlanUsesFP8DenseLinear(plan))
+      return;
+
+   AddQuantizedResourceRequirement(
+      plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::InputStaging,
+      EQuantizedResourceLifetime::Invocation, EQuantizedStorageType::Int8,
+      bytes(EQuantizedStorageType::Int8, physicalM * physicalK), cudaAlignment, true,
+      "cuBLASLt int8 input staging or padding buffer");
+   AddQuantizedResourceRequirement(
+      plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::Accumulator,
+      EQuantizedResourceLifetime::Invocation, EQuantizedStorageType::Int32Accumulator,
+      bytes(EQuantizedStorageType::Int32Accumulator, physicalM * physicalN), cudaAlignment, true,
+      "cuBLASLt int32 accumulator and epilogue source");
+   if (QuantizedShapePolicyUsesPadding(shape.policy)) {
+      AddQuantizedResourceRequirement(
+         plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::OutputStaging,
+         EQuantizedResourceLifetime::Invocation, plan.outputStorage,
+         bytes(plan.outputStorage, physicalM * physicalN), cudaAlignment, true,
+         "padded quantized output staging buffer");
+   }
+   if (hasBias) {
+      AddQuantizedResourceRequirement(
+         plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::BiasStaging,
+         EQuantizedResourceLifetime::Invocation, EQuantizedStorageType::FloatCarrier,
+         bytes(EQuantizedStorageType::FloatCarrier, physicalN), cudaAlignment, true,
+         "transient bias-to-output offset for the quantized epilogue");
+   }
+}
+
 QuantizedLoweringPlan MakeUnsupportedQuantizedMatMulPlan(const QuantizedMatMulRegion &region,
                                                          EQuantizedBackend backend,
                                                          std::string reason,
@@ -727,7 +827,7 @@ QuantizedDenseLinearBackendCapability SelectExecutableDenseLinearCapability(Quan
 
 QuantizedLoweringPlan MakeMatMulAlpakaTransposedWeightStoragePlan(const QuantizedMatMulRegion &region,
                                                                  const std::string &weightStorageTensor,
-                                                                 const QuantizedDenseLinearShapePolicy &shapePolicy)
+                                                                 const QuantizedMatrixShapePolicy &shapePolicy)
 {
    QuantizedLoweringPlan plan;
    plan.backend = EQuantizedBackend::ALPAKA;
@@ -749,7 +849,8 @@ QuantizedLoweringPlan MakeMatMulAlpakaTransposedWeightStoragePlan(const Quantize
    }
    plan.inputStorage = QuantizedStorageTypeForCarrier(region.inputQuant);
    plan.weightStorage = QuantizedStorageTypeForCarrier(region.weightQuant);
-   plan.biasStorage = EQuantizedStorageType::UNDEFINED;
+   const bool hasBias = QuantizedEpilogueHasBias(region.epilogue.kind);
+   plan.biasStorage = hasBias ? EQuantizedStorageType::FloatCarrier : EQuantizedStorageType::UNDEFINED;
    plan.accumulatorStorage = EQuantizedStorageType::Int32Accumulator;
    plan.outputStorage = QuantizedStorageTypeForCarrier(region.outputQuant);
    plan.outputMode = EQuantizedOutputMode::Quantized;
@@ -757,7 +858,7 @@ QuantizedLoweringPlan MakeMatMulAlpakaTransposedWeightStoragePlan(const Quantize
                             ? EQuantizedComputeProfile::SignedInt8PerTensorActivationPerChannelWeightRank2
                             : EQuantizedComputeProfile::SignedInt8SymmetricPerTensorRank2;
    SetAffineLowPrecisionCarriers(plan, region.inputQuant, region.weightQuant, region.outputQuant);
-   plan.shapePolicy = shapePolicy;
+   plan.matrixShapePolicy = shapePolicy;
    plan.weightStorageTensor = weightStorageTensor;
    plan.weightLayout = EQuantizedLayout::PlainDevice;
    if (IsPerChannelAxis(region.weightQuant, 1)) {
@@ -765,9 +866,10 @@ QuantizedLoweringPlan MakeMatMulAlpakaTransposedWeightStoragePlan(const Quantize
       plan.weightScaleTensor = region.weightQuant.scaleTensor;
       plan.weightZeroPointTensor = region.weightQuant.zeroPointTensor;
    }
-   plan.consumedOperatorIndices = QuantizedMatMulConsumedOperatorIndices(region);
+   plan.consumedOperatorIndices = QuantizedRegionConsumedOperatorIndices(region);
    plan.preservesQuantizationSemantics = true;
    plan.isMetadataOnly = false;
+   PopulateDenseLinearResourceRequirements(plan, hasBias);
    return plan;
 }
 
@@ -782,7 +884,7 @@ QuantizedLoweringPlan MakeAvailableQuantizedGemmPlan(const QuantizedGemmRegion &
    plan.status = status;
    plan.reason = std::move(reason);
    plan.capabilityTag = std::move(capabilityTag);
-   plan.consumedOperatorIndices = QuantizedGemmConsumedOperatorIndices(region);
+   plan.consumedOperatorIndices = QuantizedRegionConsumedOperatorIndices(region);
    plan.preservesQuantizationSemantics = true;
    plan.isMetadataOnly = false;
    plan.suppressesGraphOperators = true;
@@ -795,9 +897,10 @@ QuantizedLoweringPlan MakeCPUPackedWeightBaselinePlan(const QuantizedGemmRegion 
    auto plan = MakeAvailableQuantizedGemmPlan(region, EQuantizedBackend::CPU, EQuantizedLoweringStatus::Baseline,
                                               "CPU baseline lowering with packed pre-quantized weight storage",
                                               "cpu_packed_weight_baseline");
-   plan.inputStorage = QuantizedStorageTypeForCarrier(region.inputQuant);
+   plan.inputStorage = EQuantizedStorageType::FloatCarrier;
    plan.weightStorage = QuantizedStorageTypeForCarrier(region.weightQuant);
-   plan.biasStorage = EQuantizedStorageType::FloatCarrier;
+   const bool hasBias = !region.biasSourceTensor.empty();
+   plan.biasStorage = hasBias ? EQuantizedStorageType::FloatCarrier : EQuantizedStorageType::UNDEFINED;
    plan.accumulatorStorage = EQuantizedStorageType::Int32Accumulator;
    plan.outputStorage = EQuantizedStorageType::FloatCarrier;
    plan.outputMode = EQuantizedOutputMode::ExactFakeQuantFloat;
@@ -882,13 +985,14 @@ QuantizedLoweringPlan MakeAlpakaCublasLtCorePlan(const QuantizedGemmRegion &regi
                                               capability.reason, capability.tag);
    plan.inputStorage = QuantizedStorageTypeForCarrier(region.inputQuant);
    plan.weightStorage = QuantizedStorageTypeForCarrier(region.weightQuant);
-   plan.biasStorage = EQuantizedStorageType::FloatCarrier;
+   const bool hasBias = !region.biasSourceTensor.empty();
+   plan.biasStorage = hasBias ? EQuantizedStorageType::FloatCarrier : EQuantizedStorageType::UNDEFINED;
    plan.accumulatorStorage = EQuantizedStorageType::Int32Accumulator;
    plan.outputStorage = QuantizedStorageTypeForCarrier(region.outputQuant);
    plan.outputMode = EQuantizedOutputMode::Quantized;
    plan.computeProfile = capability.profile;
    SetAffineLowPrecisionCarriers(plan, region.inputQuant, region.weightQuant, region.outputQuant);
-   plan.shapePolicy = capability.shapePolicy;
+   plan.matrixShapePolicy = capability.shapePolicy;
    plan.weightStorageTensor = weightStorageTensor;
    plan.weightLayout = EQuantizedLayout::PlainDevice;
    if (IsPerChannelAxis(region.weightQuant, 0)) {
@@ -896,13 +1000,14 @@ QuantizedLoweringPlan MakeAlpakaCublasLtCorePlan(const QuantizedGemmRegion &regi
       plan.weightScaleTensor = region.weightQuant.scaleTensor;
       plan.weightZeroPointTensor = region.weightQuant.zeroPointTensor;
    }
+   PopulateDenseLinearResourceRequirements(plan, hasBias);
    return plan;
 }
 
 QuantizedLoweringPlan MakeAlpakaCublasLtFP8Plan(
    const QuantizedGemmRegion &region, const std::string &weightStorageTensor,
    const QuantizedDenseLinearBackendCapability &capability,
-   const QuantizedDenseLinearShapePolicy &shapePolicy)
+   const QuantizedMatrixShapePolicy &shapePolicy)
 {
    QuantizedLoweringPlan plan;
    plan.backend = EQuantizedBackend::ALPAKA;
@@ -911,6 +1016,8 @@ QuantizedLoweringPlan MakeAlpakaCublasLtFP8Plan(
    plan.reason = capability.reason;
    plan.inputStorage = QuantizedStorageTypeForLowPrecisionCarrier(capability.inputCarrier);
    plan.weightStorage = QuantizedStorageTypeForLowPrecisionCarrier(capability.weightCarrier);
+   const bool hasBias = !region.biasSourceTensor.empty();
+   plan.biasStorage = hasBias ? EQuantizedStorageType::FloatCarrier : EQuantizedStorageType::UNDEFINED;
    plan.outputStorage = QuantizedStorageTypeForLowPrecisionCarrier(capability.outputCarrier);
    plan.accumulatorStorage = QuantizedStorageTypeForLowPrecisionCarrier(ELowPrecisionCarrier::Float32);
    plan.inputLowPrecisionCarrier = capability.inputCarrier;
@@ -922,18 +1029,19 @@ QuantizedLoweringPlan MakeAlpakaCublasLtFP8Plan(
    plan.capabilityTag = capability.tag;
    plan.weightStorageTensor = weightStorageTensor;
    plan.weightLayout = EQuantizedLayout::PlainDevice;
-   plan.shapePolicy = shapePolicy;
+   plan.matrixShapePolicy = shapePolicy;
    plan.consumedOperatorIndices = { region.gemmOpIndex };
    plan.preservesQuantizationSemantics = capability.executable;
    plan.isMetadataOnly = !capability.executable;
    plan.suppressesGraphOperators = capability.executable;
+   PopulateDenseLinearResourceRequirements(plan, hasBias);
    return plan;
 }
 
 QuantizedLoweringPlan MakeAlpakaCublasLtFP8Plan(
    const QuantizedMatMulRegion &region, const std::string &weightStorageTensor,
    const QuantizedDenseLinearBackendCapability &capability,
-   const QuantizedDenseLinearShapePolicy &shapePolicy)
+   const QuantizedMatrixShapePolicy &shapePolicy)
 {
    QuantizedLoweringPlan plan;
    plan.backend = EQuantizedBackend::ALPAKA;
@@ -942,6 +1050,8 @@ QuantizedLoweringPlan MakeAlpakaCublasLtFP8Plan(
    plan.reason = capability.reason;
    plan.inputStorage = QuantizedStorageTypeForLowPrecisionCarrier(capability.inputCarrier);
    plan.weightStorage = QuantizedStorageTypeForLowPrecisionCarrier(capability.weightCarrier);
+   const bool hasBias = QuantizedEpilogueHasBias(region.epilogue.kind);
+   plan.biasStorage = hasBias ? EQuantizedStorageType::FloatCarrier : EQuantizedStorageType::UNDEFINED;
    plan.outputStorage = QuantizedStorageTypeForLowPrecisionCarrier(capability.outputCarrier);
    plan.accumulatorStorage = QuantizedStorageTypeForLowPrecisionCarrier(ELowPrecisionCarrier::Float32);
    plan.inputLowPrecisionCarrier = capability.inputCarrier;
@@ -953,11 +1063,12 @@ QuantizedLoweringPlan MakeAlpakaCublasLtFP8Plan(
    plan.capabilityTag = capability.tag;
    plan.weightStorageTensor = weightStorageTensor;
    plan.weightLayout = EQuantizedLayout::PlainDevice;
-   plan.shapePolicy = shapePolicy;
-   plan.consumedOperatorIndices = QuantizedMatMulConsumedOperatorIndices(region);
+   plan.matrixShapePolicy = shapePolicy;
+   plan.consumedOperatorIndices = QuantizedRegionConsumedOperatorIndices(region);
    plan.preservesQuantizationSemantics = capability.executable;
    plan.isMetadataOnly = !capability.executable;
    plan.suppressesGraphOperators = capability.executable;
+   PopulateDenseLinearResourceRequirements(plan, hasBias);
    return plan;
 }
 

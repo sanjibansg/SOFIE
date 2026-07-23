@@ -41,6 +41,7 @@ enum class OperatorKind {
    NOT=25,
    QUANTIZED_GEMM=26,
    QUANTIZED_MATMUL=27,
+   QUANTIZED_CONV=31,
    UNARY_SOFTPLUS=28,
    UNARY_ATAN=29,
    UNARY_FLOOR=30
@@ -51,6 +52,7 @@ inline const char* toString(OperatorKind kind) {
        case OperatorKind::GEMM:       return "GEMM";
        case OperatorKind::QUANTIZED_GEMM: return "QUANTIZED_GEMM";
        case OperatorKind::QUANTIZED_MATMUL: return "QUANTIZED_MATMUL";
+       case OperatorKind::QUANTIZED_CONV: return "QUANTIZED_CONV";
        case OperatorKind::UNARY_SOFTPLUS: return "UNARY_SOFTPLUS";
        case OperatorKind::UNARY_ATAN: return "UNARY_ATAN";
        case OperatorKind::UNARY_FLOOR: return "UNARY_FLOOR";
@@ -122,9 +124,25 @@ public:
          return {};
       return std::string(fOutputTensorNames.front());
    }
+   virtual std::vector<std::string> GetQuantizationMetadataTargetTensors() const
+   {
+      std::vector<std::string> targets;
+      targets.reserve(fOutputTensorNames.size());
+      for (const auto &target : fOutputTensorNames)
+         targets.emplace_back(target);
+      return targets;
+   }
    virtual std::vector<int_t> GetQuantizationMetadataPermutation(std::size_t /*rank*/) const
    {
       return {};
+   }
+   // Maps each output axis to its source input axis. A -1 entry denotes an
+   // inserted or value-selected axis that cannot carry source per-axis metadata.
+   virtual std::vector<int_t> GetQuantizationMetadataAxisMap(
+      const std::vector<std::size_t> &sourceShape,
+      const std::vector<std::size_t> & /*targetShape*/) const
+   {
+      return GetQuantizationMetadataPermutation(sourceShape.size());
    }
    virtual bool RequiresCompatibleQuantizationMetadataInputs() const { return false; }
 

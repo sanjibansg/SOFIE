@@ -71,9 +71,30 @@ public:
      fAttributes.push_back(starts);
      fAttributes.push_back(ends);
      fAttributes.push_back(axes);
+     fInputTensorNames = { fNData };
+     fOutputTensorNames = { fNOutput };
     }
 
 
+
+   bool PropagatesQuantizationMetadata() const override { return true; }
+
+   std::vector<int_t> GetQuantizationMetadataAxisMap(
+      const std::vector<std::size_t> &sourceShape,
+      const std::vector<std::size_t> &targetShape) const override
+   {
+      if (sourceShape.size() != targetShape.size())
+         return std::vector<int_t>(targetShape.size(), -1);
+      std::vector<int_t> map(targetShape.size());
+      std::iota(map.begin(), map.end(), int_t{0});
+      if (!fIdentitySlice) {
+         for (auto axis : fAxes) {
+            if (axis >= 0 && static_cast<std::size_t>(axis) < map.size())
+               map[static_cast<std::size_t>(axis)] = -1;
+         }
+      }
+      return map;
+   }
 
    void Initialize(RModel& model) override {
       if (model.CheckIfTensorAlreadyExist(fNData) == false){   //input must be a graph input, or already initialized intermediate tensor

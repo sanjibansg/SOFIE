@@ -1042,6 +1042,18 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
    // for the top-level call, which is fine — we're done with the loop).
    fFusedOperators = std::move(savedFusedOperators);
 
+   // FP8 graph inputs and initializers are registered while their declarations
+   // are parsed. Register the same canonical carrier contract for explicitly
+   // typed intermediate values, including Cast-produced activation carriers.
+   for (const auto &node : graph.node()) {
+      for (const auto &output : node.output()) {
+         if (!output.empty() && IsRegisteredTensorType(output)) {
+            RegisterLowPrecisionTensorInfoFromONNXType(
+               rmodel, output, GetTensorType(output), "native ONNX FP8 intermediate tensor");
+         }
+      }
+   }
+
    std::vector<std::string> outputnames;
    if (verbose)
       std::cout << "\nParsing Graph output list\n";
