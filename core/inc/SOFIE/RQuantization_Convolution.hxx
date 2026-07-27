@@ -22,6 +22,16 @@ class RModel;
 inline constexpr std::size_t kQuantizedConvMaxReusableScratchBytes =
    512ULL * 1024ULL * 1024ULL;
 
+// Exact-shape plans whose untiled arena exceeds the budget switch to tiled
+// execution: im2col staging, the strided-batch GEMM, and the epilogue run per
+// row tile, so the arena is bounded by the tile instead of the model shape.
+// Each of the two staging buffers targets this many bytes per tile.
+inline constexpr std::size_t kQuantizedConvIm2ColTileBytes = 64ULL * 1024ULL * 1024ULL;
+
+// Row tiles stay multiples of this quantum so full tiles keep one GEMM shape;
+// the final partial tile is zero-padded in staging instead of reshaping.
+inline constexpr std::size_t kQuantizedConvIm2ColTileRowQuantum = 16;
+
 struct QuantizedConvPatternMatch {
    QuantizedConvRegion region;
    std::vector<std::string> reasons;

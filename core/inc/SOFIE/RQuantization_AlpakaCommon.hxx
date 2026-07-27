@@ -234,6 +234,11 @@ struct QuantizedDenseLinearInvocation {
    bool enableAutotuning = true;
    int autotuneIterations = 3;
    double accumulatorToOutputScale = 0.0;
+   // When true, the A operand is stored column-major as [k, m] with leading
+   // dimension m. This is the layout of an NCHW unit-kernel Conv input block,
+   // which lets eligible 1x1 Conv consume its input directly without im2col
+   // staging. Provider support for this layout is shape-dependent.
+   bool aColumnMajorInput = false;
 };
 
 struct QuantizedConvolutionInvocation {
@@ -255,6 +260,16 @@ struct QuantizedConvolutionInvocation {
    std::size_t dilationWidth = 1;
    std::size_t padTop = 0;
    std::size_t padLeft = 0;
+   // Plan-time candidacy for consuming the NCHW input directly as the GEMM
+   // operand of a unit-kernel Conv (im2col elided). The runtime verifies the
+   // geometry and falls back to staged im2col when the provider reports no
+   // algorithm for the direct layout.
+   bool unitKernelDirectInputCandidate = false;
+   // When nonzero, exact INT8 matrix execution runs in row tiles of this size:
+   // im2col staging, the strided-batch GEMM, and the epilogue each process
+   // one tile so reusable scratch is bounded by the tile, not the model shape.
+   // Zero keeps the single-shot execution used by in-budget shapes.
+   std::size_t im2colTileRows = 0;
 };
 
 struct QuantizedFP8ConvolutionInvocation {

@@ -30,6 +30,26 @@ struct QuantizedConvolutionAttributes {
    EQuantizedConvolutionKind kind = EQuantizedConvolutionKind::UNDEFINED;
 };
 
+// True when the Conv geometry makes im2col a pure copy of the NCHW input:
+// unit kernel, unit strides/dilations, no padding, a batch/group combination
+// expressible as one strided-batch GEMM over contiguous NCHW blocks, and a
+// spatial extent aligned for the provider's direct column-major input layout.
+// Empty attribute vectors carry their ONNX defaults and therefore qualify.
+inline bool QuantizedConvUnitKernelDirectInputGeometry(
+   const QuantizedConvolutionAttributes &attributes, std::size_t batch,
+   std::size_t outputSpatial)
+{
+   const auto allEqual = [](const std::vector<std::size_t> &values, std::size_t expected) {
+      for (const auto value : values)
+         if (value != expected)
+            return false;
+      return true;
+   };
+   return allEqual(attributes.kernelShape, 1) && allEqual(attributes.strides, 1) &&
+          allEqual(attributes.dilations, 1) && allEqual(attributes.pads, 0) &&
+          (batch == 1 || attributes.group == 1) && outputSpatial % 4 == 0;
+}
+
 struct QuantizedConvolutionCodegenContext {
    std::vector<std::size_t> inputShape;
    std::vector<std::size_t> weightShape;

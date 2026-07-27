@@ -282,6 +282,13 @@ QuantizedLoweringPlan MakeAlpakaConvCandidatePlan(
                                  : "alpaka_int8_conv_matrix_exact";
          plan.reason = region.reason + "; symmetric INT8 standard/grouped Conv lowered as "
                        "im2col plus cuBLASLt; " + plan.matrixShapePolicy->reason;
+         if (plan.matrixShapePolicy->policy == EQuantizedShapePolicy::Exact &&
+             plan.inputStorage == EQuantizedStorageType::Int8 &&
+             QuantizedConvUnitKernelDirectInputGeometry(region.attributes,
+                                                        inputShape.front(), outputSpatial)) {
+            plan.reason += "; unit-kernel Conv is a direct NCHW GEMM-operand candidate "
+                           "(im2col elided when the provider supports the direct layout)";
+         }
          plan.weightStorageTensor =
             region.weightSourceTensor + "_quantized_conv_matrix_storage";
          plan.weightLayout = EQuantizedLayout::PlainDevice;
@@ -379,6 +386,68 @@ QuantizedLoweringPlan MakeAlpakaConvCandidatePlan(
                EQuantizedStorageType::FloatCarrier,
                SaturatingResourceProduct({physicalN, sizeof(float)}),
                cudaAlignment, true, "per-group bias-to-output offset for padded execution");
+         }
+         // An exact-shape plan whose untiled arena exceeds the reusable-scratch
+         // budget is not rejected: it switches to tiled execution, which bounds
+         // im2col staging and the accumulator by the row tile instead of the
+         // model shape. Padded plans keep their per-group path and the
+         // existing budget enforcement.
+         if (plan.matrixShapePolicy->policy == EQuantizedShapePolicy::Exact) {
+            std::string budgetReason;
+            if (!QuantizedConvResourcesWithinBudget(plan, budgetReason)) {
+               const auto groups = region.attributes.group;
+               // Per-row cost of a tile: two staging buffers, the provider's
+               // tile input buffer, and the INT32 accumulator. The tile is
+               // sized so the whole tiled arena fits in half the budget, and
+               // each staging buffer additionally respects the tile cap.
+               const std::size_t perRowBytes =
+                  SaturatingResourceProduct({2, groups, k}) + k +
+                  SaturatingResourceProduct({groups, n, sizeof(std::int32_t)});
+               const std::size_t tileArenaBudget =
+                  kQuantizedConvMaxReusableScratchBytes / 2 > kQuantizedCudaLtMaxWorkspaceBytes
+                     ? kQuantizedConvMaxReusableScratchBytes / 2 - kQuantizedCudaLtMaxWorkspaceBytes
+                     : 0;
+               const std::size_t rowStagingBytes =
+                  std::max<std::size_t>(SaturatingResourceProduct({groups, k}), 1);
+               std::size_t tileRows = perRowBytes == 0 ? 0 : tileArenaBudget / perRowBytes;
+               tileRows = std::min(tileRows, kQuantizedConvIm2ColTileBytes / rowStagingBytes);
+               tileRows -= tileRows % kQuantizedConvIm2ColTileRowQuantum;
+               if (tileRows >= kQuantizedConvIm2ColTileRowQuantum && tileRows < m) {
+                  auto &entries = plan.resources.entries;
+                  entries.erase(
+                     std::remove_if(entries.begin(), entries.end(),
+                                    [](const QuantizedResourceRequirement &entry) {
+                                       return entry.category ==
+                                                 EQuantizedResourceCategory::BackendScratch &&
+                                              entry.reusable &&
+                                              (entry.role == EQuantizedResourceRole::InputStaging ||
+                                               entry.role == EQuantizedResourceRole::Accumulator);
+                                    }),
+                     entries.end());
+                  AddQuantizedResourceRequirement(
+                     plan.resources, EQuantizedResourceCategory::BackendScratch,
+                     EQuantizedResourceRole::InputStaging, EQuantizedResourceLifetime::Invocation,
+                     EQuantizedStorageType::Int8,
+                     SaturatingResourceProduct({2, groups, tileRows, k}),
+                     cudaAlignment, true, "double-buffered INT8 im2col staging tiles");
+                  AddQuantizedResourceRequirement(
+                     plan.resources, EQuantizedResourceCategory::BackendScratch,
+                     EQuantizedResourceRole::InputStaging, EQuantizedResourceLifetime::Invocation,
+                     EQuantizedStorageType::Int8,
+                     SaturatingResourceProduct({tileRows, k}),
+                     cudaAlignment, true, "cuBLASLt INT8 tile input buffer");
+                  AddQuantizedResourceRequirement(
+                     plan.resources, EQuantizedResourceCategory::BackendScratch,
+                     EQuantizedResourceRole::Accumulator, EQuantizedResourceLifetime::Invocation,
+                     EQuantizedStorageType::Int32Accumulator,
+                     SaturatingResourceProduct({groups, tileRows, n, sizeof(std::int32_t)}),
+                     cudaAlignment, true, "tiled cuBLASLt INT32 accumulator");
+                  plan.matrixShapePolicy->im2colTileRows = tileRows;
+                  plan.reason += "; untiled reusable scratch exceeds the arena budget, "
+                                 "so exact execution is tiled to " +
+                                 std::to_string(tileRows) + " rows per tile";
+               }
+            }
          }
       } else {
          plan.capabilityTag = "alpaka_int8_conv_matrix_shape_unsupported";

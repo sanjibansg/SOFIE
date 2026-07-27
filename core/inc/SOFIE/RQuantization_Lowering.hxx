@@ -374,6 +374,11 @@ struct QuantizedMatrixShapePolicy {
    std::size_t minimumOptimizedMacs = 0;
    bool belowMinimumWork = false;
    double paddingWorkRatio = 1.0;
+   // Nonzero selects tiled matrix execution: staging, GEMM, and epilogue run
+   // per row tile so reusable scratch is bounded by the tile instead of the
+   // full logical M. Chosen only when the untiled plan would exceed the
+   // reusable-scratch budget.
+   std::size_t im2colTileRows = 0;
    std::string reason;
 };
 

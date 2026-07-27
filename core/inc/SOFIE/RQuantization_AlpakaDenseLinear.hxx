@@ -1004,7 +1004,61 @@ struct QuantizedGemmCudaLtState {
    std::int64_t fBatchStrideA = 0;
    std::int64_t fBatchStrideB = 0;
    std::int64_t fBatchStrideC = 0;
+   bool fAColumnMajorInput = false;
    bool fInitialized = false;
+   // Remembers a provider rejection of the direct column-major input layout so
+   // an ineligible shape is probed once, not on every inference. Deliberately
+   // survives Reset(): the shape bound to this state does not change.
+   bool fDirectInputLayoutUnsupported = false;
+   // Tiled-Conv staging pipeline: an internal non-blocking stream and
+   // dependency events let the next tile's im2col staging overlap the current
+   // tile's GEMM and epilogue. Created on first tiled execution.
+   cudaStream_t fTileStagingStream = nullptr;
+   cudaEvent_t fTileEntryEvent = nullptr;
+   cudaEvent_t fTileStagingDoneEvents[2] = {nullptr, nullptr};
+   cudaEvent_t fTileComputeDoneEvents[2] = {nullptr, nullptr};
+
+   void EnsureTilePipeline()
+   {
+      if (fTileStagingStream != nullptr)
+         return;
+      INTERNAL::CheckCudaStatus(
+         cudaStreamCreateWithFlags(&fTileStagingStream, cudaStreamNonBlocking),
+         "cudaStreamCreateWithFlags(tile staging)");
+      INTERNAL::CheckCudaStatus(
+         cudaEventCreateWithFlags(&fTileEntryEvent, cudaEventDisableTiming),
+         "cudaEventCreateWithFlags(tile entry)");
+      for (auto &event : fTileStagingDoneEvents)
+         INTERNAL::CheckCudaStatus(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
+                                   "cudaEventCreateWithFlags(tile staging done)");
+      for (auto &event : fTileComputeDoneEvents)
+         INTERNAL::CheckCudaStatus(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
+                                   "cudaEventCreateWithFlags(tile compute done)");
+   }
+
+   void ReleaseTilePipeline() noexcept
+   {
+      for (auto &event : fTileStagingDoneEvents) {
+         if (event != nullptr) {
+            cudaEventDestroy(event);
+            event = nullptr;
+         }
+      }
+      for (auto &event : fTileComputeDoneEvents) {
+         if (event != nullptr) {
+            cudaEventDestroy(event);
+            event = nullptr;
+         }
+      }
+      if (fTileEntryEvent != nullptr) {
+         cudaEventDestroy(fTileEntryEvent);
+         fTileEntryEvent = nullptr;
+      }
+      if (fTileStagingStream != nullptr) {
+         cudaStreamDestroy(fTileStagingStream);
+         fTileStagingStream = nullptr;
+      }
+   }
 
    QuantizedGemmCudaLtState() = default;
    QuantizedGemmCudaLtState(const QuantizedGemmCudaLtState &) = delete;
@@ -1018,13 +1072,18 @@ struct QuantizedGemmCudaLtState {
    QuantizedGemmCudaLtState &operator=(QuantizedGemmCudaLtState &&other) noexcept
    {
       if (this != &other) {
+         ReleaseTilePipeline();
          Reset();
          MoveFrom(other);
       }
       return *this;
    }
 
-   ~QuantizedGemmCudaLtState() { Reset(); }
+   ~QuantizedGemmCudaLtState()
+   {
+      ReleaseTilePipeline();
+      Reset();
+   }
 
    void Reset() noexcept
    {
@@ -1072,16 +1131,39 @@ struct QuantizedGemmCudaLtState {
       fBatchStrideA = 0;
       fBatchStrideB = 0;
       fBatchStrideC = 0;
+      fAColumnMajorInput = false;
       fInitialized = false;
    }
 
    void Initialize(const QuantizedDenseLinearInvocation &params)
    {
+      InitializeInternal(params, true);
+   }
+
+   // Attempts initialization for the direct column-major input layout of a
+   // unit-kernel Conv. Returns false, leaving the state reset, when the
+   // provider reports no algorithm for the requested layout; the caller then
+   // falls back to staged im2col execution.
+   bool TryInitializeDirectInput(const QuantizedDenseLinearInvocation &params)
+   {
+      if (fDirectInputLayoutUnsupported)
+         return false;
+      if (!InitializeInternal(params, false)) {
+         fDirectInputLayoutUnsupported = true;
+         return false;
+      }
+      return true;
+   }
+
+private:
+   bool InitializeInternal(const QuantizedDenseLinearInvocation &params, bool throwOnNoAlgorithm)
+   {
       if (fInitialized && fM == params.m && fN == params.n && fK == params.k &&
           fBatchCount == params.batchCount && fBatchStrideA == params.batchStrideA &&
           fBatchStrideB == params.batchStrideB && fBatchStrideC == params.batchStrideC &&
+          fAColumnMajorInput == params.aColumnMajorInput &&
           fWorkspaceLimitBytes == params.maxWorkspaceBytes)
-         return;
+         return true;
 
       Reset();
       try {
@@ -1089,7 +1171,7 @@ struct QuantizedGemmCudaLtState {
          INTERNAL::CheckCublasLtStatus(cublasLtMatmulDescCreate(&fOperation, CUBLAS_COMPUTE_32I, CUDA_R_32I),
                                        "cublasLtMatmulDescCreate");
 
-         const cublasOperation_t transA = CUBLAS_OP_N;
+         const cublasOperation_t transA = params.aColumnMajorInput ? CUBLAS_OP_T : CUBLAS_OP_N;
          const cublasOperation_t transB = CUBLAS_OP_T;
          INTERNAL::CheckCublasLtStatus(cublasLtMatmulDescSetAttribute(fOperation, CUBLASLT_MATMUL_DESC_TRANSA,
                                                                       &transA, sizeof(transA)),
@@ -1098,8 +1180,13 @@ struct QuantizedGemmCudaLtState {
                                                                       &transB, sizeof(transB)),
                                        "cublasLtMatmulDescSetAttribute(transB)");
 
-         fALayout = INTERNAL::CreateRowMajorLayout(CUDA_R_8I, params.m, params.k,
-                                                  static_cast<std::int64_t>(params.k));
+         // Column-major [m, k] input is described to the row-major convention
+         // as its transpose: a [k, m] row-major matrix with leading dimension m.
+         fALayout = params.aColumnMajorInput
+                       ? INTERNAL::CreateRowMajorLayout(CUDA_R_8I, params.k, params.m,
+                                                        static_cast<std::int64_t>(params.m))
+                       : INTERNAL::CreateRowMajorLayout(CUDA_R_8I, params.m, params.k,
+                                                        static_cast<std::int64_t>(params.k));
          fBLayout = INTERNAL::CreateRowMajorLayout(CUDA_R_8I, params.n, params.k,
                                                   static_cast<std::int64_t>(params.k));
          fCLayout = INTERNAL::CreateRowMajorLayout(CUDA_R_32I, params.m, params.n,
@@ -1122,6 +1209,10 @@ struct QuantizedGemmCudaLtState {
                                                                       &fHeuristicResultCount),
                                        "cublasLtMatmulAlgoGetHeuristic");
          if (fHeuristicResultCount == 0) {
+            if (!throwOnNoAlgorithm) {
+               Reset();
+               return false;
+            }
             throw std::runtime_error("SOFIE cuBLASLt quantized GEMM found no algorithm for the selected int8 shape");
          }
 
@@ -1140,13 +1231,16 @@ struct QuantizedGemmCudaLtState {
          fBatchStrideA = params.batchStrideA;
          fBatchStrideB = params.batchStrideB;
          fBatchStrideC = params.batchStrideC;
+         fAColumnMajorInput = params.aColumnMajorInput;
          fInitialized = true;
       } catch (...) {
          Reset();
          throw;
       }
+      return true;
    }
 
+public:
    void BindScratch(QuantizedCudaScratchView scratch) { fScratch = scratch; }
 
    void PrepareScratch(const QuantizedDenseLinearInvocation &params)
@@ -1327,7 +1421,19 @@ private:
       fBatchStrideA = other.fBatchStrideA;
       fBatchStrideB = other.fBatchStrideB;
       fBatchStrideC = other.fBatchStrideC;
+      fAColumnMajorInput = other.fAColumnMajorInput;
       fInitialized = other.fInitialized;
+      fDirectInputLayoutUnsupported = other.fDirectInputLayoutUnsupported;
+      fTileStagingStream = other.fTileStagingStream;
+      fTileEntryEvent = other.fTileEntryEvent;
+      for (int i = 0; i < 2; ++i) {
+         fTileStagingDoneEvents[i] = other.fTileStagingDoneEvents[i];
+         fTileComputeDoneEvents[i] = other.fTileComputeDoneEvents[i];
+         other.fTileStagingDoneEvents[i] = nullptr;
+         other.fTileComputeDoneEvents[i] = nullptr;
+      }
+      other.fTileStagingStream = nullptr;
+      other.fTileEntryEvent = nullptr;
 
       other.fHandle = nullptr;
       other.fOperation = nullptr;

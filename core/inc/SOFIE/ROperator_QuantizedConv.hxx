@@ -487,6 +487,22 @@ public:
           << ";\n";
       out << "      " << params << ".matrix.weightScaleMode = SOFIE::EQuantizedScaleMode::"
           << (fPlan.weightScaleMode == EQuantizedParameterMode::PerOutputChannel ? "PerOutputChannel" : "PerTensor") << ";\n";
+      // Unit-kernel Conv with an INT8 input carrier and exact matrix shapes can
+      // consume its NCHW input directly as the GEMM operand; the runtime falls
+      // back to staged im2col when the provider lacks the direct layout.
+      const bool unitKernelDirectInput = !directAffine && !depthwise && !padded &&
+         fContext.inputSourceType != ETensorType::FLOAT &&
+         fContext.inputSourceType != ETensorType::UINT8 &&
+         QuantizedConvUnitKernelDirectInputGeometry(
+            fRegion.attributes, fContext.inputShape[0],
+            static_cast<std::size_t>(outputHeight) * outputWidth);
+      if (unitKernelDirectInput) {
+         out << "      " << params << ".unitKernelDirectInputCandidate = true;\n";
+      }
+      if (!directAffine && !depthwise && matrixShape.im2colTileRows > 0) {
+         out << "      " << params << ".im2colTileRows = "
+             << matrixShape.im2colTileRows << ";\n";
+      }
       if (directAffine) {
          out << "      SOFIE::QuantizedConvCudaAffine_Call(alpaka::getNativeHandle(queue), ";
       } else if (depthwise) {

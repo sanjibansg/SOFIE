@@ -55,9 +55,10 @@ inline void QuantizedConvCudaAffine_Call(
 namespace INTERNAL {
 __global__ void QuantizedConvCudaIm2ColKernel(
    const float *inputFloat, const std::int8_t *inputInt8, std::int8_t *matrix,
-   std::size_t groupBegin, std::size_t groupCount, QuantizedConvolutionInvocation params)
+   std::size_t groupBegin, std::size_t groupCount, std::size_t rowBegin,
+   std::size_t rowCount, QuantizedConvolutionInvocation params)
 {
-   const std::size_t groupElements = params.matrix.logicalM * params.matrix.logicalK;
+   const std::size_t groupElements = rowCount * params.matrix.logicalK;
    const std::size_t elements = groupCount * groupElements;
    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
    if (index >= elements)
@@ -65,8 +66,14 @@ __global__ void QuantizedConvCudaIm2ColKernel(
 
    const std::size_t group = groupBegin + index / groupElements;
    const std::size_t groupIndex = index % groupElements;
-   const std::size_t row = groupIndex / params.matrix.logicalK;
+   const std::size_t row = rowBegin + groupIndex / params.matrix.logicalK;
    const std::size_t patch = groupIndex % params.matrix.logicalK;
+   if (row >= params.matrix.logicalM) {
+      // Zero-fill the padding rows of a final partial tile so the GEMM never
+      // reads uninitialized staging; their results are not consumed.
+      matrix[index] = 0;
+      return;
+   }
    const std::size_t kernelIndex = patch % (params.kernelHeight * params.kernelWidth);
    const std::size_t inputChannelLocal = patch / (params.kernelHeight * params.kernelWidth);
    const std::size_t kernelHeight = kernelIndex / params.kernelWidth;
@@ -124,9 +131,10 @@ template <typename OutputT, bool HasBias, bool HasRelu>
 __global__ void QuantizedConvCudaQuantizedEpilogueKernel(
    OutputT *output, const std::int32_t *accumulator, const float *bias,
    const float *weightScaleVector, std::size_t groupBegin,
-   std::size_t groupCount, QuantizedConvolutionInvocation params)
+   std::size_t groupCount, std::size_t rowBegin, std::size_t rowCount,
+   std::size_t accumulatorRows, QuantizedConvolutionInvocation params)
 {
-   const std::size_t groupElements = params.matrix.logicalM * params.matrix.logicalN;
+   const std::size_t groupElements = rowCount * params.matrix.logicalN;
    const std::size_t elements = groupCount * groupElements;
    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
    if (index >= elements)
@@ -134,9 +142,13 @@ __global__ void QuantizedConvCudaQuantizedEpilogueKernel(
 
    const std::size_t group = groupBegin + index / groupElements;
    const std::size_t groupIndex = index % groupElements;
-   const std::size_t row = groupIndex / params.matrix.logicalN;
+   const std::size_t rowLocal = groupIndex / params.matrix.logicalN;
+   const std::size_t row = rowBegin + rowLocal;
    const std::size_t channelLocal = groupIndex % params.matrix.logicalN;
    const std::size_t channel = group * params.matrix.logicalN + channelLocal;
+   const std::size_t accumulatorIndex =
+      ((group - groupBegin) * accumulatorRows + rowLocal) * params.matrix.logicalN +
+      channelLocal;
    const double weightScale = params.matrix.weightScaleMode == EQuantizedScaleMode::PerOutputChannel
       ? static_cast<double>(weightScaleVector[channel])
       : params.matrix.weightScale;
@@ -157,7 +169,7 @@ __global__ void QuantizedConvCudaQuantizedEpilogueKernel(
          biasScale / params.matrix.outputScale);
    }
    int quantized = __float2int_rn(
-      __fmaf_rn(static_cast<float>(accumulator[index]), scale, offset));
+      __fmaf_rn(static_cast<float>(accumulator[accumulatorIndex]), scale, offset));
    if constexpr (HasRelu) {
       if (quantized < params.matrix.outputZeroPoint)
          quantized = params.matrix.outputZeroPoint;
@@ -177,38 +189,44 @@ inline void LaunchQuantizedConvCudaQuantizedEpilogue(
    QuantizedGemmCudaStream stream, OutputT *output,
    const std::int32_t *accumulator, const float *bias,
    const float *weightScaleVector, std::size_t groupBegin,
-   std::size_t groupCount, QuantizedConvolutionInvocation params)
+   std::size_t groupCount, std::size_t rowBegin, std::size_t rowCount,
+   std::size_t accumulatorRows, QuantizedConvolutionInvocation params)
 {
    constexpr int threads = 256;
-   const int blocks = static_cast<int>((groupCount * params.matrix.logicalM *
+   const int blocks = static_cast<int>((groupCount * rowCount *
       params.matrix.logicalN + threads - 1) / threads);
    if (params.matrix.hasBias && bias != nullptr) {
       if (params.matrix.hasRelu) {
          QuantizedConvCudaQuantizedEpilogueKernel<OutputT, true, true>
             <<<blocks, threads, 0, stream>>>(output, accumulator, bias,
-               weightScaleVector, groupBegin, groupCount, params);
+               weightScaleVector, groupBegin, groupCount, rowBegin, rowCount,
+               accumulatorRows, params);
       } else {
          QuantizedConvCudaQuantizedEpilogueKernel<OutputT, true, false>
             <<<blocks, threads, 0, stream>>>(output, accumulator, bias,
-               weightScaleVector, groupBegin, groupCount, params);
+               weightScaleVector, groupBegin, groupCount, rowBegin, rowCount,
+               accumulatorRows, params);
       }
    } else if (params.matrix.hasRelu) {
       QuantizedConvCudaQuantizedEpilogueKernel<OutputT, false, true>
          <<<blocks, threads, 0, stream>>>(output, accumulator, nullptr,
-            weightScaleVector, groupBegin, groupCount, params);
+            weightScaleVector, groupBegin, groupCount, rowBegin, rowCount,
+            accumulatorRows, params);
    } else {
       QuantizedConvCudaQuantizedEpilogueKernel<OutputT, false, false>
          <<<blocks, threads, 0, stream>>>(output, accumulator, nullptr,
-            weightScaleVector, groupBegin, groupCount, params);
+            weightScaleVector, groupBegin, groupCount, rowBegin, rowCount,
+            accumulatorRows, params);
    }
 }
 
 __global__ void QuantizedConvCudaFloatEpilogueKernel(
    float *output, const std::int32_t *accumulator, const float *bias,
    const float *weightScaleVector, std::size_t groupBegin,
-   std::size_t groupCount, QuantizedConvolutionInvocation params)
+   std::size_t groupCount, std::size_t rowBegin, std::size_t rowCount,
+   std::size_t accumulatorRows, QuantizedConvolutionInvocation params)
 {
-   const std::size_t groupElements = params.matrix.logicalM * params.matrix.logicalN;
+   const std::size_t groupElements = rowCount * params.matrix.logicalN;
    const std::size_t elements = groupCount * groupElements;
    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
    if (index >= elements)
@@ -216,13 +234,17 @@ __global__ void QuantizedConvCudaFloatEpilogueKernel(
 
    const std::size_t group = groupBegin + index / groupElements;
    const std::size_t groupIndex = index % groupElements;
-   const std::size_t row = groupIndex / params.matrix.logicalN;
+   const std::size_t rowLocal = groupIndex / params.matrix.logicalN;
+   const std::size_t row = rowBegin + rowLocal;
    const std::size_t channelLocal = groupIndex % params.matrix.logicalN;
    const std::size_t channel = group * params.matrix.logicalN + channelLocal;
+   const std::size_t accumulatorIndex =
+      ((group - groupBegin) * accumulatorRows + rowLocal) * params.matrix.logicalN +
+      channelLocal;
    const double weightScale = params.matrix.weightScaleMode == EQuantizedScaleMode::PerOutputChannel
       ? static_cast<double>(weightScaleVector[channel])
       : params.matrix.weightScale;
-   double real = params.matrix.alpha * static_cast<double>(accumulator[index]) *
+   double real = params.matrix.alpha * static_cast<double>(accumulator[accumulatorIndex]) *
                  params.matrix.inputScale * weightScale;
    if (params.matrix.hasBias && bias != nullptr) {
       const double biasScale = params.matrix.weightScaleMode == EQuantizedScaleMode::PerOutputChannel
@@ -553,6 +575,20 @@ __global__ void QuantizedConvCudaFP8Im2ColKernel(
    matrix[index] = value;
 }
 
+// Returns the current device's compute capability as major * 10 + minor.
+// Uses the attribute API: cudaGetDeviceProperties costs about one millisecond
+// per call and must not run on the per-inference FP8 Conv path.
+inline int CurrentDeviceComputeCapability(const char *context)
+{
+   int device = 0;
+   CheckCudaStatus(cudaGetDevice(&device), context);
+   int major = 0;
+   int minor = 0;
+   CheckCudaStatus(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device), context);
+   CheckCudaStatus(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device), context);
+   return major * 10 + minor;
+}
+
 } // namespace INTERNAL
 inline void QuantizedConvCudaLt_Call(
    QuantizedGemmCudaLtState &state, QuantizedCudaScratchView scratch,
@@ -590,8 +626,11 @@ inline void QuantizedConvCudaLt_Call(
          matrixParams.logicalM * matrixParams.logicalN);
    }
    const std::size_t stagedGroups = batchedExact ? params.groups : 1;
-   const std::size_t matrixInputBytes = stagedGroups *
-      matrixParams.logicalM * matrixParams.logicalK;
+   // Tiled execution stages two row tiles instead of the full im2col matrix.
+   const bool tiledExecution = batchedExact && params.im2colTileRows > 0;
+   const std::size_t matrixInputBytes = tiledExecution
+      ? 2 * params.groups * params.im2colTileRows * matrixParams.logicalK
+      : stagedGroups * matrixParams.logicalM * matrixParams.logicalK;
    const std::size_t outputElementBytes =
       matrixParams.outputCarrier == EQuantizedOutputCarrier::Float
          ? sizeof(float) : sizeof(std::int8_t);
@@ -613,27 +652,157 @@ inline void QuantizedConvCudaLt_Call(
    QuantizedConvolutionInvocation effectiveParams = params;
    effectiveParams.matrix = matrixParams;
    if (batchedExact) {
-      state.Initialize(matrixParams);
-      state.PrepareScratch(matrixParams);
-      const std::size_t inputElements = params.groups *
-         matrixParams.logicalM * matrixParams.logicalK;
-      const int inputBlocks = static_cast<int>((inputElements + threads - 1) / threads);
-      INTERNAL::QuantizedConvCudaIm2ColKernel<<<inputBlocks, threads, 0, stream>>>(
-         inputFloat, inputInt8, matrixInput, 0, params.groups, effectiveParams);
-      INTERNAL::CheckCudaStatus(cudaGetLastError(),
-                                "batched QuantizedConvCudaIm2ColKernel launch");
-      state.Execute(state.AccumulatorBuffer(), matrixInput,
-                    static_cast<const std::int8_t *>(weight), matrixParams, stream);
+      // Unit-kernel Conv with unit strides/dilations and no padding is a plain
+      // GEMM whose A operand is the NCHW input itself, viewed column-major as
+      // [spatial, channelsPerGroup] per (batch, group) block. When the direct
+      // layout is provider-supported, the im2col staging launch and its
+      // read/write traffic are elided; the accumulator layout is unchanged for
+      // batch==1 or groups==1, so the epilogue below is shared. Provider
+      // support is shape-dependent, so an unsupported layout falls back to the
+      // staged path.
+      bool executed = false;
+      const std::size_t outputSpatial = params.outputHeight * params.outputWidth;
+      const bool unitKernelGeometry =
+         params.kernelHeight == 1 && params.kernelWidth == 1 &&
+         params.strideHeight == 1 && params.strideWidth == 1 &&
+         params.dilationHeight == 1 && params.dilationWidth == 1 &&
+         params.padTop == 0 && params.padLeft == 0 &&
+         params.inputHeight == params.outputHeight &&
+         params.inputWidth == params.outputWidth &&
+         (params.batch == 1 || params.groups == 1);
+      if (params.unitKernelDirectInputCandidate && unitKernelGeometry &&
+          !tiledExecution && inputInt8 != nullptr && outputSpatial % 4 == 0) {
+         QuantizedDenseLinearInvocation directParams = matrixParams;
+         directParams.aColumnMajorInput = true;
+         directParams.m = outputSpatial;
+         directParams.batchCount = params.batch * params.groups;
+         directParams.batchStrideA =
+            static_cast<std::int64_t>(directParams.k * outputSpatial);
+         directParams.batchStrideB = params.groups > 1
+            ? static_cast<std::int64_t>(directParams.n * directParams.k) : 0;
+         directParams.batchStrideC =
+            static_cast<std::int64_t>(outputSpatial * directParams.n);
+         if (state.TryInitializeDirectInput(directParams)) {
+            state.PrepareScratch(directParams);
+            state.Execute(state.AccumulatorBuffer(), inputInt8,
+                          static_cast<const std::int8_t *>(weight), directParams, stream);
+            executed = true;
+         }
+      }
+      if (!executed && tiledExecution) {
+         // Budget-class shapes execute in row tiles: each tile is staged,
+         // multiplied, and finalized before its buffers are reused, so
+         // reusable scratch is bounded by the tile rather than the model
+         // shape. Two staging buffers and an internal staging stream let the
+         // next tile's im2col overlap the current tile's GEMM and epilogue.
+         const std::size_t tileRows = params.im2colTileRows;
+         const std::size_t totalRows = matrixParams.logicalM;
+         const std::size_t tileCount = (totalRows + tileRows - 1) / tileRows;
+         QuantizedDenseLinearInvocation tileParams = matrixParams;
+         tileParams.m = tileRows;
+         tileParams.batchCount = params.groups;
+         tileParams.batchStrideA = static_cast<std::int64_t>(tileRows * tileParams.k);
+         tileParams.batchStrideB = static_cast<std::int64_t>(tileParams.n * tileParams.k);
+         tileParams.batchStrideC = static_cast<std::int64_t>(tileRows * tileParams.n);
+         state.Initialize(tileParams);
+         state.PrepareScratch(tileParams);
+         state.EnsureTilePipeline();
+         const std::size_t tileBytes = params.groups * tileRows * tileParams.k;
+         std::int8_t *stagingBuffers[2] = {matrixInput, matrixInput + tileBytes};
+         // The staging stream must not read the input before prior main-stream
+         // work has produced it.
+         INTERNAL::CheckCudaStatus(cudaEventRecord(state.fTileEntryEvent, stream),
+                                   "cudaEventRecord(tile entry)");
+         INTERNAL::CheckCudaStatus(
+            cudaStreamWaitEvent(state.fTileStagingStream, state.fTileEntryEvent, 0),
+            "cudaStreamWaitEvent(tile entry)");
+         for (std::size_t tile = 0; tile < tileCount; ++tile) {
+            const int slot = static_cast<int>(tile & 1);
+            std::int8_t *staging = stagingBuffers[slot];
+            const std::size_t rowBegin = tile * tileRows;
+            const std::size_t validRows = std::min(tileRows, totalRows - rowBegin);
+            if (tile >= 2) {
+               INTERNAL::CheckCudaStatus(
+                  cudaStreamWaitEvent(state.fTileStagingStream,
+                                      state.fTileComputeDoneEvents[slot], 0),
+                  "cudaStreamWaitEvent(tile staging reuse)");
+            }
+            const std::size_t stagingElements =
+               params.groups * tileRows * tileParams.k;
+            const int stagingBlocks =
+               static_cast<int>((stagingElements + threads - 1) / threads);
+            INTERNAL::QuantizedConvCudaIm2ColKernel
+               <<<stagingBlocks, threads, 0, state.fTileStagingStream>>>(
+                  inputFloat, inputInt8, staging, 0, params.groups, rowBegin,
+                  tileRows, effectiveParams);
+            INTERNAL::CheckCudaStatus(cudaGetLastError(),
+                                      "tiled QuantizedConvCudaIm2ColKernel launch");
+            INTERNAL::CheckCudaStatus(
+               cudaEventRecord(state.fTileStagingDoneEvents[slot], state.fTileStagingStream),
+               "cudaEventRecord(tile staging done)");
+            INTERNAL::CheckCudaStatus(
+               cudaStreamWaitEvent(stream, state.fTileStagingDoneEvents[slot], 0),
+               "cudaStreamWaitEvent(tile staging done)");
+            state.Execute(state.AccumulatorBuffer(), staging,
+                          static_cast<const std::int8_t *>(weight), tileParams, stream);
+            INTERNAL::CheckCudaStatus(
+               cudaEventRecord(state.fTileComputeDoneEvents[slot], stream),
+               "cudaEventRecord(tile compute done)");
+            if (matrixParams.epilogueMode == EQuantizedEpilogueMode::Quantized) {
+               if (matrixParams.outputCarrier == EQuantizedOutputCarrier::UInt8) {
+                  INTERNAL::LaunchQuantizedConvCudaQuantizedEpilogue(
+                     stream, static_cast<std::uint8_t *>(output), state.AccumulatorBuffer(),
+                     bias, weightScaleVector, 0, params.groups, rowBegin, validRows,
+                     tileRows, effectiveParams);
+               } else {
+                  INTERNAL::LaunchQuantizedConvCudaQuantizedEpilogue(
+                     stream, static_cast<std::int8_t *>(output), state.AccumulatorBuffer(),
+                     bias, weightScaleVector, 0, params.groups, rowBegin, validRows,
+                     tileRows, effectiveParams);
+               }
+            } else {
+               const std::size_t outputElements =
+                  params.groups * validRows * matrixParams.logicalN;
+               const int outputBlocks =
+                  static_cast<int>((outputElements + threads - 1) / threads);
+               INTERNAL::QuantizedConvCudaFloatEpilogueKernel
+                  <<<outputBlocks, threads, 0, stream>>>(
+                     static_cast<float *>(output), state.AccumulatorBuffer(), bias,
+                     weightScaleVector, 0, params.groups, rowBegin, validRows,
+                     tileRows, effectiveParams);
+            }
+            INTERNAL::CheckCudaStatus(cudaGetLastError(),
+                                      "tiled quantized Conv epilogue launch");
+         }
+         return;
+      }
+
+      if (!executed) {
+         state.Initialize(matrixParams);
+         state.PrepareScratch(matrixParams);
+         const std::size_t inputElements = params.groups *
+            matrixParams.logicalM * matrixParams.logicalK;
+         const int inputBlocks = static_cast<int>((inputElements + threads - 1) / threads);
+         INTERNAL::QuantizedConvCudaIm2ColKernel<<<inputBlocks, threads, 0, stream>>>(
+            inputFloat, inputInt8, matrixInput, 0, params.groups, 0,
+            matrixParams.logicalM, effectiveParams);
+         INTERNAL::CheckCudaStatus(cudaGetLastError(),
+                                   "batched QuantizedConvCudaIm2ColKernel launch");
+         state.Execute(state.AccumulatorBuffer(), matrixInput,
+                       static_cast<const std::int8_t *>(weight), matrixParams, stream);
+      }
 
       if (matrixParams.epilogueMode == EQuantizedEpilogueMode::Quantized) {
          if (matrixParams.outputCarrier == EQuantizedOutputCarrier::UInt8) {
             INTERNAL::LaunchQuantizedConvCudaQuantizedEpilogue(
                stream, static_cast<std::uint8_t *>(output), state.AccumulatorBuffer(),
-               bias, weightScaleVector, 0, params.groups, effectiveParams);
+               bias, weightScaleVector, 0, params.groups, 0, matrixParams.logicalM,
+               matrixParams.logicalM, effectiveParams);
          } else {
             INTERNAL::LaunchQuantizedConvCudaQuantizedEpilogue(
                stream, static_cast<std::int8_t *>(output), state.AccumulatorBuffer(),
-               bias, weightScaleVector, 0, params.groups, effectiveParams);
+               bias, weightScaleVector, 0, params.groups, 0, matrixParams.logicalM,
+               matrixParams.logicalM, effectiveParams);
          }
       } else {
          const std::size_t outputElements = params.groups *
@@ -642,7 +811,8 @@ inline void QuantizedConvCudaLt_Call(
          INTERNAL::QuantizedConvCudaFloatEpilogueKernel
             <<<outputBlocks, threads, 0, stream>>>(
                static_cast<float *>(output), state.AccumulatorBuffer(), bias,
-               weightScaleVector, 0, params.groups, effectiveParams);
+               weightScaleVector, 0, params.groups, 0, matrixParams.logicalM,
+               matrixParams.logicalM, effectiveParams);
       }
       INTERNAL::CheckCudaStatus(cudaGetLastError(),
                                 "batched fused quantized Conv epilogue launch");
@@ -656,7 +826,8 @@ inline void QuantizedConvCudaLt_Call(
    const std::size_t weightGroupStride = matrixParams.n * matrixParams.k;
    for (std::size_t group = 0; group < params.groups; ++group) {
       INTERNAL::QuantizedConvCudaIm2ColKernel<<<inputBlocks, threads, 0, stream>>>(
-         inputFloat, inputInt8, matrixInput, group, 1, effectiveParams);
+         inputFloat, inputInt8, matrixInput, group, 1, 0, matrixParams.logicalM,
+         effectiveParams);
       INTERNAL::CheckCudaStatus(cudaGetLastError(), "QuantizedConvCudaIm2ColKernel launch");
 
       const auto *groupWeight =
@@ -747,12 +918,7 @@ inline void QuantizedConvCudaDepthwiseFP8_Call(
    if (params.matrix.hasBias && bias == nullptr)
       throw std::runtime_error("SOFIE FP8 depthwise Conv expected a bias pointer");
 
-   int device = 0;
-   cudaDeviceProp properties{};
-   INTERNAL::CheckCudaStatus(cudaGetDevice(&device), "cudaGetDevice(FP8 depthwise Conv)");
-   INTERNAL::CheckCudaStatus(cudaGetDeviceProperties(&properties, device),
-                             "cudaGetDeviceProperties(FP8 depthwise Conv)");
-   if (properties.major * 10 + properties.minor < 89)
+   if (INTERNAL::CurrentDeviceComputeCapability("compute capability (FP8 depthwise Conv)") < 89)
       throw std::runtime_error("SOFIE FP8 depthwise Conv requires CUDA compute capability 8.9 or newer");
 
    constexpr int threads = 256;
@@ -852,12 +1018,7 @@ inline void QuantizedConvCudaLtFP8_Call(
    if (!QuantizedGemmCudaLtFP8_IsExecutableE4M3TN(matrixParams))
       throw std::runtime_error("SOFIE native FP8 Conv requires executable E4M3 TN matrix parameters");
 
-   int device = 0;
-   cudaDeviceProp properties{};
-   INTERNAL::CheckCudaStatus(cudaGetDevice(&device), "cudaGetDevice(FP8 Conv)");
-   INTERNAL::CheckCudaStatus(cudaGetDeviceProperties(&properties, device),
-                             "cudaGetDeviceProperties(FP8 Conv)");
-   if (properties.major * 10 + properties.minor < 89)
+   if (INTERNAL::CurrentDeviceComputeCapability("compute capability (FP8 Conv)") < 89)
       throw std::runtime_error("SOFIE native FP8 Conv requires CUDA compute capability 8.9 or newer");
 
    auto geometry = params.geometry;
