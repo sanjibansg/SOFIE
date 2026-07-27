@@ -278,6 +278,48 @@ struct QuantizedFP8ConvolutionInvocation {
    bool hasRelu = false;
 };
 
+enum class EQuantizedElementwiseOp {
+   Add,
+   Mul
+};
+
+// kQuantizedElementwiseMaxRank is defined in RQuantization.hxx and shared with
+// the host region/codegen side.
+
+// Provider-neutral descriptor for a quantized/low-precision elementwise Add/Mul
+// with NumPy multidirectional broadcasting. Operand extents are right-aligned
+// and padded with 1; the call boundary derives the row-major strides and total
+// element count so generated code only emits extents. INT8 uses the affine
+// scale/zero-point requantization path; FP8 dequantizes E4M3 operands to FP32,
+// applies the op, and writes the output carrier.
+struct QuantizedElementwiseInvocation {
+   EQuantizedElementwiseOp op = EQuantizedElementwiseOp::Add;
+   int rank = 0;
+   std::size_t outputExtent[kQuantizedElementwiseMaxRank] = {};
+   std::size_t inputExtent[kQuantizedElementwiseMaxRank] = {};
+   std::size_t operandBExtent[kQuantizedElementwiseMaxRank] = {};
+   // Derived at the call boundary; not set by generated code.
+   std::size_t outputStride[kQuantizedElementwiseMaxRank] = {};
+   std::size_t inputStride[kQuantizedElementwiseMaxRank] = {};
+   std::size_t operandBStride[kQuantizedElementwiseMaxRank] = {};
+   std::size_t elements = 0;
+
+   double inputScale = 1.0;
+   double operandBScale = 1.0;
+   double outputScale = 1.0;
+   std::int32_t inputZeroPoint = 0;
+   std::int32_t operandBZeroPoint = 0;
+   std::int32_t outputZeroPoint = 0;
+   std::int32_t outputQMin = -128;
+   std::int32_t outputQMax = 127;
+
+   EQuantizedInputCarrier inputCarrier = EQuantizedInputCarrier::Int8;
+   EQuantizedInputCarrier operandBCarrier = EQuantizedInputCarrier::Int8;
+   EQuantizedOutputCarrier outputCarrier = EQuantizedOutputCarrier::Int8;
+   bool lowPrecisionFP8 = false;
+   bool hasRelu = false;
+};
+
 
 // Provider-local legacy names resolve to the same invocation contracts.
 using QuantizedGemmCudaLtFP8Params = QuantizedFP8DenseLinearInvocation;

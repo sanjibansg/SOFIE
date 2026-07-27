@@ -3,6 +3,7 @@
 #include "SOFIE/RQuantization_Analysis.hxx"
 #include "SOFIE/RQuantization_Convolution.hxx"
 #include "SOFIE/RQuantization_DenseLinear.hxx"
+#include "SOFIE/RQuantization_Elementwise.hxx"
 #include "SOFIE/RQuantization_Storage.hxx"
 
 #include <algorithm>
@@ -287,6 +288,7 @@ void RModel::AnalyzeQuantizedRegions()
    DiscoverQuantizedDenseLinearRegions(context);
    DiscoverQuantizedConvRegions(context);
    BuildQuantizedConvLoweringPlans(context);
+   DiscoverQuantizedElementwiseRegions(context);
 }
 
 void RModel::PrepareQuantizedTensorStorage(EQuantizedBackend backend)
@@ -334,6 +336,7 @@ void RModel::PrepareQuantizedTensorStorage(EQuantizedBackend backend)
       *this, fQuantizationState, backend, installStorage, registerLowPrecisionStorage};
    MaterializeQuantizedDenseLinearWeights(storageContext);
    MaterializeQuantizedConvWeights(storageContext);
+   MaterializeQuantizedElementwiseWeights(storageContext);
 
    std::unordered_set<std::size_t> consumedOperators;
    std::unordered_set<std::string> pruneCandidates;

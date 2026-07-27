@@ -5,5 +5,6 @@
 #include "SOFIE/RQuantization_AlpakaCommon.hxx"
 #include "SOFIE/RQuantization_AlpakaDenseLinear.hxx"
 #include "SOFIE/RQuantization_AlpakaConvolution.hxx"
+#include "SOFIE/RQuantization_AlpakaElementwise.hxx"
 
 #endif // SOFIE_QUANTIZED_ALPAKA

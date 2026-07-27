@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "SOFIE/RModel.hxx"
+#include "SOFIE/ROperator_BasicBinary.hxx"
 #include "SOFIE/ROperator_Conv.hxx"
 #include "SOFIE/ROperator_ONNXQuantizeLinear.hxx"
 #include "SOFIE/ROperator_QONNXQuant.hxx"
@@ -2229,5 +2230,421 @@ TEST_F(QuantizationAlpakaTest, MemoryPlanning)
    EXPECT_EQ(diagnostics.PlannedQuantizedDevicePeakBytes(),
              diagnostics.persistentCarrierBytes + diagnostics.graphValuePeakBytes +
                 diagnostics.reusableScratchPeakBytes);
+}
+
+TEST_F(QuantizationAlpakaTest, ElementwiseKernels)
+{
+   // SOFIE quantization uses round-half-to-even (nearbyint); the references
+   // below must match so exact-half cases do not spuriously diverge.
+   {
+      SCOPED_TRACE("INT8 Add with differing scales and zero points");
+         constexpr Idx n = 64;
+         const double sa = 0.05, sb = 0.02, so = 0.03;
+         const std::int32_t za = -3, zb = 7, zo = 2;
+         std::vector<std::int8_t> a(n), b(n), expected(n);
+         for (Idx i = 0; i < n; ++i) {
+            a[i] = static_cast<std::int8_t>(static_cast<int>(i) - 20);
+            b[i] = static_cast<std::int8_t>(30 - static_cast<int>(i));
+            const double real = sa * (a[i] - za) + sb * (b[i] - zb);
+            long q = static_cast<long>(std::nearbyint(real / so + zo));
+            expected[i] = static_cast<std::int8_t>(std::clamp(q, -128L, 127L));
+         }
+
+         auto a_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(n));
+         auto b_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(n));
+         auto out_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(n));
+         auto a_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(n));
+         auto b_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(n));
+         std::copy(a.begin(), a.end(), alpaka::getPtrNative(a_h));
+         std::copy(b.begin(), b.end(), alpaka::getPtrNative(b_h));
+         alpaka::memcpy(queue, a_d, a_h);
+         alpaka::memcpy(queue, b_d, b_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedElementwiseInvocation params{};
+         params.op = SOFIE::EQuantizedElementwiseOp::Add;
+         params.rank = 1;
+         params.outputExtent[0] = n;
+         params.inputExtent[0] = n;
+         params.operandBExtent[0] = n;
+         params.inputScale = sa; params.operandBScale = sb; params.outputScale = so;
+         params.inputZeroPoint = za; params.operandBZeroPoint = zb; params.outputZeroPoint = zo;
+         params.outputQMin = -128; params.outputQMax = 127;
+         params.inputCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.operandBCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.outputCarrier = SOFIE::EQuantizedOutputCarrier::Int8;
+
+         SOFIE::QuantizedElementwise_Call(alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(out_d), alpaka::getPtrNative(a_d),
+            alpaka::getPtrNative(b_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto out_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(n));
+         alpaka::memcpy(queue, out_h, out_d);
+         alpaka::wait(queue);
+         EXPECT_EQ(std::vector<std::int8_t>(alpaka::getPtrNative(out_h),
+                                            alpaka::getPtrNative(out_h) + n), expected);
+   }
+   {
+      SCOPED_TRACE("INT8 Mul uses the product scale");
+         constexpr Idx n = 48;
+         const double sa = 0.1, sb = 0.05, so = 0.2;
+         std::vector<std::int8_t> a(n), b(n), expected(n);
+         for (Idx i = 0; i < n; ++i) {
+            a[i] = static_cast<std::int8_t>(static_cast<int>(i) - 15);
+            b[i] = static_cast<std::int8_t>(static_cast<int>(i) - 25);
+            const double real = (sa * a[i]) * (sb * b[i]);
+            long q = static_cast<long>(std::nearbyint(real / so));
+            expected[i] = static_cast<std::int8_t>(std::clamp(q, -128L, 127L));
+         }
+
+         auto a_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(n));
+         auto b_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(n));
+         auto out_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(n));
+         auto a_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(n));
+         auto b_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(n));
+         std::copy(a.begin(), a.end(), alpaka::getPtrNative(a_h));
+         std::copy(b.begin(), b.end(), alpaka::getPtrNative(b_h));
+         alpaka::memcpy(queue, a_d, a_h);
+         alpaka::memcpy(queue, b_d, b_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedElementwiseInvocation params{};
+         params.op = SOFIE::EQuantizedElementwiseOp::Mul;
+         params.rank = 1;
+         params.outputExtent[0] = n; params.inputExtent[0] = n; params.operandBExtent[0] = n;
+         params.inputScale = sa; params.operandBScale = sb; params.outputScale = so;
+         params.outputQMin = -128; params.outputQMax = 127;
+         params.inputCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.operandBCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.outputCarrier = SOFIE::EQuantizedOutputCarrier::Int8;
+
+         SOFIE::QuantizedElementwise_Call(alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(out_d), alpaka::getPtrNative(a_d),
+            alpaka::getPtrNative(b_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto out_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(n));
+         alpaka::memcpy(queue, out_h, out_d);
+         alpaka::wait(queue);
+         EXPECT_EQ(std::vector<std::int8_t>(alpaka::getPtrNative(out_h),
+                                            alpaka::getPtrNative(out_h) + n), expected);
+   }
+   {
+      SCOPED_TRACE("INT8 Mul with Mamba gating broadcast [1,2048,1]x[1,1,16]");
+         constexpr Idx D = 2048, H = 16;
+         const double sa = 0.03, sb = 0.07, so = 0.02;
+         std::vector<std::int8_t> a(D), b(H), expected(D * H);
+         for (Idx i = 0; i < D; ++i) a[i] = static_cast<std::int8_t>(static_cast<int>(i % 40) - 20);
+         for (Idx i = 0; i < H; ++i) b[i] = static_cast<std::int8_t>(static_cast<int>(i) - 8);
+         for (Idx d = 0; d < D; ++d)
+            for (Idx h = 0; h < H; ++h) {
+               const double real = (sa * a[d]) * (sb * b[h]);
+               long q = static_cast<long>(std::nearbyint(real / so));
+               expected[d * H + h] = static_cast<std::int8_t>(std::clamp(q, -128L, 127L));
+            }
+
+         auto a_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(D));
+         auto b_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(H));
+         auto out_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(D * H));
+         auto a_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(D));
+         auto b_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(H));
+         std::copy(a.begin(), a.end(), alpaka::getPtrNative(a_h));
+         std::copy(b.begin(), b.end(), alpaka::getPtrNative(b_h));
+         alpaka::memcpy(queue, a_d, a_h);
+         alpaka::memcpy(queue, b_d, b_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedElementwiseInvocation params{};
+         params.op = SOFIE::EQuantizedElementwiseOp::Mul;
+         params.rank = 3;
+         params.outputExtent[0] = 1; params.outputExtent[1] = D; params.outputExtent[2] = H;
+         params.inputExtent[0] = 1; params.inputExtent[1] = D; params.inputExtent[2] = 1;
+         params.operandBExtent[0] = 1; params.operandBExtent[1] = 1; params.operandBExtent[2] = H;
+         params.inputScale = sa; params.operandBScale = sb; params.outputScale = so;
+         params.outputQMin = -128; params.outputQMax = 127;
+         params.inputCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.operandBCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.outputCarrier = SOFIE::EQuantizedOutputCarrier::Int8;
+
+         SOFIE::QuantizedElementwise_Call(alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(out_d), alpaka::getPtrNative(a_d),
+            alpaka::getPtrNative(b_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto out_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(D * H));
+         alpaka::memcpy(queue, out_h, out_d);
+         alpaka::wait(queue);
+         EXPECT_EQ(std::vector<std::int8_t>(alpaka::getPtrNative(out_h),
+                                            alpaka::getPtrNative(out_h) + D * H), expected);
+   }
+   {
+      SCOPED_TRACE("native FP8 E4M3 Add to FP32 output");
+         constexpr Idx n = 32;
+         std::vector<__nv_fp8_e4m3> a(n), b(n);
+         std::vector<float> expected(n);
+         for (Idx i = 0; i < n; ++i) {
+            const float av = 0.5f * (static_cast<int>(i) - 16);
+            const float bv = 0.25f * (static_cast<int>(i) - 8);
+            a[i] = static_cast<__nv_fp8_e4m3>(av);
+            b[i] = static_cast<__nv_fp8_e4m3>(bv);
+            // Reference dequantizes through the same E4M3 rounding the device uses.
+            expected[i] = static_cast<float>(a[i]) + static_cast<float>(b[i]);
+         }
+
+         auto a_d = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(device, Ext1D::all(n));
+         auto b_d = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(device, Ext1D::all(n));
+         auto out_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(n));
+         auto a_h = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(host, Ext1D::all(n));
+         auto b_h = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(host, Ext1D::all(n));
+         std::copy(a.begin(), a.end(), alpaka::getPtrNative(a_h));
+         std::copy(b.begin(), b.end(), alpaka::getPtrNative(b_h));
+         alpaka::memcpy(queue, a_d, a_h);
+         alpaka::memcpy(queue, b_d, b_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedElementwiseInvocation params{};
+         params.op = SOFIE::EQuantizedElementwiseOp::Add;
+         params.rank = 1;
+         params.outputExtent[0] = n; params.inputExtent[0] = n; params.operandBExtent[0] = n;
+         params.lowPrecisionFP8 = true;
+         params.outputCarrier = SOFIE::EQuantizedOutputCarrier::Float;
+
+         SOFIE::QuantizedElementwise_Call(alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(out_d), alpaka::getPtrNative(a_d),
+            alpaka::getPtrNative(b_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto out_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(n));
+         alpaka::memcpy(queue, out_h, out_d);
+         alpaka::wait(queue);
+         const float *result = alpaka::getPtrNative(out_h);
+         for (Idx i = 0; i < n; ++i)
+            EXPECT_FLOAT_EQ(result[i], expected[i]);
+   }
+}
+
+TEST(QuantizationMetadata, Elementwise)
+{
+   using SOFIE::EBasicBinaryOperator;
+   const std::vector<std::size_t> shape{1, 8};
+
+   auto addFloatTensor = [](SOFIE::RModel &model, const std::string &name,
+                            const std::vector<std::size_t> &tensorShape,
+                            const std::vector<float> &values) {
+      model.AddInitializedTensor(
+         name, SOFIE::ETensorType::FLOAT, tensorShape,
+         std::shared_ptr<void>(new float[values.size()], std::default_delete<float[]>()));
+      std::copy(values.begin(), values.end(),
+                static_cast<float *>(model.GetInitializedTensorData(name).get()));
+   };
+
+   // QONNX fake-quant elementwise: both operands and the output pass through
+   // QONNX Quant boundaries, so operands are float carriers on the grid.
+   auto buildQONNX = [&](const std::string &name, EBasicBinaryOperator op, float zeroPoint) {
+      SOFIE::RModel model(name);
+      model.AddInputTensorInfo("xa", SOFIE::ETensorType::FLOAT, shape);
+      model.AddInputTensorInfo("xb", SOFIE::ETensorType::FLOAT, shape);
+      addFloatTensor(model, "scale", {}, {0.125f});
+      addFloatTensor(model, "zero_point", {}, {zeroPoint});
+      addFloatTensor(model, "bit_width", {}, {8.0f});
+      auto quant = [&](const std::string &prefix, const std::string &src, const std::string &dst) {
+         AddNamedOperator<SOFIE::ROperator_QONNXQuant>(
+            model, prefix, src, "scale", "zero_point", "bit_width", dst, true, false,
+            SOFIE::EQuantizationRoundingMode::ROUND, SOFIE::EQuantizationOverflowMode::SAT);
+      };
+      quant("quant_a", "xa", "xa_q");
+      quant("quant_b", "xb", "xb_q");
+      if (op == EBasicBinaryOperator::Add)
+         AddNamedOperator<SOFIE::ROperator_BasicBinary<float, EBasicBinaryOperator::Add>>(
+            model, "elementwise", "xa_q", "xb_q", "ew_out");
+      else
+         AddNamedOperator<SOFIE::ROperator_BasicBinary<float, EBasicBinaryOperator::Mul>>(
+            model, "elementwise", "xa_q", "xb_q", "ew_out");
+      quant("quant_out", "ew_out", "output");
+      model.Initialize();
+      return model;
+   };
+
+   // ONNX Q/DQ elementwise: operands are genuine INT8 carriers dequantized into
+   // the Add/Mul and requantized after.
+   auto buildQDQ = [&](const std::string &name, EBasicBinaryOperator op) {
+      SOFIE::RModel model(name);
+      model.AddInputTensorInfo("xa", SOFIE::ETensorType::FLOAT, shape);
+      model.AddInputTensorInfo("xb", SOFIE::ETensorType::FLOAT, shape);
+      addFloatTensor(model, "scale", {}, {0.125f});
+      model.AddInitializedTensor(
+         "zero_point_int8", SOFIE::ETensorType::INT8, std::vector<std::size_t>{},
+         std::shared_ptr<void>(new std::int8_t[1]{}, std::default_delete<std::int8_t[]>()));
+      auto quantize = [&](const std::string &prefix, const std::string &src, const std::string &dst) {
+         AddNamedOperator<SOFIE::ROperator_ONNXQuantizeLinear>(
+            model, prefix, src, "scale", "zero_point_int8", dst, SOFIE::ETensorType::INT8, -1);
+      };
+      auto dequantize = [&](const std::string &prefix, const std::string &src, const std::string &dst) {
+         AddNamedOperator<SOFIE::ROperator_ONNXDequantizeLinear>(
+            model, prefix, src, "scale", "zero_point_int8", dst, SOFIE::ETensorType::INT8, -1);
+      };
+      quantize("q_a", "xa", "xa_i8");
+      quantize("q_b", "xb", "xb_i8");
+      dequantize("dq_a", "xa_i8", "xa_f");
+      dequantize("dq_b", "xb_i8", "xb_f");
+      if (op == EBasicBinaryOperator::Add)
+         AddNamedOperator<SOFIE::ROperator_BasicBinary<float, EBasicBinaryOperator::Add>>(
+            model, "elementwise", "xa_f", "xb_f", "ew_out");
+      else
+         AddNamedOperator<SOFIE::ROperator_BasicBinary<float, EBasicBinaryOperator::Mul>>(
+            model, "elementwise", "xa_f", "xb_f", "ew_out");
+      quantize("q_out", "ew_out", "output");
+      model.Initialize();
+      return model;
+   };
+
+   auto singleRegion = [](const SOFIE::RModel &model) -> const SOFIE::QuantizedElementwiseRegion * {
+      const auto &state = model.GetQuantizationState();
+      EXPECT_EQ(SOFIE::CountQuantizedRegions<SOFIE::QuantizedElementwiseRegion>(state), 1U);
+      return SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedElementwiseRegion>(state);
+   };
+
+   {
+      SCOPED_TRACE("QONNX and Q/DQ Add canonicalize to one recognized region");
+         auto qonnx = buildQONNX("qonnx_add", EBasicBinaryOperator::Add, 0.0f);
+         auto qdq = buildQDQ("qdq_add", EBasicBinaryOperator::Add);
+         const auto *qonnxRegion = singleRegion(qonnx);
+         const auto *qdqRegion = singleRegion(qdq);
+         ASSERT_NE(qonnxRegion, nullptr);
+         ASSERT_NE(qdqRegion, nullptr);
+         EXPECT_EQ(qonnxRegion->kind, SOFIE::EQuantizedElementwiseKind::Add);
+         EXPECT_EQ(qdqRegion->kind, SOFIE::EQuantizedElementwiseKind::Add);
+         EXPECT_EQ(qonnxRegion->status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
+         EXPECT_EQ(qdqRegion->status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
+         ASSERT_TRUE(qonnxRegion->inputQuant.has_value());
+         ASSERT_TRUE(qdqRegion->inputQuant.has_value());
+         EXPECT_EQ(qonnxRegion->inputQuant->scale, qdqRegion->inputQuant->scale);
+         EXPECT_EQ(qonnxRegion->outputQuant->scale, qdqRegion->outputQuant->scale);
+
+         for (const auto *model : {&qonnx, &qdq}) {
+            const auto &state = model->GetQuantizationState();
+            const auto *region = SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedElementwiseRegion>(state);
+            const auto *plan = SOFIE::FindQuantizedLoweringPlan(
+               state, region->elementwiseOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+            ASSERT_NE(plan, nullptr) << region->reason;
+            EXPECT_EQ(plan->status, SOFIE::EQuantizedLoweringStatus::Optimized) << region->reason;
+            EXPECT_EQ(plan->capabilityTag, "alpaka_int8_elementwise_add");
+            EXPECT_TRUE(plan->suppressesGraphOperators);
+         }
+         // The Q/DQ operands are true INT8 carriers; the QONNX operands are
+         // float fake-quant carriers. Both are correct for their frontend.
+         const auto &qdqState = qdq.GetQuantizationState();
+         const auto *qdqPlan = SOFIE::FindQuantizedLoweringPlan(
+            qdqState, qdqRegion->elementwiseOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+         EXPECT_EQ(qdqPlan->inputStorage, SOFIE::EQuantizedStorageType::Int8);
+         EXPECT_EQ(qdqPlan->outputStorage, SOFIE::EQuantizedStorageType::Int8);
+   }
+   {
+      SCOPED_TRACE("Mul lowers with the same family");
+         auto qdqMul = buildQDQ("qdq_mul", EBasicBinaryOperator::Mul);
+         const auto *region = singleRegion(qdqMul);
+         ASSERT_NE(region, nullptr);
+         EXPECT_EQ(region->kind, SOFIE::EQuantizedElementwiseKind::Mul);
+         EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
+         const auto *plan = SOFIE::FindQuantizedLoweringPlan(
+            qdqMul.GetQuantizationState(), region->elementwiseOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+         ASSERT_NE(plan, nullptr);
+         EXPECT_EQ(plan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         EXPECT_EQ(plan->capabilityTag, "alpaka_int8_elementwise_mul");
+   }
+   {
+      SCOPED_TRACE("constant operand is recognized and canonicalized into the B slot");
+         // Activation A times an INT8 constant B: input xa -> Q -> DQ; constant
+         // cB_i8 is a genuine INT8 initializer -> DQ; Mul -> Q. `swapOperands`
+         // places the constant first to exercise commutative canonicalization.
+         auto buildConstMul = [&](const std::string &name, bool swapOperands) {
+            SOFIE::RModel model(name);
+            model.AddInputTensorInfo("xa", SOFIE::ETensorType::FLOAT, shape);
+            addFloatTensor(model, "scale", {}, {0.125f});
+            model.AddInitializedTensor(
+               "zero_point_int8", SOFIE::ETensorType::INT8, std::vector<std::size_t>{},
+               std::shared_ptr<void>(new std::int8_t[1]{}, std::default_delete<std::int8_t[]>()));
+            model.AddInitializedTensor(
+               "cB_i8", SOFIE::ETensorType::INT8, shape,
+               std::shared_ptr<void>(new std::int8_t[8]{1, 2, 3, 4, 5, 6, 7, 8},
+                                     std::default_delete<std::int8_t[]>()));
+            AddNamedOperator<SOFIE::ROperator_ONNXQuantizeLinear>(
+               model, "q_a", "xa", "scale", "zero_point_int8", "xa_i8", SOFIE::ETensorType::INT8, -1);
+            AddNamedOperator<SOFIE::ROperator_ONNXDequantizeLinear>(
+               model, "dq_a", "xa_i8", "scale", "zero_point_int8", "xa_f", SOFIE::ETensorType::INT8, -1);
+            AddNamedOperator<SOFIE::ROperator_ONNXDequantizeLinear>(
+               model, "dq_b", "cB_i8", "scale", "zero_point_int8", "cB_f", SOFIE::ETensorType::INT8, -1);
+            if (swapOperands)
+               AddNamedOperator<SOFIE::ROperator_BasicBinary<float, EBasicBinaryOperator::Mul>>(
+                  model, "elementwise", "cB_f", "xa_f", "ew_out");
+            else
+               AddNamedOperator<SOFIE::ROperator_BasicBinary<float, EBasicBinaryOperator::Mul>>(
+                  model, "elementwise", "xa_f", "cB_f", "ew_out");
+            AddNamedOperator<SOFIE::ROperator_ONNXQuantizeLinear>(
+               model, "q_out", "ew_out", "scale", "zero_point_int8", "output", SOFIE::ETensorType::INT8, -1);
+            model.Initialize();
+            return model;
+         };
+
+         for (bool swap : {false, true}) {
+            SCOPED_TRACE(swap ? "constant as first operand" : "constant as second operand");
+            auto model = buildConstMul(swap ? "const_mul_swapped" : "const_mul", swap);
+            const auto *region = singleRegion(model);
+            ASSERT_NE(region, nullptr);
+            EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
+            // The constant is always canonicalized into B; the activation stays
+            // in the input slot regardless of source operand order.
+            EXPECT_TRUE(region->operandBIsConstant);
+            EXPECT_EQ(region->operandBSourceTensor, "cB_i8");
+            EXPECT_EQ(region->inputSourceTensor, "xa_i8");
+            const auto *plan = SOFIE::FindQuantizedLoweringPlan(
+               model.GetQuantizationState(), region->elementwiseOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+            ASSERT_NE(plan, nullptr);
+            EXPECT_EQ(plan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+            // The constant is pointed at the shared storage/externalization path.
+            EXPECT_EQ(plan->weightStorageTensor, "cB_i8");
+         }
+   }
+   {
+      SCOPED_TRACE("asymmetric-zero-point Mul is rejected with a factual reason");
+         auto qonnxMul = buildQONNX("qonnx_mul_asym", EBasicBinaryOperator::Mul, 5.0f);
+         const auto *region = singleRegion(qonnxMul);
+         ASSERT_NE(region, nullptr);
+         EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticUnsupported);
+         EXPECT_NE(region->reason.find("symmetric"), std::string::npos) << region->reason;
+         const auto *plan = SOFIE::FindQuantizedLoweringPlan(
+            qonnxMul.GetQuantizationState(), region->elementwiseOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+         ASSERT_NE(plan, nullptr);
+         EXPECT_FALSE(SOFIE::IsQuantizedLoweringAvailable(plan->status));
+   }
+   {
+      SCOPED_TRACE("mixed precision with an unquantized operand is rejected");
+         SOFIE::RModel model("mixed_precision_add");
+         model.AddInputTensorInfo("xa", SOFIE::ETensorType::FLOAT, shape);
+         model.AddInputTensorInfo("xb", SOFIE::ETensorType::FLOAT, shape);
+         addFloatTensor(model, "scale", {}, {0.125f});
+         addFloatTensor(model, "zero_point", {}, {0.0f});
+         addFloatTensor(model, "bit_width", {}, {8.0f});
+         AddNamedOperator<SOFIE::ROperator_QONNXQuant>(
+            model, "quant_a", "xa", "scale", "zero_point", "bit_width", "xa_q", true, false,
+            SOFIE::EQuantizationRoundingMode::ROUND, SOFIE::EQuantizationOverflowMode::SAT);
+         // Operand B (xb) stays an unquantized float activation.
+         AddNamedOperator<SOFIE::ROperator_BasicBinary<float, EBasicBinaryOperator::Add>>(
+            model, "elementwise", "xa_q", "xb", "ew_out");
+         AddNamedOperator<SOFIE::ROperator_QONNXQuant>(
+            model, "quant_out", "ew_out", "scale", "zero_point", "bit_width", "output", true, false,
+            SOFIE::EQuantizationRoundingMode::ROUND, SOFIE::EQuantizationOverflowMode::SAT);
+         model.Initialize();
+         const auto *region = singleRegion(model);
+         ASSERT_NE(region, nullptr);
+         EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticUnsupported);
+         EXPECT_NE(region->reason.find("no quantization or low-precision metadata"), std::string::npos)
+            << region->reason;
+   }
 }
 

@@ -191,39 +191,109 @@ struct QuantizedConvRegion {
    std::string reason;
 };
 
-using QuantizedRegion = std::variant<QuantizedGemmRegion, QuantizedMatMulRegion, QuantizedConvRegion>;
+enum class EQuantizedElementwiseKind {
+   UNDEFINED = 0,
+   Add = 1,
+   Mul = 2
+};
+
+// Maximum static rank supported by the quantized elementwise broadcast kernel;
+// shared by the host region/codegen and the generated-code invocation. The
+// recognizer rejects higher-rank regions with a factual reason.
+inline constexpr int kQuantizedElementwiseMaxRank = 8;
+
+// A quantized/low-precision elementwise Add or Mul over two operands. Operands
+// are symmetric activations by default; a constant operand is canonicalized into
+// the B slot so it reuses the shared weight-storage path. Both-activation
+// regions materialize no persistent storage.
+struct QuantizedElementwiseRegion {
+   EQuantizedElementwiseKind kind = EQuantizedElementwiseKind::UNDEFINED;
+
+   // Quantized carrier tensors (outputs of the operand quantization boundaries).
+   std::string inputTensor;
+   std::string operandBTensor;
+   std::string elementwiseOutputTensor;
+   std::string outputTensor;
+
+   // Source tensors consumed by the boundaries; used when suppressing the
+   // literal Quant nodes. operandBSourceTensor doubles as the weight-source slot
+   // for the shared storage/pruning path.
+   std::string inputSourceTensor;
+   std::string operandBSourceTensor;
+
+   std::size_t inputQuantOpIndex = static_cast<std::size_t>(-1);
+   std::size_t operandBQuantOpIndex = static_cast<std::size_t>(-1);
+   std::size_t elementwiseOpIndex = static_cast<std::size_t>(-1);
+   std::optional<std::size_t> outputQuantOpIndex;
+
+   // Affine INT8 carriers.
+   std::optional<QuantizationInfo> inputQuant;
+   std::optional<QuantizationInfo> operandBQuant;
+   std::optional<QuantizationInfo> outputQuant;
+   // Native low-precision (FP8) carriers.
+   std::optional<LowPrecisionTensorInfo> inputLowPrecision;
+   std::optional<LowPrecisionTensorInfo> operandBLowPrecision;
+   std::optional<LowPrecisionTensorInfo> outputLowPrecision;
+
+   std::vector<std::size_t> inputShape;
+   std::vector<std::size_t> operandBShape;
+   std::vector<std::size_t> outputShape;
+
+   bool operandBIsConstant = false;
+   bool hasRelu = false;
+
+   EQuantizedLoweringStatus status = EQuantizedLoweringStatus::UNDEFINED;
+   std::string reason;
+};
+
+using QuantizedRegion = std::variant<QuantizedGemmRegion, QuantizedMatMulRegion, QuantizedConvRegion,
+                                     QuantizedElementwiseRegion>;
 
 inline std::size_t QuantizedRegionAnchorIndex(const QuantizedGemmRegion &region) { return region.gemmOpIndex; }
 inline std::size_t QuantizedRegionAnchorIndex(const QuantizedMatMulRegion &region) { return region.matmulOpIndex; }
 inline std::size_t QuantizedRegionAnchorIndex(const QuantizedConvRegion &region) { return region.convOpIndex; }
+inline std::size_t QuantizedRegionAnchorIndex(const QuantizedElementwiseRegion &region) { return region.elementwiseOpIndex; }
 
 inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedGemmRegion &region) { return region.inputSourceTensor; }
 inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedMatMulRegion &region) { return region.inputSourceTensor; }
 inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedConvRegion &region) { return region.inputSourceTensor; }
+inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedElementwiseRegion &region) { return region.inputSourceTensor; }
 
 inline const std::string &QuantizedRegionOutputTensor(const QuantizedGemmRegion &region) { return region.outputTensor; }
 inline const std::string &QuantizedRegionOutputTensor(const QuantizedMatMulRegion &region) { return region.outputTensor; }
 inline const std::string &QuantizedRegionOutputTensor(const QuantizedConvRegion &region) { return region.outputTensor; }
+inline const std::string &QuantizedRegionOutputTensor(const QuantizedElementwiseRegion &region) { return region.outputTensor; }
 
 inline const std::string &QuantizedRegionWeightSourceTensor(const QuantizedGemmRegion &region) { return region.weightSourceTensor; }
 inline const std::string &QuantizedRegionWeightSourceTensor(const QuantizedMatMulRegion &region) { return region.weightSourceTensor; }
 inline const std::string &QuantizedRegionWeightSourceTensor(const QuantizedConvRegion &region) { return region.weightSourceTensor; }
+// The constant operand (if any) is canonicalized into the B slot, so it reuses
+// the shared weight-storage/pruning path; both-activation regions expose an
+// activation name here, which is harmless because it is never an initializer.
+inline const std::string &QuantizedRegionWeightSourceTensor(const QuantizedElementwiseRegion &region) { return region.operandBSourceTensor; }
 
 inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedGemmRegion &region) { return region.biasSourceTensor; }
 inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedMatMulRegion &region) { return region.epilogue.biasSourceTensor; }
 inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedConvRegion &region) { return region.biasSourceTensor; }
+inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedElementwiseRegion &) {
+   static const std::string kNoBias;
+   return kNoBias;
+}
 
 std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedGemmRegion &region);
 std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedMatMulRegion &region);
 std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedConvRegion &region);
+std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedElementwiseRegion &region);
 
 inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedGemmRegion &region) { return region.status; }
 inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedMatMulRegion &region) { return region.status; }
 inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedConvRegion &region) { return region.status; }
+inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedElementwiseRegion &region) { return region.status; }
 
 inline const std::string &QuantizedRegionReason(const QuantizedGemmRegion &region) { return region.reason; }
 inline const std::string &QuantizedRegionReason(const QuantizedMatMulRegion &region) { return region.reason; }
 inline const std::string &QuantizedRegionReason(const QuantizedConvRegion &region) { return region.reason; }
+inline const std::string &QuantizedRegionReason(const QuantizedElementwiseRegion &region) { return region.reason; }
 
 
 struct QuantizationModelState {
