@@ -246,23 +246,55 @@ struct QuantizedElementwiseRegion {
    std::string reason;
 };
 
+// A weight-only quantized/low-precision Gather (embedding/head): a quantized
+// constant table gathered by integral indices, dequantized on the gathered
+// payload. Indices are never quantized; there is no activation quantization or
+// output requantization boundary.
+struct QuantizedGatherRegion {
+   // The quantized table carrier (boundary output) and its physical source.
+   std::string tableTensor;
+   std::string tableSourceTensor;
+   std::string indicesTensor;
+   std::string gatherOutputTensor;
+   std::string outputTensor;
+
+   std::size_t tableQuantOpIndex = static_cast<std::size_t>(-1);
+   std::size_t gatherOpIndex = static_cast<std::size_t>(-1);
+
+   std::int64_t axis = 0;
+
+   std::optional<QuantizationInfo> tableQuant;
+   std::optional<LowPrecisionTensorInfo> tableLowPrecision;
+
+   std::vector<std::size_t> tableShape;
+   std::vector<std::size_t> indicesShape;
+   std::vector<std::size_t> outputShape;
+
+   EQuantizedLoweringStatus status = EQuantizedLoweringStatus::UNDEFINED;
+   std::string reason;
+};
+
 using QuantizedRegion = std::variant<QuantizedGemmRegion, QuantizedMatMulRegion, QuantizedConvRegion,
-                                     QuantizedElementwiseRegion>;
+                                     QuantizedElementwiseRegion, QuantizedGatherRegion>;
 
 inline std::size_t QuantizedRegionAnchorIndex(const QuantizedGemmRegion &region) { return region.gemmOpIndex; }
 inline std::size_t QuantizedRegionAnchorIndex(const QuantizedMatMulRegion &region) { return region.matmulOpIndex; }
 inline std::size_t QuantizedRegionAnchorIndex(const QuantizedConvRegion &region) { return region.convOpIndex; }
 inline std::size_t QuantizedRegionAnchorIndex(const QuantizedElementwiseRegion &region) { return region.elementwiseOpIndex; }
+inline std::size_t QuantizedRegionAnchorIndex(const QuantizedGatherRegion &region) { return region.gatherOpIndex; }
 
 inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedGemmRegion &region) { return region.inputSourceTensor; }
 inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedMatMulRegion &region) { return region.inputSourceTensor; }
 inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedConvRegion &region) { return region.inputSourceTensor; }
 inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedElementwiseRegion &region) { return region.inputSourceTensor; }
+// The indices tensor is the runtime input; the table is the persistent carrier.
+inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedGatherRegion &region) { return region.indicesTensor; }
 
 inline const std::string &QuantizedRegionOutputTensor(const QuantizedGemmRegion &region) { return region.outputTensor; }
 inline const std::string &QuantizedRegionOutputTensor(const QuantizedMatMulRegion &region) { return region.outputTensor; }
 inline const std::string &QuantizedRegionOutputTensor(const QuantizedConvRegion &region) { return region.outputTensor; }
 inline const std::string &QuantizedRegionOutputTensor(const QuantizedElementwiseRegion &region) { return region.outputTensor; }
+inline const std::string &QuantizedRegionOutputTensor(const QuantizedGatherRegion &region) { return region.outputTensor; }
 
 inline const std::string &QuantizedRegionWeightSourceTensor(const QuantizedGemmRegion &region) { return region.weightSourceTensor; }
 inline const std::string &QuantizedRegionWeightSourceTensor(const QuantizedMatMulRegion &region) { return region.weightSourceTensor; }
@@ -277,6 +309,7 @@ inline const std::string &QuantizedRegionSecondaryStorageTensor(const QuantizedG
 inline const std::string &QuantizedRegionSecondaryStorageTensor(const QuantizedMatMulRegion &region) { return region.weightSourceTensor; }
 inline const std::string &QuantizedRegionSecondaryStorageTensor(const QuantizedConvRegion &region) { return region.weightSourceTensor; }
 inline const std::string &QuantizedRegionSecondaryStorageTensor(const QuantizedElementwiseRegion &region) { return region.operandBSourceTensor; }
+inline const std::string &QuantizedRegionSecondaryStorageTensor(const QuantizedGatherRegion &region) { return region.tableSourceTensor; }
 
 inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedGemmRegion &region) { return region.biasSourceTensor; }
 inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedMatMulRegion &region) { return region.epilogue.biasSourceTensor; }
@@ -285,21 +318,28 @@ inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedElement
    static const std::string kNoBias;
    return kNoBias;
 }
+inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedGatherRegion &) {
+   static const std::string kNoBias;
+   return kNoBias;
+}
 
 std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedGemmRegion &region);
 std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedMatMulRegion &region);
 std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedConvRegion &region);
 std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedElementwiseRegion &region);
+std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedGatherRegion &region);
 
 inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedGemmRegion &region) { return region.status; }
 inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedMatMulRegion &region) { return region.status; }
 inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedConvRegion &region) { return region.status; }
 inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedElementwiseRegion &region) { return region.status; }
+inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedGatherRegion &region) { return region.status; }
 
 inline const std::string &QuantizedRegionReason(const QuantizedGemmRegion &region) { return region.reason; }
 inline const std::string &QuantizedRegionReason(const QuantizedMatMulRegion &region) { return region.reason; }
 inline const std::string &QuantizedRegionReason(const QuantizedConvRegion &region) { return region.reason; }
 inline const std::string &QuantizedRegionReason(const QuantizedElementwiseRegion &region) { return region.reason; }
+inline const std::string &QuantizedRegionReason(const QuantizedGatherRegion &region) { return region.reason; }
 
 
 struct QuantizationModelState {

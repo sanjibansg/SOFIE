@@ -38,6 +38,11 @@ public:
          fOutputTensorNames = { fNY };
    }
 
+   // Normalized (non-negative after Initialize) gather axis. Used by the
+   // quantized weight-only Gather recognizer, mirroring the getter pattern the
+   // dense-linear recognizer uses on ROperator_Gemm.
+   int64_t GetAxis() const { return fAttrAxis; }
+
    std::vector<ETensorType> TypeInference(std::vector<ETensorType> input) override {
       return input;
    }

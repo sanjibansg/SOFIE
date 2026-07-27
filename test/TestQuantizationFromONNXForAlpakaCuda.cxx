@@ -12,6 +12,7 @@
 #include "SOFIE/RModel.hxx"
 #include "SOFIE/ROperator_BasicBinary.hxx"
 #include "SOFIE/ROperator_Conv.hxx"
+#include "SOFIE/ROperator_Gather.hxx"
 #include "SOFIE/ROperator_ONNXQuantizeLinear.hxx"
 #include "SOFIE/ROperator_QONNXQuant.hxx"
 #include "SOFIE/ROperator_QuantizedConv.hxx"
@@ -2648,3 +2649,289 @@ TEST(QuantizationMetadata, Elementwise)
    }
 }
 
+
+TEST_F(QuantizationAlpakaTest, GatherKernels)
+{
+   {
+      SCOPED_TRACE("INT8 weight-only gather, axis 0, with a negative index");
+         constexpr Idx V = 6, D = 4;
+         const double scale = 0.05;
+         const std::int32_t zero = 3;
+         std::vector<std::int8_t> table(V * D);
+         for (Idx i = 0; i < V * D; ++i)
+            table[i] = static_cast<std::int8_t>(static_cast<int>(i) - 12);
+         const std::vector<std::int64_t> idx = {2, 0, 5, -1};
+         std::vector<float> expected(idx.size() * D);
+         for (Idx t = 0; t < idx.size(); ++t) {
+            long k = idx[t];
+            if (k < 0) k += V;
+            for (Idx d = 0; d < D; ++d)
+               expected[t * D + d] = static_cast<float>(scale * (table[k * D + d] - zero));
+         }
+
+         auto table_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(table.size()));
+         auto idx_d = alpaka::allocBuf<std::int64_t, Idx>(device, Ext1D::all(idx.size()));
+         auto out_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(expected.size()));
+         auto table_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(table.size()));
+         auto idx_h = alpaka::allocBuf<std::int64_t, Idx>(host, Ext1D::all(idx.size()));
+         std::copy(table.begin(), table.end(), alpaka::getPtrNative(table_h));
+         std::copy(idx.begin(), idx.end(), alpaka::getPtrNative(idx_h));
+         alpaka::memcpy(queue, table_d, table_h);
+         alpaka::memcpy(queue, idx_d, idx_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedGatherInvocation params{};
+         params.outer = 1; params.axisLength = V; params.inner = D; params.indexCount = idx.size();
+         params.scale = scale; params.zeroPoint = zero;
+         params.tableCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.indicesInt64 = true;
+
+         SOFIE::QuantizedGather_Call(alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(out_d), alpaka::getPtrNative(table_d),
+            alpaka::getPtrNative(idx_d), nullptr, params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto out_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, out_h, out_d);
+         alpaka::wait(queue);
+         const float *result = alpaka::getPtrNative(out_h);
+         for (Idx i = 0; i < expected.size(); ++i)
+            EXPECT_FLOAT_EQ(result[i], expected[i]);
+   }
+   {
+      SCOPED_TRACE("general axis=1 gather with int32 indices");
+         constexpr Idx B = 2, V = 5, C = 3;
+         const double scale = 0.1;
+         std::vector<std::int8_t> table(B * V * C);
+         for (Idx i = 0; i < table.size(); ++i)
+            table[i] = static_cast<std::int8_t>(static_cast<int>((i * 3) % 200) - 100);
+         const std::vector<std::int32_t> idx = {3, 1};
+         std::vector<float> expected(B * idx.size() * C);
+         for (Idx b = 0; b < B; ++b)
+            for (Idx t = 0; t < idx.size(); ++t)
+               for (Idx c = 0; c < C; ++c)
+                  expected[(b * idx.size() + t) * C + c] =
+                     static_cast<float>(scale * table[(b * V + idx[t]) * C + c]);
+
+         auto table_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(table.size()));
+         auto idx_d = alpaka::allocBuf<std::int32_t, Idx>(device, Ext1D::all(idx.size()));
+         auto out_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(expected.size()));
+         auto table_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(table.size()));
+         auto idx_h = alpaka::allocBuf<std::int32_t, Idx>(host, Ext1D::all(idx.size()));
+         std::copy(table.begin(), table.end(), alpaka::getPtrNative(table_h));
+         std::copy(idx.begin(), idx.end(), alpaka::getPtrNative(idx_h));
+         alpaka::memcpy(queue, table_d, table_h);
+         alpaka::memcpy(queue, idx_d, idx_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedGatherInvocation params{};
+         params.outer = B; params.axisLength = V; params.inner = C; params.indexCount = idx.size();
+         params.scale = scale; params.zeroPoint = 0;
+         params.tableCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.indicesInt64 = false;
+
+         SOFIE::QuantizedGather_Call(alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(out_d), alpaka::getPtrNative(table_d),
+            alpaka::getPtrNative(idx_d), nullptr, params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto out_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, out_h, out_d);
+         alpaka::wait(queue);
+         const float *result = alpaka::getPtrNative(out_h);
+         for (Idx i = 0; i < expected.size(); ++i)
+            EXPECT_FLOAT_EQ(result[i], expected[i]);
+   }
+   {
+      SCOPED_TRACE("native FP8 E4M3 weight-only gather");
+         constexpr Idx V = 4, D = 2;
+         std::vector<__nv_fp8_e4m3> table(V * D);
+         for (Idx i = 0; i < table.size(); ++i)
+            table[i] = static_cast<__nv_fp8_e4m3>(0.5f * (static_cast<int>(i) - 3));
+         const std::vector<std::int64_t> idx = {1, 3, 0};
+         std::vector<float> expected(idx.size() * D);
+         for (Idx t = 0; t < idx.size(); ++t)
+            for (Idx d = 0; d < D; ++d)
+               expected[t * D + d] = static_cast<float>(table[idx[t] * D + d]);
+
+         auto table_d = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(device, Ext1D::all(table.size()));
+         auto idx_d = alpaka::allocBuf<std::int64_t, Idx>(device, Ext1D::all(idx.size()));
+         auto out_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(expected.size()));
+         auto table_h = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(host, Ext1D::all(table.size()));
+         auto idx_h = alpaka::allocBuf<std::int64_t, Idx>(host, Ext1D::all(idx.size()));
+         std::copy(table.begin(), table.end(), alpaka::getPtrNative(table_h));
+         std::copy(idx.begin(), idx.end(), alpaka::getPtrNative(idx_h));
+         alpaka::memcpy(queue, table_d, table_h);
+         alpaka::memcpy(queue, idx_d, idx_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedGatherInvocation params{};
+         params.outer = 1; params.axisLength = V; params.inner = D; params.indexCount = idx.size();
+         params.lowPrecisionFP8 = true; params.indicesInt64 = true;
+
+         SOFIE::QuantizedGather_Call(alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(out_d), alpaka::getPtrNative(table_d),
+            alpaka::getPtrNative(idx_d), nullptr, params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto out_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, out_h, out_d);
+         alpaka::wait(queue);
+         const float *result = alpaka::getPtrNative(out_h);
+         for (Idx i = 0; i < expected.size(); ++i)
+            EXPECT_FLOAT_EQ(result[i], expected[i]);
+   }
+   {
+      SCOPED_TRACE("INT8 per-channel (per-row) gather along the gathered axis");
+         // Table [V, D] quantized per-row (quant axis 0 == gather axis 0): the
+         // scale vector is gathered by the same index. quantAxisStride = D.
+         constexpr Idx V = 6, D = 4;
+         std::vector<std::int8_t> table(V * D);
+         std::vector<float> scaleVec(V);
+         for (Idx r = 0; r < V; ++r) {
+            scaleVec[r] = 0.02f * static_cast<float>(r + 1);
+            for (Idx d = 0; d < D; ++d)
+               table[r * D + d] = static_cast<std::int8_t>(static_cast<int>(r * D + d) - 12);
+         }
+         const std::vector<std::int64_t> idx = {4, 1, 4, 0};
+         std::vector<float> expected(idx.size() * D);
+         for (Idx t = 0; t < idx.size(); ++t)
+            for (Idx d = 0; d < D; ++d)
+               expected[t * D + d] = scaleVec[idx[t]] * table[idx[t] * D + d];
+
+         auto table_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(table.size()));
+         auto scale_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(scaleVec.size()));
+         auto idx_d = alpaka::allocBuf<std::int64_t, Idx>(device, Ext1D::all(idx.size()));
+         auto out_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(expected.size()));
+         auto table_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(table.size()));
+         auto scale_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(scaleVec.size()));
+         auto idx_h = alpaka::allocBuf<std::int64_t, Idx>(host, Ext1D::all(idx.size()));
+         std::copy(table.begin(), table.end(), alpaka::getPtrNative(table_h));
+         std::copy(scaleVec.begin(), scaleVec.end(), alpaka::getPtrNative(scale_h));
+         std::copy(idx.begin(), idx.end(), alpaka::getPtrNative(idx_h));
+         alpaka::memcpy(queue, table_d, table_h);
+         alpaka::memcpy(queue, scale_d, scale_h);
+         alpaka::memcpy(queue, idx_d, idx_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedGatherInvocation params{};
+         params.outer = 1; params.axisLength = V; params.inner = D; params.indexCount = idx.size();
+         params.perChannel = true; params.quantAxisStride = D; params.quantAxisLength = V;
+         params.tableCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.indicesInt64 = true;
+
+         SOFIE::QuantizedGather_Call(alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(out_d), alpaka::getPtrNative(table_d),
+            alpaka::getPtrNative(idx_d), alpaka::getPtrNative(scale_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto out_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, out_h, out_d);
+         alpaka::wait(queue);
+         const float *result = alpaka::getPtrNative(out_h);
+         for (Idx i = 0; i < expected.size(); ++i)
+            EXPECT_FLOAT_EQ(result[i], expected[i]);
+   }
+}
+
+TEST(QuantizationMetadata, Gather)
+{
+   const std::vector<std::size_t> tableShape{6, 4};
+   const std::vector<std::size_t> indicesShape{3};
+
+   auto addInt8Table = [](SOFIE::RModel &model, const std::string &name,
+                          const std::vector<std::size_t> &shape) {
+      const auto count = SOFIE::ConvertShapeToLength(shape);
+      model.AddInitializedTensor(
+         name, SOFIE::ETensorType::INT8, shape,
+         std::shared_ptr<void>(new std::int8_t[count]{}, std::default_delete<std::int8_t[]>()));
+   };
+   auto addFloatScalar = [](SOFIE::RModel &model, const std::string &name, float value) {
+      model.AddInitializedTensor(
+         name, SOFIE::ETensorType::FLOAT, std::vector<std::size_t>{},
+         std::shared_ptr<void>(new float[1]{value}, std::default_delete<float[]>()));
+   };
+
+   enum class Quant { PerTensor, PerChannelSymmetric, PerChannelAsymmetric };
+
+   // Q/DQ weight-only Gather: an INT8 constant table -> DequantizeLinear ->
+   // float table -> Gather(table, int64 indices) -> output. Per-channel uses a
+   // per-row scale/zero-point vector along axis 0 (the gathered axis).
+   auto buildQDQGather = [&](const std::string &name, Quant quant) {
+      SOFIE::RModel model(name);
+      addInt8Table(model, "table_i8", tableShape);
+      model.AddInputTensorInfo("indices", SOFIE::ETensorType::INT64, indicesShape);
+      const bool perChannel = quant != Quant::PerTensor;
+      if (perChannel) {
+         const auto rows = tableShape.front();
+         model.AddInitializedTensor(
+            "scale", SOFIE::ETensorType::FLOAT, std::vector<std::size_t>{rows},
+            std::shared_ptr<void>(new float[rows], std::default_delete<float[]>()));
+         std::fill_n(static_cast<float *>(model.GetInitializedTensorData("scale").get()), rows, 0.05f);
+         auto zeros = std::shared_ptr<void>(new std::int8_t[rows]{}, std::default_delete<std::int8_t[]>());
+         if (quant == Quant::PerChannelAsymmetric)
+            static_cast<std::int8_t *>(zeros.get())[0] = 4; // one non-zero row -> asymmetric
+         model.AddInitializedTensor("zero_point_int8", SOFIE::ETensorType::INT8,
+                                    std::vector<std::size_t>{rows}, std::move(zeros));
+      } else {
+         addFloatScalar(model, "scale", 0.05f);
+         model.AddInitializedTensor(
+            "zero_point_int8", SOFIE::ETensorType::INT8, std::vector<std::size_t>{},
+            std::shared_ptr<void>(new std::int8_t[1]{}, std::default_delete<std::int8_t[]>()));
+      }
+      const int axis = perChannel ? 0 : -1;
+      AddNamedOperator<SOFIE::ROperator_ONNXDequantizeLinear>(
+         model, "dq_table", "table_i8", "scale", "zero_point_int8", "table_f",
+         SOFIE::ETensorType::INT8, axis);
+      AddNamedOperator<SOFIE::ROperator_Gather>(
+         model, "gather", int64_t{0}, "table_f", "indices", "gather_out");
+      model.Initialize();
+      return model;
+   };
+
+   {
+      SCOPED_TRACE("per-tensor weight-only Gather is recognized and externalizes the table");
+         auto model = buildQDQGather("qdq_gather", Quant::PerTensor);
+         const auto &state = model.GetQuantizationState();
+         ASSERT_EQ(SOFIE::CountQuantizedRegions<SOFIE::QuantizedGatherRegion>(state), 1U);
+         const auto *region = SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedGatherRegion>(state);
+         ASSERT_NE(region, nullptr);
+         EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
+         EXPECT_EQ(region->axis, 0);
+         EXPECT_EQ(region->tableSourceTensor, "table_i8");
+         const auto *plan = SOFIE::FindQuantizedLoweringPlan(
+            state, region->gatherOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+         ASSERT_NE(plan, nullptr) << region->reason;
+         EXPECT_EQ(plan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         EXPECT_EQ(plan->capabilityTag, "alpaka_int8_gather");
+         EXPECT_TRUE(plan->suppressesGraphOperators);
+         EXPECT_EQ(plan->weightStorageTensor, "table_i8");
+   }
+   {
+      SCOPED_TRACE("symmetric per-gathered-axis quantization is recognized and protects the scale");
+         auto model = buildQDQGather("qdq_gather_perchannel", Quant::PerChannelSymmetric);
+         const auto &state = model.GetQuantizationState();
+         const auto *region = SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedGatherRegion>(state);
+         ASSERT_NE(region, nullptr);
+         EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized) << region->reason;
+         const auto *plan = SOFIE::FindQuantizedLoweringPlan(
+            state, region->gatherOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+         ASSERT_NE(plan, nullptr);
+         EXPECT_EQ(plan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         EXPECT_EQ(plan->weightScaleMode, SOFIE::EQuantizedParameterMode::PerOutputChannel);
+         EXPECT_EQ(plan->weightScaleTensor, "scale");
+   }
+   {
+      SCOPED_TRACE("asymmetric per-channel quantization is rejected");
+         auto model = buildQDQGather("qdq_gather_asym", Quant::PerChannelAsymmetric);
+         const auto &state = model.GetQuantizationState();
+         const auto *region = SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedGatherRegion>(state);
+         ASSERT_NE(region, nullptr);
+         EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticUnsupported);
+         EXPECT_NE(region->reason.find("symmetric"), std::string::npos) << region->reason;
+   }
+}

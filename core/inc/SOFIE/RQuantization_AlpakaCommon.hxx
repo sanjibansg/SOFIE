@@ -320,6 +320,34 @@ struct QuantizedElementwiseInvocation {
    bool hasRelu = false;
 };
 
+// Provider-neutral descriptor for a weight-only quantized/low-precision Gather.
+// Any ONNX Gather (arbitrary axis, index rank, negative indices) collapses to
+// three ranges: outer (table dims before axis), the gathered axis of length
+// axisLength, and inner (table dims after axis); the flattened index tensor has
+// indexCount entries. Output element (o, p, i) reads table[(o*axisLength +
+// idx[p]) * inner + i] and dequantizes it. Indices are integral (int32/int64).
+struct QuantizedGatherInvocation {
+   std::size_t outer = 1;
+   std::size_t axisLength = 0;
+   std::size_t inner = 1;
+   std::size_t indexCount = 0;
+
+   // Per-tensor scale/zero point when perChannel is false. When perChannel is
+   // true the scale/zeroPoint device vectors are indexed by the table's
+   // quantization axis: the channel of the dequantized element is
+   // (dataFlatIndex / quantAxisStride) % quantAxisLength, which resolves the axis
+   // coordinate whether the quant axis lies before, at, or after the gather axis.
+   double scale = 1.0;
+   std::int32_t zeroPoint = 0;
+   bool perChannel = false;
+   std::size_t quantAxisStride = 1;
+   std::size_t quantAxisLength = 1;
+
+   EQuantizedInputCarrier tableCarrier = EQuantizedInputCarrier::Int8;
+   bool lowPrecisionFP8 = false;
+   bool indicesInt64 = true;
+};
+
 
 // Provider-local legacy names resolve to the same invocation contracts.
 using QuantizedGemmCudaLtFP8Params = QuantizedFP8DenseLinearInvocation;

@@ -30,6 +30,7 @@ set(sources_headers
    SOFIE/ROperator_Gemm.hxx
    SOFIE/ROperator_QuantizedConv.hxx
    SOFIE/ROperator_QuantizedElementwise.hxx
+   SOFIE/ROperator_QuantizedGather.hxx
    SOFIE/ROperator_QuantizedGemm.hxx
    SOFIE/ROperator_QuantizedMatMul.hxx
    SOFIE/ROperator_QuantizedMatrix.hxx
@@ -41,6 +42,7 @@ set(sources_headers
    SOFIE/RQuantization_AlpakaDenseLinear.hxx
    SOFIE/RQuantization_AlpakaConvolution.hxx
    SOFIE/RQuantization_AlpakaElementwise.hxx
+   SOFIE/RQuantization_AlpakaGather.hxx
    SOFIE/RQuantization.hxx
    SOFIE/RQuantization_Analysis.hxx
    SOFIE/RQuantization_Convolution.hxx
@@ -48,6 +50,7 @@ set(sources_headers
    SOFIE/RQuantization_DenseLinear.hxx
    SOFIE/RQuantization_DenseLinearTypes.hxx
    SOFIE/RQuantization_Elementwise.hxx
+   SOFIE/RQuantization_Gather.hxx
    SOFIE/RQuantization_Lowering.hxx
    SOFIE/RQuantization_Parameters.hxx
    SOFIE/RQuantization_Storage.hxx
@@ -111,6 +114,7 @@ set(sources_cxx
     src/RQuantization_ConvolutionLowering.cxx
     src/RQuantization_DenseLinear.cxx
     src/RQuantization_Elementwise.cxx
+    src/RQuantization_Gather.cxx
     src/RQuantization_DenseLinearPass.cxx
     src/RQuantization_Parameters.cxx
     src/RQuantization_Storage.cxx
