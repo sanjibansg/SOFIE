@@ -99,25 +99,16 @@ QuantizedLoweringPlan MakeUnsupportedConvPlan(
    const QuantizedConvRegion &region, EQuantizedBackend backend,
    std::string reason, bool semanticRecognized)
 {
-   QuantizedLoweringPlan plan;
-   plan.backend = backend;
-   plan.status = semanticRecognized ? EQuantizedLoweringStatus::BackendUnsupported
-                                    : EQuantizedLoweringStatus::SemanticUnsupported;
-   plan.reason = std::move(reason);
-   plan.inputStorage = semanticRecognized ? EQuantizedStorageType::MetadataOnly
-                                          : EQuantizedStorageType::UNDEFINED;
-   plan.weightStorage = plan.inputStorage;
+   auto plan = MakeUnsupportedQuantizedPlan(backend, std::move(reason), semanticRecognized);
+   // Conv mirrors the input carrier onto bias only when a bias exists, and
+   // deliberately leaves outputMode unset (unlike the dense-linear families).
    plan.biasStorage = region.biasSourceTensor.empty()
                          ? EQuantizedStorageType::UNDEFINED : plan.inputStorage;
-   plan.outputStorage = plan.inputStorage;
    plan.computeProfile = semanticRecognized ? EQuantizedComputeProfile::GenericRecognized
                                             : EQuantizedComputeProfile::UNDEFINED;
    plan.capabilityTag = semanticRecognized ? "conv_recognized_backend_unsupported"
                                            : "conv_semantic_unsupported";
    plan.consumedOperatorIndices = QuantizedRegionConsumedOperatorIndices(region);
-   plan.preservesQuantizationSemantics = semanticRecognized;
-   plan.isMetadataOnly = semanticRecognized;
-   plan.suppressesGraphOperators = false;
    return plan;
 }
 

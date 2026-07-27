@@ -267,10 +267,16 @@ inline const std::string &QuantizedRegionOutputTensor(const QuantizedElementwise
 inline const std::string &QuantizedRegionWeightSourceTensor(const QuantizedGemmRegion &region) { return region.weightSourceTensor; }
 inline const std::string &QuantizedRegionWeightSourceTensor(const QuantizedMatMulRegion &region) { return region.weightSourceTensor; }
 inline const std::string &QuantizedRegionWeightSourceTensor(const QuantizedConvRegion &region) { return region.weightSourceTensor; }
-// The constant operand (if any) is canonicalized into the B slot, so it reuses
-// the shared weight-storage/pruning path; both-activation regions expose an
-// activation name here, which is harmless because it is never an initializer.
-inline const std::string &QuantizedRegionWeightSourceTensor(const QuantizedElementwiseRegion &region) { return region.operandBSourceTensor; }
+
+// Neutral accessor for the persistent operand the shared storage/pruning path
+// materializes and protects: the weight for dense-linear/Conv, and the
+// (canonicalized) constant operand for elementwise. Both-activation elementwise
+// regions expose an activation name here, harmless because it is never an
+// initializer. The shared model pass speaks in these terms rather than "weight".
+inline const std::string &QuantizedRegionSecondaryStorageTensor(const QuantizedGemmRegion &region) { return region.weightSourceTensor; }
+inline const std::string &QuantizedRegionSecondaryStorageTensor(const QuantizedMatMulRegion &region) { return region.weightSourceTensor; }
+inline const std::string &QuantizedRegionSecondaryStorageTensor(const QuantizedConvRegion &region) { return region.weightSourceTensor; }
+inline const std::string &QuantizedRegionSecondaryStorageTensor(const QuantizedElementwiseRegion &region) { return region.operandBSourceTensor; }
 
 inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedGemmRegion &region) { return region.biasSourceTensor; }
 inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedMatMulRegion &region) { return region.epilogue.biasSourceTensor; }
@@ -376,10 +382,10 @@ inline const std::string &QuantizedRegionOutputTensor(const QuantizedRegion &reg
    }, region);
 }
 
-inline const std::string &QuantizedRegionWeightSourceTensor(const QuantizedRegion &region)
+inline const std::string &QuantizedRegionSecondaryStorageTensor(const QuantizedRegion &region)
 {
    return std::visit([](const auto &typed) -> const std::string & {
-      return QuantizedRegionWeightSourceTensor(typed);
+      return QuantizedRegionSecondaryStorageTensor(typed);
    }, region);
 }
 

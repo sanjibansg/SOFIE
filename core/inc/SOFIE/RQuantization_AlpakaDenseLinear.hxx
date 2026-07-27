@@ -2,6 +2,7 @@
 #define SOFIE_RQUANTIZATION_ALPAKA_DENSE_LINEAR
 
 #include "SOFIE/RQuantization_AlpakaCommon.hxx"
+#include "SOFIE/RQuantization_AlpakaPrimitives.hxx"
 
 #include <algorithm>
 #include <cstddef>
@@ -256,32 +257,15 @@ inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &, QuantizedGemmCu
 
 namespace INTERNAL {
 
-inline void CheckCudaStatus(cudaError_t status, const char *where)
-{
-   if (status != cudaSuccess) {
-      throw std::runtime_error(std::string("SOFIE CUDA quantized GEMM failure in ") + where + ": " +
-                               cudaGetErrorString(status));
-   }
-}
-
+// CheckCudaStatus, QuantizedCudaClamp, and QuantizedCudaQuantizeClamp are shared
+// primitives in RQuantization_AlpakaPrimitives.hxx. CheckCublasLtStatus stays
+// here because it is cuBLASLt-specific.
 inline void CheckCublasLtStatus(cublasStatus_t status, const char *where)
 {
    if (status != CUBLAS_STATUS_SUCCESS) {
       throw std::runtime_error(std::string("SOFIE cuBLASLt quantized GEMM failure in ") + where +
                                ": status " + std::to_string(static_cast<int>(status)));
    }
-}
-
-__device__ inline std::int32_t QuantizedCudaClamp(std::int32_t value, std::int32_t qmin, std::int32_t qmax)
-{
-   return value < qmin ? qmin : (value > qmax ? qmax : value);
-}
-
-__device__ inline std::int32_t QuantizedCudaQuantizeClamp(double value, double scale, std::int32_t zero,
-                                                          std::int32_t qmin, std::int32_t qmax)
-{
-   const auto quantized = static_cast<std::int32_t>(nearbyint((value / scale) + static_cast<double>(zero)));
-   return QuantizedCudaClamp(quantized, qmin, qmax);
 }
 
 __global__ void QuantizedGemmCudaQuantizeInputKernel(const float *input, std::int8_t *inputQuantized,

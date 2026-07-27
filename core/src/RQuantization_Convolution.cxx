@@ -427,6 +427,8 @@ void DiscoverQuantizedConvRegions(QuantizationPassContext &context)
                    << stored.reason << std::endl;
       }
    }
+
+   BuildQuantizedConvLoweringPlans(context);
 }
 
 } // namespace SOFIE

@@ -527,6 +527,32 @@ struct QuantizedLoweringPlan {
    bool suppressesGraphOperators = false;
 };
 
+// Shared skeleton for a family's rejection plan: it sets only the fields that
+// are identical across every family (status/reason from the preserve flag, the
+// MetadataOnly-or-UNDEFINED storage triple, and the metadata/suppression
+// flags). Callers set the family-specific bias/accumulator storage, output
+// mode, compute profile, capability tag, consumed operators, and carriers so
+// this stays a byte-preserving factorization of the previous per-family code.
+inline QuantizedLoweringPlan MakeUnsupportedQuantizedPlan(EQuantizedBackend backend,
+                                                          std::string reason,
+                                                          bool preservesSemantics)
+{
+   QuantizedLoweringPlan plan;
+   plan.backend = backend;
+   plan.status = preservesSemantics ? EQuantizedLoweringStatus::BackendUnsupported
+                                    : EQuantizedLoweringStatus::SemanticUnsupported;
+   plan.reason = std::move(reason);
+   const auto storage = preservesSemantics ? EQuantizedStorageType::MetadataOnly
+                                           : EQuantizedStorageType::UNDEFINED;
+   plan.inputStorage = storage;
+   plan.weightStorage = storage;
+   plan.outputStorage = storage;
+   plan.preservesQuantizationSemantics = preservesSemantics;
+   plan.isMetadataOnly = preservesSemantics;
+   plan.suppressesGraphOperators = false;
+   return plan;
+}
+
 inline QuantizedMatrixShapePolicy &EnsureQuantizedMatrixShapePolicy(QuantizedLoweringPlan &plan)
 {
    if (!plan.matrixShapePolicy)

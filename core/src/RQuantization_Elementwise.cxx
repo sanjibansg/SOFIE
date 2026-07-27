@@ -322,15 +322,10 @@ void DiscoverQuantizedElementwiseRegions(QuantizationPassContext &context)
          region.reason = reasons.empty() ? "elementwise region is metadata-recognized but unsupported"
                                          : JoinQuantizationReasons(reasons);
          auto &plans = state.loweringPlans[opIndex];
-         QuantizedLoweringPlan unsupported;
-         unsupported.backend = EQuantizedBackend::ALPAKA;
-         unsupported.status = EQuantizedLoweringStatus::SemanticUnsupported;
-         unsupported.reason = region.reason;
-         unsupported.isMetadataOnly = true;
-         QuantizedLoweringPlan unsupportedCpu = unsupported;
-         unsupportedCpu.backend = EQuantizedBackend::CPU;
-         plans[EQuantizedBackend::CPU] = std::move(unsupportedCpu);
-         plans[EQuantizedBackend::ALPAKA] = std::move(unsupported);
+         plans[EQuantizedBackend::CPU] =
+            MakeUnsupportedQuantizedPlan(EQuantizedBackend::CPU, region.reason, false);
+         plans[EQuantizedBackend::ALPAKA] =
+            MakeUnsupportedQuantizedPlan(EQuantizedBackend::ALPAKA, region.reason, false);
          StoreQuantizedRegion(state, std::move(region));
          if (verbose > 0)
             std::cout << "SOFIE quantized elementwise candidate at operator " << opIndex

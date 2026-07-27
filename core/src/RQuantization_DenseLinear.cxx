@@ -739,23 +739,11 @@ QuantizedLoweringPlan MakeUnsupportedQuantizedMatMulPlan(const QuantizedMatMulRe
                                                          std::string reason,
                                                          bool preservesSemantics)
 {
-   QuantizedLoweringPlan plan;
-   plan.backend = backend;
-   plan.status = preservesSemantics ? EQuantizedLoweringStatus::BackendUnsupported
-                                    : EQuantizedLoweringStatus::SemanticUnsupported;
-   plan.reason = std::move(reason);
-   plan.inputStorage = preservesSemantics ? EQuantizedStorageType::MetadataOnly : EQuantizedStorageType::UNDEFINED;
-   plan.weightStorage = preservesSemantics ? EQuantizedStorageType::MetadataOnly : EQuantizedStorageType::UNDEFINED;
-   plan.biasStorage = EQuantizedStorageType::UNDEFINED;
-   plan.accumulatorStorage = EQuantizedStorageType::UNDEFINED;
-   plan.outputStorage = preservesSemantics ? EQuantizedStorageType::MetadataOnly : EQuantizedStorageType::UNDEFINED;
+   auto plan = MakeUnsupportedQuantizedPlan(backend, std::move(reason), preservesSemantics);
    plan.outputMode = preservesSemantics ? EQuantizedOutputMode::ExactFakeQuantFloat : EQuantizedOutputMode::UNDEFINED;
    plan.computeProfile = preservesSemantics ? EQuantizedComputeProfile::GenericRecognized : EQuantizedComputeProfile::UNDEFINED;
    plan.capabilityTag = preservesSemantics ? "matmul_recognized_backend_unsupported" : "matmul_semantic_unsupported";
    plan.consumedOperatorIndices = { region.matmulOpIndex };
-   plan.preservesQuantizationSemantics = preservesSemantics;
-   plan.isMetadataOnly = preservesSemantics;
-   plan.suppressesGraphOperators = false;
    if (preservesSemantics) {
       SetAffineLowPrecisionCarriers(plan, region.inputQuant, region.weightQuant, region.outputQuant);
    }
@@ -768,20 +756,15 @@ QuantizedLoweringPlan MakeUnsupportedLowPrecisionDenseLinearPlan(
    ELowPrecisionCarrier outputCarrier, ELowPrecisionAccumulation accumulation,
    EQuantizedComputeProfile profile, std::string capabilityTag)
 {
-   QuantizedLoweringPlan plan;
-   plan.backend = backend;
-   plan.status = preservesSemantics ? EQuantizedLoweringStatus::BackendUnsupported
-                                    : EQuantizedLoweringStatus::SemanticUnsupported;
-   plan.reason = std::move(reason);
-   plan.inputStorage = preservesSemantics ? QuantizedStorageTypeForLowPrecisionCarrier(inputCarrier)
-                                          : EQuantizedStorageType::UNDEFINED;
-   plan.weightStorage = preservesSemantics ? QuantizedStorageTypeForLowPrecisionCarrier(weightCarrier)
-                                           : EQuantizedStorageType::UNDEFINED;
-   plan.biasStorage = EQuantizedStorageType::UNDEFINED;
-   plan.accumulatorStorage = preservesSemantics ? QuantizedStorageTypeForLowPrecisionCarrier(ELowPrecisionCarrier::Float32)
-                                                : EQuantizedStorageType::UNDEFINED;
-   plan.outputStorage = preservesSemantics ? QuantizedStorageTypeForLowPrecisionCarrier(outputCarrier)
-                                           : EQuantizedStorageType::UNDEFINED;
+   auto plan = MakeUnsupportedQuantizedPlan(backend, std::move(reason), preservesSemantics);
+   // Low-precision rejections keep their carrier-specific storage rather than the
+   // generic MetadataOnly triple so downstream diagnostics see the intended carriers.
+   if (preservesSemantics) {
+      plan.inputStorage = QuantizedStorageTypeForLowPrecisionCarrier(inputCarrier);
+      plan.weightStorage = QuantizedStorageTypeForLowPrecisionCarrier(weightCarrier);
+      plan.accumulatorStorage = QuantizedStorageTypeForLowPrecisionCarrier(ELowPrecisionCarrier::Float32);
+      plan.outputStorage = QuantizedStorageTypeForLowPrecisionCarrier(outputCarrier);
+   }
    plan.outputMode = preservesSemantics ? EQuantizedOutputMode::ExactFakeQuantFloat : EQuantizedOutputMode::UNDEFINED;
    plan.computeProfile = preservesSemantics ? profile : EQuantizedComputeProfile::UNDEFINED;
    plan.capabilityTag = preservesSemantics ? std::move(capabilityTag) : "low_precision_dense_linear_semantic_unsupported";
@@ -789,9 +772,6 @@ QuantizedLoweringPlan MakeUnsupportedLowPrecisionDenseLinearPlan(
    plan.weightLowPrecisionCarrier = weightCarrier;
    plan.outputLowPrecisionCarrier = outputCarrier;
    plan.lowPrecisionAccumulation = accumulation;
-   plan.preservesQuantizationSemantics = preservesSemantics;
-   plan.isMetadataOnly = preservesSemantics;
-   plan.suppressesGraphOperators = false;
    return plan;
 }
 
@@ -913,22 +893,11 @@ QuantizedLoweringPlan MakeCPUPackedWeightBaselinePlan(const QuantizedGemmRegion 
 
 QuantizedLoweringPlan MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend backend, std::string reason, bool preservesSemantics)
 {
-   QuantizedLoweringPlan plan;
-   plan.backend = backend;
-   plan.status = preservesSemantics ? EQuantizedLoweringStatus::BackendUnsupported
-                                    : EQuantizedLoweringStatus::SemanticUnsupported;
-   plan.reason = std::move(reason);
-   plan.inputStorage = preservesSemantics ? EQuantizedStorageType::MetadataOnly : EQuantizedStorageType::UNDEFINED;
-   plan.weightStorage = preservesSemantics ? EQuantizedStorageType::MetadataOnly : EQuantizedStorageType::UNDEFINED;
+   auto plan = MakeUnsupportedQuantizedPlan(backend, std::move(reason), preservesSemantics);
    plan.biasStorage = preservesSemantics ? EQuantizedStorageType::MetadataOnly : EQuantizedStorageType::UNDEFINED;
-   plan.accumulatorStorage = EQuantizedStorageType::UNDEFINED;
-   plan.outputStorage = preservesSemantics ? EQuantizedStorageType::MetadataOnly : EQuantizedStorageType::UNDEFINED;
    plan.outputMode = preservesSemantics ? EQuantizedOutputMode::ExactFakeQuantFloat : EQuantizedOutputMode::UNDEFINED;
    plan.computeProfile = preservesSemantics ? EQuantizedComputeProfile::GenericRecognized : EQuantizedComputeProfile::UNDEFINED;
    plan.capabilityTag = preservesSemantics ? "recognized_backend_unsupported" : "semantic_unsupported";
-   plan.preservesQuantizationSemantics = preservesSemantics;
-   plan.isMetadataOnly = preservesSemantics;
-   plan.suppressesGraphOperators = false;
    return plan;
 }
 

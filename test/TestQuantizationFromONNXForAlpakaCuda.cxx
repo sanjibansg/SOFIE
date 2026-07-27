@@ -307,7 +307,7 @@ TEST(QuantizationContracts, Core)
          const auto &storedGemm = state.regions.at(11);
          EXPECT_EQ(SOFIE::QuantizedRegionAnchorIndex(storedGemm), 11U);
          EXPECT_EQ(SOFIE::QuantizedRegionInputSourceTensor(storedGemm), "gemm_input");
-         EXPECT_EQ(SOFIE::QuantizedRegionWeightSourceTensor(storedGemm), "gemm_weight");
+         EXPECT_EQ(SOFIE::QuantizedRegionSecondaryStorageTensor(storedGemm), "gemm_weight");
          EXPECT_EQ(SOFIE::QuantizedRegionOutputTensor(storedGemm), "gemm_output");
          EXPECT_EQ(SOFIE::QuantizedRegionStatus(storedGemm),
                    SOFIE::EQuantizedLoweringStatus::SemanticRecognized);

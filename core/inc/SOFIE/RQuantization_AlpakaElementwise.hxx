@@ -1,10 +1,10 @@
 #ifndef SOFIE_RQUANTIZATION_ALPAKA_ELEMENTWISE
 #define SOFIE_RQUANTIZATION_ALPAKA_ELEMENTWISE
 
-// Pulls in the shared INTERNAL device helpers (QuantizedCudaQuantizeClamp,
-// CheckCudaStatus) alongside the common invocation contracts, plus the shared
-// row-major multidirectional broadcast primitive.
-#include "SOFIE/RQuantization_AlpakaDenseLinear.hxx"
+// Depends only on the shared utility layers: the requantize-clamp and status
+// primitives, and the row-major multidirectional broadcast primitive. It no
+// longer pulls in the dense-linear family header just for those helpers.
+#include "SOFIE/RQuantization_AlpakaPrimitives.hxx"
 #include "SOFIE/RQuantization_AlpakaBroadcast.hxx"
 
 #include <cstddef>

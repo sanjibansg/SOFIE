@@ -36,6 +36,7 @@ set(sources_headers
    SOFIE/SOFIE_Quantized.hxx
    SOFIE/SOFIE_QuantizedAlpaka.hxx
    SOFIE/RQuantization_AlpakaCommon.hxx
+   SOFIE/RQuantization_AlpakaPrimitives.hxx
    SOFIE/RQuantization_AlpakaBroadcast.hxx
    SOFIE/RQuantization_AlpakaDenseLinear.hxx
    SOFIE/RQuantization_AlpakaConvolution.hxx

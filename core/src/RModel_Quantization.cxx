@@ -285,9 +285,10 @@ void RModel::AnalyzeQuantizedRegions()
 
    const auto graph = BuildQuantizationGraphIndex(fOperators);
    QuantizationPassContext context{*this, fOperators, fQuantizationState, graph, fVerbose};
+   // Each family exposes one Discover* entry that yields both regions and their
+   // lowering plans; the model pass no longer calls a family-specific plan step.
    DiscoverQuantizedDenseLinearRegions(context);
    DiscoverQuantizedConvRegions(context);
-   BuildQuantizedConvLoweringPlans(context);
    DiscoverQuantizedElementwiseRegions(context);
 }
 
@@ -305,7 +306,7 @@ void RModel::PrepareQuantizedTensorStorage(EQuantizedBackend backend)
    };
    for (const auto &[index, region] : fQuantizationState.regions) {
       (void)index;
-      restoreSource(QuantizedRegionWeightSourceTensor(region));
+      restoreSource(QuantizedRegionSecondaryStorageTensor(region));
    }
 
    auto installStorage = [this](MaterializedQuantizedTensor materialized) {
@@ -354,7 +355,7 @@ void RModel::PrepareQuantizedTensorStorage(EQuantizedBackend backend)
       if (!planIt->second.weightZeroPointTensor.empty())
          protectedTensors.insert(planIt->second.weightZeroPointTensor);
       const auto &region = fQuantizationState.regions.at(opIndex);
-      const auto &weightSource = QuantizedRegionWeightSourceTensor(region);
+      const auto &weightSource = QuantizedRegionSecondaryStorageTensor(region);
       pruneCandidates.insert(weightSource);
       if (QuantizedPlanUsesFP8DenseLinear(planIt->second))
          protectedTensors.insert(weightSource);
