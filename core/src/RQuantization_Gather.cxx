@@ -53,6 +53,65 @@ bool PerChannelIsSymmetric(RModel &model, const QuantizationInfo &info)
    }
 }
 
+// Reads a per-channel symmetric scale vector as doubles (the initializer is
+// stored as float or double), used to quantize a float table into its carrier.
+std::vector<double> ReadGatherChannelScales(RModel &model, const QuantizationInfo &info)
+{
+   if (info.scaleTensor.empty() || !model.IsInitializedTensor(info.scaleTensor))
+      return {};
+   if (model.GetTensorType(info.scaleTensor) == ETensorType::DOUBLE) {
+      const auto values = model.GetTensorData<double>(info.scaleTensor);
+      return std::vector<double>(values.begin(), values.end());
+   }
+   const auto values = model.GetTensorData<float>(info.scaleTensor);
+   return std::vector<double>(values.begin(), values.end());
+}
+
+// Quantizes a float gather table into its int8/uint8 carrier with a plain
+// row-major layout (no transform). Per-tensor uses the scalar affine contract;
+// per-channel resolves each element's scale from the quantization axis stride
+// (channel = (flatIndex / inner) % axisLength) and is symmetric (zero point 0).
+MaterializedQuantizedTensor MaterializeQuantizedGatherTable(
+   const QuantizedGatherRegion &region, const QuantizedLoweringPlan &plan,
+   EQuantizedBackend backend, const float *sourceData,
+   const std::vector<std::size_t> &shape, const std::vector<double> &channelScales)
+{
+   const auto &tableQuant = *region.tableQuant;
+   const auto count = QuantizedStorageElementCount(shape);
+   const bool perChannel = tableQuant.granularity == EQuantizationGranularity::PerChannel;
+   std::size_t inner = 1;
+   std::size_t axisLength = 1;
+   if (perChannel) {
+      const auto axis = static_cast<std::size_t>(tableQuant.axis);
+      axisLength = shape[axis];
+      for (std::size_t d = axis + 1; d < shape.size(); ++d)
+         inner *= shape[d];
+   }
+
+   MaterializedQuantizedTensor result;
+   result.bytes.resize(count);
+   for (std::size_t i = 0; i < count; ++i) {
+      QuantizationInfo elementInfo = tableQuant;
+      if (perChannel) {
+         const std::size_t channel = (i / inner) % axisLength;
+         elementInfo.scale = channelScales.at(channel);
+         elementInfo.zeroPoint = 0; // per-channel symmetric
+         elementInfo.granularity = EQuantizationGranularity::PerTensor;
+      }
+      const auto quantized = QuantizeScalarToIntegerGrid(sourceData[i], elementInfo);
+      result.bytes[i] = tableQuant.isSigned
+                           ? static_cast<std::uint8_t>(static_cast<std::int8_t>(quantized))
+                           : static_cast<std::uint8_t>(quantized);
+   }
+
+   result.storage = MakeQuantizedTensorStorage(region.tableTensor, region.tableSourceTensor,
+                                               plan.weightStorageTensor, tableQuant,
+                                               EQuantizedLayout::Plain, shape, backend);
+   result.tensorType = TensorTypeForQuantizedStorage(result.storage.storageType);
+   ValidateMaterializedQuantizedTensor(result);
+   return result;
+}
+
 } // namespace
 
 void DiscoverQuantizedGatherRegions(QuantizationPassContext &context)
@@ -178,10 +237,16 @@ void DiscoverQuantizedGatherRegions(QuantizationPassContext &context)
       alpaka.suppressesGraphOperators = true;
       alpaka.isMetadataOnly = false;
       alpaka.outputStorage = EQuantizedStorageType::FloatCarrier;
-      // The constant table reuses the shared storage/externalization path.
-      alpaka.weightStorageTensor = region.tableSourceTensor;
       alpaka.weightLayout = EQuantizedLayout::Plain;
+      // The table is materialized into a dedicated weight-storage tensor so the
+      // lowered kernel reads it in its real int8/uint8/fp8 carrier and the tensor
+      // is externalized to the binary weight file. A float ONNX source (QONNX
+      // fake-quant) or an fp8 source that would otherwise be inlined both need a
+      // distinct storage tensor; a source already in the affine carrier is used
+      // in place (metadata-only registration).
+      const std::string dedicatedStorage = region.tableSourceTensor + "_quantized_gather_storage";
       if (fp8) {
+         alpaka.weightStorageTensor = dedicatedStorage;
          alpaka.inputStorage = EQuantizedStorageType::FP8E4M3;
          alpaka.weightStorage = EQuantizedStorageType::FP8E4M3;
          alpaka.inputLowPrecisionCarrier = ELowPrecisionCarrier::FP8E4M3;
@@ -192,6 +257,12 @@ void DiscoverQuantizedGatherRegions(QuantizationPassContext &context)
       } else {
          const auto storage = region.tableQuant->isSigned ? EQuantizedStorageType::Int8
                                                           : EQuantizedStorageType::UInt8;
+         // A float source (QONNX fake-quant) is quantized into the carrier; a
+         // source already stored as int8/uint8 is used in place.
+         const auto tableType = model.GetTensorType(region.tableSourceTensor);
+         const bool sourceInCarrier =
+            tableType == ETensorType::INT8 || tableType == ETensorType::UINT8;
+         alpaka.weightStorageTensor = sourceInCarrier ? region.tableSourceTensor : dedicatedStorage;
          alpaka.inputStorage = storage;
          alpaka.weightStorage = storage;
          alpaka.capabilityTag = "alpaka_int8_gather";
@@ -238,22 +309,42 @@ void MaterializeQuantizedGatherWeights(QuantizedStoragePassContext &context)
 
       const auto shape = model.GetTensorShape(region->tableSourceTensor);
       if (region->tableLowPrecision) {
-         context.registerLowPrecision(region->tableTensor, region->tableSourceTensor,
-                                      plan->weightLayout);
+         // Copy the fp8 table bytes into the dedicated weight-storage tensor so it
+         // is externalized to the binary weight file instead of inlined in source.
+         context.install(MaterializeLowPrecisionWeightBytes(
+            region->tableTensor, region->tableSourceTensor, plan->weightStorageTensor,
+            *region->tableLowPrecision, EQuantizedLayout::Plain, backend,
+            model.GetInitializedTensorData(region->tableSourceTensor).get(), shape));
       } else if (region->tableQuant) {
-         model.RegisterQuantizedTensorStorage(MakeQuantizedTensorStorage(
-            region->tableTensor, region->tableSourceTensor, region->tableSourceTensor,
-            *region->tableQuant, EQuantizedLayout::Plain, shape, backend));
+         if (plan->weightStorageTensor == region->tableSourceTensor) {
+            // Source already in the affine carrier: register storage metadata only.
+            model.RegisterQuantizedTensorStorage(MakeQuantizedTensorStorage(
+               region->tableTensor, region->tableSourceTensor, region->tableSourceTensor,
+               *region->tableQuant, EQuantizedLayout::Plain, shape, backend));
+         } else {
+            // Float source (QONNX fake-quant): quantize the table into its carrier.
+            std::vector<double> channelScales;
+            if (region->tableQuant->granularity == EQuantizationGranularity::PerChannel)
+               channelScales = ReadGatherChannelScales(model, *region->tableQuant);
+            context.install(MaterializeQuantizedGatherTable(
+               *region, *plan, backend,
+               static_cast<const float *>(
+                  model.GetInitializedTensorData(region->tableSourceTensor).get()),
+               shape, channelScales));
+         }
       }
    }
 }
 
 QuantizedGatherCodegenContext MakeQuantizedGatherCodegenContext(
-   RModel &model, const QuantizedGatherRegion &region)
+   RModel &model, const QuantizedGatherRegion &region, const QuantizedLoweringPlan &plan)
 {
    QuantizedGatherCodegenContext context;
-   context.tableSourceType = region.tableSourceTensor.empty()
-                                ? ETensorType::UNDEFINED : model.GetTensorType(region.tableSourceTensor);
+   // The codegen carrier comes from the resolved weight-storage tensor (int8/
+   // uint8/fp8), which the materialization step has by now installed, rather than
+   // from the ONNX source tensor (which may still be the pre-quantization float).
+   context.tableSourceType = plan.weightStorageTensor.empty()
+                                ? ETensorType::UNDEFINED : model.GetTensorType(plan.weightStorageTensor);
    context.indicesType = region.indicesTensor.empty()
                             ? ETensorType::UNDEFINED : model.GetTensorType(region.indicesTensor);
    return context;
@@ -265,7 +356,7 @@ std::unique_ptr<ROperator> MakeLoweredQuantizedOperator(
 {
    (void)source;
    return std::make_unique<ROperator_QuantizedGather>(
-      region, plan, MakeQuantizedGatherCodegenContext(model, region));
+      region, plan, MakeQuantizedGatherCodegenContext(model, region, plan));
 }
 
 } // namespace SOFIE

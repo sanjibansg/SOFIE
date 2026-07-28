@@ -303,6 +303,11 @@ struct QuantizedElementwiseInvocation {
    std::size_t inputStride[kQuantizedElementwiseMaxRank] = {};
    std::size_t operandBStride[kQuantizedElementwiseMaxRank] = {};
    std::size_t elements = 0;
+   // Derived at the call boundary: true when an operand shares the output shape
+   // on every axis (no broadcast), so its element offset is the linear index and
+   // the per-element mixed-radix offset computation can be skipped.
+   bool inputContiguous = false;
+   bool operandBContiguous = false;
 
    double inputScale = 1.0;
    double operandBScale = 1.0;

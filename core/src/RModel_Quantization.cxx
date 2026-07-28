@@ -424,8 +424,18 @@ void RModel::AddLoweredQuantizedOperators(EQuantizedBackend backend)
                                                              const std::string &inputSourceTensor,
                                                              const std::string &outputTensor,
                                                              std::unique_ptr<ROperator> lowered) {
-      if (QuantizedPlanExposesQuantizedInputCarrier(plan))
-         setKnownTensorType(inputSourceTensor, TensorTypeForQuantizedStorage(plan.inputStorage));
+      // Retype the input source to the quantized carrier only for a real-valued
+      // activation input. A weight-only family (Gather) exposes its carrier
+      // through the weight/table slot while its runtime input is an integer index
+      // tensor, which must keep its INT32/INT64 type rather than be reinterpreted
+      // as an int8/fp8 carrier.
+      if (QuantizedPlanExposesQuantizedInputCarrier(plan)) {
+         const auto currentInputType = GetTensorType(inputSourceTensor);
+         const bool isIndexInput = currentInputType == ETensorType::INT32 ||
+                                   currentInputType == ETensorType::INT64;
+         if (!isIndexInput)
+            setKnownTensorType(inputSourceTensor, TensorTypeForQuantizedStorage(plan.inputStorage));
+      }
       if (plan.outputLowPrecisionCarrier == ELowPrecisionCarrier::Float32)
          setKnownTensorType(outputTensor, ETensorType::FLOAT);
       if (QuantizedPlanExposesQuantizedOutputCarrier(plan))
@@ -474,7 +484,12 @@ void RModel::AddQuantizedGeneratedHeaders(EQuantizedBackend backend)
       if (backend == EQuantizedBackend::CPU && QuantizedPlanUsesPrequantizedWeights(plan) &&
           plan.weightLayout == EQuantizedLayout::PackedCPU)
          AddNeededCustomHeader("SOFIE/SOFIE_Quantized.hxx");
-      if (backend == EQuantizedBackend::ALPAKA && IsOptimizedQuantizedAlpakaPlainDevicePlan(plan)) {
+      // Any optimized ALPAKA plan emits a *_Call into the Alpaka quantized
+      // facade, so the facade header is required whether or not the plan carries
+      // a prequantized weight/table constant. Weightless plans (e.g. a
+      // two-activation elementwise Add/Mul) are optimized but do not satisfy the
+      // plain-device prequantized-weight predicate, so gate on optimization.
+      if (backend == EQuantizedBackend::ALPAKA && IsQuantizedLoweringOptimized(plan.status)) {
          AddNeededCustomHeader("SOFIE/SOFIE_QuantizedAlpaka.hxx");
       }
    }

@@ -26,7 +26,7 @@ struct QuantizedGatherCodegenContext {
 };
 
 QuantizedGatherCodegenContext MakeQuantizedGatherCodegenContext(
-   RModel &model, const QuantizedGatherRegion &region);
+   RModel &model, const QuantizedGatherRegion &region, const QuantizedLoweringPlan &plan);
 
 class ROperator_QuantizedGather final : public ROperator {
 private:
@@ -57,7 +57,10 @@ public:
    {
       fKind = OperatorKind::UNDEFINED;
       fName = "QuantizedGather";
-      fInputTensorNames = {fRegion.tableSourceTensor, fRegion.indicesTensor};
+      // The table is read from the resolved weight-storage tensor (its real
+      // int8/uint8/fp8 carrier), not the ONNX source (which may be the float
+      // pre-quantization tensor).
+      fInputTensorNames = {fPlan.weightStorageTensor, fRegion.indicesTensor};
       fOutputTensorNames = {fRegion.outputTensor};
    }
 
@@ -132,7 +135,7 @@ public:
           << (fContext.indicesType == ETensorType::INT64 ? "true" : "false") << ";\n";
       out << "      SOFIE::QuantizedGather_Call(alpaka::getNativeHandle(queue), "
           << "alpaka::getPtrNative(deviceBuf_" << fRegion.outputTensor << "), "
-          << "alpaka::getPtrNative(deviceBuf_" << fRegion.tableSourceTensor << "), "
+          << "alpaka::getPtrNative(deviceBuf_" << fPlan.weightStorageTensor << "), "
           << "alpaka::getPtrNative(deviceBuf_" << fRegion.indicesTensor << "), "
           << scaleVector << ", " << params << ");\n";
       out << "   }\n";

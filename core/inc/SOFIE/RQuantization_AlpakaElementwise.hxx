@@ -50,10 +50,14 @@ __global__ void QuantizedElementwiseAffineKernel(
    if (index >= params.elements)
       return;
 
-   const std::size_t aOffset = INTERNAL::QuantizedBroadcastOffset(
-      index, params.outputStride, params.outputExtent, params.inputStride, params.rank);
-   const std::size_t bOffset = INTERNAL::QuantizedBroadcastOffset(
-      index, params.outputStride, params.outputExtent, params.operandBStride, params.rank);
+   const std::size_t aOffset = params.inputContiguous
+      ? index
+      : INTERNAL::QuantizedBroadcastOffset(index, params.outputStride, params.outputExtent,
+                                           params.inputStride, params.rank);
+   const std::size_t bOffset = params.operandBContiguous
+      ? index
+      : INTERNAL::QuantizedBroadcastOffset(index, params.outputStride, params.outputExtent,
+                                           params.operandBStride, params.rank);
 
    const double a = QuantizedElementwiseDequant<CarrierT>(inputA[aOffset], params.inputScale, params.inputZeroPoint);
    const double b = QuantizedElementwiseDequant<CarrierT>(inputB[bOffset], params.operandBScale, params.operandBZeroPoint);
@@ -80,10 +84,14 @@ __global__ void QuantizedElementwiseFP8Kernel(
    if (index >= params.elements)
       return;
 
-   const std::size_t aOffset = INTERNAL::QuantizedBroadcastOffset(
-      index, params.outputStride, params.outputExtent, params.inputStride, params.rank);
-   const std::size_t bOffset = INTERNAL::QuantizedBroadcastOffset(
-      index, params.outputStride, params.outputExtent, params.operandBStride, params.rank);
+   const std::size_t aOffset = params.inputContiguous
+      ? index
+      : INTERNAL::QuantizedBroadcastOffset(index, params.outputStride, params.outputExtent,
+                                           params.inputStride, params.rank);
+   const std::size_t bOffset = params.operandBContiguous
+      ? index
+      : INTERNAL::QuantizedBroadcastOffset(index, params.outputStride, params.outputExtent,
+                                           params.operandBStride, params.rank);
 
    const float a = static_cast<float>(inputA[aOffset]);
    const float b = static_cast<float>(inputB[bOffset]);
@@ -139,6 +147,18 @@ inline void QuantizedElementwise_Call(QuantizedGemmCudaStream stream, void *outp
    INTERNAL::QuantizedFillBroadcastStrides(params.inputExtent, params.inputStride, params.rank);
    INTERNAL::QuantizedFillBroadcastStrides(params.operandBExtent, params.operandBStride, params.rank);
    params.elements = elements;
+   // An operand that matches the output extent on every axis never broadcasts,
+   // so its element offset is the linear index; flag it to skip the per-element
+   // mixed-radix offset (a chain of 64-bit div/mod that otherwise dominates this
+   // memory-bound kernel). Broadcasting operands keep the general path.
+   params.inputContiguous = true;
+   params.operandBContiguous = true;
+   for (int axis = 0; axis < params.rank; ++axis) {
+      if (params.inputExtent[axis] != params.outputExtent[axis])
+         params.inputContiguous = false;
+      if (params.operandBExtent[axis] != params.outputExtent[axis])
+         params.operandBContiguous = false;
+   }
    if (elements == 0)
       return;
 
