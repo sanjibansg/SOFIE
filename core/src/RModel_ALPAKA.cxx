@@ -21,81 +21,296 @@
 
 namespace SOFIE {
 
-void RModel::ComputeEltwiseFusionGroups() {
+void RModel::ComputeEltwiseFusionGroups()
+{
    fEltwiseFusionGroups.clear();
    fOpToFusionGroupIdx.clear();
-   fFusionIntermediateTensors.clear();
 
-   // Build tensor -> consumer op indices map
+   // Build tensor -> consumer operator indices.
    std::unordered_map<std::string, std::vector<size_t>> tensorConsumers;
-   for (size_t i = 0; i < fOperators.size(); i++) {
-      for (const auto& name : fOperators[i]->GetOpInputTensors())
-         tensorConsumers[std::string(name)].push_back(i);
+
+   for (size_t opIdx = 0; opIdx < fOperators.size(); ++opIdx) {
+      for (const auto &inputName : fOperators[opIdx]->GetOpInputTensors())
+         tensorConsumers[std::string(inputName)].push_back(opIdx);
    }
 
-   // Returns true if tensorName is safe to treat as a fusion intermediate:
-   // consumed by exactly one op AND not a model output.
-   auto isFuseSafe = [&](const std::string& tensorName) -> bool {
-      for (const auto& outName : fOutputTensorNames)
-         if (outName == tensorName) return false;
-      auto it = tensorConsumers.find(tensorName);
-      return it != tensorConsumers.end() && it->second.size() == 1;
+   // An intermediate can be removed only when it has one consumer and is not
+   // externally visible as a model output.
+   auto isFuseSafeIntermediate = [&](const std::string &tensorName) {
+      if (std::find(fOutputTensorNames.begin(), fOutputTensorNames.end(), tensorName) != fOutputTensorNames.end()) {
+         return false;
+      }
+
+      const auto consumerIt = tensorConsumers.find(tensorName);
+
+      return consumerIt != tensorConsumers.end() && consumerIt->second.size() == 1;
+   };
+
+   // Determine how an input is accessed by a fused pointwise kernel.
+   auto getInputAccess = [&](const std::string &tensorName, const std::vector<size_t> &outputShape, EFusionInputAccess &access, std::vector<size_t> &alignedStrides) {
+      alignedStrides.clear();
+
+      try {
+         if (IsAliasTensor(tensorName) || GetTensorType(tensorName) != ETensorType::FLOAT) return false;
+
+         const auto inputShape = GetTensorShape(tensorName);
+         const size_t inputLength = inputShape.empty() ? 1 : ConvertShapeToLength(inputShape);
+
+         if (inputShape == outputShape) {
+            access = EFusionInputAccess::Elementwise;
+            return true;
+         }
+
+         if (inputShape.size() > outputShape.size()) return false;
+
+         if (inputLength == 1) {
+            access = EFusionInputAccess::Scalar;
+            return true;
+         }
+
+         alignedStrides.assign(outputShape.size(), 0);
+         size_t inputStride = 1;
+
+         for (size_t inputDimIdx = inputShape.size(); inputDimIdx-- > 0;) {
+            const size_t outputDimIdx = outputShape.size() - inputShape.size() + inputDimIdx;
+            const size_t inputDim = inputShape[inputDimIdx];
+            const size_t outputDim = outputShape[outputDimIdx];
+
+            if (inputDim != 1 && inputDim != outputDim) return false;
+
+            if (inputDim != 1) alignedStrides[outputDimIdx] = inputStride;
+            inputStride *= inputDim;
+         }
+
+         access = EFusionInputAccess::Broadcast;
+         return true;
+      } catch (...) {
+         return false;
+      }
+   };
+
+   // Accept OneToOne operators and static OneToMany operators whose inputs can
+   // be represented using multidirectional broadcast indexing.
+   auto isSupportedPointwise = [&](size_t opIdx) {
+      if (opIdx >= fOperators.size())
+         return false;
+
+      if (fSkipOperators.count(opIdx))
+         return false;
+
+      const auto &op = fOperators[opIdx];
+
+      const auto mappingType = op->GetFusionMappingType();
+
+      if (mappingType != EFusionMappingType::OneToOne && mappingType != EFusionMappingType::OneToMany)
+         return false;
+
+      const auto inputs = op->GetOpInputTensors();
+      const auto outputs = op->GetOpOutputTensors();
+
+      if (inputs.empty() || outputs.size() != 1)
+         return false;
+
+      const std::string outputName(outputs[0]);
+
+      if (IsAliasTensor(outputName))
+         return false;
+
+      std::vector<size_t> outputShape;
+
+      try {
+         if (GetTensorType(outputName) != ETensorType::FLOAT)
+            return false;
+
+         outputShape = GetTensorShape(outputName);
+      } catch (...) {
+         // Dynamic or unresolved tensors are not supported yet.
+         return false;
+      }
+
+      for (const auto &inputNameView : inputs) {
+         EFusionInputAccess access;
+         std::vector<size_t> alignedStrides;
+         const std::string inputName(inputNameView);
+
+         if (!getInputAccess(inputName, outputShape, access, alignedStrides))
+            return false;
+      }
+
+      // Confirm that the operator can generate an inline expression.
+      std::vector<std::string> testInputs;
+      testInputs.reserve(inputs.size());
+
+      for (size_t inputIdx = 0; inputIdx < inputs.size(); ++inputIdx)
+         testInputs.push_back("x" + std::to_string(inputIdx));
+
+      return !op->GetFusionExpr(testInputs).empty();
    };
 
    std::vector<bool> opAssigned(fOperators.size(), false);
 
-   for (size_t i = 0; i < fOperators.size(); i++) {
-      if (opAssigned[i]) continue;
-      opAssigned[i] = true;
+   for (size_t firstOpIdx = 0; firstOpIdx < fOperators.size(); ++firstOpIdx) {
+      if (opAssigned[firstOpIdx])
+         continue;
+
+      if (!isSupportedPointwise(firstOpIdx))
+         continue;
+
+      const auto firstOutputs = fOperators[firstOpIdx]->GetOpOutputTensors();
+
+      const std::string firstOutput(firstOutputs[0]);
+      const auto groupOutputShape = GetTensorShape(firstOutput);
 
       EltwiseFusionGroup group;
-      group.opIndices.push_back(i);
+      group.opIndices.push_back(firstOpIdx);
+      opAssigned[firstOpIdx] = true;
 
-      auto firstInputs = fOperators[i]->GetOpInputTensors();
-      group.inputTensor = firstInputs.empty() ? "" : std::string(firstInputs[0]);
+      // Adds an external input once and records how it must be indexed.
+      auto addExternalInput = [&](const std::string &tensorName, EFusionInputAccess access, const std::vector<size_t> &alignedStrides) {
+         const auto existingIt = std::find_if(group.externalInputs.begin(), group.externalInputs.end(), [&](const FusionExternalInput &input) {
+            return input.tensorName == tensorName;
+         });
 
-      // Extend chain: only if CURRENT op is elementwise and its single output can be fused
-      size_t current = i;
-      while (fOperators[current]->IsElementwise()) {
-         auto curOutputs = fOperators[current]->GetOpOutputTensors();
-         if (curOutputs.size() != 1) break;
-         std::string curOut = std::string(curOutputs[0]);
-         if (!isFuseSafe(curOut)) break;
+         if (existingIt == group.externalInputs.end()) {
+            group.externalInputs.push_back(FusionExternalInput{tensorName, access, alignedStrides});
+            return;
+         }
 
-         size_t nextIdx = tensorConsumers.find(curOut)->second[0];
-         // Must be strictly the next op in sequence and itself elementwise with single input
-         if (nextIdx != current + 1) break;
-         if (opAssigned[nextIdx]) break;
-         if (!fOperators[nextIdx]->IsElementwise()) break;
-         auto nextInputs = fOperators[nextIdx]->GetOpInputTensors();
-         if (nextInputs.size() != 1) break;
+         if (existingIt->access != access || existingIt->alignedStrides != alignedStrides)
+            throw std::runtime_error("Conflicting fused access modes for tensor " + tensorName);
+      };
 
-         opAssigned[nextIdx] = true;
-         group.opIndices.push_back(nextIdx);
-         current = nextIdx;
+      for (const auto &inputNameView : fOperators[firstOpIdx]->GetOpInputTensors()) {
+         const std::string inputName(inputNameView);
+         EFusionInputAccess access;
+         std::vector<size_t> alignedStrides;
+
+         if (!getInputAccess(inputName, groupOutputShape, access, alignedStrides))
+            throw std::runtime_error("Invalid external input for fusion group: " + inputName);
+
+         addExternalInput(inputName, access, alignedStrides);
       }
 
-      // Output tensor is the last op's output
-      auto lastOutputs = fOperators[current]->GetOpOutputTensors();
-      group.outputTensor = lastOutputs.empty() ? "" : std::string(lastOutputs[0]);
+      std::vector<std::string> producedTensors;
+      producedTensors.push_back(firstOutput);
 
-      // Element count from intermediate tensor info (all op outputs are intermediates)
-      if (!group.outputTensor.empty()) {
-         auto it = fIntermediateTensorInfos.find(group.outputTensor);
-         if (it != fIntermediateTensorInfos.end())
-            group.numElements = ConvertShapeToLength(it->second.shape);
+      size_t currentOpIdx = firstOpIdx;
+
+      while (true) {
+         const auto currentOutputs = fOperators[currentOpIdx]->GetOpOutputTensors();
+
+         if (currentOutputs.size() != 1)
+            break;
+
+         const std::string currentOutput(currentOutputs[0]);
+
+         if (!isFuseSafeIntermediate(currentOutput))
+            break;
+
+         const size_t nextOpIdx = tensorConsumers.at(currentOutput).front();
+
+         // Keep fusion groups consecutive for now.
+         if (nextOpIdx != currentOpIdx + 1)
+            break;
+
+         if (opAssigned[nextOpIdx])
+            break;
+
+         if (!isSupportedPointwise(nextOpIdx))
+            break;
+
+         const auto nextOutputs =
+            fOperators[nextOpIdx]->GetOpOutputTensors();
+
+         if (nextOutputs.size() != 1)
+            break;
+
+         const std::string nextOutput(nextOutputs[0]);
+
+         std::vector<size_t> nextOutputShape;
+
+         try {
+            nextOutputShape = GetTensorShape(nextOutput);
+         } catch (...) {
+            break;
+         }
+
+         // All operators in this first implementation must produce tensors
+         // with the same shape. Only their external inputs may be scalars.
+         if (nextOutputShape != groupOutputShape)
+            break;
+
+         const auto nextInputs = fOperators[nextOpIdx]->GetOpInputTensors();
+
+         std::vector<FusionExternalInput> pendingExternalInputs;
+         bool canFuseNext = true;
+
+         for (const auto &inputNameView : nextInputs) {
+            const std::string inputName(inputNameView);
+
+            const bool producedInsideGroup = std::find(producedTensors.begin(), producedTensors.end(), inputName) != producedTensors.end();
+
+            if (producedInsideGroup)
+               continue;
+
+            EFusionInputAccess access;
+            std::vector<size_t> alignedStrides;
+
+            if (!getInputAccess(inputName, groupOutputShape, access, alignedStrides)) {
+               canFuseNext = false;
+               break;
+            }
+
+            pendingExternalInputs.push_back(FusionExternalInput{inputName, access, alignedStrides});
+         }
+
+         if (!canFuseNext)
+            break;
+
+         for (const auto &externalInput : pendingExternalInputs)
+            addExternalInput(externalInput.tensorName, externalInput.access, externalInput.alignedStrides);
+
+         opAssigned[nextOpIdx] = true;
+         group.opIndices.push_back(nextOpIdx);
+         producedTensors.push_back(nextOutput);
+         currentOpIdx = nextOpIdx;
       }
 
-      size_t gIdx = fEltwiseFusionGroups.size();
-      for (auto opIdx : group.opIndices)
-         fOpToFusionGroupIdx[opIdx] = gIdx;
+      const auto finalOutputs = fOperators[currentOpIdx]->GetOpOutputTensors();
 
-      // Mark all-but-last outputs as fusion intermediates (skip allocation)
+      group.outputTensor = std::string(finalOutputs[0]);
+      group.numElements = ConvertShapeToLength(groupOutputShape);
+
+      const size_t groupIdx = fEltwiseFusionGroups.size();
+
+      for (const size_t opIdx : group.opIndices)
+         fOpToFusionGroupIdx[opIdx] = groupIdx;
+
       if (group.isFused()) {
-         for (size_t k = 0; k + 1 < group.opIndices.size(); k++) {
-            auto midOuts = fOperators[group.opIndices[k]]->GetOpOutputTensors();
-            if (!midOuts.empty())
-               fFusionIntermediateTensors.insert(std::string(midOuts[0]));
+         for (size_t groupOpIdx = 0; groupOpIdx + 1 < group.opIndices.size(); ++groupOpIdx) {
+            const auto intermediateOutputs = fOperators[group.opIndices[groupOpIdx]]->GetOpOutputTensors();
+
+            if (!intermediateOutputs.empty()) {
+               fFusionIntermediateTensors.insert(std::string(intermediateOutputs[0]));
+            }
+         }
+
+         if (fVerbose) {
+            std::cout << "[SOFIE elementwise fusion] operators";
+
+            for (const size_t opIdx : group.opIndices)
+               std::cout << " " << opIdx;
+
+            size_t scalarInputs = 0;
+            size_t broadcastInputs = 0;
+
+            for (const auto &externalInput : group.externalInputs) {
+               if (externalInput.access == EFusionInputAccess::Scalar) ++scalarInputs;
+               if (externalInput.access == EFusionInputAccess::Broadcast) ++broadcastInputs;
+            }
+
+            std::cout << " -> " << group.outputTensor << " with " << group.externalInputs.size()
+               << " external input(s), " << scalarInputs << " scalar input(s), " << broadcastInputs << " broadcast input(s)" << std::endl;
          }
       }
 
@@ -494,9 +709,18 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
             fusedCode += SP + SP + "auto const elementsPerThread_fused" + sfx + " = Vec::all(static_cast<Idx>(1));\n";
             fusedCode += SP + SP + "auto const elementsPerGrid_fused" + sfx + " = Vec::all(Idx{" + std::to_string(grp.numElements) + "});\n";
             fusedCode += SP + SP + "auto const workDiv_fused" + sfx + " = sofie_workdiv(elementsPerGrid_fused" + sfx + ");\n";
-            fusedCode += SP + SP + "auto task_fused" + sfx + " = alpaka::createTaskKernel<Acc>(workDiv_fused" + sfx + ", " + kname +
-                   ", alpaka::getPtrNative(deviceBuf_" + grp.inputTensor + "), alpaka::getPtrNative(deviceBuf_" + grp.outputTensor +
-                   "), static_cast<Idx>(" + std::to_string(grp.numElements) + "));\n";
+
+            fusedCode += SP + SP + "auto task_fused" + sfx +
+             " = alpaka::createTaskKernel<Acc>(workDiv_fused" + sfx +
+             ", " + kname;
+
+            for (const auto &externalInput : grp.externalInputs) {
+               fusedCode += ", alpaka::getPtrNative(deviceBuf_" + externalInput.tensorName + ")";
+            }
+            fusedCode += ", alpaka::getPtrNative(deviceBuf_" + grp.outputTensor +
+                         "), static_cast<Idx>(" +
+                         std::to_string(grp.numElements) + "));\n";
+
             fusedCode += SP + SP + "alpaka::enqueue(queue, task_fused" + sfx + ");\n";
             fusedCode += SP + "}\n";
             if (fProfile) {
@@ -1075,6 +1299,9 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       SOFIE::OperatorKind::UNARY_SIN,
       SOFIE::OperatorKind::UNARY_COS,
       SOFIE::OperatorKind::UNARY_ABS,
+      SOFIE::OperatorKind::UNARY_SOFTPLUS,
+      SOFIE::OperatorKind::UNARY_ATAN,
+      SOFIE::OperatorKind::UNARY_FLOOR,
       SOFIE::OperatorKind::NOT
    };
 
@@ -1098,13 +1325,99 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
             fGC += "\n//------ FUSED_ELTWISE_KERNEL" + sfx + "\n";
             fGC += "struct FusedEltwiseKernel" + sfx + " {\n";
             fGC += SP + "template<typename TAcc, typename T>\n";
-            fGC += SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc, T const* __restrict__ data, T* __restrict__ out, std::size_t n) const {\n";
+            fGC += SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc";
+
+            for (size_t inputIdx = 0; inputIdx < grp.externalInputs.size(); ++inputIdx) {
+               fGC += ", T const* __restrict__ input" + std::to_string(inputIdx);
+            }
+
+            fGC += ", T* __restrict__ out, std::size_t n) const {\n";
             fGC += SP + SP + "const auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
             fGC += SP + SP + "if (idx < n) {\n";
-            fGC += SP + SP + SP + "T v = data[idx];\n";
-            for (size_t opIdx : grp.opIndices)
-               fGC += SP + SP + SP + "v = " + fOperators[opIdx]->GetElementwiseExpr("v") + ";\n";
-            fGC += SP + SP + SP + "out[idx] = v;\n";
+
+            std::unordered_map<std::string, std::string> tensorValues;
+            const auto fusedOutputShape = GetTensorShape(grp.outputTensor);
+            const auto fusedOutputStrides = UTILITY::ComputeStrideFromShape(fusedOutputShape);
+
+            for (size_t inputIdx = 0; inputIdx < grp.externalInputs.size(); ++inputIdx) {
+               const std::string localName = "v_input_" + std::to_string(inputIdx);
+               const auto &externalInput = grp.externalInputs[inputIdx];
+               std::string indexExpression;
+
+               if (externalInput.access == EFusionInputAccess::Elementwise) {
+                  indexExpression = "idx";
+               } else if (externalInput.access == EFusionInputAccess::Scalar) {
+                  indexExpression = "0";
+               } else {
+                  for (size_t dimIdx = 0; dimIdx < externalInput.alignedStrides.size(); ++dimIdx) {
+                     const size_t inputStride = externalInput.alignedStrides[dimIdx];
+                     if (inputStride == 0) continue;
+
+                     std::string coordinate;
+                     if (fusedOutputStrides[dimIdx] == 1)
+                        coordinate = "(idx % " + std::to_string(fusedOutputShape[dimIdx]) + ")";
+                     else
+                        coordinate = "((idx / " + std::to_string(fusedOutputStrides[dimIdx]) + ") % " + std::to_string(fusedOutputShape[dimIdx]) + ")";
+
+                     if (!indexExpression.empty()) indexExpression += " + ";
+                     indexExpression += coordinate;
+                     if (inputStride != 1) indexExpression += " * " + std::to_string(inputStride);
+                  }
+
+                  if (indexExpression.empty()) indexExpression = "0";
+               }
+
+               fGC += SP + SP + SP + "T " + localName + " = input" + std::to_string(inputIdx) + "[" + indexExpression + "];\n";
+               tensorValues[externalInput.tensorName] = localName;
+            }
+
+            for (size_t opIdx : grp.opIndices) {
+               std::vector<std::string> inputExpressions;
+
+               for (const auto &inputNameView : fOperators[opIdx]->GetOpInputTensors()) {
+                  const std::string inputName(inputNameView);
+                  const auto valueIt = tensorValues.find(inputName);
+
+                  if (valueIt == tensorValues.end()) {
+                     throw std::runtime_error(
+                        "Missing fused value for tensor " + inputName);
+                  }
+
+                  inputExpressions.push_back(valueIt->second);
+               }
+
+               const std::string expression =
+                  fOperators[opIdx]->GetFusionExpr(inputExpressions);
+
+               if (expression.empty()) {
+                  throw std::runtime_error(
+                     "Operator " + std::to_string(opIdx) +
+                     " does not provide a fused expression");
+               }
+
+               const auto outputs = fOperators[opIdx]->GetOpOutputTensors();
+
+               if (outputs.size() != 1) {
+                  throw std::runtime_error(
+                     "Fused operator " + std::to_string(opIdx) +
+                     " must have exactly one output");
+               }
+
+               const std::string outputName(outputs[0]);
+               const std::string localName = "v_op_" + std::to_string(opIdx);
+
+               fGC += SP + SP + SP + "T " + localName + " = " + expression + ";\n";
+               tensorValues[outputName] = localName;
+            }
+
+            const auto finalValueIt = tensorValues.find(grp.outputTensor);
+
+            if (finalValueIt == tensorValues.end()) {
+               throw std::runtime_error(
+                  "Missing final fused value for tensor " + grp.outputTensor);
+            }
+
+            fGC += SP + SP + SP + "out[idx] = " + finalValueIt->second + ";\n";
             fGC += SP + SP + "}\n";
             fGC += SP + "}\n";
             fGC += "};\n";
@@ -1320,7 +1633,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
 void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int batchSize, bool verbose) {
    fProfile = static_cast<bool>(options & static_cast<std::underlying_type_t<Options>>(Options::kProfile));
-   fVerbose = true;
+   fVerbose = verbose;
    fBatchSize = batchSize;
 
    if (fProfile)
@@ -1348,6 +1661,10 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
       throw std::runtime_error("SOFIE GPU does not yet supports GNN Inference.");
 
    Initialize(batchSize, verbose);
+
+   fSkipOperators.clear();
+   fFusionIntermediateTensors.clear();
+
    FuseGemmActivations_GPU();   // must run before elementwise fusion (redirects tensors)
    ComputeEltwiseFusionGroups();
 

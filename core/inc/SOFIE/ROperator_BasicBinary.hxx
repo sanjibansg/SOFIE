@@ -497,50 +497,40 @@ public:
             if (fShapeB[i] != fShapeY[i]) { isBContiguous = false; break; }
       }
 
-      std::string flattened_index_A = "";
-      std::string flattened_index_B = "";
+      auto buildBroadcastIndex = [&](const std::vector<size_t> &inputShape, const std::vector<size_t> &inputStrides, bool isScalar, bool isContiguous) {
+         if (isScalar) return std::string("0");
+         if (isContiguous) return std::string("idx");
 
-      if (isAScalar) {
-         // A is a single broadcast value
-         flattened_index_A = "0";
-      } else if (isAContiguous) {
-         // A and Y have identical shapes → direct index
-         flattened_index_A = "idx";
-      } else {
-         // General broadcast case: decompose idx into per-dim coords
-         std::string temp = "idx";
-         for (size_t id_s = 0; id_s < fShapeA.size(); ++id_s) {
-            auto strideY = stridesY[id_s];
-            auto strideA = stridesA[id_s];
-            std::string coord = "(int)(" + temp + " / " + std::to_string(strideY) + ")";
-            flattened_index_A += coord + " * " + std::to_string(strideA) + " + ";
-            temp = temp + " - (" + coord + " * " + std::to_string(strideY) + ")";
+         if (inputShape.size() > fShapeY.size())
+            throw std::runtime_error("SOFIE BasicBinary input rank exceeds output rank");
+
+         const size_t rankOffset = fShapeY.size() - inputShape.size();
+         std::string indexExpression;
+
+         for (size_t inputDimIdx = 0; inputDimIdx < inputShape.size(); ++inputDimIdx) {
+            if (inputShape[inputDimIdx] == 1) continue;
+
+            const size_t outputDimIdx = rankOffset + inputDimIdx;
+            std::string coordinate;
+
+            if (stridesY[outputDimIdx] == 1)
+               coordinate = "(idx % " + std::to_string(fShapeY[outputDimIdx]) + ")";
+            else
+               coordinate = "((idx / " + std::to_string(stridesY[outputDimIdx]) + ") % " + std::to_string(fShapeY[outputDimIdx]) + ")";
+
+            if (!indexExpression.empty()) indexExpression += " + ";
+            indexExpression += coordinate;
+
+            if (inputStrides[inputDimIdx] != 1)
+               indexExpression += " * " + std::to_string(inputStrides[inputDimIdx]);
          }
-         if (!flattened_index_A.empty())
-            flattened_index_A.erase(flattened_index_A.size() - 3);
-      }
 
-      if (isBScalar) {
-         // B is a single broadcast value
-         flattened_index_B = "0";
-      } else if (isBContiguous) {
-         // B and Y have identical shapes → direct index
-         flattened_index_B = "idx";
-      } else {
-         // General broadcast case
-         std::string temp = "idx";
-         for (size_t id_s = 0; id_s < fShapeB.size(); ++id_s) {
-            auto strideY = stridesY[id_s];
-            auto strideB = stridesB[id_s];
-            std::string coord = "(int)(" + temp + " / " + std::to_string(strideY) + ")";
-            flattened_index_B += coord + " * " + std::to_string(strideB) + " + ";
-            temp = temp + " - (" + coord + " * " + std::to_string(strideY) + ")";
-         }
-         if (!flattened_index_B.empty())
-            flattened_index_B.erase(flattened_index_B.size() - 3);
-      }
+         return indexExpression.empty() ? std::string("0") : indexExpression;
+      };
 
-      op += "C[idx] = " + BinaryOperatorTrait<T, Op>::Op("A["+flattened_index_A+"]", "B["+flattened_index_B+"]") + ";\n";
+      const std::string flattened_index_A = buildBroadcastIndex(fShapeA, stridesA, isAScalar, isAContiguous);
+      const std::string flattened_index_B = buildBroadcastIndex(fShapeB, stridesB, isBScalar, isBContiguous);
+      op += "C[idx] = " + BinaryOperatorTrait<T, Op>::Op("A[" + flattened_index_A + "]", "B[" + flattened_index_B + "]") + ";\n";
       op += "}\n}\n};\n";
       return op;
    }
@@ -579,6 +569,32 @@ public:
       } else {
          return {};
       }
+   }
+
+   EFusionMappingType GetFusionMappingType() const override
+   {
+      if (fIsOutputConstant)
+         return EFusionMappingType::Unsupported;
+
+      // Initial generic fusion support is restricted to static,
+      // equal-shape binary elementwise operations.
+      if (!fShapeY.empty() && fShapeA == fShapeB && fShapeA == fShapeY)
+         return EFusionMappingType::OneToOne;
+
+      // Broadcasting maps one input value to multiple output positions.
+      if (!fShapeY.empty())
+         return EFusionMappingType::OneToMany;
+
+      // Dynamic-shape cases are not supported by the first implementation.
+      return EFusionMappingType::Unsupported;
+   }
+
+   std::string GetFusionExpr(const std::vector<std::string> &inputs) const override
+   {
+      if (fIsOutputConstant || inputs.size() != 2) return "";
+      const auto mapping = GetFusionMappingType();
+      if (mapping != EFusionMappingType::OneToOne && mapping != EFusionMappingType::OneToMany) return "";
+      return BinaryOperatorTrait<T, Op>::Op(inputs[0], inputs[1]);
    }
 
    

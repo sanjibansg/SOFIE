@@ -60,10 +60,22 @@ private:
 
    std::string fExtraCodeForDimShapes; // extra code needed for initialization of dynamic parameters (e.g. number of non zero elements in NonZero operator)
 
+   enum class EFusionInputAccess {
+      Elementwise,
+      Scalar,
+      Broadcast
+   };
+   
+   struct FusionExternalInput {
+      std::string tensorName;
+      EFusionInputAccess access = EFusionInputAccess::Elementwise;
+      std::vector<size_t> alignedStrides;
+   };
+
    // GPU ALPAKA elementwise kernel fusion state (transient, computed in GenerateGPU_ALPAKA)
    struct EltwiseFusionGroup {
       std::vector<size_t> opIndices; ///< consecutive op indices forming this group
-      std::string inputTensor;       ///< input tensor name of the first op
+      std::vector<FusionExternalInput> externalInputs; ///< tensors entering the fusion group from outside
       std::string outputTensor;      ///< output tensor name of the last op
       size_t numElements = 0;
       bool isFused() const { return opIndices.size() > 1; }

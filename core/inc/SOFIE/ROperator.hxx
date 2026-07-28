@@ -38,8 +38,39 @@ enum class OperatorKind {
    UNARY_COS=22,
    UNARY_ABS=23,
    CLIP=24,
-   NOT=25
+   NOT=25,
+   UNARY_SOFTPLUS=26,
+   UNARY_ATAN=27,
+   UNARY_FLOOR=28
 };
+
+enum class EFusionMappingType {
+   OneToOne,
+   OneToMany,
+   ManyToMany,
+   Reorganize,
+   Shuffle,
+   Unsupported
+};
+
+inline const char *toString(EFusionMappingType type)
+{
+   switch (type) {
+      case EFusionMappingType::OneToOne:
+         return "OneToOne";
+      case EFusionMappingType::OneToMany:
+         return "OneToMany";
+      case EFusionMappingType::ManyToMany:
+         return "ManyToMany";
+      case EFusionMappingType::Reorganize:
+         return "Reorganize";
+      case EFusionMappingType::Shuffle:
+         return "Shuffle";
+      case EFusionMappingType::Unsupported:
+         return "Unsupported";
+   }
+   return "Unsupported";
+}
 
 inline const char* toString(OperatorKind kind) {
    switch (kind) {
@@ -50,6 +81,9 @@ inline const char* toString(OperatorKind kind) {
        case OperatorKind::CONSTANTOFSHAPE: return "CONSTANTOFSHAPE";
        case OperatorKind::BATCHNORM:       return "BATCHNORM";  
        case OperatorKind::CONV:       return "CONV";
+       case OperatorKind::UNARY_SOFTPLUS: return "UNARY_SOFTPLUS";
+       case OperatorKind::UNARY_ATAN:     return "UNARY_ATAN";
+       case OperatorKind::UNARY_FLOOR:    return "UNARY_FLOOR";
        case OperatorKind::UNDEFINED:  return "UNDEFINED";
        default:                       return "UNKNOWN";
    }
@@ -87,6 +121,23 @@ public:
    // Returns the C++ expression applying this op to inputVar (a local T variable) for fused kernel generation
    virtual std::string GetElementwiseExpr(const std::string& /*inputVar*/) const { return ""; }
 
+   // DNNFusion-style input/output mapping classification.
+   // One-To-One, One-To-Many, Many-To-Many, Reorganize, Shuffle
+   virtual EFusionMappingType GetFusionMappingType() const
+   {
+      return IsElementwise() ? EFusionMappingType::OneToOne : EFusionMappingType::Unsupported;
+   }
+
+   // Returns the expression produced by this operator from its input
+   // expressions. The default implementation adapts the existing unary
+   // GetElementwiseExpr interface.
+   virtual std::string GetFusionExpr(const std::vector<std::string> &inputs) const
+   {
+      if (inputs.size() != 1)
+         return "";
+
+      return GetElementwiseExpr(inputs[0]);
+   }
    //virtual void Forward_reference() = 0;
    //virtual void Forward_blas() = 0;
    virtual ~ROperator(){}

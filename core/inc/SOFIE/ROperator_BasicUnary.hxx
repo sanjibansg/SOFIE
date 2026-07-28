@@ -121,6 +121,15 @@ public:
             case EBasicUnaryOperator::kAbs:
                fKind = OperatorKind::UNARY_ABS;
                break;
+            case EBasicUnaryOperator::kSoftplus:
+               fKind = OperatorKind::UNARY_SOFTPLUS;
+               break;
+            case EBasicUnaryOperator::kAtan:
+               fKind = OperatorKind::UNARY_ATAN;
+               break;
+            case EBasicUnaryOperator::kFloor:
+               fKind = OperatorKind::UNARY_FLOOR;
+               break;
          }
          fInputTensorNames =  { fNX };
          fOutputTensorNames = { fNY };
@@ -189,11 +198,10 @@ public:
    }
 
    std::vector<std::string> GetStdLibs() override {
-      if (Op == EBasicUnaryOperator::kSqrt || Op == EBasicUnaryOperator::kExp || Op == EBasicUnaryOperator::kLog) {
-         return { std::string("cmath") };
-      } else {
+      if constexpr (Op == EBasicUnaryOperator::kReciprocal || Op == EBasicUnaryOperator::kNeg)
          return {};
-      }
+
+      return {"cmath"};
    }
 
    bool IsElementwise() const override { return !fIsOutputConstant; }

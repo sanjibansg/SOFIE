@@ -341,6 +341,36 @@ std::string Generate_GPU_ALPAKA(std::string opName) override {
 
     return out.str();
 }
+
+EFusionMappingType GetFusionMappingType() const override {
+   if (fIsOutputConstant || fInitialized)
+       return EFusionMappingType::Unsupported;
+
+   const auto isStatic = [](const std::vector<Dim> &shape) {
+       return std::all_of(shape.begin(), shape.end(), [](const Dim &dim) {
+          return !dim.isParam;
+       });
+   };
+
+   if (!isStatic(fShapeX) || !isStatic(fShapeY))
+       return EFusionMappingType::Unsupported;
+
+   if (fShapeX == fShapeY)
+       return EFusionMappingType::OneToOne;
+
+   return EFusionMappingType::OneToMany;
+}
+
+std::string GetFusionExpr(const std::vector<std::string> &inputs) const override {
+   if (inputs.size() != 1)
+       return "";
+
+   const auto mapping = GetFusionMappingType();
+   if (mapping != EFusionMappingType::OneToOne && mapping != EFusionMappingType::OneToMany)
+       return "";
+
+   return inputs[0];
+}
 };
 }//SOFIE
 
