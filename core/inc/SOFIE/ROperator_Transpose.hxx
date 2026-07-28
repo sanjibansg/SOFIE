@@ -120,6 +120,16 @@ public:
          for (size_t i = 0; i < fAttrPerm.size(); i++){
             fDimShapeOutput[i] = fDimShapeData[fAttrPerm[i]];
          }
+         try {
+            fShapeData = model.GetTensorShape(fNData);
+            fShapeOutput.resize(fAttrPerm.size());
+
+            for (size_t i = 0; i < fAttrPerm.size(); ++i)
+               fShapeOutput[i] = fShapeData[fAttrPerm[i]];
+         } catch (...) {
+            fShapeData.clear();
+            fShapeOutput.clear();
+         }
          model.AddIntermediateTensor(fNOutput, model.GetTensorType(fNData), fDimShapeOutput);
          if (model.Verbose()) {
             std::cout << "Transpose ---> " << fNOutput << " " << ConvertDimShapeToString(fDimShapeOutput) << std::endl;
@@ -229,6 +239,61 @@ public:
          << "), alpaka::getPtrNative(deviceBuf_" << fNOutput << "), static_cast<Idx>(" << length << "));\n";
       out << SP <<"alpaka::enqueue(queue, task_" << OpName << ");\n";
       return out.str();
+   }
+
+   EFusionMappingType GetFusionMappingType() const override
+   {
+      if (fIsOutputConstant || fAttrPerm.empty())
+         return EFusionMappingType::Unsupported;
+
+      return EFusionMappingType::Shuffle;
+   }
+
+   bool SupportsFusionTypes(const std::vector<ETensorType> &inputTypes, ETensorType outputType) const override
+   {
+      return inputTypes.size() == 1 && inputTypes[0] == outputType;
+   }
+
+   std::string GetFusionExpr(const std::vector<std::string> &inputs) const override
+   {
+      if (GetFusionMappingType() != EFusionMappingType::Shuffle || inputs.size() != 1)
+         return "";
+
+      return inputs[0];
+   }
+
+   std::string GetFusionInputIndexExpr(size_t inputIndex, const std::string &outputIndex,
+                                    const std::vector<size_t> &inputShape,
+                                    const std::vector<size_t> &outputShape) const override
+   {
+      if (inputIndex != 0 || GetFusionMappingType() != EFusionMappingType::Shuffle)
+         return "";
+
+      if (inputShape.size() != outputShape.size() || fAttrPerm.size() != outputShape.size())
+         return "";
+
+      const auto inputStrides = UTILITY::ComputeStrideFromShape(inputShape);
+      const auto outputStrides = UTILITY::ComputeStrideFromShape(outputShape);
+
+      std::string expression;
+
+      for (size_t outputAxis = 0; outputAxis < outputShape.size(); ++outputAxis) {
+         const auto inputAxisValue = fAttrPerm[outputAxis];
+
+         if (inputAxisValue < 0 || static_cast<size_t>(inputAxisValue) >= inputShape.size())
+            return "";
+
+         const size_t inputAxis = static_cast<size_t>(inputAxisValue);
+
+         if (!expression.empty())
+            expression += " + ";
+
+         expression += "((" + outputIndex + " / " + std::to_string(outputStrides[outputAxis]) + "u) % " +
+                       std::to_string(outputShape[outputAxis]) + "u) * " +
+                       std::to_string(inputStrides[inputAxis]) + "u";
+      }
+
+      return expression;
    }
 
 };

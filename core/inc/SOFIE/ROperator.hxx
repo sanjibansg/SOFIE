@@ -138,6 +138,23 @@ public:
 
       return GetElementwiseExpr(inputs[0]);
    }
+
+   virtual bool SupportsFusionTypes(const std::vector<ETensorType> &inputTypes, ETensorType outputType) const
+   {
+      if (outputType != ETensorType::FLOAT)
+         return false;
+
+      return std::all_of(inputTypes.begin(), inputTypes.end(), [](ETensorType type) {
+         return type == ETensorType::FLOAT;
+      });
+   }
+
+   virtual std::string GetFusionInputIndexExpr(size_t /*inputIndex*/, const std::string &/*outputIndex*/,
+                                            const std::vector<size_t> &/*inputShape*/,
+                                            const std::vector<size_t> &/*outputShape*/) const
+   {
+      return "";
+   }
    //virtual void Forward_reference() = 0;
    //virtual void Forward_blas() = 0;
    virtual ~ROperator(){}

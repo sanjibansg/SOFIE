@@ -51,7 +51,7 @@ void RModel::ComputeEltwiseFusionGroups()
       alignedStrides.clear();
 
       try {
-         if (IsAliasTensor(tensorName) || GetTensorType(tensorName) != ETensorType::FLOAT) return false;
+         if (IsAliasTensor(tensorName)) return false;
 
          const auto inputShape = GetTensorShape(tensorName);
          const size_t inputLength = inputShape.empty() ? 1 : ConvertShapeToLength(inputShape);
@@ -89,20 +89,16 @@ void RModel::ComputeEltwiseFusionGroups()
       }
    };
 
-   // Accept OneToOne operators and static OneToMany operators whose inputs can
-   // be represented using multidirectional broadcast indexing.
-   auto isSupportedPointwise = [&](size_t opIdx) {
-      if (opIdx >= fOperators.size())
-         return false;
-
-      if (fSkipOperators.count(opIdx))
+   auto isSupportedFusionOp = [&](size_t opIdx, bool allowShuffle) {
+      if (opIdx >= fOperators.size() || fSkipOperators.count(opIdx))
          return false;
 
       const auto &op = fOperators[opIdx];
-
       const auto mappingType = op->GetFusionMappingType();
+      const bool pointwise = mappingType == EFusionMappingType::OneToOne || mappingType == EFusionMappingType::OneToMany;
+      const bool shuffle = mappingType == EFusionMappingType::Shuffle;
 
-      if (mappingType != EFusionMappingType::OneToOne && mappingType != EFusionMappingType::OneToMany)
+      if (!pointwise && !(allowShuffle && shuffle))
          return false;
 
       const auto inputs = op->GetOpInputTensors();
@@ -117,27 +113,46 @@ void RModel::ComputeEltwiseFusionGroups()
          return false;
 
       std::vector<size_t> outputShape;
+      std::vector<ETensorType> inputTypes;
+      ETensorType outputType = ETensorType::UNDEFINED;
 
       try {
-         if (GetTensorType(outputName) != ETensorType::FLOAT)
-            return false;
-
          outputShape = GetTensorShape(outputName);
+         outputType = GetTensorType(outputName);
+
+         for (const auto &inputNameView : inputs)
+            inputTypes.push_back(GetTensorType(std::string(inputNameView)));
       } catch (...) {
-         // Dynamic or unresolved tensors are not supported yet.
          return false;
       }
 
-      for (const auto &inputNameView : inputs) {
-         EFusionInputAccess access;
-         std::vector<size_t> alignedStrides;
-         const std::string inputName(inputNameView);
+      if (!op->SupportsFusionTypes(inputTypes, outputType))
+         return false;
 
-         if (!getInputAccess(inputName, outputShape, access, alignedStrides))
+      if (shuffle) {
+         if (inputs.size() != 1 || IsAliasTensor(std::string(inputs[0])))
             return false;
+
+         std::vector<size_t> inputShape;
+
+         try {
+            inputShape = GetTensorShape(std::string(inputs[0]));
+         } catch (...) {
+            return false;
+         }
+
+         if (op->GetFusionInputIndexExpr(0, "idx", inputShape, outputShape).empty())
+            return false;
+      } else {
+         for (const auto &inputNameView : inputs) {
+            EFusionInputAccess access;
+            std::vector<size_t> alignedStrides;
+
+            if (!getInputAccess(std::string(inputNameView), outputShape, access, alignedStrides))
+               return false;
+         }
       }
 
-      // Confirm that the operator can generate an inline expression.
       std::vector<std::string> testInputs;
       testInputs.reserve(inputs.size());
 
@@ -153,7 +168,7 @@ void RModel::ComputeEltwiseFusionGroups()
       if (opAssigned[firstOpIdx])
          continue;
 
-      if (!isSupportedPointwise(firstOpIdx))
+      if (!isSupportedFusionOp(firstOpIdx, true))
          continue;
 
       const auto firstOutputs = fOperators[firstOpIdx]->GetOpOutputTensors();
@@ -166,29 +181,51 @@ void RModel::ComputeEltwiseFusionGroups()
       opAssigned[firstOpIdx] = true;
 
       // Adds an external input once and records how it must be indexed.
-      auto addExternalInput = [&](const std::string &tensorName, EFusionInputAccess access, const std::vector<size_t> &alignedStrides) {
+      auto addExternalInput = [&](const std::string &tensorName, EFusionInputAccess access, const std::vector<size_t> &alignedStrides, const std::string &customIndexExpression) {
          const auto existingIt = std::find_if(group.externalInputs.begin(), group.externalInputs.end(), [&](const FusionExternalInput &input) {
             return input.tensorName == tensorName;
          });
 
          if (existingIt == group.externalInputs.end()) {
-            group.externalInputs.push_back(FusionExternalInput{tensorName, access, alignedStrides});
+            group.externalInputs.push_back(FusionExternalInput{tensorName, access, alignedStrides, customIndexExpression});
             return;
          }
 
-         if (existingIt->access != access || existingIt->alignedStrides != alignedStrides)
+         if (existingIt->access != access || existingIt->alignedStrides != alignedStrides || existingIt->customIndexExpression != customIndexExpression)
             throw std::runtime_error("Conflicting fused access modes for tensor " + tensorName);
       };
 
-      for (const auto &inputNameView : fOperators[firstOpIdx]->GetOpInputTensors()) {
-         const std::string inputName(inputNameView);
+      const auto firstInputs = fOperators[firstOpIdx]->GetOpInputTensors();
+      const auto firstMappingType = fOperators[firstOpIdx]->GetFusionMappingType();
+
+      for (size_t inputIdx = 0; inputIdx < firstInputs.size(); ++inputIdx) {
+         const std::string inputName(firstInputs[inputIdx]);
+
+         if (firstMappingType == EFusionMappingType::Shuffle) {
+            std::vector<size_t> inputShape;
+
+            try {
+               inputShape = GetTensorShape(inputName);
+            } catch (...) {
+               throw std::runtime_error("Cannot resolve Shuffle input shape for fusion: " + inputName);
+            }
+
+            const std::string customIndexExpression = fOperators[firstOpIdx]->GetFusionInputIndexExpr(inputIdx, "idx", inputShape, groupOutputShape);
+
+            if (customIndexExpression.empty())
+               throw std::runtime_error("Shuffle operator does not provide a fused input index expression");
+
+            addExternalInput(inputName, EFusionInputAccess::Elementwise, {}, customIndexExpression);
+            continue;
+         }
+
          EFusionInputAccess access;
          std::vector<size_t> alignedStrides;
 
          if (!getInputAccess(inputName, groupOutputShape, access, alignedStrides))
             throw std::runtime_error("Invalid external input for fusion group: " + inputName);
 
-         addExternalInput(inputName, access, alignedStrides);
+         addExternalInput(inputName, access, alignedStrides, "");
       }
 
       std::vector<std::string> producedTensors;
@@ -216,7 +253,7 @@ void RModel::ComputeEltwiseFusionGroups()
          if (opAssigned[nextOpIdx])
             break;
 
-         if (!isSupportedPointwise(nextOpIdx))
+         if (!isSupportedFusionOp(nextOpIdx, false))
             break;
 
          const auto nextOutputs =
@@ -261,14 +298,14 @@ void RModel::ComputeEltwiseFusionGroups()
                break;
             }
 
-            pendingExternalInputs.push_back(FusionExternalInput{inputName, access, alignedStrides});
+            pendingExternalInputs.push_back(FusionExternalInput{inputName, access, alignedStrides, ""});
          }
 
          if (!canFuseNext)
             break;
 
          for (const auto &externalInput : pendingExternalInputs)
-            addExternalInput(externalInput.tensorName, externalInput.access, externalInput.alignedStrides);
+            addExternalInput(externalInput.tensorName, externalInput.access, externalInput.alignedStrides, externalInput.customIndexExpression);
 
          opAssigned[nextOpIdx] = true;
          group.opIndices.push_back(nextOpIdx);
@@ -1324,14 +1361,19 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
             std::string sfx = grp.suffix();
             fGC += "\n//------ FUSED_ELTWISE_KERNEL" + sfx + "\n";
             fGC += "struct FusedEltwiseKernel" + sfx + " {\n";
-            fGC += SP + "template<typename TAcc, typename T>\n";
+            fGC += SP + "template<typename TAcc";
+
+            for (size_t inputIdx = 0; inputIdx < grp.externalInputs.size(); ++inputIdx)
+               fGC += ", typename TInput" + std::to_string(inputIdx);
+
+            fGC += ", typename TOutput>\n";
             fGC += SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc";
 
-            for (size_t inputIdx = 0; inputIdx < grp.externalInputs.size(); ++inputIdx) {
-               fGC += ", T const* __restrict__ input" + std::to_string(inputIdx);
-            }
+            for (size_t inputIdx = 0; inputIdx < grp.externalInputs.size(); ++inputIdx)
+               fGC += ", TInput" + std::to_string(inputIdx) + " const* __restrict__ input" + std::to_string(inputIdx);
 
-            fGC += ", T* __restrict__ out, std::size_t n) const {\n";
+            fGC += ", TOutput* __restrict__ out, std::size_t n) const {\n";
+            fGC += SP + SP + "using T = TOutput;\n";
             fGC += SP + SP + "const auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
             fGC += SP + SP + "if (idx < n) {\n";
 
@@ -1344,7 +1386,9 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
                const auto &externalInput = grp.externalInputs[inputIdx];
                std::string indexExpression;
 
-               if (externalInput.access == EFusionInputAccess::Elementwise) {
+               if (!externalInput.customIndexExpression.empty()) {
+                  indexExpression = externalInput.customIndexExpression;
+               } else if (externalInput.access == EFusionInputAccess::Elementwise) {
                   indexExpression = "idx";
                } else if (externalInput.access == EFusionInputAccess::Scalar) {
                   indexExpression = "0";
@@ -1367,7 +1411,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
                   if (indexExpression.empty()) indexExpression = "0";
                }
 
-               fGC += SP + SP + SP + "T " + localName + " = input" + std::to_string(inputIdx) + "[" + indexExpression + "];\n";
+               fGC += SP + SP + SP + "auto " + localName + " = input" + std::to_string(inputIdx) + "[" + indexExpression + "];\n";
                tensorValues[externalInput.tensorName] = localName;
             }
 
@@ -1406,7 +1450,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
                const std::string outputName(outputs[0]);
                const std::string localName = "v_op_" + std::to_string(opIdx);
 
-               fGC += SP + SP + SP + "T " + localName + " = " + expression + ";\n";
+               fGC += SP + SP + SP + "auto " + localName + " = " + expression + ";\n";
                tensorValues[outputName] = localName;
             }
 

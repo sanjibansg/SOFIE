@@ -70,6 +70,7 @@ private:
       std::string tensorName;
       EFusionInputAccess access = EFusionInputAccess::Elementwise;
       std::vector<size_t> alignedStrides;
+      std::string customIndexExpression;
    };
 
    // GPU ALPAKA elementwise kernel fusion state (transient, computed in GenerateGPU_ALPAKA)
