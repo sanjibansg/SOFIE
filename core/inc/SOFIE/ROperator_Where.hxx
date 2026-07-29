@@ -606,6 +606,37 @@ public:
       return out.str();
    }
 
+   EFusionMappingType GetFusionMappingType() const override
+   {
+      if (fIsOutputConstant || fShapeX.empty() || fShapeY.empty() || fShapeC.empty() || fShapeZ.empty())
+         return EFusionMappingType::Unsupported;
+
+      if (fShapeX == fShapeZ && fShapeY == fShapeZ && fShapeC == fShapeZ)
+         return EFusionMappingType::OneToOne;
+
+      return EFusionMappingType::OneToMany;
+   }
+
+   bool SupportsFusionTypes(const std::vector<ETensorType> &inputTypes, ETensorType outputType) const override
+   {
+      return inputTypes.size() == 3 &&
+             inputTypes[0] == outputType &&
+             inputTypes[1] == outputType &&
+             inputTypes[2] == ETensorType::BOOL;
+   }
+
+   std::string GetFusionExpr(const std::vector<std::string> &inputs) const override
+   {
+      if (fIsOutputConstant || inputs.size() != 3)
+         return "";
+
+      const auto mapping = GetFusionMappingType();
+
+      if (mapping != EFusionMappingType::OneToOne && mapping != EFusionMappingType::OneToMany)
+         return "";
+
+      return "(" + inputs[2] + " ? " + inputs[0] + " : " + inputs[1] + ")";
+   }
 };
 
 }//SOFIE
