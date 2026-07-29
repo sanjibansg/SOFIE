@@ -46,13 +46,11 @@ void RModel::ComputeEltwiseFusionGroups()
       return consumerIt != tensorConsumers.end() && consumerIt->second.size() == 1;
    };
 
-   // Determine how an input is accessed by a fused pointwise kernel.
+   // Determine how an external input is accessed by a fused kernel.
    auto getInputAccess = [&](const std::string &tensorName, const std::vector<size_t> &outputShape, EFusionInputAccess &access, std::vector<size_t> &alignedStrides) {
       alignedStrides.clear();
 
       try {
-         if (IsAliasTensor(tensorName)) return false;
-
          const auto inputShape = GetTensorShape(tensorName);
          const size_t inputLength = inputShape.empty() ? 1 : ConvertShapeToLength(inputShape);
 
@@ -89,7 +87,7 @@ void RModel::ComputeEltwiseFusionGroups()
       }
    };
 
-   auto isSupportedFusionOp = [&](size_t opIdx, bool allowShuffle) {
+   auto isSupportedFusionOp = [&](size_t opIdx, bool allowShuffle, bool allowReorganize) {
       if (opIdx >= fOperators.size() || fSkipOperators.count(opIdx))
          return false;
 
@@ -97,19 +95,30 @@ void RModel::ComputeEltwiseFusionGroups()
       const auto mappingType = op->GetFusionMappingType();
       const bool pointwise = mappingType == EFusionMappingType::OneToOne || mappingType == EFusionMappingType::OneToMany;
       const bool shuffle = mappingType == EFusionMappingType::Shuffle;
+      const bool reorganize = mappingType == EFusionMappingType::Reorganize;
 
-      if (!pointwise && !(allowShuffle && shuffle))
+      if (!pointwise && !(allowShuffle && shuffle) && !(allowReorganize && reorganize))
          return false;
 
       const auto inputs = op->GetOpInputTensors();
       const auto outputs = op->GetOpOutputTensors();
 
-      if (inputs.empty() || outputs.size() != 1)
+      const auto dataInputIndices = op->GetFusionDataInputIndices();
+
+      if (dataInputIndices.empty())
+         return false;
+
+      for (const size_t inputIdx : dataInputIndices) {
+         if (inputIdx >= inputs.size())
+            return false;
+      }
+
+      if (outputs.size() != 1)
          return false;
 
       const std::string outputName(outputs[0]);
 
-      if (IsAliasTensor(outputName))
+      if (IsAliasTensor(outputName) && !reorganize)
          return false;
 
       std::vector<size_t> outputShape;
@@ -120,8 +129,8 @@ void RModel::ComputeEltwiseFusionGroups()
          outputShape = GetTensorShape(outputName);
          outputType = GetTensorType(outputName);
 
-         for (const auto &inputNameView : inputs)
-            inputTypes.push_back(GetTensorType(std::string(inputNameView)));
+         for (const size_t inputIdx : dataInputIndices)
+            inputTypes.push_back(GetTensorType(std::string(inputs[inputIdx])));
       } catch (...) {
          return false;
       }
@@ -130,33 +139,46 @@ void RModel::ComputeEltwiseFusionGroups()
          return false;
 
       if (shuffle) {
-         if (inputs.size() != 1 || IsAliasTensor(std::string(inputs[0])))
+         if (dataInputIndices.size() != 1)
             return false;
 
+         const std::string inputName(inputs[dataInputIndices[0]]);
          std::vector<size_t> inputShape;
 
          try {
-            inputShape = GetTensorShape(std::string(inputs[0]));
+            inputShape = GetTensorShape(inputName);
          } catch (...) {
             return false;
          }
 
-         if (op->GetFusionInputIndexExpr(0, "idx", inputShape, outputShape).empty())
+         if (op->GetFusionInputIndexExpr(dataInputIndices[0], "idx", inputShape, outputShape).empty())
             return false;
+      } else if (reorganize) {
+         if (dataInputIndices.size() != 1)
+            return false;
+
+         try {
+            const auto inputShape = GetTensorShape(std::string(inputs[dataInputIndices[0]]));
+
+            if (ConvertShapeToLength(inputShape) != ConvertShapeToLength(outputShape))
+               return false;
+         } catch (...) {
+            return false;
+         }
       } else {
-         for (const auto &inputNameView : inputs) {
+         for (const size_t inputIdx : dataInputIndices) {
             EFusionInputAccess access;
             std::vector<size_t> alignedStrides;
 
-            if (!getInputAccess(std::string(inputNameView), outputShape, access, alignedStrides))
+            if (!getInputAccess(std::string(inputs[inputIdx]), outputShape, access, alignedStrides))
                return false;
          }
       }
 
       std::vector<std::string> testInputs;
-      testInputs.reserve(inputs.size());
+      testInputs.reserve(dataInputIndices.size());
 
-      for (size_t inputIdx = 0; inputIdx < inputs.size(); ++inputIdx)
+      for (size_t inputIdx = 0; inputIdx < dataInputIndices.size(); ++inputIdx)
          testInputs.push_back("x" + std::to_string(inputIdx));
 
       return !op->GetFusionExpr(testInputs).empty();
@@ -168,13 +190,16 @@ void RModel::ComputeEltwiseFusionGroups()
       if (opAssigned[firstOpIdx])
          continue;
 
-      if (!isSupportedFusionOp(firstOpIdx, true))
+      if (!isSupportedFusionOp(firstOpIdx, true, false))
          continue;
 
       const auto firstOutputs = fOperators[firstOpIdx]->GetOpOutputTensors();
 
       const std::string firstOutput(firstOutputs[0]);
       const auto groupOutputShape = GetTensorShape(firstOutput);
+
+      std::vector<size_t> currentLogicalShape = groupOutputShape;
+      bool hasReorganize = false;
 
       EltwiseFusionGroup group;
       group.opIndices.push_back(firstOpIdx);
@@ -196,9 +221,10 @@ void RModel::ComputeEltwiseFusionGroups()
       };
 
       const auto firstInputs = fOperators[firstOpIdx]->GetOpInputTensors();
+      const auto firstDataInputIndices = fOperators[firstOpIdx]->GetFusionDataInputIndices();
       const auto firstMappingType = fOperators[firstOpIdx]->GetFusionMappingType();
 
-      for (size_t inputIdx = 0; inputIdx < firstInputs.size(); ++inputIdx) {
+      for (const size_t inputIdx : firstDataInputIndices) {
          const std::string inputName(firstInputs[inputIdx]);
 
          if (firstMappingType == EFusionMappingType::Shuffle) {
@@ -253,7 +279,7 @@ void RModel::ComputeEltwiseFusionGroups()
          if (opAssigned[nextOpIdx])
             break;
 
-         if (!isSupportedFusionOp(nextOpIdx, false))
+         if (!isSupportedFusionOp(nextOpIdx, false, true))
             break;
 
          const auto nextOutputs =
@@ -272,18 +298,34 @@ void RModel::ComputeEltwiseFusionGroups()
             break;
          }
 
-         // All operators in this first implementation must produce tensors
-         // with the same shape. Only their external inputs may be scalars.
-         if (nextOutputShape != groupOutputShape)
+         const auto nextMappingType = fOperators[nextOpIdx]->GetFusionMappingType();
+         const bool nextIsReorganize = nextMappingType == EFusionMappingType::Reorganize;
+
+         if (nextIsReorganize) {
+            if (ConvertShapeToLength(nextOutputShape) != ConvertShapeToLength(currentLogicalShape))
+               break;
+
+            // Broadcast indexing stored before a shape change is relative to the old
+            // logical shape and cannot yet be safely reused.
+            const bool hasBroadcastInput =
+               std::any_of(group.externalInputs.begin(), group.externalInputs.end(), [](const FusionExternalInput &input) {
+                  return input.access == EFusionInputAccess::Broadcast;
+               });
+
+            if (hasBroadcastInput)
+               break;
+         } else if (nextOutputShape != currentLogicalShape) {
             break;
+         }
 
          const auto nextInputs = fOperators[nextOpIdx]->GetOpInputTensors();
+         const auto nextDataInputIndices = fOperators[nextOpIdx]->GetFusionDataInputIndices();
 
          std::vector<FusionExternalInput> pendingExternalInputs;
          bool canFuseNext = true;
 
-         for (const auto &inputNameView : nextInputs) {
-            const std::string inputName(inputNameView);
+         for (const size_t inputIdx : nextDataInputIndices) {
+            const std::string inputName(nextInputs[inputIdx]);
 
             const bool producedInsideGroup = std::find(producedTensors.begin(), producedTensors.end(), inputName) != producedTensors.end();
 
@@ -293,7 +335,12 @@ void RModel::ComputeEltwiseFusionGroups()
             EFusionInputAccess access;
             std::vector<size_t> alignedStrides;
 
-            if (!getInputAccess(inputName, groupOutputShape, access, alignedStrides)) {
+            if (!getInputAccess(inputName, nextIsReorganize ? currentLogicalShape : nextOutputShape, access, alignedStrides)) {
+               canFuseNext = false;
+               break;
+            }
+
+            if (hasReorganize && access == EFusionInputAccess::Broadcast) {
                canFuseNext = false;
                break;
             }
@@ -311,12 +358,24 @@ void RModel::ComputeEltwiseFusionGroups()
          group.opIndices.push_back(nextOpIdx);
          producedTensors.push_back(nextOutput);
          currentOpIdx = nextOpIdx;
+
+         if (nextIsReorganize) {
+            currentLogicalShape = nextOutputShape;
+            hasReorganize = true;
+         }
       }
 
       const auto finalOutputs = fOperators[currentOpIdx]->GetOpOutputTensors();
 
       group.outputTensor = std::string(finalOutputs[0]);
       group.numElements = ConvertShapeToLength(groupOutputShape);
+
+      if (IsAliasTensor(group.outputTensor)) {
+         for (const size_t opIdx : group.opIndices)
+            opAssigned[opIdx] = false;
+
+         continue;
+      }
 
       const size_t groupIdx = fEltwiseFusionGroups.size();
 
@@ -1418,8 +1477,11 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
             for (size_t opIdx : grp.opIndices) {
                std::vector<std::string> inputExpressions;
 
-               for (const auto &inputNameView : fOperators[opIdx]->GetOpInputTensors()) {
-                  const std::string inputName(inputNameView);
+               const auto opInputs = fOperators[opIdx]->GetOpInputTensors();
+               const auto dataInputIndices = fOperators[opIdx]->GetFusionDataInputIndices();
+
+               for (const size_t inputIdx : dataInputIndices) {
+                  const std::string inputName(opInputs[inputIdx]);
                   const auto valueIt = tensorValues.find(inputName);
 
                   if (valueIt == tensorValues.end()) {

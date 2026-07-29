@@ -155,6 +155,17 @@ public:
    {
       return "";
    }
+
+   virtual std::vector<size_t> GetFusionDataInputIndices() const
+   {
+      std::vector<size_t> indices;
+      indices.reserve(fInputTensorNames.size());
+
+      for (size_t i = 0; i < fInputTensorNames.size(); ++i)
+         indices.push_back(i);
+
+      return indices;
+   }
    //virtual void Forward_reference() = 0;
    //virtual void Forward_blas() = 0;
    virtual ~ROperator(){}
