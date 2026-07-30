@@ -46,11 +46,16 @@ inline void ValidateFP8GemmContext(const QuantizedGemmCodegenContext &context,
                                    const std::string &pathName)
 {
    ValidateQuantizedMatrixContext(context, "Gemm", pathName);
-   if (context.transA != 1 || context.transB != 0) {
-      throw std::runtime_error("SOFIE " + pathName + " supports native FP8 Gemm with transA=1 and transB=0");
+   const bool legacyTN = context.transA == 1 && context.transB == 0;
+   const bool standardNT = context.transA == 0 && context.transB == 1;
+   if (!legacyTN && !standardNT) {
+      throw std::runtime_error("SOFIE " + pathName +
+                               " supports native FP8 Gemm with transA=1/transB=0 or transA=0/transB=1");
    }
-   if (context.activation != EActivationType::UNDEFINED) {
-      throw std::runtime_error("SOFIE " + pathName + " does not support fused activation for native FP8 Gemm");
+   // Relu is fused into the FP8 epilogue (params.hasRelu); any other activation is not.
+   if (context.activation != EActivationType::UNDEFINED && context.activation != EActivationType::RELU) {
+      throw std::runtime_error("SOFIE " + pathName +
+                               " supports only a fused Relu activation for native FP8 Gemm");
    }
 }
 
@@ -232,6 +237,7 @@ inline std::string GenerateFusedQuantizedGemmCublasLtCoreLaunch(std::string opNa
       context.inputShape[dimA - 1].GetVal(), plan, region.inputQuant, region.weightQuant,
       region.biasQuant, region.outputQuant, INTERNAL::HasQuantizedGemmBias(region),
       context.activation == EActivationType::RELU, region.weightQuant.isSigned, context.alpha, context.beta);
+   call.outputRequantize = region.outputRequantize;
    return INTERNAL::GenerateQuantizedCudaLtMatMulCall(call);
 }
 
@@ -260,12 +266,21 @@ inline std::string GenerateFusedQuantizedGemmCublasLtFP8Launch(std::string opNam
       throw std::runtime_error("SOFIE fused Quantized Gemm cuBLASLt FP8 launch requires rank-2 tensors");
    }
 
+   // NT takes M/K from the input and N from the weight's rows; TN takes K/M from the input
+   // and N from the weight's columns.
+   const bool ntSpelling = context.transA == 0 && context.transB == 1;
+   const std::string mVal = ntSpelling ? context.inputShape[0].GetVal() : context.inputShape[1].GetVal();
+   const std::string kVal = ntSpelling ? context.inputShape[1].GetVal() : context.inputShape[0].GetVal();
+   const std::string nVal = ntSpelling ? context.weightShape[0].GetVal() : context.weightShape[1].GetVal();
+
    auto call = INTERNAL::MakeQuantizedCudaLtFP8DenseLinearCall(
       "ROperator_QuantizedGemm cuBLASLt FP8 dense-linear boundary " + opName,
       "quantizedGemmCudaLtFP8State_" + opName, "params_quantizedGemmFP8_" + opName,
       region.outputTensor, region.inputSourceTensor, plan.weightStorageTensor,
       region.biasSourceTensor, INTERNAL::HasQuantizedGemmBias(region), context.alpha, context.beta,
-      context.inputShape[1].GetVal(), context.weightShape[1].GetVal(), context.inputShape[0].GetVal(), plan);
+      mVal, nVal, kVal, plan);
+   call.weightIsMatrixA = ntSpelling;
+   call.hasRelu = context.activation == EActivationType::RELU;
    return INTERNAL::GenerateQuantizedCudaLtFP8DenseLinearCall(call);
 }
 

@@ -438,6 +438,10 @@ void RModel::AddLoweredQuantizedOperators(EQuantizedBackend backend)
       }
       if (plan.outputLowPrecisionCarrier == ELowPrecisionCarrier::Float32)
          setKnownTensorType(outputTensor, ETensorType::FLOAT);
+      // An E4M3 activation carrier (an FP8 layer handing the next FP8 layer a native
+      // operand) is stored as a byte-wide FP8 tensor.
+      if (plan.outputLowPrecisionCarrier == ELowPrecisionCarrier::FP8E4M3)
+         setKnownTensorType(outputTensor, ETensorType::FLOAT8E4M3FN);
       if (QuantizedPlanExposesQuantizedOutputCarrier(plan))
          setKnownTensorType(outputTensor, TensorTypeForQuantizedStorage(plan.outputStorage));
 

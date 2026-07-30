@@ -41,6 +41,33 @@ __device__ inline double QuantizedElementwiseDequant(CarrierT value, double scal
       return scale * (static_cast<double>(static_cast<std::int32_t>(value)) - static_cast<double>(zero));
 }
 
+// Quantized value of one elementwise result: both operands dequantized, combined, then
+// rounded onto the output grid with the Relu applied there.
+template <typename CarrierT>
+__device__ inline std::int32_t QuantizedElementwiseEvaluate(CarrierT ca, CarrierT cb,
+                                                            const QuantizedElementwiseInvocation &params)
+{
+   const double a = QuantizedElementwiseDequant<CarrierT>(ca, params.inputScale, params.inputZeroPoint);
+   const double b = QuantizedElementwiseDequant<CarrierT>(cb, params.operandBScale, params.operandBZeroPoint);
+   const double real = params.op == EQuantizedElementwiseOp::Add ? a + b : a * b;
+   auto quantized = QuantizedCudaQuantizeClamp(real, params.outputScale, params.outputZeroPoint,
+                                               params.outputQMin, params.outputQMax);
+   if (params.hasRelu && quantized < params.outputZeroPoint)
+      quantized = params.outputZeroPoint;
+   return quantized;
+}
+
+// Stores a quantized result as either an int8/uint8 carrier or a dequantized float.
+template <typename OutputT>
+__device__ inline OutputT QuantizedElementwiseStore(std::int32_t quantized,
+                                                    const QuantizedElementwiseInvocation &params)
+{
+   if constexpr (std::is_same_v<OutputT, float>)
+      return static_cast<float>(static_cast<double>(quantized - params.outputZeroPoint) * params.outputScale);
+   else
+      return static_cast<OutputT>(quantized);
+}
+
 template <typename CarrierT, typename OutputT>
 __global__ void QuantizedElementwiseAffineKernel(
    OutputT *output, const CarrierT *inputA, const CarrierT *inputB,
@@ -59,20 +86,41 @@ __global__ void QuantizedElementwiseAffineKernel(
       : INTERNAL::QuantizedBroadcastOffset(index, params.outputStride, params.outputExtent,
                                            params.operandBStride, params.rank);
 
-   const double a = QuantizedElementwiseDequant<CarrierT>(inputA[aOffset], params.inputScale, params.inputZeroPoint);
-   const double b = QuantizedElementwiseDequant<CarrierT>(inputB[bOffset], params.operandBScale, params.operandBZeroPoint);
-   double real = params.op == EQuantizedElementwiseOp::Add ? a + b : a * b;
+   output[index] = QuantizedElementwiseStore<OutputT>(
+      QuantizedElementwiseEvaluate<CarrierT>(inputA[aOffset], inputB[bOffset], params), params);
+}
 
-   auto quantized = QuantizedCudaQuantizeClamp(real, params.outputScale, params.outputZeroPoint,
-                                               params.outputQMin, params.outputQMax);
-   if (params.hasRelu && quantized < params.outputZeroPoint)
-      quantized = params.outputZeroPoint;
-   if constexpr (std::is_same_v<OutputT, float>) {
-      // Fake-quant float output: round-trip through the output grid.
-      output[index] = static_cast<float>(
-         static_cast<double>(quantized - params.outputZeroPoint) * params.outputScale);
-   } else {
-      output[index] = static_cast<OutputT>(quantized);
+// Four carriers per thread. One byte per thread yields 32-byte warp transactions instead of
+// 128; a single aligned 32-bit access restores full width. Arithmetic is unchanged.
+template <typename CarrierT, typename OutputT>
+__global__ void QuantizedElementwiseAffineVectorKernel(
+   OutputT *output, const CarrierT *inputA, const CarrierT *inputB,
+   QuantizedElementwiseInvocation params)
+{
+   struct alignas(4) Carrier4 { CarrierT v[4]; };
+   struct alignas(4) Output4 { OutputT v[4]; };
+
+   const std::size_t vectorCount = params.elements / 4;
+   const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+
+   if (index < vectorCount) {
+      const Carrier4 av = reinterpret_cast<const Carrier4 *>(inputA)[index];
+      const Carrier4 bv = reinterpret_cast<const Carrier4 *>(inputB)[index];
+      Output4 out;
+#pragma unroll
+      for (int lane = 0; lane < 4; ++lane)
+         out.v[lane] = QuantizedElementwiseStore<OutputT>(
+            QuantizedElementwiseEvaluate<CarrierT>(av.v[lane], bv.v[lane], params), params);
+      reinterpret_cast<Output4 *>(output)[index] = out;
+   }
+
+   // Up to three trailing elements when the count is not a multiple of four.
+   const std::size_t tailBegin = vectorCount * 4;
+   const std::size_t tailCount = params.elements - tailBegin;
+   if (blockIdx.x == 0 && threadIdx.x < tailCount) {
+      const std::size_t tail = tailBegin + threadIdx.x;
+      output[tail] = QuantizedElementwiseStore<OutputT>(
+         QuantizedElementwiseEvaluate<CarrierT>(inputA[tail], inputB[tail], params), params);
    }
 }
 
@@ -110,6 +158,36 @@ inline void LaunchQuantizedElementwiseAffine(QuantizedGemmCudaStream stream, voi
    const int blocks = static_cast<int>((params.elements + threads - 1) / threads);
    const auto *a = static_cast<const CarrierT *>(inputA);
    const auto *b = static_cast<const CarrierT *>(inputB);
+
+   // Vectorised only for a dense 4-element-aligned run: contiguous operands, 4-byte-aligned
+   // pointers, at least one full vector. Anything else keeps the scalar kernel.
+   const auto isAligned4 = [](const void *pointer) {
+      return (reinterpret_cast<std::uintptr_t>(pointer) & 0x3u) == 0u;
+   };
+   const std::size_t outputElementSize =
+      params.outputCarrier == EQuantizedOutputCarrier::Float ? sizeof(float) : 1u;
+   const bool vectorised = params.inputContiguous && params.operandBContiguous &&
+                           params.elements >= 4 && isAligned4(a) && isAligned4(b) &&
+                           isAligned4(output) &&
+                           (outputElementSize == 1u ||
+                            (reinterpret_cast<std::uintptr_t>(output) & 0xFu) == 0u);
+   if (vectorised) {
+      const int vectorBlocks =
+         static_cast<int>(((params.elements / 4) + threads - 1) / threads);
+      const int launchBlocks = vectorBlocks > 0 ? vectorBlocks : 1;
+      if (params.outputCarrier == EQuantizedOutputCarrier::UInt8) {
+         QuantizedElementwiseAffineVectorKernel<CarrierT, std::uint8_t>
+            <<<launchBlocks, threads, 0, stream>>>(static_cast<std::uint8_t *>(output), a, b, params);
+      } else if (params.outputCarrier == EQuantizedOutputCarrier::Int8) {
+         QuantizedElementwiseAffineVectorKernel<CarrierT, std::int8_t>
+            <<<launchBlocks, threads, 0, stream>>>(static_cast<std::int8_t *>(output), a, b, params);
+      } else {
+         QuantizedElementwiseAffineVectorKernel<CarrierT, float>
+            <<<launchBlocks, threads, 0, stream>>>(static_cast<float *>(output), a, b, params);
+      }
+      return;
+   }
+
    if (params.outputCarrier == EQuantizedOutputCarrier::UInt8) {
       QuantizedElementwiseAffineKernel<CarrierT, std::uint8_t>
          <<<blocks, threads, 0, stream>>>(static_cast<std::uint8_t *>(output), a, b, params);

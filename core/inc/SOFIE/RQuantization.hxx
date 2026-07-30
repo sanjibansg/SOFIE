@@ -113,6 +113,18 @@ struct QuantizedMatMulRegion {
    std::size_t weightQuantOpIndex = static_cast<std::size_t>(-1);
    std::size_t matmulOpIndex = static_cast<std::size_t>(-1);
    std::size_t outputQuantOpIndex = static_cast<std::size_t>(-1);
+   // Leading QuantizeLinear of a Q/DQ input pair, absorbed so the region reads the Q's
+   // float source directly.
+   std::optional<std::size_t> inputPairQuantizeOpIndex;
+   // Trailing DequantizeLinear of a Q/DQ output pair; the pair is one fake-quant, so the
+   // region emits the DQ's float output.
+   std::optional<std::size_t> outputDequantOpIndex;
+   // Relu consuming the output boundary, applied by the epilogue's hasRelu instead of a
+   // standalone kernel. The region then emits the Relu's output.
+   std::optional<std::size_t> outputReluOpIndex;
+   // Consuming region's input grid; the epilogue re-quantizes onto it and emits an int8
+   // carrier instead of a float.
+   std::optional<QuantizationInfo> outputRequantize;
 
    QuantizedEpilogue epilogue;
    QuantizedMatMulShapeAssessment shape;
@@ -144,6 +156,18 @@ struct QuantizedGemmRegion {
    std::optional<std::size_t> biasQuantOpIndex;
    std::size_t gemmOpIndex = static_cast<std::size_t>(-1);
    std::size_t outputQuantOpIndex = static_cast<std::size_t>(-1);
+   // Leading QuantizeLinear of a Q/DQ input pair, absorbed so the region reads the Q's
+   // float source directly.
+   std::optional<std::size_t> inputPairQuantizeOpIndex;
+   // Trailing DequantizeLinear of a Q/DQ output pair; the pair is one fake-quant, so the
+   // region emits the DQ's float output.
+   std::optional<std::size_t> outputDequantOpIndex;
+   // Relu consuming the output boundary, applied by the epilogue's hasRelu instead of a
+   // standalone kernel. The region then emits the Relu's output.
+   std::optional<std::size_t> outputReluOpIndex;
+   // Consuming region's input grid; the epilogue re-quantizes onto it and emits an int8
+   // carrier instead of a float.
+   std::optional<QuantizationInfo> outputRequantize;
 
    QuantizationInfo inputQuant;
    QuantizationInfo weightQuant;

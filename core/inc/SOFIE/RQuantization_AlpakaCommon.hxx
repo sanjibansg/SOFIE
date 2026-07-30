@@ -193,6 +193,12 @@ struct QuantizedFP8DenseLinearInvocation {
    std::size_t maxWorkspaceBytes = kQuantizedCudaLtMaxWorkspaceBytes;
    bool enableAutotuning = true;
    int autotuneIterations = 3;
+   // Relu applied by the FP8 epilogue; there is no FP8 Relu operator, so an E4M3 layer
+   // chain depends on it.
+   bool hasRelu = false;
+   // NT spelling: the weight is cuBLASLt's A operand with m/n exchanged, so the bias index
+   // is idx % m.
+   bool weightIsMatrixA = false;
 };
 
 struct QuantizedDenseLinearInvocation {
@@ -225,6 +231,13 @@ struct QuantizedDenseLinearInvocation {
    std::int32_t outputQMax = 127;
    bool hasBias = false;
    bool hasRelu = false;
+   // Re-quantize the fake-quant float onto the consuming region's input grid and store an
+   // int8 carrier, collapsing epilogue, Relu and the consumer's input-quantize into one pass.
+   bool fuseOutputRequantize = false;
+   double requantizeScale = 1.0;
+   std::int32_t requantizeZeroPoint = 0;
+   std::int32_t requantizeQMin = -128;
+   std::int32_t requantizeQMax = 127;
    std::size_t maxWorkspaceBytes = kQuantizedCudaLtMaxWorkspaceBytes;
    EQuantizedEpilogueMode epilogueMode = EQuantizedEpilogueMode::ExactFakeQuant;
    EQuantizedInputCarrier inputCarrier = EQuantizedInputCarrier::Float;

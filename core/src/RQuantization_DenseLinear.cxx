@@ -220,22 +220,26 @@ QuantizedDenseLinearProfileAssessment AssessDenseLinearComputeProfile(
    const QuantizationInfo &weightQuant,
    const QuantizationInfo &outputQuant,
    int expectedWeightPerChannelAxis,
-   const std::string &operatorName)
+   const std::string &operatorName,
+   bool outputFloatConsumed)
 {
    QuantizedDenseLinearProfileAssessment assessment;
 
-   const bool input8 = inputQuant.bitWidth == 8;
-   const bool weight8 = weightQuant.bitWidth == 8;
-   const bool output8 = outputQuant.bitWidth == 8;
+   // Sub-8-bit fixed point fits an int8 carrier exactly and the clamp range derives from
+   // bitWidth, so any 2..8-bit affine carrier is accepted; a float output waives them.
+   auto isInt8ExecutableWidth = [](unsigned b) { return b >= 2 && b <= 8; };
+   const bool input8 = isInt8ExecutableWidth(inputQuant.bitWidth);
+   const bool weight8 = isInt8ExecutableWidth(weightQuant.bitWidth);
+   const bool output8 = outputFloatConsumed || isInt8ExecutableWidth(outputQuant.bitWidth);
    if (!input8)
-      assessment.reasons.push_back(operatorName + " input bit width is not 8");
+      assessment.reasons.push_back(operatorName + " input bit width is not in the int8-executable range (2..8)");
    if (!weight8)
-      assessment.reasons.push_back(operatorName + " weight bit width is not 8");
+      assessment.reasons.push_back(operatorName + " weight bit width is not in the int8-executable range (2..8)");
    if (!output8)
-      assessment.reasons.push_back(operatorName + " output bit width is not 8");
+      assessment.reasons.push_back(operatorName + " output bit width is not in the int8-executable range (2..8)");
 
    const bool inputPerTensor = IsScalarPerTensor(inputQuant);
-   const bool outputPerTensor = IsScalarPerTensor(outputQuant);
+   const bool outputPerTensor = outputFloatConsumed || IsScalarPerTensor(outputQuant);
    const bool weightPerTensor = IsScalarPerTensor(weightQuant);
    const bool weightPerChannel = IsPerChannelAxis(weightQuant, expectedWeightPerChannelAxis);
    auto parameterReasons = DenseLinearQuantizationParameterUnsupportedReasons(
@@ -244,7 +248,7 @@ QuantizedDenseLinearProfileAssessment AssessDenseLinearComputeProfile(
 
    const bool hasAsymmetricInput = !IsScalarZeroPointZero(inputQuant);
    const bool hasAsymmetricWeight = !IsScalarZeroPointZero(weightQuant);
-   const bool hasAsymmetricOutput = !IsScalarZeroPointZero(outputQuant);
+   const bool hasAsymmetricOutput = !outputFloatConsumed && !IsScalarZeroPointZero(outputQuant);
    if (hasAsymmetricInput) {
       assessment.reasons.push_back(operatorName + " input zero point is nonzero; cuBLASLt int8 lowering requires row-sum zero-point correction");
    }
@@ -265,7 +269,7 @@ QuantizedDenseLinearProfileAssessment AssessDenseLinearComputeProfile(
       return assessment;
    }
 
-   if (inputQuant.isSigned && weightQuant.isSigned && outputQuant.isSigned) {
+   if (inputQuant.isSigned && weightQuant.isSigned && (outputFloatConsumed || outputQuant.isSigned)) {
       assessment.profile = weightPerChannel ? EQuantizedComputeProfile::SignedInt8PerTensorActivationPerChannelWeightRank2
                                             : EQuantizedComputeProfile::SignedInt8SymmetricPerTensorRank2;
       assessment.cublasLtOptimizedCandidate = true;
@@ -323,7 +327,10 @@ QuantizedMatrixShapePolicy MakeCublasLtShapePolicy(std::size_t m, std::size_t k,
          policy.policy = EQuantizedShapePolicy::Exact;
          policy.reason = "exact cuBLASLt int8 shape; " + reason.str();
       }
-   } else if (policy.paddingWorkRatio <= kCublasLtPaddingCandidateMaxWorkRatio) {
+   } else if (policy.paddingWorkRatio <= kCublasLtPaddingCandidateMaxWorkRatio ||
+              policy.physicalMacs < kCublasLtMinOptimizedMacs) {
+      // Padding is accepted when cheap, or when the whole padded GEMM is still tiny: the
+      // absolute wasted work is then negligible and the output is sliced back to N.
       policy.policy = EQuantizedShapePolicy::PaddedCandidate;
       policy.reason = "padded cuBLASLt candidate; profitability policy selects executable padded lowering; " + reason.str();
    } else {
@@ -336,8 +343,13 @@ QuantizedMatrixShapePolicy MakeCublasLtShapePolicy(std::size_t m, std::size_t k,
 
 bool IsProfitableCublasLtPaddedDenseLinearPolicy(const QuantizedMatrixShapePolicy &policy)
 {
-   return policy.policy == EQuantizedShapePolicy::PaddedCandidate &&
-          policy.logicalMacs >= kCublasLtMinProfitablePaddedMacs &&
+   if (policy.policy != EQuantizedShapePolicy::PaddedCandidate)
+      return false;
+   // The ratio and K/N minimums guard against waste on big GEMMs, which does not apply
+   // when the total padded work is negligible.
+   if (policy.physicalMacs < kCublasLtMinOptimizedMacs)
+      return true;
+   return policy.logicalMacs >= kCublasLtMinProfitablePaddedMacs &&
           policy.paddingWorkRatio <= kCublasLtProfitablePaddedMaxWorkRatio &&
           policy.logicalK >= kCublasLtMinProfitablePaddedK &&
           policy.logicalN >= kCublasLtMinProfitablePaddedN;
@@ -578,7 +590,8 @@ QuantizedDenseLinearBackendCapability AssessCublasLtDenseLinearCapability(
    const auto computeProfile = AssessDenseLinearComputeProfile(operands.inputQuant, operands.weightQuant,
                                                                operands.outputQuant,
                                                                operands.weightOutputChannelAxis,
-                                                               operands.operatorName);
+                                                               operands.operatorName,
+                                                               operands.outputFloatConsumed);
    semanticReasons.insert(semanticReasons.end(), computeProfile.reasons.begin(), computeProfile.reasons.end());
 
    const bool perTensorWeight = IsScalarPerTensor(operands.weightQuant);
@@ -805,9 +818,21 @@ QuantizedDenseLinearBackendCapability SelectExecutableDenseLinearCapability(Quan
    return capability;
 }
 
+// An output consumed by a non-quantized op must be a dequantized float, which the
+// cuBLASLt ExactFakeQuantFloat epilogue already produces.
+static void ApplyDequantizedFloatOutput(QuantizedLoweringPlan &plan, bool dequantizeFloatOutput)
+{
+   if (!dequantizeFloatOutput)
+      return;
+   plan.outputStorage = EQuantizedStorageType::FloatCarrier;
+   plan.outputMode = EQuantizedOutputMode::ExactFakeQuantFloat;
+   plan.outputLowPrecisionCarrier = ELowPrecisionCarrier::Float32;
+}
+
 QuantizedLoweringPlan MakeMatMulAlpakaTransposedWeightStoragePlan(const QuantizedMatMulRegion &region,
                                                                  const std::string &weightStorageTensor,
-                                                                 const QuantizedMatrixShapePolicy &shapePolicy)
+                                                                 const QuantizedMatrixShapePolicy &shapePolicy,
+                                                                 bool dequantizeFloatOutput)
 {
    QuantizedLoweringPlan plan;
    plan.backend = EQuantizedBackend::ALPAKA;
@@ -849,6 +874,7 @@ QuantizedLoweringPlan MakeMatMulAlpakaTransposedWeightStoragePlan(const Quantize
    plan.consumedOperatorIndices = QuantizedRegionConsumedOperatorIndices(region);
    plan.preservesQuantizationSemantics = true;
    plan.isMetadataOnly = false;
+   ApplyDequantizedFloatOutput(plan, dequantizeFloatOutput);
    PopulateDenseLinearResourceRequirements(plan, hasBias);
    return plan;
 }
@@ -948,7 +974,9 @@ QuantizedDenseLinearOperands MakeDenseLinearOperands(const QuantizedMatMulRegion
 
 QuantizedLoweringPlan MakeAlpakaCublasLtCorePlan(const QuantizedGemmRegion &region,
                                                  const std::string &weightStorageTensor,
-                                                 const QuantizedDenseLinearBackendCapability &capability)
+                                                 const QuantizedDenseLinearBackendCapability &capability,
+                                                 bool dequantizeFloatOutput,
+                                                 bool floatInputCarrier)
 {
    auto plan = MakeAvailableQuantizedGemmPlan(region, EQuantizedBackend::ALPAKA, EQuantizedLoweringStatus::Optimized,
                                               capability.reason, capability.tag);
@@ -969,6 +997,11 @@ QuantizedLoweringPlan MakeAlpakaCublasLtCorePlan(const QuantizedGemmRegion &regi
       plan.weightScaleTensor = region.weightQuant.scaleTensor;
       plan.weightZeroPointTensor = region.weightQuant.zeroPointTensor;
    }
+   ApplyDequantizedFloatOutput(plan, dequantizeFloatOutput);
+   // An intermediate input is a float activation, so the cuBLASLt path reads it as a
+   // float carrier and quantizes internally rather than retyping the source.
+   if (floatInputCarrier)
+      plan.inputStorage = EQuantizedStorageType::FloatCarrier;
    PopulateDenseLinearResourceRequirements(plan, hasBias);
    return plan;
 }

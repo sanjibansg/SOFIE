@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -16,6 +17,7 @@
 #include "SOFIE/ROperator_ONNXQuantizeLinear.hxx"
 #include "SOFIE/ROperator_QONNXQuant.hxx"
 #include "SOFIE/ROperator_QuantizedConv.hxx"
+#include "SOFIE/ROperator_Gemm.hxx"
 #include "SOFIE/ROperator_Relu.hxx"
 #include "SOFIE/RQuantization_Convolution.hxx"
 #include "SOFIE/RQuantization_DenseLinear.hxx"
@@ -37,6 +39,8 @@
 #include "ONNX_QDQ_QuantMatMul_RankNProjection_Add_FromONNX_GPU_ALPAKA.hxx"
 #include "QONNX_QuantConv_FromONNX_GPU_ALPAKA.hxx"
 #include "ONNX_QDQ_QuantConv_FromONNX_GPU_ALPAKA.hxx"
+#include "QONNX_QuantMLP_FromONNX_GPU_ALPAKA.hxx"
+#include "ONNX_QDQ_QuantMLP_FromONNX_GPU_ALPAKA.hxx"
 
 #include <alpaka/alpaka.hpp>
 #include <cuda_runtime.h>
@@ -238,6 +242,76 @@ TEST_F(QuantizationAlpakaTest, DenseLinear)
             "ONNX_QDQ_QuantMatMul_RankNProjection_Add_FromONNX_GPU_ALPAKA.dat",
             QuantizedLinearTest{256, 64, 64, true, true, false});
    }
+}
+
+// Runs a generated multi-layer quantized Session on the GPU. The DenseLinear cases above
+// check one GEMM's numerics; this covers the multi-layer carrier plumbing.
+TEST_F(QuantizationAlpakaTest, MultiLayerMlpRuns)
+{
+   // QONNX_QuantMLP.onnx: input[32,256] -> Quant -> Gemm(256) -> Relu -> Gemm(256) -> Quant, signed int8.
+   constexpr Idx kM = 32, kK = 256, kN = 256;
+   std::vector<std::int8_t> input(static_cast<std::size_t>(kM) * kK);
+   for (std::size_t i = 0; i < input.size(); ++i)
+      input[i] = static_cast<std::int8_t>((static_cast<int>(i * 7 + 3) % 15) - 7);
+
+   auto input_d = CopyQuantizedInputToDevice(input);
+   SOFIE_QONNX_QuantMLP::Session<alpaka::TagGpuCudaRt> model("QONNX_QuantMLP_FromONNX_GPU_ALPAKA.dat");
+
+   const Idx outputSize = static_cast<Idx>(kM) * kN;
+   auto result = model.infer(input_d);
+   alpaka::wait(queue);
+   cudaDeviceSynchronize();
+
+   auto result_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(outputSize));
+   alpaka::memcpy(queue, result_h, result);
+   alpaka::wait(queue);
+   const auto *res_ptr = reinterpret_cast<const std::int8_t *>(alpaka::getPtrNative(result_h));
+
+   // Non-degenerate output: both GEMMs ran, and the result is not a constant fill.
+   int nonZero = 0;
+   std::int8_t minv = 127, maxv = -128;
+   for (Idx i = 0; i < outputSize; ++i) {
+      nonZero += (res_ptr[i] != 0);
+      minv = std::min(minv, res_ptr[i]);
+      maxv = std::max(maxv, res_ptr[i]);
+   }
+   EXPECT_GT(nonZero, 0) << "multi-layer quantized MLP produced an all-zero output";
+   EXPECT_NE(static_cast<int>(minv), static_cast<int>(maxv)) << "output is a constant fill";
+}
+
+// The same network in standard ONNX Q/DQ, which lowers to the same kernels. Its terminal
+// DequantizeLinear makes the graph output float rather than int8.
+TEST_F(QuantizationAlpakaTest, MultiLayerQdqMlpRuns)
+{
+   constexpr Idx kM = 32, kK = 256, kN = 256;
+   std::vector<std::int8_t> input(static_cast<std::size_t>(kM) * kK);
+   for (std::size_t i = 0; i < input.size(); ++i)
+      input[i] = static_cast<std::int8_t>((static_cast<int>(i * 7 + 3) % 15) - 7);
+
+   auto input_d = CopyQuantizedInputToDevice(input);
+   SOFIE_ONNX_QDQ_QuantMLP::Session<alpaka::TagGpuCudaRt> model("ONNX_QDQ_QuantMLP_FromONNX_GPU_ALPAKA.dat");
+
+   const Idx outputSize = static_cast<Idx>(kM) * kN;
+   auto result = model.infer(input_d);
+   alpaka::wait(queue);
+   cudaDeviceSynchronize();
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(outputSize));
+   alpaka::memcpy(queue, result_h, result);
+   alpaka::wait(queue);
+   const auto *res_ptr = reinterpret_cast<const float *>(alpaka::getPtrNative(result_h));
+
+   int nonZero = 0;
+   float minv = std::numeric_limits<float>::infinity();
+   float maxv = -std::numeric_limits<float>::infinity();
+   for (Idx i = 0; i < outputSize; ++i) {
+      nonZero += (res_ptr[i] != 0.0f);
+      minv = std::min(minv, res_ptr[i]);
+      maxv = std::max(maxv, res_ptr[i]);
+      ASSERT_TRUE(std::isfinite(res_ptr[i])) << "non-finite output at i=" << i;
+   }
+   EXPECT_GT(nonZero, 0) << "Q/DQ multi-layer MLP produced an all-zero output";
+   EXPECT_NE(minv, maxv) << "output is a constant fill";
 }
 
 TEST(QuantizationContracts, Core)
@@ -2934,4 +3008,73 @@ TEST(QuantizationMetadata, Gather)
          EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticUnsupported);
          EXPECT_NE(region->reason.find("symmetric"), std::string::npos) << region->reason;
    }
+}
+
+// Multi-layer QONNX MLP in the shape a PQuant export produces. Every Gemm must reach the
+// optimized cuBLASLt int8 path, and codegen must not abort on an orphaned Quant.
+TEST(QuantizationMLP, MultiLayerQONNXWeaverStyle)
+{
+#ifndef SOFIE_USE_CUBLASLT
+   GTEST_SKIP() << "SOFIE_USE_CUBLASLT is not enabled";
+#else
+   // >1M MACs per Gemm, so each is a cuBLASLt exact-shape optimized candidate.
+   const std::size_t M = 64, K = 256, H = 256, N = 256;
+   SOFIE::RModel model("quant_mlp_weaver_style");
+   model.AddInputTensorInfo("input", SOFIE::ETensorType::FLOAT, std::vector<std::size_t>{M, K});
+
+   auto addFloat = [&](const std::string &name, const std::vector<std::size_t> &shp,
+                       std::size_t count, float v) {
+      model.AddInitializedTensor(name, SOFIE::ETensorType::FLOAT, shp,
+                                 std::shared_ptr<void>(new float[count], std::default_delete<float[]>()));
+      std::fill_n(static_cast<float *>(model.GetInitializedTensorData(name).get()), count, v);
+   };
+   addFloat("scale", {}, 1, 0.03125f);
+   addFloat("zp", {}, 1, 0.0f);
+   addFloat("bits", {}, 1, 8.0f);
+   addFloat("W0", {H, K}, H * K, 0.02f); // [out, in] for transB=1
+   addFloat("b0", {H}, H, 0.0f);
+   addFloat("W1", {N, H}, N * H, 0.02f);
+   addFloat("b1", {N}, N, 0.0f);
+
+   auto quant = [&](const std::string &pfx, const std::string &src, const std::string &dst) {
+      AddNamedOperator<SOFIE::ROperator_QONNXQuant>(
+         model, pfx, src, "scale", "zp", "bits", dst, true, false,
+         SOFIE::EQuantizationRoundingMode::ROUND, SOFIE::EQuantizationOverflowMode::SAT);
+   };
+   quant("q_in", "input", "in_q");
+   quant("q_w0", "W0", "W0_q");
+   quant("q_b0", "b0", "b0_q");
+   AddNamedOperator<SOFIE::ROperator_Gemm<float>>(model, "gemm0", 1.0f, 1.0f, 0, 1,
+                                                  "in_q", "W0_q", "b0_q", "g0");
+   quant("q_g0", "g0", "g0_q");
+   AddNamedOperator<SOFIE::ROperator_Relu<float>>(model, "relu0", "g0_q", "a0");
+   quant("q_a0", "a0", "a0_q");
+   quant("q_w1", "W1", "W1_q");
+   quant("q_b1", "b1", "b1_q");
+   AddNamedOperator<SOFIE::ROperator_Gemm<float>>(model, "gemm1", 1.0f, 1.0f, 0, 1,
+                                                  "a0_q", "W1_q", "b1_q", "g1");
+   quant("q_out", "g1", "output");
+   model.AddOutputTensorNameList({"output"});
+
+   ASSERT_NO_THROW(model.Initialize());
+   const auto &state = model.GetQuantizationState();
+
+   // Two quantized Gemm regions, each with an optimized cuBLASLt int8 ALPAKA plan.
+   ASSERT_EQ(SOFIE::CountQuantizedRegions<SOFIE::QuantizedGemmRegion>(state), 2U);
+   std::size_t optimizedGemms = 0;
+   for (const auto &[opIndex, region] : state.regions) {
+      if (SOFIE::FindQuantizedRegion<SOFIE::QuantizedGemmRegion>(state, opIndex) == nullptr)
+         continue;
+      const auto *plan =
+         SOFIE::FindQuantizedLoweringPlan(state, opIndex, SOFIE::EQuantizedBackend::ALPAKA);
+      ASSERT_NE(plan, nullptr);
+      EXPECT_EQ(plan->status, SOFIE::EQuantizedLoweringStatus::Optimized) << plan->reason;
+      if (plan->status == SOFIE::EQuantizedLoweringStatus::Optimized)
+         ++optimizedGemms;
+   }
+   EXPECT_EQ(optimizedGemms, 2U);
+
+   // The chain must generate without aborting on an orphaned QONNX Quant.
+   EXPECT_NO_THROW(model.GenerateGPU_ALPAKA(SOFIE::Options::kBinaryWeightFile));
+#endif
 }

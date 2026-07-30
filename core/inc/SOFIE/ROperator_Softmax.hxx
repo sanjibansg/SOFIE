@@ -185,6 +185,87 @@ public:
       }
       return out.str();
    }
+
+   // ---- GPU / Alpaka codegen -------------------------------------------------
+   // Softmax collapses to (outer, axisLen, inner): one thread per row runs the serial
+   // max / exp-sum / normalize scan along the axis, matching the CPU numerics.
+private:
+   std::size_t SoftmaxAxis() const
+   {
+      const std::size_t size = fShape.size();
+      return fAttrAxis < 0 ? size + fAttrAxis : static_cast<std::size_t>(fAttrAxis);
+   }
+   std::string SoftmaxDimProduct(std::size_t lo, std::size_t hi) const
+   {
+      std::string product;
+      for (std::size_t i = lo; i < hi; ++i)
+         product += (product.empty() ? "(" : "*(") + fShape[i].GetVal() + ")";
+      return product.empty() ? "1" : product;
+   }
+
+public:
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override
+   {
+      opName = "op_" + opName;
+      const std::string kname = "SoftmaxKernel_" + opName;
+      std::string op;
+      op = "\n//------ SOFTMAX_KERNEL_ALPAKA\n";
+      op += SP + "struct " + kname + " {\n";
+      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const* __restrict__ X, "
+            "T* __restrict__ Y, std::size_t numRows, std::size_t axisLen, std::size_t inner) const {\n";
+      op += SP + SP + SP + "const auto row = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (row >= numRows) return;\n";
+      op += SP + SP + SP + "const std::size_t o = row / inner;\n";
+      op += SP + SP + SP + "const std::size_t i = row % inner;\n";
+      op += SP + SP + SP + "const std::size_t base = o * axisLen * inner + i;\n";
+      op += SP + SP + SP + "T vmax = X[base];\n";
+      op += SP + SP + SP + "for (std::size_t k = 1; k < axisLen; ++k) { T v = X[base + k * inner]; if (v > vmax) vmax = v; }\n";
+      op += SP + SP + SP + "T sum = static_cast<T>(0);\n";
+      op += SP + SP + SP + "for (std::size_t k = 0; k < axisLen; ++k) { T e = static_cast<T>(exp(X[base + k * inner] - vmax)); Y[base + k * inner] = e; sum += e; }\n";
+      op += SP + SP + SP + "const T inv = static_cast<T>(1) / sum;\n";
+      op += SP + SP + SP + "for (std::size_t k = 0; k < axisLen; ++k) {\n";
+      op += SP + SP + SP + SP + "Y[base + k * inner] *= inv;\n";
+      if (fLogSoftmax)
+         op += SP + SP + SP + SP + "Y[base + k * inner] = static_cast<T>(log(Y[base + k * inner]));\n";
+      op += SP + SP + SP + "}\n";
+      op += SP + SP + "}\n";
+      op += SP + "};\n";
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override
+   {
+      opName = "op_" + opName;
+      return SP + "SoftmaxKernel_" + opName + " softmaxKernel_" + opName + ";\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string opName) override
+   {
+      if (fShape.empty())
+         throw std::runtime_error("SOFIE Operator Softmax called to Generate without being initialized first");
+      opName = "op_" + opName;
+      const std::size_t size = fShape.size();
+      const std::size_t axis = SoftmaxAxis();
+      const std::string axisLen = "(" + fShape[axis].GetVal() + ")";
+      const std::string inner = SoftmaxDimProduct(axis + 1, size);
+      const std::string outer = SoftmaxDimProduct(0, axis);
+      const std::string numRows = "(" + outer + ")*(" + inner + ")";
+
+      std::stringstream out;
+      out << "\n//------ SOFTMAX_GPU_ALPAKA\n";
+      out << SP << "auto const elementsPerThread_" << fNY << " = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_" << fNY << " = Vec::all(Idx{" << numRows << "});\n";
+      out << SP << "auto const workDiv_" << fNY << " = sofie_workdiv(elementsPerGrid_" << fNY << ");\n";
+      out << SP << "auto task_" << opName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNY
+          << ", softmaxKernel_" << opName << ", alpaka::getPtrNative(deviceBuf_" << fNX
+          << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), static_cast<Idx>(" << numRows
+          << "), static_cast<Idx>(" << axisLen << "), static_cast<Idx>(" << inner << "));\n";
+      out << SP << "alpaka::enqueue(queue, task_" << opName << ");\n";
+      return out.str();
+   }
+
+   std::vector<std::string> GetStdLibs() override { return { std::string("cmath") }; }
 };
 
 } // namespace SOFIE

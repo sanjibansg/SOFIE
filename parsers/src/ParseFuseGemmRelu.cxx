@@ -54,6 +54,24 @@ ParserFuseFuncSignature ParseFuseGemmRelu = [](RModelParser_ONNX &parser, const 
                                             gemmnode.input(1), gemmnode.input(2), relunode.output(0), EActivationType::RELU));
       }
       break;
+   case ETensorType::FLOAT8E4M3FN:
+   case ETensorType::FLOAT8E4M3FNUZ:
+   case ETensorType::FLOAT8E5M2:
+   case ETensorType::FLOAT8E5M2FNUZ:
+   case ETensorType::FLOAT8E8M0:
+      // Native FP8 Gemm with the Relu fused into its epilogue; there is no FP8 Relu
+      // operator.
+      if (gemmnode.input_size() == 2) {
+         op.reset(new ROperator_Gemm<float>(attr_alpha, attr_beta, attr_transA, attr_transB, gemmnode.input(0),
+                                            gemmnode.input(1), relunode.output(0), EActivationType::RELU, true));
+      } else if (gemmnode.input_size() == 3) {
+         op.reset(new ROperator_Gemm<float>(attr_alpha, attr_beta, attr_transA, attr_transB, gemmnode.input(0),
+                                            gemmnode.input(1), gemmnode.input(2), relunode.output(0),
+                                            EActivationType::RELU, true));
+      } else {
+         throw std::runtime_error("TMVA::SOFIE - Unsupported - native FP8 fused Gemm+Relu requires two or three inputs");
+      }
+      break;
    default:
       throw std::runtime_error("TMVA::SOFIE - Unsupported - Operator Gemm does not yet support input type " +
                                std::to_string(static_cast<int>(input_type)));
@@ -61,7 +79,9 @@ ParserFuseFuncSignature ParseFuseGemmRelu = [](RModelParser_ONNX &parser, const 
 
    std::string output_name = relunode.output(0);
    if (!parser.IsRegisteredTensorType(output_name)) {
-      parser.RegisterTensorType(output_name, input_type);
+      // As in ParseGemm, an FP8 dense layer produces FLOAT; keeping the activation in E4M3
+      // is a lowering decision, so registering FP8 here would leak into float fallbacks.
+      parser.RegisterTensorType(output_name, DenseLinearOutputTensorType(input_type));
    }
 
    return op;

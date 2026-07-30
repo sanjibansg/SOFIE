@@ -141,9 +141,12 @@ inline const char *QuantizedGemmCudaLtFP8_OutputProfileName(EQuantizedFP8OutputC
 
 inline bool QuantizedGemmCudaLtFP8_IsExecutableE4M3TN(const QuantizedFP8DenseLinearInvocation &params)
 {
+   // E4M3 is executable as an output carrier, which is what keeps an FP8 layer chain in
+   // FP8. It requires the BF16 C matrix set up below.
    const bool supportedOutput = params.outputCarrier == EQuantizedFP8OutputCarrier::Float16 ||
                                 params.outputCarrier == EQuantizedFP8OutputCarrier::BFloat16 ||
-                                params.outputCarrier == EQuantizedFP8OutputCarrier::Float32;
+                                params.outputCarrier == EQuantizedFP8OutputCarrier::Float32 ||
+                                params.outputCarrier == EQuantizedFP8OutputCarrier::FP8E4M3;
    return params.m != 0 && params.n != 0 && params.k != 0 && params.batchCount != 0 &&
           params.inputFormat == EQuantizedFP8Format::E4M3 &&
           params.weightFormat == EQuantizedFP8Format::E4M3 &&
@@ -182,7 +185,7 @@ inline QuantizedDenseLinearBackendCapability QuantizedGemmCudaLtFP8_QueryCapabil
       LowPrecisionCarrierForCudaFP8Format(params.weightFormat),
       LowPrecisionCarrierForCudaFP8OutputCarrier(params.outputCarrier),
       LowPrecisionAccumulationForCudaFP8(params.accumulation),
-      "SOFIE FP8 cuBLASLt dense-linear boundary supports executable E4M3 x E4M3 TN Float16/BFloat16/Float32 output only in this build/backend");
+      "SOFIE FP8 cuBLASLt dense-linear boundary supports executable E4M3 x E4M3 TN E4M3/Float16/BFloat16/Float32 output only in this build/backend");
 }
 
 #ifdef SOFIE_USE_CUBLASLT
@@ -355,20 +358,29 @@ __global__ void QuantizedGemmCudaQuantizedEpilogueKernel(OutputT *__restrict__ o
    output[idx] = static_cast<OutputT>(yq);
 }
 
-__global__ void QuantizedGemmCudaEpilogueKernel(float *output, const std::int32_t *accumulator, const float *bias,
-                                                const float *weightScaleVector,
-                                                QuantizedDenseLinearInvocation params)
+// Logical output extent: a padded GEMM keeps its physical row stride in params.n, so the
+// epilogue slices [logicalM, logicalN] out of the padded accumulator.
+__device__ inline std::size_t QuantizedGemmCudaLogicalElements(const QuantizedDenseLinearInvocation &params)
 {
-   const std::size_t elements = params.m * params.n;
-   const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-   if (idx >= elements)
-      return;
+   const std::size_t cols = params.logicalN != 0 ? params.logicalN : params.n;
+   const std::size_t rows = params.logicalM != 0 ? params.logicalM : params.m;
+   return rows * cols;
+}
 
-   const std::size_t col = idx % params.n;
+// Fake-quant value of one logical output element: the accumulator scaled and biased, rounded
+// onto the output grid with the Relu applied there, then dequantized back to float.
+__device__ inline float QuantizedGemmCudaEpilogueValue(std::size_t idx, const std::int32_t *accumulator,
+                                                       const float *bias, const float *weightScaleVector,
+                                                       const QuantizedDenseLinearInvocation &params)
+{
+   const std::size_t logicalCols = params.logicalN != 0 ? params.logicalN : params.n;
+   const std::size_t col = idx % logicalCols;
+   const std::size_t row = idx / logicalCols;
+   const std::size_t accIdx = row * params.n + col;
    const double weightScale = params.weightScaleMode == EQuantizedScaleMode::PerOutputChannel
                                  ? static_cast<double>(weightScaleVector[col])
                                  : params.weightScale;
-   double real = params.alpha * static_cast<double>(accumulator[idx]) * params.inputScale * weightScale;
+   double real = params.alpha * static_cast<double>(accumulator[accIdx]) * params.inputScale * weightScale;
    if (params.hasBias && bias != nullptr) {
       const double biasScale = params.weightScaleMode == EQuantizedScaleMode::PerOutputChannel
                                   ? params.inputScale * weightScale
@@ -383,7 +395,33 @@ __global__ void QuantizedGemmCudaEpilogueKernel(float *output, const std::int32_
    if (params.hasRelu && yq < params.outputZeroPoint)
       yq = params.outputZeroPoint;
    yq = QuantizedCudaClamp(yq, params.outputQMin, params.outputQMax);
-   output[idx] = static_cast<float>(static_cast<double>(yq - params.outputZeroPoint) * params.outputScale);
+   return static_cast<float>(static_cast<double>(yq - params.outputZeroPoint) * params.outputScale);
+}
+
+__global__ void QuantizedGemmCudaEpilogueKernel(float *output, const std::int32_t *accumulator, const float *bias,
+                                                const float *weightScaleVector,
+                                                QuantizedDenseLinearInvocation params)
+{
+   const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+   if (idx >= QuantizedGemmCudaLogicalElements(params))
+      return;
+   output[idx] = QuantizedGemmCudaEpilogueValue(idx, accumulator, bias, weightScaleVector, params);
+}
+
+// Re-quantizes the same fake-quant value onto the consuming region's input grid and stores an
+// int8 carrier, collapsing epilogue, Relu and the consumer's input-quantize into one pass.
+__global__ void QuantizedGemmCudaFusedRequantizeEpilogueKernel(std::int8_t *output,
+                                                              const std::int32_t *accumulator, const float *bias,
+                                                              const float *weightScaleVector,
+                                                              QuantizedDenseLinearInvocation params)
+{
+   const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+   if (idx >= QuantizedGemmCudaLogicalElements(params))
+      return;
+   const float value = QuantizedGemmCudaEpilogueValue(idx, accumulator, bias, weightScaleVector, params);
+   output[idx] = static_cast<std::int8_t>(QuantizedCudaQuantizeClamp(
+      static_cast<double>(value), params.requantizeScale, params.requantizeZeroPoint,
+      params.requantizeQMin, params.requantizeQMax));
 }
 
 template <typename OutputT>
@@ -408,8 +446,13 @@ __global__ void QuantizedGemmCudaLtFP8BiasEpilogueKernel(OutputT *__restrict__ o
    if (idx >= elements)
       return;
 
-   const std::size_t col = idx % params.n;
-   const float value = QuantizedGemmCudaFP8OutputToFloat(output[idx]) + params.beta * bias[col];
+   // Output features run along m under NT, along n otherwise.
+   const std::size_t col = params.weightIsMatrixA ? (idx % params.m) : (idx % params.n);
+   float value = QuantizedGemmCudaFP8OutputToFloat(output[idx]);
+   if (params.hasBias && bias != nullptr)
+      value += params.beta * bias[col];
+   if (params.hasRelu && !(value > 0.0f))
+      value = 0.0f;
    output[idx] = QuantizedGemmCudaFP8OutputFromFloat<OutputT>(value);
 }
 
@@ -417,7 +460,8 @@ inline void QuantizedGemmCudaLtFP8ApplyBiasEpilogue(QuantizedGemmCudaStream stre
                                                      const float *bias,
                                                      const QuantizedFP8DenseLinearInvocation &params)
 {
-   if (!params.hasBias || bias == nullptr || params.beta == 0.0f)
+   const bool appliesBias = params.hasBias && bias != nullptr && params.beta != 0.0f;
+   if (!appliesBias && !params.hasRelu)
       return;
    const std::size_t elements = params.m * params.n;
    if (elements == 0)
@@ -434,8 +478,13 @@ inline void QuantizedGemmCudaLtFP8ApplyBiasEpilogue(QuantizedGemmCudaStream stre
    case EQuantizedFP8OutputCarrier::BFloat16:
       QuantizedGemmCudaLtFP8BiasEpilogueKernel<__nv_bfloat16><<<blocks, threads, 0, stream>>>(static_cast<__nv_bfloat16 *>(output), bias, params);
       break;
+   case EQuantizedFP8OutputCarrier::FP8E4M3:
+      // E4M3 activation carrier: the GEMM already stored E4M3, so bias and Relu are applied
+      // in place through float.
+      QuantizedGemmCudaLtFP8BiasEpilogueKernel<__nv_fp8_e4m3><<<blocks, threads, 0, stream>>>(static_cast<__nv_fp8_e4m3 *>(output), bias, params);
+      break;
    default:
-      throw std::runtime_error("SOFIE FP8 bias epilogue supports Float32, Float16, and BFloat16 output carriers");
+      throw std::runtime_error("SOFIE FP8 bias epilogue supports E4M3, Float32, Float16, and BFloat16 output carriers");
    }
    CheckCudaStatus(cudaGetLastError(), "QuantizedGemmCudaLtFP8BiasEpilogueKernel");
 }
@@ -559,7 +608,11 @@ inline void QuantizedGemmCudaLtFP8State::Initialize(const QuantizedFP8DenseLinea
                                                                static_cast<std::int64_t>(params.k)),
                                     "cublasLtMatrixLayoutCreate(FP8 B)");
       const auto outputDataType = QuantizedGemmCudaLtFP8_OutputDataType(params.outputCarrier);
-      INTERNAL::CheckCublasLtStatus(cublasLtMatrixLayoutCreate(&fCLayout, outputDataType,
+      // cuBLASLt requires a BF16 or FP16 C when D is FP8. beta is 0 here, so C is unused.
+      const auto cDataType = (outputDataType == CUDA_R_8F_E4M3 || outputDataType == CUDA_R_8F_E5M2)
+                                ? CUDA_R_16BF
+                                : outputDataType;
+      INTERNAL::CheckCublasLtStatus(cublasLtMatrixLayoutCreate(&fCLayout, cDataType,
                                                                static_cast<std::uint64_t>(params.m),
                                                                static_cast<std::uint64_t>(params.n),
                                                                static_cast<std::int64_t>(params.m)),
@@ -1482,9 +1535,19 @@ inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &state, QuantizedG
        params.outputCarrier == EQuantizedOutputCarrier::Float) {
       throw std::runtime_error("SOFIE cuBLASLt quantized GEMM quantized epilogue requires an integer output carrier");
    }
-   if (params.epilogueMode != EQuantizedEpilogueMode::Quantized &&
+   if (params.epilogueMode != EQuantizedEpilogueMode::Quantized && !params.fuseOutputRequantize &&
        params.outputCarrier != EQuantizedOutputCarrier::Float) {
       throw std::runtime_error("SOFIE cuBLASLt quantized GEMM float epilogues require a float output carrier");
+   }
+   if (params.fuseOutputRequantize) {
+      if (params.epilogueMode == EQuantizedEpilogueMode::Quantized)
+         throw std::runtime_error("SOFIE cuBLASLt quantized GEMM output requantize fusion applies to the fake-quant "
+                                  "float epilogue, not the quantized epilogue");
+      if (params.outputCarrier != EQuantizedOutputCarrier::Int8)
+         throw std::runtime_error("SOFIE cuBLASLt quantized GEMM output requantize fusion requires an int8 output "
+                                  "carrier");
+      if (!(params.requantizeScale > 0.0))
+         throw std::runtime_error("SOFIE cuBLASLt quantized GEMM output requantize fusion requires a positive scale");
    }
 
    QuantizedDenseLinearInvocation effectiveParams = params;
@@ -1522,8 +1585,11 @@ inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &state, QuantizedG
          inputQuantized = state.InputQuantizedBuffer();
       }
    } else {
-      if (effectiveParams.paddedExecution) {
-         throw std::runtime_error("SOFIE cuBLASLt quantized GEMM padded execution currently requires int8 input carriers");
+      // Float input carrier: quantize float->int8 internally. Output/N padding is fine here;
+      // input-dimension padding would need a second pass over the quantized buffer.
+      if (effectiveParams.paddedExecution &&
+          (effectiveParams.logicalM < effectiveParams.m || effectiveParams.logicalK < effectiveParams.k)) {
+         throw std::runtime_error("SOFIE cuBLASLt quantized GEMM float input carrier with padded input dimensions is not yet supported");
       }
       const int inputBlocks = static_cast<int>((inputElements + threads - 1) / threads);
       const float *inputFloat = static_cast<const float *>(input);
@@ -1597,12 +1663,19 @@ inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &state, QuantizedG
          }
       }
    } else {
-      if (effectiveParams.paddedExecution) {
-         throw std::runtime_error("SOFIE cuBLASLt quantized GEMM padded execution currently requires quantized output mode");
+      // Fake-quant float output: the epilogue writes the LOGICAL output directly
+      // (slicing the padded accumulator), so padded execution needs no scratch.
+      const int logicalOutputBlocks = static_cast<int>((logicalOutputElements + threads - 1) / threads);
+      if (effectiveParams.fuseOutputRequantize) {
+         // Writes the logical output compactly, so a padded GEMM needs no scratch or unpad.
+         INTERNAL::QuantizedGemmCudaFusedRequantizeEpilogueKernel<<<logicalOutputBlocks, threads, 0, stream>>>(
+            static_cast<std::int8_t *>(output), state.AccumulatorBuffer(), bias, weightScaleVector, effectiveParams);
+         INTERNAL::CheckCudaStatus(cudaGetLastError(), "QuantizedGemmCudaFusedRequantizeEpilogueKernel launch");
+      } else {
+         auto *floatOutput = static_cast<float *>(output);
+         INTERNAL::QuantizedGemmCudaEpilogueKernel<<<logicalOutputBlocks, threads, 0, stream>>>(floatOutput, state.AccumulatorBuffer(), bias, weightScaleVector, effectiveParams);
+         INTERNAL::CheckCudaStatus(cudaGetLastError(), "QuantizedGemmCudaEpilogueKernel launch");
       }
-      auto *floatOutput = static_cast<float *>(output);
-      INTERNAL::QuantizedGemmCudaEpilogueKernel<<<outputBlocks, threads, 0, stream>>>(floatOutput, state.AccumulatorBuffer(), bias, weightScaleVector, effectiveParams);
-      INTERNAL::CheckCudaStatus(cudaGetLastError(), "QuantizedGemmCudaEpilogueKernel launch");
    }
    profileTimer.RecordEpilogueStop(stream, state.WorkspaceSize(), state.HeuristicResultCount(),
                                    state.SelectedHeuristicIndex(), state.AutotuneMs(),

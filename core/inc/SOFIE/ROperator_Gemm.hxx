@@ -279,10 +279,13 @@ namespace SOFIE{
                shapeY.erase(shapeY.end()-1);
          }
 
+         // Use the same rule as TypeInference: a dense layer with an FP8 operand produces a
+         // FLOAT value.
+         const ETensorType outputType = TypeInference({model.GetTensorType(fNA)})[0];
          if (!fIsDynamic)
-            model.AddIntermediateTensor(fNY, model.GetTensorType(fNA), shapeY);
+            model.AddIntermediateTensor(fNY, outputType, shapeY);
          else
-            model.AddDynamicTensor(fNY, model.GetTensorType(fNA), fShapeY);
+            model.AddDynamicTensor(fNY, outputType, fShapeY);
 
          if (model.Verbose()){
             std::cout << "Gemm (or MatMul) " << " ---> " << fNY << " shape ";

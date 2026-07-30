@@ -51,6 +51,12 @@ std::unique_ptr<ROperator> ParseBasicBinary(RModelParser_ONNX &parser, const onn
       // to a direct low-precision kernel with an FP32-semantic float output.
       op.reset(new ROperator_BasicBinary<float, Op>(nodeproto.input(0), nodeproto.input(1), output_name));
       break;
+   case ETensorType::INT8:
+   case ETensorType::UINT8:
+      // An already-quantized operand, as seen inside a quantized region. Same treatment as
+      // FP8: parse to the float operator and let the quantization pass lower it.
+      op.reset(new ROperator_BasicBinary<float, Op>(nodeproto.input(0), nodeproto.input(1), output_name));
+      break;
    default:
       throw std::runtime_error("TMVA::SOFIE - Unsupported - Binary Operator does not yet support input type " +
                                std::to_string(static_cast<int>(input_type)));
@@ -58,7 +64,9 @@ std::unique_ptr<ROperator> ParseBasicBinary(RModelParser_ONNX &parser, const onn
 
    // Infer the output type; an FP8 binary op carries FP32 semantics downstream.
    if (!parser.IsRegisteredTensorType(output_name)) {
-      parser.RegisterTensorType(output_name, IsFP8TensorType(input_type) ? ETensorType::FLOAT : input_type);
+      const bool lowPrecisionOperand = IsFP8TensorType(input_type) || input_type == ETensorType::INT8 ||
+                                       input_type == ETensorType::UINT8;
+      parser.RegisterTensorType(output_name, lowPrecisionOperand ? ETensorType::FLOAT : input_type);
    }
 
    return op;

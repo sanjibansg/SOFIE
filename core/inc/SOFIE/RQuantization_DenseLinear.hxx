@@ -29,6 +29,10 @@ struct QuantizedDenseLinearOperands {
    std::vector<std::size_t> weightShape;
    std::vector<std::size_t> outputShape;
 
+   // A region feeding a non-quantized op emits a dequantized float, so the output-quant
+   // carrier constraints are waived.
+   bool outputFloatConsumed = false;
+
    bool hasLogicalShape = false;
    bool requiresBatchedLowering = false;
    std::size_t logicalM = 0;
@@ -77,7 +81,8 @@ QuantizedDenseLinearProfileAssessment AssessDenseLinearComputeProfile(
    const QuantizationInfo &weightQuant,
    const QuantizationInfo &outputQuant,
    int expectedWeightPerChannelAxis,
-   const std::string &operatorName);
+   const std::string &operatorName,
+   bool outputFloatConsumed = false);
 
 QuantizedMatrixShapePolicy MakeCublasLtShapePolicy(std::size_t m, std::size_t k, std::size_t n);
 QuantizedMatrixShapePolicy MakeExactFP8DenseLinearShapePolicy(std::size_t m, std::size_t k, std::size_t n);
@@ -117,7 +122,7 @@ QuantizedLoweringPlan MakeUnsupportedLowPrecisionDenseLinearPlan(
    EQuantizedComputeProfile profile, std::string capabilityTag);
 QuantizedLoweringPlan MakeMatMulAlpakaTransposedWeightStoragePlan(
    const QuantizedMatMulRegion &region, const std::string &weightStorageTensor,
-   const QuantizedMatrixShapePolicy &shapePolicy);
+   const QuantizedMatrixShapePolicy &shapePolicy, bool dequantizeFloatOutput = false);
 QuantizedLoweringPlan MakeCPUPackedWeightBaselinePlan(const QuantizedGemmRegion &region,
                                                        const std::string &weightStorageTensor);
 QuantizedLoweringPlan MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend backend,
@@ -125,7 +130,8 @@ QuantizedLoweringPlan MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend backend
                                                        bool preservesSemantics);
 QuantizedLoweringPlan MakeAlpakaCublasLtCorePlan(
    const QuantizedGemmRegion &region, const std::string &weightStorageTensor,
-   const QuantizedDenseLinearBackendCapability &capability);
+   const QuantizedDenseLinearBackendCapability &capability, bool dequantizeFloatOutput = false,
+   bool floatInputCarrier = false);
 
 QuantizedLoweringPlan MakeAlpakaCublasLtFP8Plan(
    const QuantizedGemmRegion &region, const std::string &weightStorageTensor,

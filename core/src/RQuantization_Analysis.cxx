@@ -189,6 +189,12 @@ std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedG
                                        region.gemmOpIndex, region.outputQuantOpIndex};
    if (region.biasQuantOpIndex)
       indices.push_back(*region.biasQuantOpIndex);
+   if (region.inputPairQuantizeOpIndex)
+      indices.push_back(*region.inputPairQuantizeOpIndex);
+   if (region.outputDequantOpIndex)
+      indices.push_back(*region.outputDequantOpIndex);
+   if (region.outputReluOpIndex)
+      indices.push_back(*region.outputReluOpIndex);
    std::sort(indices.begin(), indices.end());
    return indices;
 }
@@ -199,6 +205,12 @@ std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedM
                                        region.matmulOpIndex, region.outputQuantOpIndex};
    if (region.epilogue.addOpIndex)
       indices.push_back(*region.epilogue.addOpIndex);
+   if (region.inputPairQuantizeOpIndex)
+      indices.push_back(*region.inputPairQuantizeOpIndex);
+   if (region.outputDequantOpIndex)
+      indices.push_back(*region.outputDequantOpIndex);
+   if (region.outputReluOpIndex)
+      indices.push_back(*region.outputReluOpIndex);
    std::sort(indices.begin(), indices.end());
    return indices;
 }
@@ -216,6 +228,10 @@ QuantizedMatMulRegion MakeQuantizedMatMulRegionFromGemmLikeRegion(const Quantize
    matmul.weightQuantOpIndex = region.weightQuantOpIndex;
    matmul.matmulOpIndex = region.gemmOpIndex;
    matmul.outputQuantOpIndex = region.outputQuantOpIndex;
+   matmul.inputPairQuantizeOpIndex = region.inputPairQuantizeOpIndex;
+   matmul.outputDequantOpIndex = region.outputDequantOpIndex;
+   matmul.outputReluOpIndex = region.outputReluOpIndex;
+   matmul.outputRequantize = region.outputRequantize;
    matmul.inputQuant = region.inputQuant;
    matmul.weightQuant = region.weightQuant;
    matmul.outputQuant = region.outputQuant;

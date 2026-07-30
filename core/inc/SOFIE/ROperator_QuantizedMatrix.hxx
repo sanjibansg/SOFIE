@@ -76,8 +76,10 @@ inline const char *QuantizedCudaEpilogueModeName(EQuantizedOutputMode mode, cons
 
 inline const char *QuantizedCudaOutputCarrierName(const QuantizationInfo &info, const std::string &pathName)
 {
-   if (info.bitWidth != 8) {
-      throw std::runtime_error("SOFIE " + pathName + " currently supports only 8-bit output carriers");
+   // A 2..8-bit affine output rides in an int8/uint8 buffer with a bitWidth-derived clamp
+   // range; only widths outside that range are unsupported.
+   if (info.bitWidth < 2 || info.bitWidth > 8) {
+      throw std::runtime_error("SOFIE " + pathName + " output bit width is not in the int8-executable range (2..8)");
    }
    return info.isSigned ? "Int8" : "UInt8";
 }
@@ -107,6 +109,9 @@ struct QuantizedCudaLtMatMulCall {
    bool hasBias = false;
    bool hasRelu = false;
    bool weightIsSigned = true;
+   // Consuming region's input grid; the epilogue re-quantizes onto it and stores an int8
+   // carrier.
+   std::optional<QuantizationInfo> outputRequantize;
    float alpha = 1.0f;
    float beta = 1.0f;
 };
@@ -216,8 +221,25 @@ inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMul
        << QuantizedCudaEpilogueModeName(call.outputMode, call.boundaryName) << ";\n";
    out << "      " << call.paramsName << ".inputCarrier = SOFIE::EQuantizedInputCarrier::"
        << QuantizedCudaInputCarrierName(call.inputCarrierMode, call.boundaryName) << ";\n";
+   // A fake-quant-float epilogue dequantizes to a float D, so the carrier must be Float;
+   // a quantized epilogue keeps the int8/uint8 carrier.
+   const bool fusedRequantize =
+      call.outputMode != EQuantizedOutputMode::Quantized && call.outputRequantize.has_value();
    out << "      " << call.paramsName << ".outputCarrier = SOFIE::EQuantizedOutputCarrier::"
-       << QuantizedCudaOutputCarrierName(call.outputQuant, call.boundaryName) << ";\n";
+       << (call.outputMode == EQuantizedOutputMode::Quantized
+              ? QuantizedCudaOutputCarrierName(call.outputQuant, call.boundaryName)
+              : (fusedRequantize ? std::string("Int8") : std::string("Float"))) << ";\n";
+   if (fusedRequantize) {
+      const auto requantRange = QuantizedIntegerRange(*call.outputRequantize);
+      out << "      " << call.paramsName << ".fuseOutputRequantize = true;\n";
+      out << "      " << call.paramsName << ".requantizeScale = " << call.outputRequantize->scale << ";\n";
+      out << "      " << call.paramsName << ".requantizeZeroPoint = static_cast<std::int32_t>("
+          << call.outputRequantize->zeroPoint << ");\n";
+      out << "      " << call.paramsName << ".requantizeQMin = static_cast<std::int32_t>(" << requantRange.first
+          << ");\n";
+      out << "      " << call.paramsName << ".requantizeQMax = static_cast<std::int32_t>(" << requantRange.second
+          << ");\n";
+   }
    out << "      " << call.paramsName << ".weightType = SOFIE::EQuantizedWeightCarrier::"
        << (call.weightIsSigned ? "Int8" : "UInt8") << ";\n";
    out << "      " << call.paramsName << ".weightScaleMode = SOFIE::EQuantizedScaleMode::"
@@ -264,7 +286,11 @@ struct QuantizedCudaLtFP8DenseLinearCall {
    ELowPrecisionCarrier outputCarrier = ELowPrecisionCarrier::UNDEFINED;
    ELowPrecisionAccumulation accumulation = ELowPrecisionAccumulation::UNDEFINED;
    std::string capabilityTag;
-   std::string reason;
+   std::string reason;   // NT spelling: cuBLASLt's A operand is the weight and B the activation, with m=N and
+   // n=M, so the output is row-major [M, N]. TN passes them the other way.
+   bool weightIsMatrixA = false;
+   bool hasRelu = false;
+
 };
 
 inline QuantizedCudaLtFP8DenseLinearCall MakeQuantizedCudaLtFP8DenseLinearCall(
@@ -355,8 +381,11 @@ inline std::string GenerateQuantizedCudaLtFP8DenseLinearCall(const QuantizedCuda
    out << "      // Low-precision lowering capability: " << call.capabilityTag << "\n";
    out << "      // Low-precision lowering reason: " << call.reason << "\n";
    out << "      SOFIE::QuantizedFP8DenseLinearInvocation " << call.paramsName << "{};\n";
-   out << "      " << call.paramsName << ".m = static_cast<std::size_t>(" << call.m << ");\n";
-   out << "      " << call.paramsName << ".n = static_cast<std::size_t>(" << call.n << ");\n";
+   // NT swaps the cuBLASLt operand roles: m/n are exchanged along with the A/B pointers.
+   out << "      " << call.paramsName << ".m = static_cast<std::size_t>("
+       << (call.weightIsMatrixA ? call.n : call.m) << ");\n";
+   out << "      " << call.paramsName << ".n = static_cast<std::size_t>("
+       << (call.weightIsMatrixA ? call.m : call.n) << ");\n";
    out << "      " << call.paramsName << ".k = static_cast<std::size_t>(" << call.k << ");\n";
    out << "      " << call.paramsName << ".inputFormat = SOFIE::EQuantizedFP8Format::"
        << QuantizedCudaFP8FormatName(call.inputCarrier, call.boundaryName) << ";\n";
@@ -371,13 +400,18 @@ inline std::string GenerateQuantizedCudaLtFP8DenseLinearCall(const QuantizedCuda
    out << "      " << call.paramsName << ".beta = static_cast<float>("
        << std::setprecision(std::numeric_limits<float>::max_digits10) << call.beta << ");\n";
    out << "      " << call.paramsName << ".hasBias = " << (call.hasBias ? "true" : "false") << ";\n";
+   out << "      " << call.paramsName << ".hasRelu = " << (call.hasRelu ? "true" : "false") << ";\n";
+   out << "      " << call.paramsName << ".weightIsMatrixA = "
+       << (call.weightIsMatrixA ? "true" : "false") << ";\n";
    out << "      " << call.paramsName << ".maxWorkspaceBytes = SOFIE::kQuantizedCudaLtMaxWorkspaceBytes;\n";
    out << "      " << call.stateName << ".BindScratch(quantizedCudaScratchArena.View());\n";
    out << "      SOFIE::QuantizedGemmCudaLtFP8_Call(" << call.stateName
        << ", alpaka::getNativeHandle(queue)"
        << ", alpaka::getPtrNative(deviceBuf_" << call.outputTensor << ")"
-       << ", alpaka::getPtrNative(deviceBuf_" << call.inputTensor << ")"
-       << ", alpaka::getPtrNative(deviceBuf_" << call.weightStorageTensor << ")";
+       << ", alpaka::getPtrNative(deviceBuf_"
+       << (call.weightIsMatrixA ? call.weightStorageTensor : call.inputTensor) << ")"
+       << ", alpaka::getPtrNative(deviceBuf_"
+       << (call.weightIsMatrixA ? call.inputTensor : call.weightStorageTensor) << ")";
    if (call.hasBias) {
       out << ", alpaka::getPtrNative(deviceBuf_" << call.biasTensor << ")";
    } else {
