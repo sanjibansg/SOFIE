@@ -81,6 +81,7 @@ set(sources_cxx
     src/RModelProfiler.cxx
     src/RModelProfilerGPU.cxx
     src/RModel_ALPAKA.cxx
+    src/RModel_Fusion_ALPAKA.cxx
     src/RModel_GNN.cxx
     src/RModel_GraphIndependent.cxx
     src/RFunction.cxx

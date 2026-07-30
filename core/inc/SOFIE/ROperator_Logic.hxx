@@ -225,9 +225,42 @@ public:
       return out.str();
    }
 
-   bool IsElementwise() const override { return !fIsOutputConstant; }
-   std::string GetElementwiseExpr(const std::string& v) const override {
-      return Trait::Expr(v, v);   // not really meaningful for binary, but satisfy interface
+   bool IsElementwise() const override
+   {
+      return !fIsOutputConstant;
+   }
+
+   EFusionMappingType GetFusionMappingType() const override
+   {
+      return fIsOutputConstant ? EFusionMappingType::Unsupported : EFusionMappingType::OneToOne;
+   }
+
+   bool SupportsFusionTypes(const std::vector<ETensorType> &inputTypes, ETensorType outputType) const override
+   {
+      if (inputTypes.size() != 2)
+         return false;
+
+      if constexpr (Op == ELogicBinaryOp::And ||
+                    Op == ELogicBinaryOp::Or ||
+                    Op == ELogicBinaryOp::Xor) {
+         return inputTypes[0] == ETensorType::BOOL &&
+                inputTypes[1] == ETensorType::BOOL &&
+                outputType == ETensorType::BOOL;
+                    } else {
+                       const auto type = GetTemplatedType(T{});
+
+                       return inputTypes[0] == type &&
+                              inputTypes[1] == type &&
+                              outputType == type;
+                    }
+   }
+
+   std::string GetFusionExpr(const std::vector<std::string> &inputs) const override
+   {
+      if (fIsOutputConstant || inputs.size() != 2)
+         return "";
+
+      return Trait::Expr(inputs[0], inputs[1]);
    }
 };
 
