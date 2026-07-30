@@ -1672,27 +1672,40 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    // Allocate memory efficiently
    GenerateInitializedTensorInfo_GPU_ALPAKA();
 
-   // if (fOptimizationLevel == OptimizationLevel::kExtended) {
-      std::string intermediate_memory_alloc_string = "";
-      intermediate_memory_alloc_string += "\n// --- Positioning GPU intermediate tensor memory --\n";
+   std::string intermediate_memory_alloc_string = "";
+   intermediate_memory_alloc_string += "\n// --- Positioning GPU intermediate tensor memory --\n";
 
-      for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
-         if (fSkipOperators.count(op_idx)) continue;
+   for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
+      if (fSkipOperators.count(op_idx)) continue;
 
-         intermediate_memory_alloc_string +=
-            AllocateIntermediateMemory_GPU_ALPAKA(
-               fOperators[op_idx]->GetOpOutputTensors());
+      intermediate_memory_alloc_string +=
+         AllocateIntermediateMemory_GPU_ALPAKA(
+            fOperators[op_idx]->GetOpOutputTensors());
 
-         CheckAndFlushIntermediateMemory_GPU_ALPAKA(
-            fOperators[op_idx]->GetOpInputTensors(), op_idx);
+      CheckAndFlushIntermediateMemory_GPU_ALPAKA(
+         fOperators[op_idx]->GetOpInputTensors(), op_idx);
+
+      const auto groupIt = fOpToFusionGroupIdx.find(op_idx);
+
+      if (groupIt != fOpToFusionGroupIdx.end()) {
+         const auto &group = fEltwiseFusionGroups[groupIt->second];
+
+         if (group.isFused() && group.launchOpIndex == op_idx) {
+            std::vector<std::string> fusedExternalInputs;
+            fusedExternalInputs.reserve(group.externalInputs.size());
+
+            for (const auto &externalInput : group.externalInputs)
+               fusedExternalInputs.push_back(externalInput.tensorName);
+
+            CheckAndFlushIntermediateMemory_GPU_ALPAKA(
+               fusedExternalInputs, op_idx);
+         }
       }
+   }
 
    GenerateIntermediateMemoryPool_GPU_ALPAKA();
 
-      fGC += intermediate_memory_alloc_string;
-   // } else {
-   //    GenerateGPU_ALPAKA_Buffers();
-   // } TODO: uncomment
+   fGC += intermediate_memory_alloc_string;
 
    GenerateOperatorDeclarations();
 
