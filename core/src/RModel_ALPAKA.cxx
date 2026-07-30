@@ -28,10 +28,14 @@ void RModel::ComputeEltwiseFusionGroups()
 
    // Build tensor -> consumer operator indices.
    std::unordered_map<std::string, std::vector<size_t>> tensorConsumers;
+   std::unordered_map<std::string, size_t> tensorProducers;
 
    for (size_t opIdx = 0; opIdx < fOperators.size(); ++opIdx) {
       for (const auto &inputName : fOperators[opIdx]->GetOpInputTensors())
          tensorConsumers[std::string(inputName)].push_back(opIdx);
+
+      for (const auto &outputName : fOperators[opIdx]->GetOpOutputTensors())
+         tensorProducers[std::string(outputName)] = opIdx;
    }
 
    // An intermediate can be removed only when it has one consumer and is not
@@ -272,8 +276,46 @@ void RModel::ComputeEltwiseFusionGroups()
 
          const size_t nextOpIdx = tensorConsumers.at(currentOutput).front();
 
-         // Keep fusion groups consecutive for now.
-         if (nextOpIdx != currentOpIdx + 1)
+         if (nextOpIdx <= currentOpIdx)
+            break;
+
+         bool crossesAssignedOperator = false;
+
+         for (size_t gapIdx = currentOpIdx + 1; gapIdx < nextOpIdx; ++gapIdx) {
+            if (opAssigned[gapIdx]) {
+               crossesAssignedOperator = true;
+               break;
+            }
+         }
+
+         if (crossesAssignedOperator)
+            break;
+
+         bool allExternalInputsReady = true;
+         const auto nextDataInputs = fOperators[nextOpIdx]->GetFusionDataInputIndices();
+         const auto nextInputsForReadiness = fOperators[nextOpIdx]->GetOpInputTensors();
+
+         for (const size_t inputIdx : nextDataInputs) {
+            const std::string inputName(nextInputsForReadiness[inputIdx]);
+
+            if (inputName == currentOutput)
+               continue;
+
+            const bool producedInsideGroup =
+               std::find(producedTensors.begin(), producedTensors.end(), inputName) != producedTensors.end();
+
+            if (producedInsideGroup)
+               continue;
+
+            const auto producerIt = tensorProducers.find(inputName);
+
+            if (producerIt != tensorProducers.end() && producerIt->second >= nextOpIdx) {
+               allExternalInputsReady = false;
+               break;
+            }
+         }
+
+         if (!allExternalInputsReady)
             break;
 
          if (opAssigned[nextOpIdx])
@@ -369,6 +411,7 @@ void RModel::ComputeEltwiseFusionGroups()
 
       group.outputTensor = std::string(finalOutputs[0]);
       group.numElements = ConvertShapeToLength(groupOutputShape);
+      group.launchOpIndex = currentOpIdx;
 
       if (IsAliasTensor(group.outputTensor)) {
          for (const size_t opIdx : group.opIndices)
@@ -411,6 +454,27 @@ void RModel::ComputeEltwiseFusionGroups()
       }
 
       fEltwiseFusionGroups.push_back(std::move(group));
+   }
+
+   // Delayed nonconsecutive fused launches require all external inputs to
+   // remain alive until the final fused operator's original position.
+   for (const auto &group : fEltwiseFusionGroups) {
+      if (!group.isFused())
+         continue;
+
+      for (const auto &externalInput : group.externalInputs) {
+         std::string tensorName = externalInput.tensorName;
+
+         if (IsAliasTensor(tensorName))
+            tensorName = fAliasTensors[tensorName];
+
+         const auto frequencyIt =
+            fIntermediateTensorFrequencyLookup.find(tensorName);
+
+         if (frequencyIt != fIntermediateTensorFrequencyLookup.end())
+            frequencyIt->second =
+               std::max(frequencyIt->second, group.launchOpIndex);
+      }
    }
 }
 
@@ -794,8 +858,8 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
       bool inFusedGroup = (gIdx != SIZE_MAX) && fEltwiseFusionGroups[gIdx].isFused();
 
       if (inFusedGroup) {
-         // Only emit the fused kernel launch once, at the chain leader
-         if (fEltwiseFusionGroups[gIdx].opIndices[0] == op_idx && !fusedGroupsLaunched.count(gIdx)) {
+         // Emit the fused kernel once at the final fused operator's original position.
+         if (fEltwiseFusionGroups[gIdx].launchOpIndex == op_idx && !fusedGroupsLaunched.count(gIdx)) {
             const auto& grp = fEltwiseFusionGroups[gIdx];
             std::string sfx = grp.suffix();
             std::string kname = "fusedEltwiseKernel" + sfx;

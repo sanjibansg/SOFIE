@@ -75,10 +75,12 @@ private:
 
    // GPU ALPAKA elementwise kernel fusion state (transient, computed in GenerateGPU_ALPAKA)
    struct EltwiseFusionGroup {
-      std::vector<size_t> opIndices; ///< consecutive op indices forming this group
+      std::vector<size_t> opIndices; ///< dependency-chain operator indices forming this group
       std::vector<FusionExternalInput> externalInputs; ///< tensors entering the fusion group from outside
       std::string outputTensor;      ///< output tensor name of the last op
       size_t numElements = 0;
+      size_t launchOpIndex = 0;
+
       bool isFused() const { return opIndices.size() > 1; }
       std::string suffix() const {
          std::string s;
