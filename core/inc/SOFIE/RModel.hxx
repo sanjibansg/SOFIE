@@ -93,6 +93,16 @@ private:
    std::set<std::string> fFusionIntermediateTensors;        ///<!  intermediate tensors whose alloc is skipped
    std::set<size_t>      fSkipOperators;                    ///<!  ops swallowed by a preceding fusion (e.g. GEMM+LeakyReLU)
    void ComputeEltwiseFusionGroups();
+
+   bool ResolveFusionInputAccess(const std::string &tensorName, const std::vector<size_t> &outputShape,
+                              EFusionInputAccess &access, std::vector<size_t> &alignedStrides) const;
+
+   bool IsSupportedFusionOperator(size_t opIdx, bool allowShuffle, bool allowReorganize) const;
+
+   void AddFusionExternalInput(EltwiseFusionGroup &group, const FusionExternalInput &input) const;
+
+   void InitializeFusionGroup(size_t firstOpIdx, EltwiseFusionGroup &group,
+                              std::vector<std::string> &producedTensors, std::vector<size_t> &groupOutputShape) const;
    /// GPU-only pass: fuse GEMM→LeakyReLU (and GEMM→ReLU where not already
    /// handled by the ONNX parser) into a single in-place kernel sequence.
    void FuseGemmActivations_GPU();
