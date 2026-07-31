@@ -307,6 +307,45 @@ std::string RModel::GenerateImplSignature_GPU_ALPAKA(bool isdecl) {
    return rGC;
 }
 
+std::string RModel::GenerateFusedEltwiseLaunch_GPU_ALPAKA(const EltwiseFusionGroup &group) const
+{
+   const std::string suffix = group.suffix();
+   const std::string kernelName = "fusedEltwiseKernel" + suffix;
+   std::string launchCode;
+
+   launchCode += "\n//------ FUSED_ELTWISE_GPU_ALPAKA" + suffix + "\n";
+   launchCode += SP + "{\n";
+   launchCode += SP + SP + "auto const elementsPerThread_fused" + suffix + " = Vec::all(static_cast<Idx>(1));\n";
+   launchCode += SP + SP + "auto const elementsPerGrid_fused" + suffix + " = Vec::all(Idx{" + std::to_string(group.numElements) + "});\n";
+   launchCode += SP + SP + "auto const workDiv_fused" + suffix + " = sofie_workdiv(elementsPerGrid_fused" + suffix + ");\n";
+   launchCode += SP + SP + "auto task_fused" + suffix + " = alpaka::createTaskKernel<Acc>(workDiv_fused" + suffix + ", " + kernelName;
+
+   for (const auto &externalInput : group.externalInputs)
+      launchCode += ", alpaka::getPtrNative(deviceBuf_" + externalInput.tensorName + ")";
+
+   launchCode += ", alpaka::getPtrNative(deviceBuf_" + group.outputTensor + "), static_cast<Idx>(" +
+                 std::to_string(group.numElements) + "));\n";
+
+   launchCode += SP + SP + "alpaka::enqueue(queue, task_fused" + suffix + ");\n";
+   launchCode += SP + "}\n";
+
+   if (!fProfile)
+      return launchCode;
+
+   const std::string fusedName = "FusedKernel" + suffix;
+   std::string profiledCode;
+
+   profiledCode += "   // -- GPU Profiling fused group: " + fusedName + " --\n";
+   profiledCode += "   tp_start = std::chrono::steady_clock::now();\n";
+   profiledCode += launchCode;
+   profiledCode += "   alpaka::wait(queue);\n";
+   profiledCode += "   fProfilingResults[\"" + fusedName + "\"].push_back(\n";
+   profiledCode += "      std::chrono::duration_cast<std::chrono::duration<double, std::micro>>(\n";
+   profiledCode += "         std::chrono::steady_clock::now() - tp_start).count());\n\n";
+
+   return profiledCode;
+}
+
 void RModel::GenerateOutput_GPU_ALPAKA() {
    if (fVerbose)
       std::cout << "Generating main inference code for " << fName << std::endl;
@@ -402,45 +441,10 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
       if (inFusedGroup) {
          // Emit the fused kernel once at the final fused operator's original position.
          if (fEltwiseFusionGroups[gIdx].launchOpIndex == op_idx && !fusedGroupsLaunched.count(gIdx)) {
-            const auto& grp = fEltwiseFusionGroups[gIdx];
-            std::string sfx = grp.suffix();
-            std::string kname = "fusedEltwiseKernel" + sfx;
-            std::string fusedCode;
-            fusedCode += "\n//------ FUSED_ELTWISE_GPU_ALPAKA" + sfx + "\n";
-            fusedCode += SP + "{\n";
-            fusedCode += SP + SP + "auto const elementsPerThread_fused" + sfx + " = Vec::all(static_cast<Idx>(1));\n";
-            fusedCode += SP + SP + "auto const elementsPerGrid_fused" + sfx + " = Vec::all(Idx{" + std::to_string(grp.numElements) + "});\n";
-            fusedCode += SP + SP + "auto const workDiv_fused" + sfx + " = sofie_workdiv(elementsPerGrid_fused" + sfx + ");\n";
-
-            fusedCode += SP + SP + "auto task_fused" + sfx +
-             " = alpaka::createTaskKernel<Acc>(workDiv_fused" + sfx +
-             ", " + kname;
-
-            for (const auto &externalInput : grp.externalInputs) {
-               fusedCode += ", alpaka::getPtrNative(deviceBuf_" + externalInput.tensorName + ")";
-            }
-            fusedCode += ", alpaka::getPtrNative(deviceBuf_" + grp.outputTensor +
-                         "), static_cast<Idx>(" +
-                         std::to_string(grp.numElements) + "));\n";
-
-            fusedCode += SP + SP + "alpaka::enqueue(queue, task_fused" + sfx + ");\n";
-            fusedCode += SP + "}\n";
-            if (fProfile) {
-               // wrap fused group with profiling
-               std::string fusedName = "FusedKernel" + sfx;
-               fGC += "   // -- GPU Profiling fused group: " + fusedName + " --\n";
-               fGC += "   tp_start = std::chrono::steady_clock::now();\n";
-               fGC += fusedCode;
-               fGC += "   alpaka::wait(queue);\n";
-               fGC += "   fProfilingResults[\"" + fusedName + "\"].push_back(\n";
-               fGC += "      std::chrono::duration_cast<std::chrono::duration<double, std::micro>>(\n";
-               fGC += "         std::chrono::steady_clock::now() - tp_start).count());\n\n";
-            } else {
-               fGC += fusedCode;
-            }
+            fGC += GenerateFusedEltwiseLaunch_GPU_ALPAKA(fEltwiseFusionGroups[gIdx]);
             fusedGroupsLaunched.insert(gIdx);
          }
-         // Chain followers: skip — their logic is inside the fused kernel
+         // Chain followers are skipped because their logic is inside the fused kernel.
       } else {
          if (fProfile) {
             fGC += RModelProfilerGPU::GenerateOperatorCode(*fOperators[op_idx], op_idx);
@@ -981,6 +985,126 @@ void RModel::GenerateIntermediateMemoryPool_GPU_ALPAKA() {
    fGC += "}\n\n";
 }
 
+std::string RModel::GenerateFusedEltwiseKernel_GPU_ALPAKA(const EltwiseFusionGroup &group) const
+{
+   const std::string suffix = group.suffix();
+   std::string kernelCode;
+
+   kernelCode += "\n//------ FUSED_ELTWISE_KERNEL" + suffix + "\n";
+   kernelCode += "struct FusedEltwiseKernel" + suffix + " {\n";
+   kernelCode += SP + "template<typename TAcc";
+
+   for (size_t inputIdx = 0; inputIdx < group.externalInputs.size(); ++inputIdx)
+      kernelCode += ", typename TInput" + std::to_string(inputIdx);
+
+   kernelCode += ", typename TOutput>\n";
+   kernelCode += SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc";
+
+   for (size_t inputIdx = 0; inputIdx < group.externalInputs.size(); ++inputIdx)
+      kernelCode += ", TInput" + std::to_string(inputIdx) + " const* __restrict__ input" + std::to_string(inputIdx);
+
+   kernelCode += ", TOutput* __restrict__ out, std::size_t n) const {\n";
+   kernelCode += SP + SP + "using T = TOutput;\n";
+   kernelCode += SP + SP + "const auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+   kernelCode += SP + SP + "if (idx < n) {\n";
+
+   std::unordered_map<std::string, std::string> tensorValues;
+   const auto fusedOutputShape = GetTensorShape(group.outputTensor);
+   const auto fusedOutputStrides = UTILITY::ComputeStrideFromShape(fusedOutputShape);
+
+   for (size_t inputIdx = 0; inputIdx < group.externalInputs.size(); ++inputIdx) {
+      const std::string localName = "v_input_" + std::to_string(inputIdx);
+      const auto &externalInput = group.externalInputs[inputIdx];
+      std::string indexExpression;
+
+      if (!externalInput.customIndexExpression.empty()) {
+         indexExpression = externalInput.customIndexExpression;
+      } else if (externalInput.access == EFusionInputAccess::Elementwise) {
+         indexExpression = "idx";
+      } else if (externalInput.access == EFusionInputAccess::Scalar) {
+         indexExpression = "0";
+      } else {
+         for (size_t dimIdx = 0; dimIdx < externalInput.alignedStrides.size(); ++dimIdx) {
+            const size_t inputStride = externalInput.alignedStrides[dimIdx];
+
+            if (inputStride == 0)
+               continue;
+
+            std::string coordinate;
+
+            if (fusedOutputStrides[dimIdx] == 1) {
+               coordinate = "(idx % " + std::to_string(fusedOutputShape[dimIdx]) + ")";
+            } else {
+               coordinate = "((idx / " + std::to_string(fusedOutputStrides[dimIdx]) + ") % " +
+                            std::to_string(fusedOutputShape[dimIdx]) + ")";
+            }
+
+            if (!indexExpression.empty())
+               indexExpression += " + ";
+
+            indexExpression += coordinate;
+
+            if (inputStride != 1)
+               indexExpression += " * " + std::to_string(inputStride);
+         }
+
+         if (indexExpression.empty())
+            indexExpression = "0";
+      }
+
+      kernelCode += SP + SP + SP + "auto " + localName + " = input" + std::to_string(inputIdx) +
+                    "[" + indexExpression + "];\n";
+
+      tensorValues[externalInput.tensorName] = localName;
+   }
+
+   for (const size_t opIdx : group.opIndices) {
+      std::vector<std::string> inputExpressions;
+
+      const auto opInputs = fOperators[opIdx]->GetOpInputTensors();
+      const auto dataInputIndices = fOperators[opIdx]->GetFusionDataInputIndices();
+
+      for (const size_t inputIdx : dataInputIndices) {
+         const std::string inputName(opInputs[inputIdx]);
+         const auto valueIt = tensorValues.find(inputName);
+
+         if (valueIt == tensorValues.end())
+            throw std::runtime_error("Missing fused value for tensor " + inputName);
+
+         inputExpressions.push_back(valueIt->second);
+      }
+
+      const std::string expression = fOperators[opIdx]->GetFusionExpr(inputExpressions);
+
+      if (expression.empty())
+         throw std::runtime_error("Operator " + std::to_string(opIdx) + " does not provide a fused expression");
+
+      const auto outputs = fOperators[opIdx]->GetOpOutputTensors();
+
+      if (outputs.size() != 1)
+         throw std::runtime_error("Fused operator " + std::to_string(opIdx) + " must have exactly one output");
+
+      const std::string outputName(outputs[0]);
+      const std::string localName = "v_op_" + std::to_string(opIdx);
+
+      kernelCode += SP + SP + SP + "auto " + localName + " = " + expression + ";\n";
+      tensorValues[outputName] = localName;
+   }
+
+   const auto finalValueIt = tensorValues.find(group.outputTensor);
+
+   if (finalValueIt == tensorValues.end())
+      throw std::runtime_error("Missing final fused value for tensor " + group.outputTensor);
+
+   kernelCode += SP + SP + SP + "out[idx] = " + finalValueIt->second + ";\n";
+   kernelCode += SP + SP + "}\n";
+   kernelCode += SP + "}\n";
+   kernelCode += "};\n";
+
+   return kernelCode;
+}
+
+
 void RModel::GenerateSessionCode_GPU_ALPAKA() {
    std::set<SOFIE::OperatorKind> registered_operators;
    std::set<size_t> fusedGroupsEmitted; // tracks which fusion groups have had their struct/decl emitted
@@ -1020,122 +1144,14 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       bool inFusedGroup = (gIdx != SIZE_MAX) && fEltwiseFusionGroups[gIdx].isFused();
 
       if (inFusedGroup) {
-         // Only emit the fused kernel struct once, at the chain leader
-         if (fEltwiseFusionGroups[gIdx].opIndices[0] == id && !fusedGroupsEmitted.count(gIdx)) {
-            const auto& grp = fEltwiseFusionGroups[gIdx];
-            std::string sfx = grp.suffix();
-            fGC += "\n//------ FUSED_ELTWISE_KERNEL" + sfx + "\n";
-            fGC += "struct FusedEltwiseKernel" + sfx + " {\n";
-            fGC += SP + "template<typename TAcc";
+         // Only emit the fused kernel struct once, at the chain leader.
+         const auto &group = fEltwiseFusionGroups[gIdx];
 
-            for (size_t inputIdx = 0; inputIdx < grp.externalInputs.size(); ++inputIdx)
-               fGC += ", typename TInput" + std::to_string(inputIdx);
-
-            fGC += ", typename TOutput>\n";
-            fGC += SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc";
-
-            for (size_t inputIdx = 0; inputIdx < grp.externalInputs.size(); ++inputIdx)
-               fGC += ", TInput" + std::to_string(inputIdx) + " const* __restrict__ input" + std::to_string(inputIdx);
-
-            fGC += ", TOutput* __restrict__ out, std::size_t n) const {\n";
-            fGC += SP + SP + "using T = TOutput;\n";
-            fGC += SP + SP + "const auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
-            fGC += SP + SP + "if (idx < n) {\n";
-
-            std::unordered_map<std::string, std::string> tensorValues;
-            const auto fusedOutputShape = GetTensorShape(grp.outputTensor);
-            const auto fusedOutputStrides = UTILITY::ComputeStrideFromShape(fusedOutputShape);
-
-            for (size_t inputIdx = 0; inputIdx < grp.externalInputs.size(); ++inputIdx) {
-               const std::string localName = "v_input_" + std::to_string(inputIdx);
-               const auto &externalInput = grp.externalInputs[inputIdx];
-               std::string indexExpression;
-
-               if (!externalInput.customIndexExpression.empty()) {
-                  indexExpression = externalInput.customIndexExpression;
-               } else if (externalInput.access == EFusionInputAccess::Elementwise) {
-                  indexExpression = "idx";
-               } else if (externalInput.access == EFusionInputAccess::Scalar) {
-                  indexExpression = "0";
-               } else {
-                  for (size_t dimIdx = 0; dimIdx < externalInput.alignedStrides.size(); ++dimIdx) {
-                     const size_t inputStride = externalInput.alignedStrides[dimIdx];
-                     if (inputStride == 0) continue;
-
-                     std::string coordinate;
-                     if (fusedOutputStrides[dimIdx] == 1)
-                        coordinate = "(idx % " + std::to_string(fusedOutputShape[dimIdx]) + ")";
-                     else
-                        coordinate = "((idx / " + std::to_string(fusedOutputStrides[dimIdx]) + ") % " + std::to_string(fusedOutputShape[dimIdx]) + ")";
-
-                     if (!indexExpression.empty()) indexExpression += " + ";
-                     indexExpression += coordinate;
-                     if (inputStride != 1) indexExpression += " * " + std::to_string(inputStride);
-                  }
-
-                  if (indexExpression.empty()) indexExpression = "0";
-               }
-
-               fGC += SP + SP + SP + "auto " + localName + " = input" + std::to_string(inputIdx) + "[" + indexExpression + "];\n";
-               tensorValues[externalInput.tensorName] = localName;
-            }
-
-            for (size_t opIdx : grp.opIndices) {
-               std::vector<std::string> inputExpressions;
-
-               const auto opInputs = fOperators[opIdx]->GetOpInputTensors();
-               const auto dataInputIndices = fOperators[opIdx]->GetFusionDataInputIndices();
-
-               for (const size_t inputIdx : dataInputIndices) {
-                  const std::string inputName(opInputs[inputIdx]);
-                  const auto valueIt = tensorValues.find(inputName);
-
-                  if (valueIt == tensorValues.end()) {
-                     throw std::runtime_error(
-                        "Missing fused value for tensor " + inputName);
-                  }
-
-                  inputExpressions.push_back(valueIt->second);
-               }
-
-               const std::string expression =
-                  fOperators[opIdx]->GetFusionExpr(inputExpressions);
-
-               if (expression.empty()) {
-                  throw std::runtime_error(
-                     "Operator " + std::to_string(opIdx) +
-                     " does not provide a fused expression");
-               }
-
-               const auto outputs = fOperators[opIdx]->GetOpOutputTensors();
-
-               if (outputs.size() != 1) {
-                  throw std::runtime_error(
-                     "Fused operator " + std::to_string(opIdx) +
-                     " must have exactly one output");
-               }
-
-               const std::string outputName(outputs[0]);
-               const std::string localName = "v_op_" + std::to_string(opIdx);
-
-               fGC += SP + SP + SP + "auto " + localName + " = " + expression + ";\n";
-               tensorValues[outputName] = localName;
-            }
-
-            const auto finalValueIt = tensorValues.find(grp.outputTensor);
-
-            if (finalValueIt == tensorValues.end()) {
-               throw std::runtime_error(
-                  "Missing final fused value for tensor " + grp.outputTensor);
-            }
-
-            fGC += SP + SP + SP + "out[idx] = " + finalValueIt->second + ";\n";
-            fGC += SP + SP + "}\n";
-            fGC += SP + "}\n";
-            fGC += "};\n";
+         if (group.opIndices[0] == id && !fusedGroupsEmitted.count(gIdx)) {
+            fGC += GenerateFusedEltwiseKernel_GPU_ALPAKA(group);
             fusedGroupsEmitted.insert(gIdx);
          }
-         // Chain followers: skip (their logic is inside the fused kernel)
+         // Chain followers are skipped because their logic is inside the fused kernel.
       } else {
          // Unfused op: generate individual kernel struct (with dedup for single_initialized_operators)
          if (single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {

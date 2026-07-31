@@ -94,6 +94,10 @@ private:
    std::set<size_t>      fSkipOperators;                    ///<!  ops swallowed by a preceding fusion (e.g. GEMM+LeakyReLU)
    void ComputeEltwiseFusionGroups();
 
+   std::string GenerateFusedEltwiseLaunch_GPU_ALPAKA(const EltwiseFusionGroup &group) const;
+
+   std::string GenerateFusedEltwiseKernel_GPU_ALPAKA(const EltwiseFusionGroup &group) const;
+
    bool ResolveFusionInputAccess(const std::string &tensorName, const std::vector<size_t> &outputShape,
                               EFusionInputAccess &access, std::vector<size_t> &alignedStrides) const;
 
