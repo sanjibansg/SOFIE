@@ -61,6 +61,7 @@ set(sources_cxx
     src/ParseErf.cxx
     src/ParseRange.cxx
     src/ParseLayerNormalization.cxx
+    src/ParseFuseL2Normalization.cxx
     src/ParseExpand.cxx
     src/ParseGather.cxx
     src/ParseGatherND.cxx

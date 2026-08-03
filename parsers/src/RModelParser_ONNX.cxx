@@ -116,6 +116,8 @@ extern ParserFuseFuncSignature ParseFuseGemmRelu;
 extern ParserFuseFuncSignature ParseFuseBatchnormRelu;
 extern ParserFuseFuncSignature ParseFuseConvTransposeAdd;
 extern ParserFuseFuncSignature ParseFuseMatMulAdd;
+extern std::unique_ptr<ROperator> ParseFuseL2Normalization(RModelParser_ONNX &parser, const onnx::NodeProto &reduceNode,
+                         const onnx::NodeProto &divNode, float epsilon);
 
 // Definition of  RModelParser_ONNX::OperatorsMap
 struct RModelParser_ONNX::OperatorsMapImpl {
@@ -451,6 +453,215 @@ bool IsLastTwoAxesTranspose(const onnx::NodeProto &node, const onnx::GraphProto 
           permutation[rank - 1] == static_cast<int64_t>(rank - 2);
 }
 
+int FindSingleConsumerNode(const onnx::GraphProto &graph, const std::string &tensorName)
+{
+   int consumerIdx = -1;
+
+   for (int nodeIdx = 0; nodeIdx < graph.node_size(); ++nodeIdx) {
+      bool consumesTensor = false;
+
+      for (const auto &inputName : graph.node(nodeIdx).input()) {
+         if (inputName == tensorName) {
+            consumesTensor = true;
+            break;
+         }
+      }
+
+      if (!consumesTensor)
+         continue;
+
+      if (consumerIdx != -1)
+         return -1;
+
+      consumerIdx = nodeIdx;
+   }
+
+   return consumerIdx;
+}
+
+int FindProducerNode(const onnx::GraphProto &graph, const std::string &tensorName)
+{
+   for (int nodeIdx = 0; nodeIdx < graph.node_size(); ++nodeIdx) {
+      for (const auto &outputName : graph.node(nodeIdx).output()) {
+         if (outputName == tensorName)
+            return nodeIdx;
+      }
+   }
+
+   return -1;
+}
+
+bool TryGetConstantFloat(const onnx::GraphProto &graph, const std::string &tensorName, float &value)
+{
+   for (const auto &initializer : graph.initializer()) {
+      if (initializer.name() != tensorName)
+         continue;
+
+      if (initializer.data_type() != onnx::TensorProto_DataType_FLOAT)
+         return false;
+
+      size_t length = 1;
+      for (const auto dim : initializer.dims())
+         length *= static_cast<size_t>(dim);
+
+      if (length != 1)
+         return false;
+
+      if (initializer.float_data_size() == 1) {
+         value = initializer.float_data(0);
+         return true;
+      }
+
+      if (initializer.raw_data().size() == sizeof(float)) {
+         std::memcpy(&value, initializer.raw_data().data(), sizeof(float));
+         return true;
+      }
+
+      return false;
+   }
+
+   const int producerIdx = FindProducerNode(graph, tensorName);
+
+   if (producerIdx < 0)
+      return false;
+
+   const auto &constantNode = graph.node(producerIdx);
+
+   if (constantNode.op_type() != "Constant" || constantNode.attribute_size() != 1)
+      return false;
+
+   const auto &attribute = constantNode.attribute(0);
+
+   if (attribute.name() == "value_float") {
+      value = attribute.f();
+      return true;
+   }
+
+   if (attribute.name() != "value" || !attribute.has_t())
+      return false;
+
+   const auto &tensor = attribute.t();
+
+   if (tensor.data_type() != onnx::TensorProto_DataType_FLOAT)
+      return false;
+
+   size_t length = 1;
+   for (const auto dim : tensor.dims())
+      length *= static_cast<size_t>(dim);
+
+   if (length != 1)
+      return false;
+
+   if (tensor.float_data_size() == 1) {
+      value = tensor.float_data(0);
+      return true;
+   }
+
+   if (tensor.raw_data().size() == sizeof(float)) {
+      std::memcpy(&value, tensor.raw_data().data(), sizeof(float));
+      return true;
+   }
+
+   return false;
+}
+
+bool IsConstantTensor(const onnx::GraphProto &graph, const std::string &tensorName)
+{
+   for (const auto &initializer : graph.initializer()) {
+      if (initializer.name() == tensorName)
+         return true;
+   }
+
+   const int producerIdx = FindProducerNode(graph, tensorName);
+   return producerIdx >= 0 && graph.node(producerIdx).op_type() == "Constant";
+}
+
+bool HasLastAxisReduce(const onnx::NodeProto &reduceNode)
+{
+   int64_t keepdims = 1;
+   std::vector<int64_t> axes;
+
+   for (const auto &attribute : reduceNode.attribute()) {
+      if (attribute.name() == "keepdims")
+         keepdims = attribute.i();
+      else if (attribute.name() == "axes")
+         axes.assign(attribute.ints().begin(), attribute.ints().end());
+   }
+
+   return keepdims == 1 && axes.size() == 1 && axes[0] == -1;
+}
+
+bool TryMatchL2Normalization(const onnx::GraphProto &graph, int reduceIdx,
+   int &clipIdx, int &expandIdx, int &divIdx, float &epsilon)
+{
+   const auto &reduceNode = graph.node(reduceIdx);
+
+   if (reduceNode.op_type() != "ReduceL2" || reduceNode.input_size() < 1 ||
+       reduceNode.output_size() != 1 || !HasLastAxisReduce(reduceNode))
+      return false;
+
+   const std::string inputName = reduceNode.input(0);
+   const std::string reduceOutput = reduceNode.output(0);
+
+   clipIdx = FindSingleConsumerNode(graph, reduceOutput);
+
+   if (clipIdx < 0)
+      return false;
+
+   const auto &clipNode = graph.node(clipIdx);
+
+   if (clipNode.op_type() != "Clip" || clipNode.input_size() < 2 ||
+       clipNode.output_size() != 1 || clipNode.input(0) != reduceOutput ||
+       clipNode.input(1).empty() || !TryGetConstantFloat(graph, clipNode.input(1), epsilon))
+      return false;
+
+   if (clipNode.input_size() > 2 && !clipNode.input(2).empty())
+      return false;
+
+   const std::string clipOutput = clipNode.output(0);
+   expandIdx = FindSingleConsumerNode(graph, clipOutput);
+
+   if (expandIdx < 0)
+      return false;
+
+   const auto &expandNode = graph.node(expandIdx);
+
+   if (expandNode.op_type() != "Expand" || expandNode.input_size() != 2 ||
+       expandNode.output_size() != 1 || expandNode.input(0) != clipOutput)
+      return false;
+
+   const int shapeIdx = FindProducerNode(graph, expandNode.input(1));
+
+   if (shapeIdx < 0)
+      return false;
+
+   const auto &shapeNode = graph.node(shapeIdx);
+
+   if (shapeNode.op_type() != "Shape" || shapeNode.input_size() != 1 ||
+       shapeNode.input(0) != inputName)
+      return false;
+
+   const std::string expandOutput = expandNode.output(0);
+   divIdx = FindSingleConsumerNode(graph, expandOutput);
+
+   if (divIdx < 0)
+      return false;
+
+   const auto &divNode = graph.node(divIdx);
+
+   if (divNode.op_type() != "Div" || divNode.input_size() != 2 ||
+       divNode.output_size() != 1 || divNode.input(0) != inputName ||
+       divNode.input(1) != expandOutput)
+      return false;
+
+   if (IsGraphOutput(graph, reduceOutput) || IsGraphOutput(graph, clipOutput) ||
+       IsGraphOutput(graph, expandOutput))
+      return false;
+
+   return true;
+}
+
+
 } // anonymous namespace
 
 // Parse an operator
@@ -467,6 +678,21 @@ RModelParser_ONNX::ParseOperator(const size_t i, const onnx::GraphProto &graphpr
 
    // skip already fused operators
    if (fFusedOperators[idx]) return nullptr;
+
+   if (op_type == "ReduceL2") {
+      int clipIdx = -1;
+      int expandIdx = -1;
+      int divIdx = -1;
+      float epsilon = 0.0f;
+
+      if (TryMatchL2Normalization(graphproto, idx, clipIdx, expandIdx, divIdx, epsilon)) {
+         fFusedOperators[clipIdx] = true;
+         fFusedOperators[expandIdx] = true;
+         fFusedOperators[divIdx] = true;
+
+         return ParseFuseL2Normalization(*this, nodeproto, graphproto.node(divIdx), epsilon);
+      }
+   }
 
    // try to fuse with following operator in case it is not last one
    if (children.size() == 1) {

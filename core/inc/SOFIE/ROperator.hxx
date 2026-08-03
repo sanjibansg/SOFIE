@@ -41,7 +41,8 @@ enum class OperatorKind {
    NOT=25,
    UNARY_SOFTPLUS=26,
    UNARY_ATAN=27,
-   UNARY_FLOOR=28
+   UNARY_FLOOR=28,
+   L2NORMALIZATION=29,
 };
 
 enum class EFusionMappingType {
@@ -85,6 +86,7 @@ inline const char* toString(OperatorKind kind) {
        case OperatorKind::UNARY_ATAN:     return "UNARY_ATAN";
        case OperatorKind::UNARY_FLOOR:    return "UNARY_FLOOR";
        case OperatorKind::UNDEFINED:  return "UNDEFINED";
+       case OperatorKind::L2NORMALIZATION: return "L2NORMALIZATION";
        default:                       return "UNKNOWN";
    }
 }
