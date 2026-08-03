@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -162,6 +163,19 @@ inline std::int64_t ZeroPointForElement(const QuantizationInfo &info, RModel &mo
    return zeroPoints[channel];
 }
 
+// A per-axis grid would need the channel index inside the kernel; reject it rather
+// than silently applying the wrong scale.
+inline void RequirePerTensorQDQForGpu(const QuantizationInfo &info, const std::string &opName)
+{
+   if (info.granularity != EQuantizationGranularity::PerTensor) {
+      throw std::runtime_error("SOFIE " + opName +
+                               " GPU code generation supports per-tensor parameters only; per-axis "
+                               "parameters require fused lowering");
+   }
+}
+
+using SOFIE::ExactDoubleLiteral;
+
 } // namespace DETAIL
 
 class ROperator_ONNXQuantizeLinear final : public ROperator {
@@ -174,6 +188,17 @@ private:
    int fAxis = -1;
    std::vector<size_t> fShape;
    QuantizationInfo fInfo;
+
+   // Set when this boundary emits the whole fake-quant round trip as one kernel writing
+   // the float result, with the Clip and trailing DequantizeLinear suppressed.
+   std::string fFusedDequantizedOutput;   // trailing DQ's output; empty means not fused
+   std::string fFusedClipInput;           // absorbed Clip's input; empty means read fNX
+   double fFusedClipLow = 0.0;
+   double fFusedClipHigh = 0.0;
+   bool fFusedHasClip = false;
+   // The incoming value is already on this grid, so the round trip is the identity and
+   // becomes a zero-copy alias instead of a kernel.
+   bool fFusedIsIdentity = false;
 
 public:
    ROperator_ONNXQuantizeLinear() = default;
@@ -191,6 +216,47 @@ public:
 
    bool IsQuantizationBoundary() const override { return true; }
    std::string GetQuantizationSourceTensor() const override { return fNX; }
+
+   const std::string &GetInputTensor() const { return fNX; }
+   const std::string &GetOutputTensor() const { return fNY; }
+   const std::string &GetScaleTensor() const { return fNScale; }
+   const std::string &GetZeroPointTensor() const { return fNZeroPoint; }
+   const QuantizationInfo &GetQuantizationInfo() const { return fInfo; }
+
+   // Emits one kernel for Clip? -> Quantize -> Dequantize, composing their arithmetic in
+   // the same order and precision, so the result matches running them separately.
+   void FuseFakeQuantRoundTrip(std::string dequantizedOutput, std::string clipInput, bool hasClip,
+                               double clipLow, double clipHigh)
+   {
+      fFusedDequantizedOutput = std::move(dequantizedOutput);
+      fFusedClipInput = std::move(clipInput);
+      fFusedHasClip = hasClip;
+      fFusedClipLow = clipLow;
+      fFusedClipHigh = clipHigh;
+      // Both tensor lists are restated, not just the output: graph-level reasoning such
+      // as liveness reads them, and an absorbed Clip changes what this operator reads.
+      fOutputTensorNames = {fFusedDequantizedOutput};
+      if (!fFusedClipInput.empty() && !fInputTensorNames.empty())
+         fInputTensorNames[0] = fFusedClipInput;
+   }
+   bool IsFakeQuantRoundTripFused() const { return !fFusedDequantizedOutput.empty(); }
+
+   // Absorbs the preceding Clip while still emitting the int8 carrier, for a boundary
+   // whose trailing DequantizeLinear must stay because a lowered region reads the carrier.
+   void FuseClipOnly(std::string clipInput, double clipLow, double clipHigh)
+   {
+      fFusedClipInput = std::move(clipInput);
+      fFusedHasClip = true;
+      fFusedClipLow = clipLow;
+      fFusedClipHigh = clipHigh;
+      if (!fFusedClipInput.empty() && !fInputTensorNames.empty())
+         fInputTensorNames[0] = fFusedClipInput;
+   }
+
+   // Marks the round trip as the identity, for a value already on this grid: Q(DQ(q)) is
+   // q, the rounding absorbing float32's ~1e-7 relative error against a 0.5 margin.
+   void MarkFakeQuantIdentity() { fFusedIsIdentity = true; }
+   bool IsFakeQuantIdentity() const { return fFusedIsIdentity; }
 
    std::vector<ETensorType> TypeInference(std::vector<ETensorType>) override { return {fOutputType}; }
    std::vector<std::vector<size_t>> ShapeInference(std::vector<std::vector<size_t>> input) override
@@ -228,6 +294,87 @@ public:
       out << SP << SP << "q = (q < " << qMin << ") ? " << qMin << " : ((q > " << qMax << ") ? " << qMax << " : q);\n";
       out << SP << SP << "tensor_" << fNY << "[id] = static_cast<" << ConvertTypeToString(fOutputType) << ">(q);\n";
       out << SP << "}\n";
+      return out.str();
+   }
+
+   // GPU/Alpaka codegen for boundaries no quantized region absorbed; an absorbed
+   // boundary never reaches this.
+   std::string Generate_GPU_Kernel_ALPAKA(std::string OpName) override
+   {
+      if (fIsOutputConstant || fFusedIsIdentity)
+         return "";
+      DETAIL::RequirePerTensorQDQForGpu(fInfo, "ONNX QuantizeLinear");
+      OpName = "op_" + OpName;
+      const auto [qMin, qMax] = QuantizedIntegerRange(fInfo);
+      std::string op = "\n//------ ONNX_QUANTIZELINEAR_KERNEL_ALPAKA " + OpName + "\n";
+      op += SP + "struct QuantizeLinearKernel_" + OpName + " {\n";
+      op += SP + SP + "template<typename TAcc, typename TIn, typename TOut>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, TIn const * x, TOut * y, "
+                      "std::size_t const length) const {\n";
+      op += SP + SP + SP + "auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (idx >= length) return;\n";
+      op += SP + SP + SP + "double v = static_cast<double>(x[idx]);\n";
+      if (fFusedHasClip) {
+         // The absorbed Clip runs before the quantize, exactly where it sat in the graph.
+         op += SP + SP + SP + "v = v < " + DETAIL::ExactDoubleLiteral(fFusedClipLow) + " ? " +
+               DETAIL::ExactDoubleLiteral(fFusedClipLow) + " : (v > " +
+               DETAIL::ExactDoubleLiteral(fFusedClipHigh) + " ? " +
+               DETAIL::ExactDoubleLiteral(fFusedClipHigh) + " : v);\n";
+      }
+      op += SP + SP + SP + "double q = nearbyint((v / " +
+            DETAIL::ExactDoubleLiteral(fInfo.scale) + ") + " + std::to_string(fInfo.zeroPoint) + ");\n";
+      op += SP + SP + SP + "q = (q < " + std::to_string(qMin) + ") ? " + std::to_string(qMin) + " : ((q > " +
+            std::to_string(qMax) + ") ? " + std::to_string(qMax) + " : q);\n";
+      if (IsFakeQuantRoundTripFused()) {
+         // The absorbed DequantizeLinear: same expression it would have emitted, on the
+         // value still in a register instead of a round trip through global memory.
+         op += SP + SP + SP + "y[idx] = static_cast<TOut>((q - " + std::to_string(fInfo.zeroPoint) + ") * " +
+               DETAIL::ExactDoubleLiteral(fInfo.scale) + ");\n";
+      } else {
+         op += SP + SP + SP + "y[idx] = static_cast<TOut>(q);\n";
+      }
+      op += SP + SP + "}\n";
+      op += SP + "};\n";
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string OpName) override
+   {
+      if (fIsOutputConstant || fFusedIsIdentity)
+         return "";
+      OpName = "op_" + OpName;
+      return SP + "QuantizeLinearKernel_" + OpName + " quantizeLinearKernel_" + OpName + ";\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string OpName) override
+   {
+      if (fIsOutputConstant)
+         return "";
+      OpName = "op_" + OpName;
+      const auto length = ConvertShapeToLength(fShape);
+      if (fFusedIsIdentity) {
+         // Zero-copy alias, as Reshape emits: the consumer reads the producer's buffer
+         // under the dequantized tensor's name.
+         std::stringstream alias;
+         alias << "\n//------ ONNX_QUANTIZELINEAR_ALPAKA " << OpName
+               << " (identity fake-quant: value already on this grid, aliased)\n";
+         alias << SP << "auto deviceBuf_" << fFusedDequantizedOutput
+               << " = alpaka::createView(devAcc, alpaka::getPtrNative(deviceBuf_" << fNX
+               << "), static_cast<Idx>(" << length << "));\n";
+         return alias.str();
+      }
+      // When fused, read behind the absorbed Clip and write the absorbed DQ's float output.
+      const std::string source = fFusedClipInput.empty() ? fNX : fFusedClipInput;
+      const std::string sink = IsFakeQuantRoundTripFused() ? fFusedDequantizedOutput : fNY;
+      std::stringstream out;
+      out << "\n//------ ONNX_QUANTIZELINEAR_ALPAKA " << OpName
+          << (IsFakeQuantRoundTripFused() ? " (fused fake-quant round trip)" : "") << "\n";
+      out << SP << "auto const elementsPerGrid_" << sink << " = Vec::all(Idx{" << length << "});\n";
+      out << SP << "auto const workDiv_" << sink << " = sofie_workdiv(elementsPerGrid_" << sink << ");\n";
+      out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << sink
+          << ", quantizeLinearKernel_" << OpName << ", alpaka::getPtrNative(deviceBuf_" << source
+          << "), alpaka::getPtrNative(deviceBuf_" << sink << "), " << length << ");\n";
+      out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";
       return out.str();
    }
 };
@@ -273,6 +420,12 @@ public:
    bool IsQuantizationBoundary() const override { return true; }
    std::string GetQuantizationSourceTensor() const override { return fNX; }
 
+   const std::string &GetInputTensor() const { return fNX; }
+   const std::string &GetOutputTensor() const { return fNY; }
+   const std::string &GetScaleTensor() const { return fNScale; }
+   const std::string &GetZeroPointTensor() const { return fNZeroPoint; }
+   const QuantizationInfo &GetQuantizationInfo() const { return fInfo; }
+
    std::vector<ETensorType> TypeInference(std::vector<ETensorType>) override { return {ETensorType::FLOAT}; }
    std::vector<std::vector<size_t>> ShapeInference(std::vector<std::vector<size_t>> input) override
    {
@@ -301,6 +454,8 @@ public:
             throw std::runtime_error("SOFIE ONNX DequantizeLinear supports initialized integer carriers only");
          }
          model.AddConstantTensor(fNY, fShape, values);
+         // Folded at build time, so no runtime kernel is needed on either backend.
+         fIsOutputConstant = true;
       } else {
          model.AddIntermediateTensor(fNY, ETensorType::FLOAT, fShape);
       }
@@ -325,6 +480,53 @@ public:
       out << SP << SP << "tensor_" << fNY << "[id] = (static_cast<double>(tensor_" << fNX << "[id]) - "
           << fInfo.zeroPoint << ") * " << fInfo.scale << ";\n";
       out << SP << "}\n";
+      return out.str();
+   }
+
+   // GPU/Alpaka codegen. An initialized input was dequantized into a constant tensor by
+   // Initialize, so those instances generate nothing.
+   std::string Generate_GPU_Kernel_ALPAKA(std::string OpName) override
+   {
+      if (fIsOutputConstant)
+         return "";
+      DETAIL::RequirePerTensorQDQForGpu(fInfo, "ONNX DequantizeLinear");
+      OpName = "op_" + OpName;
+      std::string op = "\n//------ ONNX_DEQUANTIZELINEAR_KERNEL_ALPAKA " + OpName + "\n";
+      op += SP + "struct DequantizeLinearKernel_" + OpName + " {\n";
+      op += SP + SP + "template<typename TAcc, typename TIn, typename TOut>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, TIn const * x, TOut * y, "
+                      "std::size_t const length) const {\n";
+      op += SP + SP + SP + "auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (idx >= length) return;\n";
+      op += SP + SP + SP + "y[idx] = static_cast<TOut>((static_cast<double>(x[idx]) - " +
+            std::to_string(fInfo.zeroPoint) + ") * " + DETAIL::ExactDoubleLiteral(fInfo.scale) + ");\n";
+      op += SP + SP + "}\n";
+      op += SP + "};\n";
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string OpName) override
+   {
+      if (fIsOutputConstant)
+         return "";
+      OpName = "op_" + OpName;
+      return SP + "DequantizeLinearKernel_" + OpName + " dequantizeLinearKernel_" + OpName + ";\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string OpName) override
+   {
+      if (fIsOutputConstant)
+         return "";
+      OpName = "op_" + OpName;
+      const auto length = ConvertShapeToLength(fShape);
+      std::stringstream out;
+      out << "\n//------ ONNX_DEQUANTIZELINEAR_ALPAKA " << OpName << "\n";
+      out << SP << "auto const elementsPerGrid_" << fNY << " = Vec::all(Idx{" << length << "});\n";
+      out << SP << "auto const workDiv_" << fNY << " = sofie_workdiv(elementsPerGrid_" << fNY << ");\n";
+      out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNY
+          << ", dequantizeLinearKernel_" << OpName << ", alpaka::getPtrNative(deviceBuf_" << fNX
+          << "), alpaka::getPtrNative(deviceBuf_" << fNY << "), " << length << ");\n";
+      out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";
       return out.str();
    }
 };

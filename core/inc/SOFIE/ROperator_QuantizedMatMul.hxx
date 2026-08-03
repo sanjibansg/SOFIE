@@ -24,8 +24,10 @@ inline void ValidateQuantizedMatMulContext(const QuantizedMatrixCodegenContext &
    if (context.inputShape.empty() || context.weightShape.empty() || context.outputShape.empty()) {
       throw std::runtime_error("SOFIE " + pathName + " called before MatMul initialization");
    }
-   if (!QuantizedMatMulShapeIsSingleGemmExecutable(region.shape)) {
-      throw std::runtime_error("SOFIE " + pathName + " requires rank-2 or flattenable-projection MatMul");
+   // TrueBatched is admitted here as well: the int8 call emits batchCount and the three
+   // strides, and the runtime already programs strided-batched layouts.
+   if (!QuantizedMatMulShapeIsRecognized(region.shape)) {
+      throw std::runtime_error("SOFIE " + pathName + " requires a recognized MatMul shape");
    }
    const auto &matrixShape =
       RequireQuantizedMatrixShapePolicy(plan, pathName);
@@ -33,6 +35,9 @@ inline void ValidateQuantizedMatMulContext(const QuantizedMatrixCodegenContext &
        matrixShape.logicalK != region.shape.logicalK ||
        matrixShape.logicalN != region.shape.logicalN) {
       throw std::runtime_error("SOFIE " + pathName + " lowering plan shape does not match the MatMul region shape");
+   }
+   if (matrixShape.batchCount != region.shape.batchCount) {
+      throw std::runtime_error("SOFIE " + pathName + " lowering plan batch count does not match the MatMul region");
    }
    if (region.inputSourceTensor.empty() || region.outputTensor.empty()) {
       throw std::runtime_error("SOFIE " + pathName + " is missing input/output tensors");
@@ -59,7 +64,10 @@ inline std::string GenerateFusedQuantizedMatMulCublasLtLaunch(std::string opName
       std::to_string(matrixShape.logicalM), std::to_string(matrixShape.logicalN),
       std::to_string(matrixShape.logicalK), plan, region.inputQuant, region.weightQuant,
       region.epilogue.biasQuant, region.outputQuant, QuantizedEpilogueHasBias(region.epilogue.kind),
-      QuantizedEpilogueHasRelu(region.epilogue.kind), region.weightQuant.isSigned);
+      QuantizedEpilogueHasRelu(region.epilogue.kind), region.weightQuant.isSigned,
+      static_cast<float>(region.outputAlpha));
+   call.outputRequantize = region.outputRequantize;
+   call.outputClamp = region.outputClamp;
    return INTERNAL::GenerateQuantizedCudaLtMatMulCall(call);
 }
 
@@ -91,6 +99,9 @@ inline std::string GenerateFusedQuantizedMatMulCublasLtFP8Launch(std::string opN
    }
    if (QuantizedEpilogueHasBias(region.epilogue.kind)) {
       throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch does not support fused bias");
+   }
+   if (region.outputAlpha != 1.0) {
+      throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch does not support an absorbed output scale");
    }
 
    auto call = INTERNAL::MakeQuantizedCudaLtFP8DenseLinearCall(

@@ -87,6 +87,15 @@ private:
    void PrepareQuantizedTensorStorage(EQuantizedBackend backend);
    void AddQuantizedGeneratedHeaders(EQuantizedBackend backend = EQuantizedBackend::CPU);
    void AddLoweredQuantizedOperators(EQuantizedBackend backend = EQuantizedBackend::CPU);
+   // Collapses each surviving Clip? -> Quantize -> Dequantize into one kernel. Runs last,
+   // so it only sees boundaries no region absorbed.
+   void FuseUnabsorbedFakeQuantBoundaries();
+   void FuseSoftmaxClipBoundaries();
+   // Stops emitting operators whose outputs nobody reads. Not quantization specific.
+   void EliminateDeadOperators();
+   // Puts a batched MatMul's B operand in [.., N, K] by re-permuting the Transpose that
+   // produces it and setting transB. Runs before Initialize so shape inference follows.
+   void CanonicaliseBatchedMatMulOperands();
 
 public:
    // Rule of five: explicitly define move semantics, disallow copy
@@ -127,6 +136,27 @@ public:
 
    void AnalyzeQuantizedRegions();
    const QuantizationModelState & GetQuantizationState() const { return fQuantizationState; }
+
+   // Read-only view of the lowering decision, for diagnostics.
+   void BuildLoweredOperatorViewForDiagnostics(EQuantizedBackend backend)
+   {
+      BuildLoweredOperatorView(backend);
+   }
+   std::size_t GetOperatorCount() const { return fOperators.size(); }
+   bool IsOperatorLowered(std::size_t index) const
+   {
+      return fLoweredOperators.find(index) != fLoweredOperators.end();
+   }
+   // The operator emitted at this index: the lowered region if one replaced the original,
+   // which reads an int8 carrier where the original read a float. Null if suppressed.
+   const ROperator * GetEmittedOperatorAt(std::size_t index) const
+   {
+      if (fLoweredConsumedOperatorIndices.count(index) != 0)
+         return nullptr;
+      if (auto it = fLoweredOperators.find(index); it != fLoweredOperators.end())
+         return it->second.get();
+      return index < fOperators.size() ? fOperators[index].get() : nullptr;
+   }
 
    // get the values for the tensor representing a shape
    const std::vector<Dim> & GetShapeTensorValues(const std::string & tensor_name) const;

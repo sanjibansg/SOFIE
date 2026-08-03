@@ -103,6 +103,11 @@ public:
       fOutputTensorNames = { fNY };
    }
 
+   // Exposed so a producer can absorb this Clip into its own epilogue. Meaningful only
+   // for constant bounds, which are the ones that can be baked into generated code.
+   bool ClipBoundsAreConstant() const { return fMinIsConstant && fMaxIsConstant; }
+   T ClipMin() const { return fMin; }
+   T ClipMax() const { return fMax; }
 
    // -----------------------------------------------------------------------
    void Initialize(RModel& model) override

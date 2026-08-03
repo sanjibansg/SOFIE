@@ -6,8 +6,14 @@
 #include "SOFIE/RQuantization_Elementwise.hxx"
 #include "SOFIE/RQuantization_Gather.hxx"
 #include "SOFIE/RQuantization_Storage.hxx"
+#include "SOFIE/ROperator_Clip.hxx"
+#include "SOFIE/ROperator_ONNXQuantizeLinear.hxx"
+#include "SOFIE/ROperator_Reshape.hxx"
+#include "SOFIE/ROperator_Softmax.hxx"
+#include "SOFIE/ROperator_Transpose.hxx"
 
 #include <algorithm>
+#include <unordered_map>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -473,6 +479,286 @@ void RModel::AddLoweredQuantizedOperators(EQuantizedBackend backend)
       installLoweredOperator(
          opIndex, *plan, QuantizedRegionInputSourceTensor(region),
          QuantizedRegionOutputTensor(region), std::move(lowered));
+   }
+}
+
+// Absorbs a saturation Clip into the preceding Softmax, which clamps in its third pass.
+// The Softmax takes over the Clip's output tensor, leaving downstream readers unchanged.
+void RModel::FuseSoftmaxClipBoundaries()
+{
+   // A subgraph body can read a tensor that does not appear in the containing operator's
+   // input list, so single-consumer reasoning is not sound there.
+   if (!fSubGraphs.empty())
+      return;
+
+   auto alive = [this](std::size_t index) {
+      return fLoweredConsumedOperatorIndices.count(index) == 0 &&
+             fLoweredOperators.find(index) == fLoweredOperators.end();
+   };
+
+   // Counts consumers over everything emitted, lowered regions included, so a region
+   // reading the Softmax output makes the Clip a second consumer.
+   std::unordered_map<std::string, std::vector<std::size_t>> consumers;
+   for (std::size_t index = 0; index < fOperators.size(); ++index) {
+      if (alive(index))
+         for (const auto &input : fOperators[index]->GetOpInputTensors())
+            consumers[std::string(input)].push_back(index);
+   }
+   for (const auto &lowered : fLoweredOperators) {
+      if (!lowered.second)
+         continue;
+      for (const auto &input : lowered.second->GetOpInputTensors())
+         consumers[std::string(input)].push_back(lowered.first);
+   }
+
+   std::unordered_set<std::string> applied;
+   for (std::size_t index = 0; index < fOperators.size(); ++index) {
+      if (!alive(index))
+         continue;
+      auto *softmax = dynamic_cast<ROperator_Softmax *>(fOperators[index].get());
+      if (softmax == nullptr || !softmax->CanFuseClip())
+         continue;
+
+      const auto outputs = fOperators[index]->GetOpOutputTensors();
+      if (outputs.size() != 1)
+         continue;
+      const std::string softmaxOutput(outputs[0]);
+      // A graph output still has to be materialised, so it cannot be skipped over.
+      if (std::find(fOutputTensorNames.begin(), fOutputTensorNames.end(), softmaxOutput) !=
+          fOutputTensorNames.end())
+         continue;
+
+      auto consumer = consumers.find(softmaxOutput);
+      if (consumer == consumers.end() || consumer->second.size() != 1)
+         continue;
+      const std::size_t clipIndex = consumer->second.front();
+      if (!alive(clipIndex) || fOperators[clipIndex]->GetKind() != OperatorKind::CLIP)
+         continue;
+      auto *clip = dynamic_cast<ROperator_Clip<float> *>(fOperators[clipIndex].get());
+      if (clip == nullptr || !clip->ClipBoundsAreConstant())
+         continue;
+      const auto clipOutputs = fOperators[clipIndex]->GetOpOutputTensors();
+      if (clipOutputs.size() != 1)
+         continue;
+
+      const std::string fusedOutput(clipOutputs[0]);
+      // A tensor already planned as an int8 handoff has a consumer committed to reading a
+      // carrier, so the Softmax must quantize rather than only clamp.
+      auto handoff = fQuantizationState.softmaxInt8Handoffs.find(fusedOutput);
+      if (handoff != fQuantizationState.softmaxInt8Handoffs.end()) {
+         softmax->FuseQuantizedOutput(fusedOutput, handoff->second, true,
+                                      static_cast<double>(clip->ClipMin()),
+                                      static_cast<double>(clip->ClipMax()));
+      } else {
+         softmax->FuseClip(fusedOutput, static_cast<double>(clip->ClipMin()),
+                           static_cast<double>(clip->ClipMax()));
+      }
+      fLoweredConsumedOperatorIndices.insert(clipIndex);
+      applied.insert(fusedOutput);
+   }
+
+   // A planned handoff whose rewrite did not happen would leave the region loading a
+   // buffer nothing writes as int8, so the mismatch is raised rather than emitted.
+   for (const auto &handoff : fQuantizationState.softmaxInt8Handoffs) {
+      if (applied.count(handoff.first) == 0)
+         throw std::runtime_error(
+            "SOFIE quantization planned a Softmax int8 handoff for tensor '" + handoff.first +
+            "' but the Softmax/Clip fusion did not apply it; the consuming region would read a "
+            "carrier nothing writes");
+   }
+}
+
+void RModel::FuseUnabsorbedFakeQuantBoundaries()
+{
+   auto alive = [this](std::size_t index) {
+      return fLoweredConsumedOperatorIndices.count(index) == 0 &&
+             fLoweredOperators.find(index) == fLoweredOperators.end();
+   };
+
+   auto readScalar = [this](const std::string &name, double &value) {
+      if (name.empty() || !CheckIfTensorAlreadyExist(name) || !IsInitializedTensor(name))
+         return false;
+      std::size_t elements = 1;
+      for (auto extent : GetTensorShape(name))
+         elements *= extent;
+      if (elements != 1)
+         return false;
+      if (GetTensorType(name) == ETensorType::FLOAT) {
+         const auto data = GetTensorData<float>(name);
+         if (data.empty())
+            return false;
+         value = static_cast<double>(data[0]);
+         return true;
+      }
+      if (GetTensorType(name) == ETensorType::DOUBLE) {
+         const auto data = GetTensorData<double>(name);
+         if (data.empty())
+            return false;
+         value = data[0];
+         return true;
+      }
+      return false;
+   };
+
+   std::unordered_map<std::string, std::size_t> producer;
+   std::unordered_map<std::string, std::vector<std::size_t>> consumers;
+   for (std::size_t index = 0; index < fOperators.size(); ++index) {
+      if (!alive(index))
+         continue;
+      for (const auto &output : fOperators[index]->GetOpOutputTensors())
+         producer[std::string(output)] = index;
+      for (const auto &input : fOperators[index]->GetOpInputTensors())
+         consumers[std::string(input)].push_back(index);
+   }
+   // Lowered regions are not `alive` -- that means "an original operator still emitted" --
+   // but they are emitted and they read tensors, so their inputs count as consumers too.
+   for (const auto &lowered : fLoweredOperators) {
+      if (!lowered.second)
+         continue;
+      for (const auto &input : lowered.second->GetOpInputTensors())
+         consumers[std::string(input)].push_back(lowered.first);
+   }
+   const std::set<std::string> graphOutputs(fOutputTensorNames.begin(), fOutputTensorNames.end());
+
+   // Reports which guard declined each boundary, which is otherwise unobservable.
+   // Off unless SOFIE_FUSE_BOUNDARY_TRACE is set.
+   const bool traceGuards = std::getenv("SOFIE_FUSE_BOUNDARY_TRACE") != nullptr;
+   std::map<std::string, int> guardCounts;
+   auto decline = [&guardCounts, traceGuards](const char *reason) {
+      if (traceGuards)
+         ++guardCounts[reason];
+   };
+   int fusedRoundTrips = 0;
+
+   // Keyed off the operators' own tensor fields rather than fOutputTensorNames, which
+   // fusion rewrites, so the pass stays idempotent across repeated calls.
+   for (std::size_t index = 0; index < fOperators.size(); ++index) {
+      if (!alive(index))
+         continue;
+      auto *quantize = dynamic_cast<ROperator_ONNXQuantizeLinear *>(fOperators[index].get());
+      if (quantize == nullptr || quantize->IsOutputConstant())
+         continue;
+      if (quantize->GetQuantizationInfo().granularity != EQuantizationGranularity::PerTensor)
+         { decline("q_not_per_tensor"); continue; }
+      // The int8 carrier stays in a register, so nothing else may read it.
+      const auto &carrier = quantize->GetOutputTensor();
+      if (graphOutputs.count(carrier) != 0)
+         { decline("carrier_is_graph_output"); continue; }
+      // The trailing DequantizeLinear is the round-trip candidate. A lowered region may
+      // also read the carrier, which then has to survive as int8.
+      constexpr auto kNoOperator = static_cast<std::size_t>(-1);
+      auto carrierConsumers = consumers.find(carrier);
+      if (carrierConsumers == consumers.end() || carrierConsumers->second.empty())
+         { decline("carrier_unread"); continue; }
+      std::size_t dequantizeIndex = kNoOperator;
+      bool carrierFeedsLoweredRegion = false;
+      bool ambiguousCarrierConsumer = false;
+      for (auto consumerIndex : carrierConsumers->second) {
+         if (fLoweredOperators.count(consumerIndex) != 0) {
+            carrierFeedsLoweredRegion = true;
+            continue;
+         }
+         if (dequantizeIndex != kNoOperator) {
+            ambiguousCarrierConsumer = true;
+            break;
+         }
+         dequantizeIndex = consumerIndex;
+      }
+      if (ambiguousCarrierConsumer || dequantizeIndex == kNoOperator) {
+         decline(ambiguousCarrierConsumer ? "ambiguous_carrier_consumer" : "no_dequantize_consumer");
+         continue;
+      }
+
+      auto *dequantize = dynamic_cast<ROperator_ONNXDequantizeLinear *>(fOperators[dequantizeIndex].get());
+      if (dequantize == nullptr || !alive(dequantizeIndex) || dequantize->IsOutputConstant())
+         { decline("consumer_not_live_dq"); continue; }
+      // Same grid, or the pair is not a round trip and collapsing it would change values.
+      if (dequantize->GetInputTensor() != carrier ||
+          !SameQuantizationGrid(dequantize->GetQuantizationInfo(), quantize->GetQuantizationInfo()))
+         { decline("grid_mismatch"); continue; }
+      if (dequantize->GetQuantizationInfo().granularity != EQuantizationGranularity::PerTensor)
+         { decline("dq_not_per_tensor"); continue; }
+
+      // Optional preceding Clip, likewise only when this Q is its sole reader.
+      std::string clipInput;
+      double clipLow = 0.0;
+      double clipHigh = 0.0;
+      bool hasClip = false;
+      std::size_t clipIndex = 0;
+      const auto &quantizeSource = quantize->GetInputTensor();
+      if (auto clipProducer = producer.find(quantizeSource);
+          clipProducer != producer.end() && graphOutputs.count(quantizeSource) == 0) {
+         const auto candidate = clipProducer->second;
+         auto *clip = fOperators[candidate].get();
+         auto clipConsumers = consumers.find(quantizeSource);
+         if (alive(candidate) && clip->GetKind() == OperatorKind::CLIP &&
+             clipConsumers != consumers.end() && clipConsumers->second.size() == 1) {
+            const auto clipInputs = clip->GetOpInputTensors();
+            if (clipInputs.size() == 3 && readScalar(std::string(clipInputs[1]), clipLow) &&
+                readScalar(std::string(clipInputs[2]), clipHigh)) {
+               clipInput = std::string(clipInputs[0]);
+               hasClip = true;
+               clipIndex = candidate;
+            }
+         }
+      }
+
+      if (carrierFeedsLoweredRegion) {
+         // The carrier is live as int8, so the DequantizeLinear stays and only the Clip is
+         // absorbed; dead-code elimination drops the DQ if the region was its sole reader.
+         if (hasClip) {
+            quantize->FuseClipOnly(clipInput, clipLow, clipHigh);
+            fLoweredConsumedOperatorIndices.insert(clipIndex);
+         }
+         { decline("carrier_feeds_lowered_region"); continue; }
+      }
+
+      quantize->FuseFakeQuantRoundTrip(dequantize->GetOutputTensor(), clipInput, hasClip, clipLow, clipHigh);
+      ++fusedRoundTrips;
+
+      // A value already on this grid makes the pair an alias. Reshape and Transpose are
+      // walked through; Clip is not, since it can change values.
+      if (!hasClip) {
+         std::string cursor = quantize->GetInputTensor();
+         for (int hop = 0; hop < 4; ++hop) {
+            auto upstream = producer.find(cursor);
+            if (upstream == producer.end())
+               break;
+            auto *op = fOperators[upstream->second].get();
+            if (auto *source = dynamic_cast<ROperator_ONNXDequantizeLinear *>(op)) {
+               // Not gated on the source still being emitted: fusing it into its own
+               // quantize leaves the grid unchanged. The type check is the real guard.
+               if (SameQuantizationGrid(source->GetQuantizationInfo(), quantize->GetQuantizationInfo()) &&
+                   GetTensorType(source->GetOutputTensor()) == ETensorType::FLOAT)
+                  quantize->MarkFakeQuantIdentity();
+               break;
+            }
+            // Only value-preserving movement, and only when this is its sole reader.
+            const bool movement = dynamic_cast<ROperator_Reshape *>(op) != nullptr ||
+                                  dynamic_cast<ROperator_Transpose<float> *>(op) != nullptr;
+            auto readers = consumers.find(cursor);
+            if (!movement || readers == consumers.end() || readers->second.size() != 1)
+               break;
+            const auto inputs = op->GetOpInputTensors();
+            if (inputs.empty())
+               break;
+            cursor = std::string(inputs[0]);
+         }
+      }
+
+      fLoweredConsumedOperatorIndices.insert(dequantizeIndex);
+      if (hasClip)
+         fLoweredConsumedOperatorIndices.insert(clipIndex);
+   }
+
+   if (traceGuards) {
+      int declined = 0;
+      for (const auto &g : guardCounts)
+         declined += g.second;
+      std::cout << "[SOFIE_FUSE_BOUNDARY_TRACE] fused round trips: " << fusedRoundTrips
+                << "   declined: " << declined << "\n";
+      for (const auto &g : guardCounts)
+         std::cout << "[SOFIE_FUSE_BOUNDARY_TRACE]   " << g.first << ": " << g.second << "\n";
    }
 }
 

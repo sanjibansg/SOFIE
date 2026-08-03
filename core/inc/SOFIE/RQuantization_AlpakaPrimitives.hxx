@@ -42,6 +42,33 @@ __device__ inline std::int32_t QuantizedCudaQuantizeClamp(double value, double s
    return QuantizedCudaClamp(quantized, qmin, qmax);
 }
 
+// Same requantize with the divide replaced by a host-precomputed reciprocal pair whose
+// correction term keeps ties on the same side as the divide.
+__device__ inline std::int32_t QuantizedCudaQuantizeClampRecip(double value, double scaleReciprocal,
+                                                               double scaleReciprocalError,
+                                                               std::int32_t zero, std::int32_t qmin,
+                                                               std::int32_t qmax)
+{
+   const double scaled = fma(value, scaleReciprocal, value * scaleReciprocalError);
+   const auto quantized = static_cast<std::int32_t>(nearbyint(scaled + static_cast<double>(zero)));
+   return QuantizedCudaClamp(quantized, qmin, qmax);
+}
+
+// Splits 1/scale into a double and its residual, so value*(r + rErr) carries about
+// twice the precision of value*r. Host side, once per launch.
+struct QuantizedScaleReciprocal {
+   double value = 1.0;
+   double error = 0.0;
+};
+
+inline QuantizedScaleReciprocal QuantizedMakeScaleReciprocal(double scale)
+{
+   QuantizedScaleReciprocal reciprocal;
+   reciprocal.value = 1.0 / scale;
+   reciprocal.error = std::fma(-scale, reciprocal.value, 1.0) * reciprocal.value;
+   return reciprocal;
+}
+
 } // namespace INTERNAL
 
 #endif // SOFIE_USE_CUBLASLT

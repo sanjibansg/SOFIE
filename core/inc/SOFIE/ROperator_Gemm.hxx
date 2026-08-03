@@ -46,6 +46,7 @@ namespace SOFIE{
       std::vector<Dim> fShapeY;
       RModel * fModel = nullptr;
       bool fForceFloatOutput = false;
+      bool fBatchedOperandBCanonicalised = false;
 
    public:
 
@@ -80,6 +81,12 @@ namespace SOFIE{
       float GetBeta() const { return fAttrBeta; }
       int_t GetTransA() const { return fAttrTransA; }
       int_t GetTransB() const { return fAttrTransB; }
+      // Only legal before Initialize, which is where the operand shapes are read.
+      void SetTransB(int_t transB) { fAttrTransB = transB; }
+      // Set by CanonicaliseBatchedMatMulOperands, distinguishing a re-permuted batched
+      // operand from an ordinary rank-2 Gemm with transB=1.
+      void MarkBatchedOperandBCanonicalised() { fBatchedOperandBCanonicalised = true; }
+      bool IsBatchedOperandBCanonicalised() const { return fBatchedOperandBCanonicalised; }
       bool HasBias() const { return !fNC.empty(); }
       const std::string &GetInputTensorName() const { return fNA; }
       const std::string &GetWeightTensorName() const { return fNB; }
@@ -700,8 +707,10 @@ namespace SOFIE{
             size_t m_sofie    = static_cast<size_t>(std::stoi(n));   // ONNX n
             size_t n_sofie    = static_cast<size_t>(std::stoi(m));   // ONNX m
             size_t k_val      = static_cast<size_t>(std::stoi(k));
-            size_t lda        = m_sofie;             // transA_sofie='n'
-            size_t ldb        = k_val;               // transB_sofie='n'
+            // Leading dimensions follow the swapped flags passed below: cuBLAS wants
+            // lda >= m when transa is 'n' and lda >= k when 't', likewise ldb.
+            size_t lda        = fAttrTransB ? k_val   : m_sofie;
+            size_t ldb        = fAttrTransA ? n_sofie : k_val;
             size_t ldc        = m_sofie;
             size_t sA         = m_sofie * k_val;     // stride per batch for fNB
             size_t sB         = k_val  * n_sofie;    // stride per batch for fNA (= strideA_onnx)

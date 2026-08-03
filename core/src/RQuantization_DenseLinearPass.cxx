@@ -6,8 +6,13 @@
 #include "SOFIE/ROperator_QuantizedGemm.hxx"
 #include "SOFIE/ROperator_QuantizedMatMul.hxx"
 #include "SOFIE/ROperator_ONNXQuantizeLinear.hxx"
+#include "SOFIE/ROperator_Reshape.hxx"
+#include "SOFIE/ROperator_Softmax.hxx"
+#include "SOFIE/ROperator_Transpose.hxx"
 
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <unordered_set>
 #include <iostream>
 #include <type_traits>
@@ -101,6 +106,138 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
       return false;
    };
 
+   // Absorbable: the region may write this op's output tensor, so only for ops that do
+   // not move data. See-through: the search may look past it. A Transpose is only the latter.
+   auto isBoundaryChainAbsorbable = [&operators](std::size_t index) {
+      if (index >= operators.size())
+         return false;
+      const auto *op = operators[index].get();
+      return dynamic_cast<const ROperator_Reshape *>(op) != nullptr ||
+             op->GetKind() == OperatorKind::CLIP;
+   };
+   auto isBoundarySearchSeeThrough = [&operators, &isBoundaryChainAbsorbable](std::size_t index) {
+      if (index >= operators.size())
+         return false;
+      return isBoundaryChainAbsorbable(index) ||
+             dynamic_cast<const ROperator_Transpose<float> *>(operators[index].get()) != nullptr;
+   };
+
+   auto readScalarInitializer = [&model](const std::string &name, double &value) {
+      if (name.empty() || !model.CheckIfTensorAlreadyExist(name) || !model.IsInitializedTensor(name))
+         return false;
+      // Genuinely one element: a broadcast vector would rescale per channel, which is a
+      // different transform from the single epilogue factor the callers fold it into.
+      std::size_t elements = 1;
+      for (auto extent : model.GetTensorShape(name))
+         elements *= extent;
+      if (elements != 1)
+         return false;
+      if (model.GetTensorType(name) == ETensorType::FLOAT) {
+         const auto data = model.GetTensorData<float>(name);
+         if (data.empty())
+            return false;
+         value = static_cast<double>(data[0]);
+         return true;
+      }
+      if (model.GetTensorType(name) == ETensorType::DOUBLE) {
+         const auto data = model.GetTensorData<double>(name);
+         if (data.empty())
+            return false;
+         value = data[0];
+         return true;
+      }
+      return false;
+   };
+
+   struct AbsorbedOutputChain {
+      std::size_t boundaryIndex = static_cast<std::size_t>(-1);
+      std::vector<std::size_t> opIndices;
+      bool hasClip = false;
+      double clipLow = -std::numeric_limits<double>::infinity();
+      double clipHigh = std::numeric_limits<double>::infinity();
+      bool clipBoundsReadable = true;
+      // Product of the constant scalar Muls absorbed off the chain, destined for the
+      // epilogue alpha.
+      double alphaScale = 1.0;
+      // False once the walk passes something see-through but not absorbable, where the
+      // boundary still defines the grid but the chain stays in the graph.
+      bool absorbable = true;
+   };
+
+   // Walks forward from a region output to the boundary defining its grid, collecting the
+   // transparent ops on the way. A fork or a non-transparent op ends the search.
+   auto findAbsorbableOutputChain = [&graph, &operators, &isBoundarySearchSeeThrough,
+                                     &isBoundaryChainAbsorbable,
+                                     &readScalarInitializer](std::string tensor,
+                                                             bool allowScaleMul = false) {
+      AbsorbedOutputChain chain;
+      constexpr int kMaxHops = 4;
+      for (int hop = 0; hop < kMaxHops; ++hop) {
+         auto consumers = graph.consumersByTensor.find(tensor);
+         if (consumers == graph.consumersByTensor.end() || consumers->second.size() != 1)
+            return chain;
+         const auto index = consumers->second.front();
+         if (index >= operators.size())
+            return chain;
+         if (operators[index]->IsQuantizationBoundary()) {
+            chain.boundaryIndex = index;
+            return chain;
+         }
+         const bool isScaleMul = allowScaleMul && IsFloatMulOperator(*operators[index]);
+         if (!isScaleMul && !isBoundarySearchSeeThrough(index))
+            return chain;
+         if (!isScaleMul && !isBoundaryChainAbsorbable(index)) {
+            // A scale fold needs the Mul suppressed, which a non-absorbable chain cannot
+            // do, so the two are mutually exclusive in either order.
+            if (chain.alphaScale != 1.0)
+               return chain;
+            chain.absorbable = false;
+         }
+         if (isScaleMul) {
+            if (!chain.absorbable)
+               return chain;
+            // A Clip already on the chain holds pre-scale bounds, which folding a later
+            // Mul into alpha would compare against the post-scale grid.
+            if (chain.hasClip)
+               return chain;
+            const auto mulInputs = operators[index]->GetOpInputTensors();
+            if (mulInputs.size() != 2)
+               return chain;
+            const std::string lhs(mulInputs[0]);
+            const std::string rhs(mulInputs[1]);
+            const std::string scalarOperand = lhs == tensor ? rhs : (rhs == tensor ? lhs : std::string{});
+            double scalar = 0.0;
+            if (scalarOperand.empty() || !readScalarInitializer(scalarOperand, scalar))
+               return chain;
+            if (!std::isfinite(scalar) || scalar == 0.0)
+               return chain;
+            chain.alphaScale *= scalar;
+         }
+         if (operators[index]->GetKind() == OperatorKind::CLIP) {
+            // Clip carries grid information the int8 dtype cannot express (a 7-bit range,
+            // or a Relu at the zero point), so its bounds fold into the epilogue clamp.
+            const auto clipInputs = operators[index]->GetOpInputTensors();
+            chain.hasClip = true;
+            double bound = 0.0;
+            if (clipInputs.size() > 1 && readScalarInitializer(std::string(clipInputs[1]), bound))
+               chain.clipLow = std::max(chain.clipLow, bound);
+            else if (clipInputs.size() > 1)
+               chain.clipBoundsReadable = false;
+            if (clipInputs.size() > 2 && readScalarInitializer(std::string(clipInputs[2]), bound))
+               chain.clipHigh = std::min(chain.clipHigh, bound);
+            else if (clipInputs.size() > 2)
+               chain.clipBoundsReadable = false;
+         }
+         const auto outputs = operators[index]->GetOpOutputTensors();
+         if (outputs.size() != 1)
+            return chain;
+         chain.opIndices.push_back(index);
+         tensor = std::string(outputs[0]);
+      }
+      chain.opIndices.clear();
+      return chain;
+   };
+
    // Activations a lowered region writes as an int8 carrier. Recorded only once that
    // producer's plan is Optimized, so a float fallback never leaves a consumer expecting int8.
    std::unordered_set<std::string> fusedInt8HandoffTensors;
@@ -120,10 +257,97 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
       return it->second < operators.size() && !operators[it->second]->IsQuantizationBoundary();
    };
 
+   // Records that a Softmax feeding this region should quantize onto the region's input
+   // grid. Applied later, once the Clip between them is absorbed.
+   auto tryPlanSoftmaxInt8Handoff = [&graph, &operators, &state, &model,
+                                     &fusedInt8HandoffTensors](const QuantizedMatMulRegion &region) {
+      const std::string &tensor = region.inputSourceTensor;
+      if (tensor.empty() || fusedInt8HandoffTensors.count(tensor) != 0)
+         return;
+      // Only a per-tensor signed-int8 grid: that is what the Softmax epilogue can emit
+      // and what the consumer reads back without a scale vector.
+      const auto &grid = region.inputQuant;
+      if (grid.granularity != EQuantizationGranularity::PerTensor || grid.bitWidth != 8 ||
+          !grid.isSigned)
+         return;
+
+      auto producer = graph.producerByTensor.find(tensor);
+      if (producer == graph.producerByTensor.end() || producer->second >= operators.size())
+         return;
+      // The Clip is transparent here only because the same fusion that consumes it folds
+      // its clamp into the Softmax; if that fusion declines, this handoff must not happen.
+      std::size_t softmaxIndex = producer->second;
+      if (operators[softmaxIndex]->GetKind() == OperatorKind::CLIP) {
+         const auto clipInputs = operators[softmaxIndex]->GetOpInputTensors();
+         if (clipInputs.empty())
+            return;
+         auto behindClip = graph.producerByTensor.find(std::string(clipInputs[0]));
+         if (behindClip == graph.producerByTensor.end() || behindClip->second >= operators.size())
+            return;
+         softmaxIndex = behindClip->second;
+      }
+      auto *softmax = dynamic_cast<ROperator_Softmax *>(operators[softmaxIndex].get());
+      if (softmax == nullptr || !softmax->CanFuseQuantizedOutput())
+         return;
+      // A second reader would still need the float value.
+      auto consumers = graph.consumersByTensor.find(tensor);
+      if (consumers == graph.consumersByTensor.end() || consumers->second.size() != 1)
+         return;
+      if (model.IsInitializedTensor(tensor))
+         return;
+
+      state.softmaxInt8Handoffs[tensor] = grid;
+      fusedInt8HandoffTensors.insert(tensor);
+   };
+
    // Ops that become a quantized region. A Q/DQ pair bridging two of them keeps its int8
    // carrier, so the pair is only collapsed to a float value beside a genuine float op.
    auto isRegionFormingOpKind = [](OperatorKind kind) {
       return kind == OperatorKind::GEMM || kind == OperatorKind::CONV;
+   };
+
+   // Walks back through zero-copy Reshapes for a DequantizeLinear on `grid` and returns
+   // its int8 input, letting the region read that carrier instead of re-deriving it.
+   auto findUpstreamInt8Carrier = [&graph, &operators, &model,                                    &reinterpretInt8StorableUnsigned](
+                                     const std::string &floatTensor,
+                                     const QuantizationInfo &grid) -> std::string {
+      std::string tensor = floatTensor;
+      constexpr int kMaxHops = 4;
+      for (int hop = 0; hop < kMaxHops; ++hop) {
+         // Nothing else may read the float, or dropping it changes what that consumer sees.
+         auto consumers = graph.consumersByTensor.find(tensor);
+         if (consumers == graph.consumersByTensor.end() || consumers->second.size() != 1)
+            return {};
+         auto producer = graph.producerByTensor.find(tensor);
+         if (producer == graph.producerByTensor.end() || producer->second >= operators.size())
+            return {};
+         auto *op = operators[producer->second].get();
+
+         if (dynamic_cast<ROperator_ONNXDequantizeLinear *>(op) != nullptr) {
+            if (!model.HasQuantizationInfo(tensor))
+               return {};
+            auto upstream = model.GetQuantizationInfo(tensor);
+            reinterpretInt8StorableUnsigned(upstream);
+            if (!SameQuantizationGrid(upstream, grid))
+               return {};
+            const std::string carrier = op->GetQuantizationSourceTensor();
+            if (carrier.empty() || !model.CheckIfTensorAlreadyExist(carrier))
+               return {};
+            const auto carrierType = model.GetTensorType(carrier);
+            if (carrierType != ETensorType::INT8 && carrierType != ETensorType::UINT8)
+               return {};
+            return carrier;
+         }
+         // A Reshape is a zero-copy alias, so it is transparent here for the same reason it
+         // is transparent to the boundary walk. Anything else can change values.
+         if (dynamic_cast<const ROperator_Reshape *>(op) == nullptr)
+            return {};
+         const auto inputs = op->GetOpInputTensors();
+         if (inputs.empty())
+            return {};
+         tensor = std::string(inputs[0]);
+      }
+      return {};
    };
 
    for (std::size_t opIndex = 0; opIndex < operators.size(); ++opIndex) {
@@ -389,6 +613,14 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
             info.inputQuant = model.GetQuantizationInfo(info.inputTensor);
             reinterpretInt8StorableUnsigned(info.inputQuant);
             CheckQuantizationInfo(info.inputQuant, "input", reasons);
+            // With the grid known, check whether the pre-Q float is itself a dequantization
+            // on that grid, in which case the existing int8 carrier is read directly.
+            if (info.inputPairQuantizeOpIndex && reasons.empty()) {
+               const std::string carrier =
+                  findUpstreamInt8Carrier(info.inputSourceTensor, info.inputQuant);
+               if (!carrier.empty())
+                  info.inputSourceTensor = carrier;
+            }
          } else {
             reasons.push_back("input tensor has no QuantizationInfo");
          }
@@ -452,8 +684,11 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
             reasons.push_back("Gemm output has multiple consumers");
          } else {
             auto consumerIndex = consumers->second.front();
-            auto setOutputQuantFromBoundary = [&](std::size_t quantIndex) {
-               info.outputQuantOpIndex = quantIndex;
+            // gridOnly reads the boundary's grid but suppresses nothing, for a chain that
+            // is see-through yet not absorbable. The intervening ops preserve the values.
+            auto setOutputQuantFromBoundary = [&](std::size_t quantIndex, bool gridOnly = false) {
+               if (!gridOnly)
+                  info.outputQuantOpIndex = quantIndex;
                auto quantOutputs = operators[quantIndex]->GetOpOutputTensors();
                if (quantOutputs.size() != 1) {
                   reasons.push_back("output quantization boundary does not have exactly one output");
@@ -467,6 +702,12 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                   CheckQuantizationInfo(info.outputQuant, "output", reasons);
                } else {
                   reasons.push_back("output tensor has no QuantizationInfo");
+               }
+               if (gridOnly) {
+                  // The region keeps writing the product itself; nothing downstream is
+                  // absorbed, so the output tensor is the one the operator already has.
+                  info.outputTensor = info.gemmOutputTensor;
+                  return;
                }
                // Q/DQ spells one fake-quant as Quantize followed by Dequantize; absorb the
                // trailing DQ and emit its float output so the pair matches QONNX's single Quant.
@@ -486,8 +727,12 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                         auto dqConsumers = graph.consumersByTensor.find(dequantOutput);
                         if (dqConsumers != graph.consumersByTensor.end() && dqConsumers->second.size() == 1) {
                            const auto dqConsumer = dqConsumers->second.front();
-                           feedsRegionFormingOp = dqConsumer < operators.size() &&
-                                                  isRegionFormingOpKind(operators[dqConsumer]->GetKind());
+                           // Elementwise counts too: collapsing the pair would leave whichever
+                           // tensor that consumer picks, int8 carrier or float, unwritten.
+                           feedsRegionFormingOp =
+                              dqConsumer < operators.size() &&
+                              (isRegionFormingOpKind(operators[dqConsumer]->GetKind()) ||
+                               IsQuantizedElementwiseCandidate(*operators[dqConsumer]));
                         }
                         if (!feedsRegionFormingOp) {
                            info.outputDequantOpIndex = dequantIndex;
@@ -539,6 +784,61 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                }
             };
 
+            // Absorbs a boundary reached through transparent ops and the ops between. A
+            // non-absorbable chain takes the grid alone and leaves every op in place.
+            auto absorbOutputChain = [&](const AbsorbedOutputChain &chain) {
+               setOutputQuantFromBoundary(chain.boundaryIndex, !chain.absorbable);
+               if (!reasons.empty())
+                  return;
+               // Grid only: nothing on the chain is suppressed, so a following Clip still
+               // clamps and the Mul fold was already refused by the walk.
+               if (!chain.absorbable)
+                  return;
+               if (!chain.clipBoundsReadable) {
+                  reasons.push_back("absorbed output Clip has non-constant bounds");
+                  return;
+               }
+               if (chain.hasClip) {
+                  const double scale = info.outputQuant.scale;
+                  if (!(scale > 0.0)) {
+                     reasons.push_back("absorbed output Clip requires a positive output scale");
+                     return;
+                  }
+                  const double zero = static_cast<double>(info.outputQuant.zeroPoint);
+                  const auto carrier = QuantizedIntegerRange(info.outputQuant);
+                  auto onGrid = [&](double bound, std::int64_t fallback, std::int64_t &grid) {
+                     if (!std::isfinite(bound)) {
+                        grid = fallback;
+                        return true;
+                     }
+                     const double scaled = bound / scale + zero;
+                     const double rounded = std::nearbyint(scaled);
+                     // The bound must land on a grid point, else the clamp would not be
+                     // the Clip and absorbing it would change results.
+                     if (std::abs(scaled - rounded) > 1e-4)
+                        return false;
+                     grid = static_cast<std::int64_t>(rounded);
+                     return true;
+                  };
+                  std::int64_t low = 0, high = 0;
+                  if (!onGrid(chain.clipLow, carrier.first, low) ||
+                      !onGrid(chain.clipHigh, carrier.second, high)) {
+                     reasons.push_back("absorbed output Clip bounds are not on the output quantization grid");
+                     return;
+                  }
+                  low = std::max(low, carrier.first);
+                  high = std::min(high, carrier.second);
+                  if (low > high) {
+                     reasons.push_back("absorbed output Clip bounds are empty on the output grid");
+                     return;
+                  }
+                  if (low != carrier.first || high != carrier.second)
+                     info.outputClamp = std::make_pair(low, high);
+               }
+               info.outputAlpha = chain.alphaScale;
+               info.absorbedOutputChainOpIndices = chain.opIndices;
+            };
+
             if (operators[consumerIndex]->IsQuantizationBoundary()) {
                setOutputQuantFromBoundary(consumerIndex);
             } else if (isMatMulSpelling && IsFloatAddOperator(*operators[consumerIndex])) {
@@ -564,19 +864,37 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                         reasons.push_back("MatMul Add epilogue output has no output quantization consumer");
                      } else if (addOutputConsumers->second.size() != 1) {
                         reasons.push_back("MatMul Add epilogue output has multiple consumers");
-                     } else if (!operators[addOutputConsumers->second.front()]->IsQuantizationBoundary()) {
-                        reasons.push_back("MatMul Add epilogue output consumer is not a quantization boundary");
                      } else {
-                        matmulEpilogue.kind = EQuantizedEpilogueKind::Bias;
-                        matmulEpilogue.biasSourceTensor = biasCandidate;
-                        matmulEpilogue.biasQuant = MakeAccumulatorBiasQuantization(info.inputQuant, info.weightQuant);
-                        matmulEpilogue.addOpIndex = consumerIndex;
-                        setOutputQuantFromBoundary(addOutputConsumers->second.front());
+                        const bool adjacentBoundary =
+                           operators[addOutputConsumers->second.front()]->IsQuantizationBoundary();
+                        const auto chain =
+                           adjacentBoundary ? AbsorbedOutputChain{}
+                                            : findAbsorbableOutputChain(addOutput, isQuantizedMatMulSpelling);
+                        if (!adjacentBoundary && chain.boundaryIndex == static_cast<std::size_t>(-1)) {
+                           reasons.push_back("MatMul Add epilogue output consumer is not a quantization boundary");
+                        } else {
+                           matmulEpilogue.kind = EQuantizedEpilogueKind::Bias;
+                           matmulEpilogue.biasSourceTensor = biasCandidate;
+                           matmulEpilogue.biasQuant = MakeAccumulatorBiasQuantization(info.inputQuant, info.weightQuant);
+                           matmulEpilogue.addOpIndex = consumerIndex;
+                           if (adjacentBoundary)
+                              setOutputQuantFromBoundary(addOutputConsumers->second.front());
+                           else
+                              absorbOutputChain(chain);
+                        }
                      }
                   }
                }
             } else {
-               reasons.push_back("Gemm output consumer is not a quantization boundary");
+               // Only the MatMul spelling carries an absorbed alpha to codegen; the Gemm
+               // spelling has its own alpha attribute, so a Mul there ends the walk.
+               const auto chain =
+                  findAbsorbableOutputChain(info.gemmOutputTensor, isQuantizedMatMulSpelling);
+               if (chain.boundaryIndex != static_cast<std::size_t>(-1)) {
+                  absorbOutputChain(chain);
+               } else {
+                  reasons.push_back("Gemm output consumer is not a quantization boundary");
+               }
             }
          }
       }
@@ -616,7 +934,15 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                std::vector<std::size_t> outputShape;
                if (!matmul.inputSourceTensor.empty())
                   inputShape = model.GetTensorShape(matmul.inputSourceTensor);
-               if (!matmul.weightSourceTensor.empty() && model.IsInitializedTensor(matmul.weightSourceTensor))
+               // A batched activation x activation product has no constant to lay out, and
+               // its B operand is already an int8 carrier written each inference.
+               const bool runtimeOperandB =
+                  !matmul.weightSourceTensor.empty() &&
+                  !model.IsInitializedTensor(matmul.weightSourceTensor) &&
+                  matmul.shape.kind == EQuantizedMatMulShapeKind::TrueBatched &&
+                  model.GetTensorType(matmul.weightSourceTensor) == ETensorType::INT8;
+               if (!matmul.weightSourceTensor.empty() &&
+                   (model.IsInitializedTensor(matmul.weightSourceTensor) || runtimeOperandB))
                   weightShape = model.GetTensorShape(matmul.weightSourceTensor);
                else
                   storageReasons.push_back("MatMul weight source tensor must be initialized for transposed quantized storage");
@@ -656,18 +982,29 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                }
 
                if (storageReasons.empty()) {
+                  // Before the plan is built: it decides staging from whether the input
+                  // source is still a float op, and this is what flips that.
+                  tryPlanSoftmaxInt8Handoff(matmul);
                   const bool paddedStorage = selectedCapability.shapePolicy.policy == EQuantizedShapePolicy::Padded;
-                  const auto deviceStorageTensor = matmul.weightSourceTensor +
-                                                   (paddedStorage ? "_quantized_transposed_padded_device_storage"
-                                                                  : "_quantized_transposed_device_storage");
+                  // A runtime operand is its own storage: canonicalisation already put it in
+                  // [.., N, K], the layout the transposed constant path materialises.
+                  const auto deviceStorageTensor =
+                     runtimeOperandB ? matmul.weightSourceTensor
+                                     : matmul.weightSourceTensor +
+                                          (paddedStorage ? "_quantized_transposed_padded_device_storage"
+                                                         : "_quantized_transposed_device_storage");
                   auto alpakaPlan = MakeMatMulAlpakaTransposedWeightStoragePlan(
                      matmul, deviceStorageTensor, selectedCapability.shapePolicy,
-                     outputHasFloatConsumer(matmul.outputTensor) || matmul.outputDequantOpIndex.has_value());
+                     outputHasFloatConsumer(matmul.outputTensor) || matmul.outputDequantOpIndex.has_value(),
+                     inputSourceIsFloatOp(matmul.inputSourceTensor));
+                  alpakaPlan.weightStorageIsRuntimeTensor = runtimeOperandB;
                   alpakaPlan.computeProfile = selectedCapability.profile;
                   alpakaPlan.capabilityTag = selectedCapability.tag;
                   alpakaPlan.reason = matmul.reason + "; " + selectedCapability.reason;
                   plans[EQuantizedBackend::ALPAKA] = std::move(alpakaPlan);
-                  matmul.reason += "; transposed pre-quantized ALPAKA weight storage selected";
+                  matmul.reason += runtimeOperandB
+                                      ? "; runtime int8 operand B read in place"
+                                      : "; transposed pre-quantized ALPAKA weight storage selected";
                } else {
                   auto alpakaReason = matmul.reason + "; " + JoinQuantizationReasons(storageReasons);
                   auto unsupportedPlan = MakeUnsupportedQuantizedMatMulPlan(matmul, EQuantizedBackend::ALPAKA, alpakaReason, true);
@@ -831,7 +1168,7 @@ void MaterializeQuantizedDenseLinearWeights(QuantizedStoragePassContext &context
    for (auto opIndex : SortedQuantizedRegionOperatorIndices(state.regions)) {
       const auto *plan = FindQuantizedLoweringPlan(state, opIndex, backend);
       if (plan == nullptr || !IsQuantizedLoweringAvailable(plan->status) ||
-          plan->weightStorageTensor.empty())
+          plan->weightStorageTensor.empty() || plan->weightStorageIsRuntimeTensor)
          continue;
 
       std::visit([&](const auto &region) {

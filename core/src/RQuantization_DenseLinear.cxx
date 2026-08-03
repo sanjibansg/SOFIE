@@ -293,18 +293,22 @@ QuantizedDenseLinearProfileAssessment AssessDenseLinearComputeProfile(
    return assessment;
 }
 
-QuantizedMatrixShapePolicy MakeCublasLtShapePolicy(std::size_t m, std::size_t k, std::size_t n)
+QuantizedMatrixShapePolicy MakeCublasLtShapePolicy(std::size_t m, std::size_t k, std::size_t n,
+                                                   std::size_t batchCount)
 {
    QuantizedMatrixShapePolicy policy;
    policy.logicalM = m;
    policy.logicalK = k;
    policy.logicalN = n;
+   policy.batchCount = batchCount == 0 ? 1 : batchCount;
    policy.physicalM = RoundUpToMultiple(m, kCublasLtInt8Alignment);
    policy.physicalK = RoundUpToMultiple(k, kCublasLtInt8Alignment);
    policy.physicalN = RoundUpToMultiple(n, kCublasLtInt8Alignment);
 
-   policy.logicalMacs = m * k * n;
-   policy.physicalMacs = policy.physicalM * policy.physicalK * policy.physicalN;
+   // Totals rather than per-batch: a strided-batched call is one launch amortising its
+   // setup over the whole batch.
+   policy.logicalMacs = policy.batchCount * m * k * n;
+   policy.physicalMacs = policy.batchCount * policy.physicalM * policy.physicalK * policy.physicalN;
    policy.minimumOptimizedMacs = kCublasLtMinOptimizedMacs;
    policy.belowMinimumWork = policy.logicalMacs < policy.minimumOptimizedMacs;
    policy.paddingWorkRatio = policy.logicalMacs > 0 ? static_cast<double>(policy.physicalMacs) /
@@ -312,8 +316,10 @@ QuantizedMatrixShapePolicy MakeCublasLtShapePolicy(std::size_t m, std::size_t k,
 
    std::ostringstream reason;
    reason << "logical M/K/N=" << policy.logicalM << "/" << policy.logicalK << "/" << policy.logicalN
-          << ", physical M/K/N=" << policy.physicalM << "/" << policy.physicalK << "/" << policy.physicalN
-          << ", logical MACs=" << policy.logicalMacs
+          << ", physical M/K/N=" << policy.physicalM << "/" << policy.physicalK << "/" << policy.physicalN;
+   if (policy.batchCount > 1)
+      reason << ", batch count=" << policy.batchCount;
+   reason << ", logical MACs=" << policy.logicalMacs
           << ", physical MACs=" << policy.physicalMacs
           << ", minimum optimized MACs=" << policy.minimumOptimizedMacs
           << ", padding work ratio=" << policy.paddingWorkRatio;
@@ -555,7 +561,30 @@ QuantizedDenseLinearBackendCapability AssessCublasLtDenseLinearCapability(
    std::vector<std::string> semanticReasons;
 
    if (operands.requiresBatchedLowering) {
-      AddCapabilityReason(semanticReasons, operands.operatorName + " true batched shape requires strided-batched cuBLASLt lowering");
+      // Strided batching is supported through batchCount and the three strides, but not
+      // padded execution: the strides assume each slice is exactly logicalM*logicalK.
+      if (operands.logicalM == 0 || operands.logicalN == 0 || operands.logicalK == 0 ||
+          operands.batchCount == 0) {
+         AddCapabilityReason(semanticReasons,
+                             operands.operatorName + " logical M, N, K, and batch count must be nonzero");
+      } else if (operands.weightOutputChannelAxis >= 0 &&
+                 IsPerChannelAxis(operands.weightQuant, operands.weightOutputChannelAxis)) {
+         // Both operands of a batched activation x activation product are activations;
+         // there is no output-channel axis for a per-channel scale to live on.
+         AddCapabilityReason(semanticReasons,
+                             operands.operatorName +
+                                " strided-batched lowering requires per-tensor weight quantization");
+      } else {
+         capability.shapePolicy = MakeCublasLtShapePolicy(operands.logicalM, operands.logicalK,
+                                                          operands.logicalN, operands.batchCount);
+         if (capability.shapePolicy.policy != EQuantizedShapePolicy::Exact &&
+             capability.shapePolicy.policy != EQuantizedShapePolicy::ExactTooSmall) {
+            AddCapabilityReason(semanticReasons,
+                                operands.operatorName +
+                                   " strided-batched lowering requires exactly aligned M/K/N; padded batched"
+                                   " execution is not implemented");
+         }
+      }
    } else if (operands.hasLogicalShape) {
       if (operands.logicalM == 0 || operands.logicalN == 0 || operands.logicalK == 0)
          AddCapabilityReason(semanticReasons, operands.operatorName + " logical M, N, and K must be nonzero");
@@ -613,22 +642,29 @@ QuantizedDenseLinearBackendCapability AssessCublasLtDenseLinearCapability(
                                                                    : operands.shapeReason;
       capability.profile = computeProfile.profile;
       capability.reason = JoinCapabilityReasons(semanticReasons);
-      capability.tag = operands.requiresBatchedLowering ? "cublaslt_dense_linear_strided_batched_not_implemented"
+      // Batching is no longer the blocker, so do not keep claiming it is: the reasons
+      // above say what actually failed.
+      capability.tag = operands.requiresBatchedLowering ? "cublaslt_dense_linear_batched_profile_unsupported"
                                                         : "cublaslt_dense_linear_profile_unsupported";
       return capability;
    }
 
+   const bool batched = operands.requiresBatchedLowering;
    capability.profile = computeProfile.profile;
    if (capability.shapePolicy.policy == EQuantizedShapePolicy::Exact) {
       capability.executable = true;
-      capability.tag = perChannelWeight ? "cublaslt_i8i8_per_channel_weight_rank2_exact"
-                                        : "cublaslt_i8i8_symmetric_per_tensor_rank2_exact";
-      capability.reason = perChannelWeight ?
+      capability.tag = batched      ? "cublaslt_i8i8_symmetric_per_tensor_batched_exact"
+                       : perChannelWeight ? "cublaslt_i8i8_per_channel_weight_rank2_exact"
+                                          : "cublaslt_i8i8_symmetric_per_tensor_rank2_exact";
+      capability.reason = batched ?
+                          "cuBLASLt optimized signed-int8 symmetric per-tensor strided-batched exact-shape " + operands.operatorName + "; " + capability.shapePolicy.reason :
+                          perChannelWeight ?
                           "cuBLASLt optimized signed-int8 per-tensor activation/per-channel weight rank-2 exact-shape " + operands.operatorName + "; " + capability.shapePolicy.reason :
                           "cuBLASLt optimized signed-int8 symmetric per-tensor rank-2 exact-shape " + operands.operatorName + "; " + capability.shapePolicy.reason;
    } else if (capability.shapePolicy.policy == EQuantizedShapePolicy::ExactTooSmall) {
-      capability.tag = perChannelWeight ? "cublaslt_i8i8_per_channel_weight_rank2_exact_too_small"
-                                        : "cublaslt_i8i8_symmetric_per_tensor_rank2_exact_too_small";
+      capability.tag = batched      ? "cublaslt_i8i8_symmetric_per_tensor_batched_exact_too_small"
+                       : perChannelWeight ? "cublaslt_i8i8_per_channel_weight_rank2_exact_too_small"
+                                          : "cublaslt_i8i8_symmetric_per_tensor_rank2_exact_too_small";
       capability.reason = "cuBLASLt exact-shape execution is legal but below the minimum optimized work threshold; " +
                           capability.shapePolicy.reason;
    } else if (capability.shapePolicy.policy == EQuantizedShapePolicy::PaddedCandidate) {
@@ -661,6 +697,9 @@ void PopulateDenseLinearResourceRequirements(QuantizedLoweringPlan &plan, bool h
    const std::size_t physicalM = shape.physicalM == 0 ? shape.logicalM : shape.physicalM;
    const std::size_t physicalK = shape.physicalK == 0 ? shape.logicalK : shape.physicalK;
    const std::size_t physicalN = shape.physicalN == 0 ? shape.logicalN : shape.physicalN;
+   // Every buffer covers the whole strided-batched call: the runtime takes
+   // batchCount*m*k staging and batchCount*m*n accumulator, and the arena is sized here.
+   const std::size_t batchCount = shape.batchCount == 0 ? 1 : shape.batchCount;
    const auto bytes = [](EQuantizedStorageType storage, std::size_t elements) {
       return QuantizedStorageElementSize(storage) * elements;
    };
@@ -668,7 +707,7 @@ void PopulateDenseLinearResourceRequirements(QuantizedLoweringPlan &plan, bool h
    AddQuantizedResourceRequirement(
       plan.resources, EQuantizedResourceCategory::TensorStorage, EQuantizedResourceRole::InputCarrier,
       EQuantizedResourceLifetime::GraphValue, plan.inputStorage,
-      bytes(plan.inputStorage, shape.logicalM * shape.logicalK),
+      bytes(plan.inputStorage, batchCount * shape.logicalM * shape.logicalK),
       std::max<std::size_t>(QuantizedStorageElementSize(plan.inputStorage), 1), false,
       "logical dense-linear input carrier");
    AddQuantizedResourceRequirement(
@@ -676,7 +715,7 @@ void PopulateDenseLinearResourceRequirements(QuantizedLoweringPlan &plan, bool h
       EQuantizedResourceLifetime::ModelPersistent, plan.weightStorage,
       bytes(plan.weightStorage, plan.backend == EQuantizedBackend::CPU
                                       ? ((shape.logicalN + 3) / 4) * 4 * shape.logicalK
-                                      : physicalN * physicalK),
+                                      : batchCount * physicalN * physicalK),
       std::max<std::size_t>(QuantizedStorageElementSize(plan.weightStorage), 1), false,
       "physical pre-lowered dense-linear weight carrier");
    if (hasBias) {
@@ -690,7 +729,7 @@ void PopulateDenseLinearResourceRequirements(QuantizedLoweringPlan &plan, bool h
    AddQuantizedResourceRequirement(
       plan.resources, EQuantizedResourceCategory::TensorStorage, EQuantizedResourceRole::OutputCarrier,
       EQuantizedResourceLifetime::GraphValue, plan.outputStorage,
-      bytes(plan.outputStorage, shape.logicalM * shape.logicalN),
+      bytes(plan.outputStorage, batchCount * shape.logicalM * shape.logicalN),
       std::max<std::size_t>(QuantizedStorageElementSize(plan.outputStorage), 1), false,
       "logical dense-linear output carrier");
 
@@ -724,18 +763,18 @@ void PopulateDenseLinearResourceRequirements(QuantizedLoweringPlan &plan, bool h
    AddQuantizedResourceRequirement(
       plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::InputStaging,
       EQuantizedResourceLifetime::Invocation, EQuantizedStorageType::Int8,
-      bytes(EQuantizedStorageType::Int8, physicalM * physicalK), cudaAlignment, true,
+      bytes(EQuantizedStorageType::Int8, batchCount * physicalM * physicalK), cudaAlignment, true,
       "cuBLASLt int8 input staging or padding buffer");
    AddQuantizedResourceRequirement(
       plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::Accumulator,
       EQuantizedResourceLifetime::Invocation, EQuantizedStorageType::Int32Accumulator,
-      bytes(EQuantizedStorageType::Int32Accumulator, physicalM * physicalN), cudaAlignment, true,
+      bytes(EQuantizedStorageType::Int32Accumulator, batchCount * physicalM * physicalN), cudaAlignment, true,
       "cuBLASLt int32 accumulator and epilogue source");
    if (QuantizedShapePolicyUsesPadding(shape.policy)) {
       AddQuantizedResourceRequirement(
          plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::OutputStaging,
          EQuantizedResourceLifetime::Invocation, plan.outputStorage,
-         bytes(plan.outputStorage, physicalM * physicalN), cudaAlignment, true,
+         bytes(plan.outputStorage, batchCount * physicalM * physicalN), cudaAlignment, true,
          "padded quantized output staging buffer");
    }
    if (hasBias) {
@@ -832,7 +871,8 @@ static void ApplyDequantizedFloatOutput(QuantizedLoweringPlan &plan, bool dequan
 QuantizedLoweringPlan MakeMatMulAlpakaTransposedWeightStoragePlan(const QuantizedMatMulRegion &region,
                                                                  const std::string &weightStorageTensor,
                                                                  const QuantizedMatrixShapePolicy &shapePolicy,
-                                                                 bool dequantizeFloatOutput)
+                                                                 bool dequantizeFloatOutput,
+                                                                 bool floatInputCarrier)
 {
    QuantizedLoweringPlan plan;
    plan.backend = EQuantizedBackend::ALPAKA;
@@ -875,6 +915,10 @@ QuantizedLoweringPlan MakeMatMulAlpakaTransposedWeightStoragePlan(const Quantize
    plan.preservesQuantizationSemantics = true;
    plan.isMetadataOnly = false;
    ApplyDequantizedFloatOutput(plan, dequantizeFloatOutput);
+   // An intermediate input is a float activation: read it as a float carrier and
+   // quantize internally rather than retyping the source, matching the Gemm path.
+   if (floatInputCarrier)
+      plan.inputStorage = EQuantizedStorageType::FloatCarrier;
    PopulateDenseLinearResourceRequirements(plan, hasBias);
    return plan;
 }

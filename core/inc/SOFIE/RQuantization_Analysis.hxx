@@ -48,12 +48,28 @@ std::optional<std::size_t> MatchQuantizationBoundaryProducer(
    const QuantizationGraphIndex &graph, const std::vector<std::unique_ptr<ROperator>> &operators,
    const std::string &tensor, const std::string &role, std::vector<std::string> &reasons);
 
+// True for ops a quantized region may look through when locating its output boundary.
+// Shared so the dense and elementwise families agree.
+bool IsQuantizationBoundarySearchTransparent(const ROperator &op);
+
+// Walks forward from a tensor through transparent ops to the boundary defining its grid,
+// appending each to transparentOps. Returns nullopt on a fork or a non-transparent op.
+std::optional<std::size_t> FindQuantizationBoundaryThroughTransparentOps(
+   const QuantizationGraphIndex &graph, const std::vector<std::unique_ptr<ROperator>> &operators,
+   const std::string &tensor, std::vector<std::size_t> &transparentOps, int maxHops = 4);
+
 std::optional<std::size_t> MatchSingleTensorConsumer(const QuantizationGraphIndex &graph,
                                                      const std::string &tensor,
                                                      const std::string &role,
                                                      std::vector<std::string> &reasons);
 
 bool IsFloatAddOperator(const ROperator &op);
+// A float Mul. On a dense-linear output chain, a constant-scalar operand makes it a pure
+// rescale that folds into the epilogue alpha.
+bool IsFloatMulOperator(const ROperator &op);
+// A float Add/Mul that the elementwise family may turn into its own quantized region.
+// A Q/DQ pair feeding one must keep its int8 carrier, exactly as for GEMM/CONV.
+bool IsQuantizedElementwiseCandidate(const ROperator &op);
 void CheckQuantizationInfo(const QuantizationInfo &info, const std::string &role,
                            std::vector<std::string> &reasons);
 void CheckQuantizedGemmAttributes(const QuantizedGemmRegion &region,

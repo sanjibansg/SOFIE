@@ -338,7 +338,9 @@ __global__ void QuantizedGemmCudaQuantizedEpilogueKernel(OutputT *__restrict__ o
                                                         const float *__restrict__ weightScaleVector,
                                                         QuantizedDenseLinearInvocation params)
 {
-   const std::size_t elements = params.m * params.n;
+   // Whole batch, not one slice. The accumulator is contiguous [batch][m][n], so idx and
+   // the column lookup carry over.
+   const std::size_t elements = (params.batchCount == 0 ? 1 : params.batchCount) * params.m * params.n;
    const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
    if (idx >= elements)
       return;
@@ -360,11 +362,14 @@ __global__ void QuantizedGemmCudaQuantizedEpilogueKernel(OutputT *__restrict__ o
 
 // Logical output extent: a padded GEMM keeps its physical row stride in params.n, so the
 // epilogue slices [logicalM, logicalN] out of the padded accumulator.
+// The extent covers the whole strided batch, matching the batchCount*M*N threads the
+// caller launched. Batched execution is never padded, so logical equals physical here.
 __device__ inline std::size_t QuantizedGemmCudaLogicalElements(const QuantizedDenseLinearInvocation &params)
 {
    const std::size_t cols = params.logicalN != 0 ? params.logicalN : params.n;
    const std::size_t rows = params.logicalM != 0 ? params.logicalM : params.m;
-   return rows * cols;
+   const std::size_t batch = params.batchCount == 0 ? 1 : params.batchCount;
+   return batch * rows * cols;
 }
 
 // Fake-quant value of one logical output element: the accumulator scaled and biased, rounded
@@ -1284,7 +1289,10 @@ public:
    {
       QuantizedCudaScratchCursor cursor(fScratch);
       fWorkspace = cursor.Take(params.maxWorkspaceBytes);
-      fInputQuantizedBytes = params.m * params.k * sizeof(std::int8_t);
+      // Batched staging covers every slice, matching the extents QuantizedGemmCudaLt_Call
+      // launches with; the accumulator below already did.
+      const std::size_t stagedBatch = params.batchCount == 0 ? 1 : params.batchCount;
+      fInputQuantizedBytes = stagedBatch * params.m * params.k * sizeof(std::int8_t);
       fInputQuantized = static_cast<std::int8_t *>(cursor.Take(fInputQuantizedBytes));
       fAccumulatorBytes = params.batchCount * params.m * params.n * sizeof(std::int32_t);
       fAccumulator = static_cast<std::int32_t *>(cursor.Take(fAccumulatorBytes));
@@ -1293,7 +1301,7 @@ public:
       if (params.paddedExecution && params.epilogueMode == EQuantizedEpilogueMode::Quantized) {
          const std::size_t outputElementSize = params.outputCarrier == EQuantizedOutputCarrier::UInt8
                                                  ? sizeof(std::uint8_t) : sizeof(std::int8_t);
-         fOutputQuantizedBytes = params.m * params.n * outputElementSize;
+         fOutputQuantizedBytes = stagedBatch * params.m * params.n * outputElementSize;
          fOutputQuantized = cursor.Take(fOutputQuantizedBytes);
       }
       fBiasOutputOffsetBytes = params.hasBias && params.batchCount == 1
@@ -1566,9 +1574,13 @@ inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &state, QuantizedG
       effectiveParams.accumulatorToOutputScale =
          (effectiveParams.alpha * effectiveParams.inputScale * effectiveParams.weightScale) / effectiveParams.outputScale;
 
-   const std::size_t inputElements = effectiveParams.m * effectiveParams.k;
-   const std::size_t outputElements = effectiveParams.m * effectiveParams.n;
-   const std::size_t logicalOutputElements = effectiveParams.logicalM * effectiveParams.logicalN;
+   // The staging and epilogue kernels are elementwise passes over the whole buffer, so
+   // their extents are per-batch counts times the batch, indexed [batch][m][n].
+   const std::size_t batchCount = effectiveParams.batchCount == 0 ? 1 : effectiveParams.batchCount;
+   const std::size_t inputElements = batchCount * effectiveParams.m * effectiveParams.k;
+   const std::size_t outputElements = batchCount * effectiveParams.m * effectiveParams.n;
+   const std::size_t logicalOutputElements =
+      batchCount * effectiveParams.logicalM * effectiveParams.logicalN;
    state.Initialize(effectiveParams);
    state.PrepareScratch(effectiveParams);
    QuantizedGemmCudaLtEventTimer profileTimer(QuantizedGemmCudaLt_ProfilingEnabled());

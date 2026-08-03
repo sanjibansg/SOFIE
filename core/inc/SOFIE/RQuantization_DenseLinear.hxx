@@ -84,7 +84,8 @@ QuantizedDenseLinearProfileAssessment AssessDenseLinearComputeProfile(
    const std::string &operatorName,
    bool outputFloatConsumed = false);
 
-QuantizedMatrixShapePolicy MakeCublasLtShapePolicy(std::size_t m, std::size_t k, std::size_t n);
+QuantizedMatrixShapePolicy MakeCublasLtShapePolicy(std::size_t m, std::size_t k, std::size_t n,
+                                                   std::size_t batchCount = 1);
 QuantizedMatrixShapePolicy MakeExactFP8DenseLinearShapePolicy(std::size_t m, std::size_t k, std::size_t n);
 QuantizedDenseLinearBackendCapability MakeNativeFP8E4M3TNF32Capability(std::size_t m, std::size_t n, std::size_t k);
 
@@ -122,7 +123,8 @@ QuantizedLoweringPlan MakeUnsupportedLowPrecisionDenseLinearPlan(
    EQuantizedComputeProfile profile, std::string capabilityTag);
 QuantizedLoweringPlan MakeMatMulAlpakaTransposedWeightStoragePlan(
    const QuantizedMatMulRegion &region, const std::string &weightStorageTensor,
-   const QuantizedMatrixShapePolicy &shapePolicy, bool dequantizeFloatOutput = false);
+   const QuantizedMatrixShapePolicy &shapePolicy, bool dequantizeFloatOutput = false,
+   bool floatInputCarrier = false);
 QuantizedLoweringPlan MakeCPUPackedWeightBaselinePlan(const QuantizedGemmRegion &region,
                                                        const std::string &weightStorageTensor);
 QuantizedLoweringPlan MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend backend,

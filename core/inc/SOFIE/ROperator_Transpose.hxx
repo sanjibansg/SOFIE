@@ -43,6 +43,13 @@ public:
          fOutputTensorNames = { fNOutput };
    }
 
+   const std::vector<int_t> &GetPerm() const { return fAttrPerm; }
+   const std::string &GetInputTensor() const { return fNData; }
+   const std::string &GetOutputTensor() const { return fNOutput; }
+   // Only legal before Initialize: the output shape is derived from the perm there, and
+   // nothing has been inferred downstream yet. See RModel::CanonicaliseBatchedMatMulOperands.
+   void SetPerm(std::vector<int_t> perm) { fAttrPerm = std::move(perm); }
+
    bool PropagatesQuantizationMetadata() const override { return true; }
 
    std::vector<int_t> GetQuantizationMetadataPermutation(std::size_t rank) const override

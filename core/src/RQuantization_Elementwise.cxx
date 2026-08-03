@@ -24,6 +24,8 @@ std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedE
       indices.push_back(region.elementwiseOpIndex);
    if (region.outputQuantOpIndex)
       indices.push_back(*region.outputQuantOpIndex);
+   indices.insert(indices.end(), region.absorbedOutputChainOpIndices.begin(),
+                  region.absorbedOutputChainOpIndices.end());
    return indices;
 }
 
@@ -286,14 +288,21 @@ void DiscoverQuantizedElementwiseRegions(QuantizationPassContext &context)
          if (AffineStorageType(operandA.sourceType) != AffineStorageType(operandB.sourceType))
             reasons.push_back("elementwise operands do not share an integer carrier type");
 
-         // Resolve the output quantization boundary consuming the op output.
+         // Resolves the output quantization boundary through the same transparent ops the
+         // dense family looks through, absorbing them with the boundary.
+         std::vector<std::size_t> transparentOps;
+         auto boundary = FindQuantizationBoundaryThroughTransparentOps(graph, operators, elementwiseOutput,
+                                                                       transparentOps);
          auto consumers = graph.consumersByTensor.find(elementwiseOutput);
          if (consumers == graph.consumersByTensor.end() || consumers->second.empty()) {
             reasons.push_back("elementwise output has no quantization consumer");
-         } else if (consumers->second.size() != 1) {
-            reasons.push_back("elementwise output has multiple consumers");
-         } else if (operators[consumers->second.front()]->IsQuantizationBoundary()) {
-            const auto consumerIndex = consumers->second.front();
+         } else if (!boundary) {
+            reasons.push_back(consumers->second.size() != 1
+                                 ? "elementwise output has multiple consumers"
+                                 : "elementwise output is not consumed by a quantization boundary");
+         } else {
+            const auto consumerIndex = *boundary;
+            region.absorbedOutputChainOpIndices = transparentOps;
             const auto quantOutputs = operators[consumerIndex]->GetOpOutputTensors();
             if (quantOutputs.size() != 1) {
                reasons.push_back("elementwise output boundary does not have exactly one output");
@@ -312,8 +321,6 @@ void DiscoverQuantizedElementwiseRegions(QuantizationPassContext &context)
                   reasons.push_back("elementwise output tensor has no QuantizationInfo");
                }
             }
-         } else {
-            reasons.push_back("elementwise output is not consumed by a quantization boundary");
          }
       }
 

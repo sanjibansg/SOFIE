@@ -7,7 +7,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -43,6 +45,25 @@ struct QuantizationInfo {
    EQuantizationGranularity granularity = EQuantizationGranularity::PerTensor;
    int axis = -1;
 };
+
+// Round-trippable literal; the default ostream precision truncates a scale to six
+// significant digits, which would shift every quantized value.
+inline std::string ExactDoubleLiteral(double value)
+{
+   std::ostringstream out;
+   out << std::setprecision(std::numeric_limits<double>::max_digits10) << value;
+   return out.str();
+}
+
+// True when a value quantized on `a` is bit-identical on `b`. Compares the encoding, not
+// the scale/zero-point tensor names, so separately named but equal parameters agree.
+inline bool SameQuantizationGrid(const QuantizationInfo &a, const QuantizationInfo &b)
+{
+   return a.granularity == EQuantizationGranularity::PerTensor &&
+          b.granularity == EQuantizationGranularity::PerTensor && a.scale == b.scale &&
+          a.zeroPoint == b.zeroPoint && a.isSigned == b.isSigned && a.bitWidth == b.bitWidth &&
+          a.rounding == b.rounding;
+}
 
 inline std::pair<std::int64_t, std::int64_t> QuantizedIntegerRange(const QuantizationInfo &info)
 {
@@ -122,9 +143,18 @@ struct QuantizedMatMulRegion {
    // Relu consuming the output boundary, applied by the epilogue's hasRelu instead of a
    // standalone kernel. The region then emits the Relu's output.
    std::optional<std::size_t> outputReluOpIndex;
+   // Value-preserving ops between the region output and its quantization boundary,
+   // absorbed so no standalone glue op survives.
+   std::vector<std::size_t> absorbedOutputChainOpIndices;
+   // Effective [qmin, qmax] for the epilogue when an absorbed Clip narrows the grid below
+   // what the carrier's bit width implies. Empty means use the carrier range.
+   std::optional<std::pair<std::int64_t, std::int64_t>> outputClamp;
    // Consuming region's input grid; the epilogue re-quantizes onto it and emits an int8
    // carrier instead of a float.
    std::optional<QuantizationInfo> outputRequantize;
+   // Constant scalar Mul absorbed off the output chain and folded into the epilogue's
+   // alpha, which scales inputScale*weightScale/outputScale while the GEMM runs alpha=1.
+   double outputAlpha = 1.0;
 
    QuantizedEpilogue epilogue;
    QuantizedMatMulShapeAssessment shape;
@@ -165,9 +195,18 @@ struct QuantizedGemmRegion {
    // Relu consuming the output boundary, applied by the epilogue's hasRelu instead of a
    // standalone kernel. The region then emits the Relu's output.
    std::optional<std::size_t> outputReluOpIndex;
+   // Value-preserving ops between the region output and its quantization boundary,
+   // absorbed so no standalone glue op survives.
+   std::vector<std::size_t> absorbedOutputChainOpIndices;
+   // Effective [qmin, qmax] for the epilogue when an absorbed Clip narrows the grid below
+   // what the carrier's bit width implies. Empty means use the carrier range.
+   std::optional<std::pair<std::int64_t, std::int64_t>> outputClamp;
    // Consuming region's input grid; the epilogue re-quantizes onto it and emits an int8
    // carrier instead of a float.
    std::optional<QuantizationInfo> outputRequantize;
+   // Constant scalar Mul absorbed off the output chain and folded into the epilogue's
+   // alpha, which scales inputScale*weightScale/outputScale while the GEMM runs alpha=1.
+   double outputAlpha = 1.0;
 
    QuantizationInfo inputQuant;
    QuantizationInfo weightQuant;
@@ -249,6 +288,9 @@ struct QuantizedElementwiseRegion {
    std::size_t operandBQuantOpIndex = static_cast<std::size_t>(-1);
    std::size_t elementwiseOpIndex = static_cast<std::size_t>(-1);
    std::optional<std::size_t> outputQuantOpIndex;
+   // Transparent ops (Reshape/Transpose/Clip) between the region output and its
+   // boundary, absorbed so no standalone glue op survives.
+   std::vector<std::size_t> absorbedOutputChainOpIndices;
 
    // Affine INT8 carriers.
    std::optional<QuantizationInfo> inputQuant;
@@ -373,6 +415,9 @@ struct QuantizationModelState {
    std::unordered_map<std::size_t, QuantizedRegion> regions;
    std::unordered_map<std::size_t, std::unordered_map<EQuantizedBackend, QuantizedLoweringPlan>> loweringPlans;
    std::vector<std::string> metadataDiagnostics;
+   // Grids for Softmax operators that should write an int8 carrier, keyed by the tensor
+   // each writes. Decided when planning the consumer, applied when the Clip is absorbed.
+   std::unordered_map<std::string, QuantizationInfo> softmaxInt8Handoffs;
 
    void ClearDerivedAnalysis()
    {
@@ -380,6 +425,7 @@ struct QuantizationModelState {
       regions.clear();
       loweringPlans.clear();
       metadataDiagnostics.clear();
+      softmaxInt8Handoffs.clear();
    }
 };
 

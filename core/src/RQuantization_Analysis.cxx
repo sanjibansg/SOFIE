@@ -1,4 +1,6 @@
 #include "SOFIE/RQuantization_Analysis.hxx"
+#include "SOFIE/ROperator_Reshape.hxx"
+#include "SOFIE/ROperator_Transpose.hxx"
 #include "SOFIE/ROperator_BasicBinary.hxx"
 #include "SOFIE/RQuantization_DenseLinear.hxx"
 
@@ -33,14 +35,21 @@ QuantizedDenseLinearPatternMatch MatchQuantizedDenseLinearPattern(
       region.gemmOutputTensor = std::string(outputs[0]);
    }
 
+   // transB == 1 is admitted only for a canonicalised [.., N, K] operand; a plain rank-2
+   // Gemm with transB=1 keeps going down the Gemm path.
+   const bool canonicalisedOperandB = region.transB == 1 && gemm.IsBatchedOperandBCanonicalised();
    const bool matmul = inputs.size() == 2 && region.alpha == 1.0f && region.beta == 0.0f &&
-                       region.transA == 0 && region.transB == 0;
+                       region.transA == 0 && (region.transB == 0 || canonicalisedOperandB);
    match.hasInlineMatMulBias = inputs.size() == 3 && region.alpha == 1.0f && region.beta == 1.0f &&
                                region.transA == 0 && region.transB == 0;
    match.isMatMul = matmul || match.hasInlineMatMulBias;
    if (match.isMatMul) {
       const auto inputShape = region.inputTensor.empty() ? std::vector<std::size_t>{} : tensorShape(region.inputTensor);
-      const auto weightShape = region.weightTensor.empty() ? std::vector<std::size_t>{} : tensorShape(region.weightTensor);
+      auto weightShape = region.weightTensor.empty() ? std::vector<std::size_t>{} : tensorShape(region.weightTensor);
+      // The assessment reasons about the logical [.., K, N], so a canonicalised operand's
+      // physical [.., N, K] is undone here only; lowering keeps the physical layout.
+      if (canonicalisedOperandB && weightShape.size() >= 2)
+         std::swap(weightShape[weightShape.size() - 2], weightShape[weightShape.size() - 1]);
       const auto outputShape = region.gemmOutputTensor.empty() ? std::vector<std::size_t>{} : tensorShape(region.gemmOutputTensor);
       match.matmulShape = AssessQuantizedMatMulShape(inputShape, weightShape, outputShape);
       if (!QuantizedMatMulShapeIsRecognized(match.matmulShape)) {
@@ -70,6 +79,40 @@ QuantizationGraphIndex BuildQuantizationGraphIndex(const std::vector<std::unique
          graph.consumersByTensor[std::string(input)].push_back(opIndex);
    }
    return graph;
+}
+
+bool IsQuantizationBoundarySearchTransparent(const ROperator &op)
+{
+   // Transpose is a template; float is the activation instantiation (the int64_t one is
+   // shape plumbing and never sits on a region output).
+   return dynamic_cast<const ROperator_Reshape *>(&op) != nullptr ||
+          dynamic_cast<const ROperator_Transpose<float> *>(&op) != nullptr ||
+          op.GetKind() == OperatorKind::CLIP;
+}
+
+std::optional<std::size_t> FindQuantizationBoundaryThroughTransparentOps(
+   const QuantizationGraphIndex &graph, const std::vector<std::unique_ptr<ROperator>> &operators,
+   const std::string &tensor, std::vector<std::size_t> &transparentOps, int maxHops)
+{
+   std::string current = tensor;
+   for (int hop = 0; hop < maxHops; ++hop) {
+      auto consumers = graph.consumersByTensor.find(current);
+      if (consumers == graph.consumersByTensor.end() || consumers->second.size() != 1)
+         return std::nullopt;
+      const auto index = consumers->second.front();
+      if (index >= operators.size())
+         return std::nullopt;
+      if (operators[index]->IsQuantizationBoundary())
+         return index;
+      if (!IsQuantizationBoundarySearchTransparent(*operators[index]))
+         return std::nullopt;
+      const auto outputs = operators[index]->GetOpOutputTensors();
+      if (outputs.size() != 1)
+         return std::nullopt;
+      transparentOps.push_back(index);
+      current = std::string(outputs[0]);
+   }
+   return std::nullopt;
 }
 
 std::optional<std::size_t> MatchQuantizationBoundaryProducer(
@@ -129,6 +172,17 @@ std::optional<std::size_t> MatchSingleTensorConsumer(const QuantizationGraphInde
 bool IsFloatAddOperator(const ROperator &op)
 {
    return dynamic_cast<const ROperator_BasicBinary<float, EBasicBinaryOperator::Add> *>(&op) != nullptr;
+}
+
+bool IsFloatMulOperator(const ROperator &op)
+{
+   return dynamic_cast<const ROperator_BasicBinary<float, EBasicBinaryOperator::Mul> *>(&op) != nullptr;
+}
+
+bool IsQuantizedElementwiseCandidate(const ROperator &op)
+{
+   return dynamic_cast<const ROperator_BasicBinary<float, EBasicBinaryOperator::Add> *>(&op) != nullptr ||
+          dynamic_cast<const ROperator_BasicBinary<float, EBasicBinaryOperator::Mul> *>(&op) != nullptr;
 }
 
 void CheckQuantizationInfo(const QuantizationInfo &info, const std::string &role,
@@ -195,6 +249,8 @@ std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedG
       indices.push_back(*region.outputDequantOpIndex);
    if (region.outputReluOpIndex)
       indices.push_back(*region.outputReluOpIndex);
+   indices.insert(indices.end(), region.absorbedOutputChainOpIndices.begin(),
+                  region.absorbedOutputChainOpIndices.end());
    std::sort(indices.begin(), indices.end());
    return indices;
 }
@@ -211,6 +267,8 @@ std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedM
       indices.push_back(*region.outputDequantOpIndex);
    if (region.outputReluOpIndex)
       indices.push_back(*region.outputReluOpIndex);
+   indices.insert(indices.end(), region.absorbedOutputChainOpIndices.begin(),
+                  region.absorbedOutputChainOpIndices.end());
    std::sort(indices.begin(), indices.end());
    return indices;
 }
@@ -228,10 +286,13 @@ QuantizedMatMulRegion MakeQuantizedMatMulRegionFromGemmLikeRegion(const Quantize
    matmul.weightQuantOpIndex = region.weightQuantOpIndex;
    matmul.matmulOpIndex = region.gemmOpIndex;
    matmul.outputQuantOpIndex = region.outputQuantOpIndex;
+   matmul.absorbedOutputChainOpIndices = region.absorbedOutputChainOpIndices;
+   matmul.outputClamp = region.outputClamp;
    matmul.inputPairQuantizeOpIndex = region.inputPairQuantizeOpIndex;
    matmul.outputDequantOpIndex = region.outputDequantOpIndex;
    matmul.outputReluOpIndex = region.outputReluOpIndex;
    matmul.outputRequantize = region.outputRequantize;
+   matmul.outputAlpha = region.outputAlpha;
    matmul.inputQuant = region.inputQuant;
    matmul.weightQuant = region.weightQuant;
    matmul.outputQuant = region.outputQuant;

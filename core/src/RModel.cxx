@@ -14,6 +14,11 @@
 #include "SOFIE/RModelProfiler.hxx"
 #include "SOFIE/RWeightFile.hxx"
 #include "SOFIE/SOFIE_common.hxx"
+#include "SOFIE/ROperator_Gemm.hxx"
+#include "SOFIE/ROperator_ONNXQuantizeLinear.hxx"
+#include "SOFIE/ROperator_Transpose.hxx"
+
+#include <unordered_map>
 
 namespace SOFIE {
 
@@ -61,6 +66,133 @@ void RModel::BuildLoweredOperatorView(EQuantizedBackend backend)
    fLoweredConsumedOperatorIndices.clear();
    PrepareQuantizedTensorStorage(backend);
    AddLoweredQuantizedOperators(backend);
+   // Both must only see the boundaries no region absorbed, and dead-code elimination
+   // must see the final emit set, so it runs after the fusion rather than before.
+   FuseUnabsorbedFakeQuantBoundaries();
+   // Runs on both sides of the Softmax/Clip fusion: before, because a dead reader blocks
+   // that fusion's single-consumer guard; after, because it changes the emitted set.
+   EliminateDeadOperators();
+   FuseSoftmaxClipBoundaries();
+   EliminateDeadOperators();
+}
+
+void RModel::CanonicaliseBatchedMatMulOperands()
+{
+   // Same reasoning as EliminateDeadOperators: a subgraph body can reference an outer
+   // tensor invisibly, so the single-consumer guards below would not be sound.
+   if (!fSubGraphs.empty())
+      return;
+
+   // Runs before the operator Initialize loop, where connectivity exists but shapes do
+   // not, so ordinary shape inference derives every downstream shape from the new perm.
+   std::unordered_map<std::string, std::size_t> producer;
+   std::unordered_map<std::string, std::size_t> readers;
+   for (std::size_t index = 0; index < fOperators.size(); ++index) {
+      for (const auto &output : fOperators[index]->GetOpOutputTensors())
+         producer[std::string(output)] = index;
+      for (const auto &input : fOperators[index]->GetOpInputTensors())
+         ++readers[std::string(input)];
+   }
+   const std::set<std::string> graphOutputs(fOutputTensorNames.begin(), fOutputTensorNames.end());
+
+   for (std::size_t index = 0; index < fOperators.size(); ++index) {
+      auto *gemm = dynamic_cast<ROperator_Gemm<float> *>(fOperators[index].get());
+      // A bias would take this off the strided-batched branch, and a transpose already
+      // set means somebody else owns the layout.
+      if (gemm == nullptr || gemm->GetTransA() != 0 || gemm->GetTransB() != 0 || gemm->HasBias())
+         continue;
+
+      // Walks back from the B operand, through any fake-quant, to the Transpose that lays
+      // it out. Every tensor on the way must be read only here.
+      std::string cursor = gemm->GetWeightTensorName();
+      ROperator_Transpose<float> *transpose = nullptr;
+      for (int hop = 0; hop < 3 && !cursor.empty(); ++hop) {
+         if (readers[cursor] != 1 || graphOutputs.count(cursor) != 0)
+            break;
+         auto found = producer.find(cursor);
+         if (found == producer.end())
+            break;
+         auto *op = fOperators[found->second].get();
+         if (auto *candidate = dynamic_cast<ROperator_Transpose<float> *>(op)) {
+            transpose = candidate;
+            break;
+         }
+         if (auto *dequantize = dynamic_cast<ROperator_ONNXDequantizeLinear *>(op)) {
+            cursor = dequantize->GetInputTensor();
+            continue;
+         }
+         if (auto *quantize = dynamic_cast<ROperator_ONNXQuantizeLinear *>(op)) {
+            cursor = quantize->GetInputTensor();
+            continue;
+         }
+         break;
+      }
+      if (transpose == nullptr)
+         continue;
+
+      auto perm = transpose->GetPerm();
+      // Rank 2 is the dense path, which already hands cuBLASLt a [N,K] weight.
+      if (perm.size() < 3)
+         continue;
+
+      // B arrives as [.., K, N]; swapping the last two perm entries yields [.., N, K] at
+      // identical cost, with transB restoring the semantics. cuBLASLt accepts only this.
+      std::swap(perm[perm.size() - 2], perm[perm.size() - 1]);
+      transpose->SetPerm(std::move(perm));
+      gemm->SetTransB(1);
+      gemm->MarkBatchedOperandBCanonicalised();
+   }
+}
+
+void RModel::EliminateDeadOperators()
+{
+   // A subgraph body can reference an outer tensor not listed among its operator's
+   // inputs, so a tensor that looks unread here may not be.
+   if (!fSubGraphs.empty())
+      return;
+
+   const std::set<std::string> graphOutputs(fOutputTensorNames.begin(), fOutputTensorNames.end());
+
+   // Consumers are counted over the operators actually emitted, which differ from
+   // fOperators wherever a lowered region replaced one and suppressed those it absorbed.
+   auto emitted = [this](std::size_t index) -> const ROperator * {
+      if (fLoweredConsumedOperatorIndices.count(index) != 0)
+         return nullptr;
+      if (auto lowered = fLoweredOperators.find(index); lowered != fLoweredOperators.end())
+         return lowered->second.get();
+      return fOperators[index].get();
+   };
+
+   // To a fixpoint: dropping one operator can strand the operator that fed it.
+   bool changed = true;
+   while (changed) {
+      changed = false;
+      std::unordered_map<std::string, std::size_t> readers;
+      for (std::size_t index = 0; index < fOperators.size(); ++index) {
+         const auto *op = emitted(index);
+         if (op == nullptr)
+            continue;
+         for (const auto &input : op->GetOpInputTensors())
+            ++readers[std::string(input)];
+      }
+      for (std::size_t index = 0; index < fOperators.size(); ++index) {
+         const auto *op = emitted(index);
+         if (op == nullptr)
+            continue;
+         const auto outputs = op->GetOpOutputTensors();
+         if (outputs.empty())
+            continue;
+         const bool dead = std::all_of(outputs.begin(), outputs.end(), [&](const auto &output) {
+            const std::string name(output);
+            return readers[name] == 0 && graphOutputs.count(name) == 0;
+         });
+         if (dead) {
+            // Same suppression channel the lowering uses; the effect wanted is identical.
+            fLoweredConsumedOperatorIndices.insert(index);
+            changed = true;
+         }
+      }
+   }
 }
 
 std::vector<size_t> RModel::GetTensorShape(const std::string & name) const {
@@ -651,6 +783,8 @@ void RModel::Initialize(const std::map<std::string, size_t> & inputParams, bool 
       PrintRequiredInputTensors();
       PrintDynamicTensors();
    }
+
+   CanonicaliseBatchedMatMulOperands();
 
    // Go through model and initialize each operator
    int i = 0;

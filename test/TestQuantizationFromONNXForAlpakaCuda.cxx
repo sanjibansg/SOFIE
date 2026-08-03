@@ -3,6 +3,8 @@
 #include <limits>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <numeric>
 #include <sstream>
@@ -41,6 +43,12 @@
 #include "ONNX_QDQ_QuantConv_FromONNX_GPU_ALPAKA.hxx"
 #include "QONNX_QuantMLP_FromONNX_GPU_ALPAKA.hxx"
 #include "ONNX_QDQ_QuantMLP_FromONNX_GPU_ALPAKA.hxx"
+#include "ONNX_QDQ_ReshapeGemm_FromONNX_GPU_ALPAKA.hxx"
+#include "ONNX_QDQ_ResidualAdd_FromONNX_GPU_ALPAKA.hxx"
+#include "ONNX_QDQ_BatchedMatMul_FromONNX_GPU_ALPAKA.hxx"
+#include "ONNX_QDQ_BatchedMatMul_NarrowClip_FromONNX_GPU_ALPAKA.hxx"
+#include "ONNX_QDQ_BatchedMatMul_TransposedOutput_FromONNX_GPU_ALPAKA.hxx"
+#include "ONNX_QDQ_CarrierHandoff_FromONNX_GPU_ALPAKA.hxx"
 
 #include <alpaka/alpaka.hpp>
 #include <cuda_runtime.h>
@@ -312,6 +320,147 @@ TEST_F(QuantizationAlpakaTest, MultiLayerQdqMlpRuns)
    }
    EXPECT_GT(nonZero, 0) << "Q/DQ multi-layer MLP produced an all-zero output";
    EXPECT_NE(minv, maxv) << "output is a constant fill";
+}
+
+// A rank-3 dense layer folded to rank-2, whose input source is a float tensor behind an
+// absorbed Q/DQ pair. Values must match exactly.
+TEST_F(QuantizationAlpakaTest, QdqReshapeGemmMatchesExactReference)
+{
+   constexpr Idx kB = 8, kT = 32, kK = 128, kN = 128;
+   constexpr double kInScale = 0.0078125, kWeightScale = 0.00390625, kOutScale = 0.015625;
+   constexpr Idx kM = kB * kT;
+
+   // Mirrors make_qdq_reshape_gemm_fixture.py; keep the two in sync.
+   auto weightValue = [](std::size_t k, std::size_t n) {
+      return static_cast<int>((k * 31 + n * 17) % 15) - 7;
+   };
+   auto biasValue = [](std::size_t n) {
+      return (static_cast<double>(n % 5) - 2.0) * kInScale * kWeightScale * 4.0;
+   };
+
+   std::vector<float> input(static_cast<std::size_t>(kM) * kK);
+   for (std::size_t i = 0; i < input.size(); ++i)
+      input[i] = static_cast<float>((static_cast<int>(i * 13 + 5) % 97) - 48) * 0.03125f;
+
+   // Host reference: quantize the input, accumulate in int32, rescale, clip on the output
+   // grid, re-quantize, dequantize -- exactly what the graph spells out.
+   auto clampTo = [](double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); };
+   std::vector<std::int8_t> inputQ(input.size());
+   for (std::size_t i = 0; i < input.size(); ++i)
+      inputQ[i] = static_cast<std::int8_t>(clampTo(std::nearbyint(input[i] / kInScale), -128.0, 127.0));
+
+   std::vector<float> expected(static_cast<std::size_t>(kM) * kN);
+   for (std::size_t m = 0; m < kM; ++m) {
+      for (std::size_t n = 0; n < kN; ++n) {
+         std::int32_t acc = 0;
+         for (std::size_t k = 0; k < kK; ++k)
+            acc += static_cast<std::int32_t>(inputQ[m * kK + k]) * weightValue(k, n);
+         double real = acc * kInScale * kWeightScale + biasValue(n);
+         real = clampTo(real, -128.0 * kOutScale, 127.0 * kOutScale);
+         const double q = clampTo(std::nearbyint(real / kOutScale), -128.0, 127.0);
+         expected[m * kN + n] = static_cast<float>(q * kOutScale);
+      }
+   }
+
+   const Idx inputSize = static_cast<Idx>(input.size());
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(inputSize));
+   std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(inputSize));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+
+   SOFIE_ONNX_QDQ_ReshapeGemm::Session<alpaka::TagGpuCudaRt> model(
+      "ONNX_QDQ_ReshapeGemm_FromONNX_GPU_ALPAKA.dat");
+   auto result = model.infer(input_d);
+   alpaka::wait(queue);
+   cudaDeviceSynchronize();
+
+   const Idx outputSize = static_cast<Idx>(expected.size());
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(outputSize));
+   alpaka::memcpy(queue, result_h, result);
+   alpaka::wait(queue);
+   const auto *res_ptr = reinterpret_cast<const float *>(alpaka::getPtrNative(result_h));
+
+   int mismatches = 0;
+   for (Idx i = 0; i < outputSize && mismatches < 5; ++i) {
+      if (res_ptr[i] != expected[i]) {
+         ++mismatches;
+         EXPECT_EQ(res_ptr[i], expected[i]) << "at i=" << i;
+      }
+   }
+   EXPECT_EQ(mismatches, 0) << "quantized Reshape->Gemm region diverged from the exact reference";
+}
+
+// A quantized dense region feeding a quantized residual Add, where both families must
+// agree on which carrier materialises on the tensor they share.
+TEST_F(QuantizationAlpakaTest, QdqResidualAddMatchesExactReference)
+{
+   constexpr Idx kB = 8, kT = 32, kK = 128, kN = 128;
+   constexpr double kInScale = 0.0078125, kWeightScale = 0.00390625;
+   constexpr double kOutScale = 0.015625, kResScale = 0.03125;
+   constexpr Idx kM = kB * kT;
+
+   // Mirrors make_qdq_reshape_gemm_fixture.py; keep the two in sync.
+   auto weightValue = [](std::size_t k, std::size_t n) {
+      return static_cast<int>((k * 31 + n * 17) % 15) - 7;
+   };
+   auto biasValue = [](std::size_t n) {
+      return (static_cast<double>(n % 5) - 2.0) * kInScale * kWeightScale * 4.0;
+   };
+   auto clampTo = [](double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); };
+
+   std::vector<float> input(static_cast<std::size_t>(kM) * kK);
+   for (std::size_t i = 0; i < input.size(); ++i)
+      input[i] = static_cast<float>((static_cast<int>(i * 13 + 5) % 97) - 48) * 0.03125f;
+
+   std::vector<std::int8_t> inputQ(input.size());
+   for (std::size_t i = 0; i < input.size(); ++i)
+      inputQ[i] = static_cast<std::int8_t>(clampTo(std::nearbyint(input[i] / kInScale), -128.0, 127.0));
+
+   std::vector<float> expected(static_cast<std::size_t>(kM) * kN);
+   for (std::size_t m = 0; m < kM; ++m) {
+      for (std::size_t n = 0; n < kN; ++n) {
+         std::int32_t acc = 0;
+         for (std::size_t k = 0; k < kK; ++k)
+            acc += static_cast<std::int32_t>(inputQ[m * kK + k]) * weightValue(k, n);
+         double real = acc * kInScale * kWeightScale + biasValue(n);
+         real = clampTo(real, -128.0 * kOutScale, 127.0 * kOutScale);
+         const double dense = clampTo(std::nearbyint(real / kOutScale), -128.0, 127.0) * kOutScale;
+         // Residual operand is the dequantized input, on its own grid.
+         const double skip = static_cast<double>(inputQ[m * kK + n]) * kInScale;
+         double sum = clampTo(dense + skip, -128.0 * kResScale, 127.0 * kResScale);
+         const double q = clampTo(std::nearbyint(sum / kResScale), -128.0, 127.0);
+         expected[m * kN + n] = static_cast<float>(q * kResScale);
+      }
+   }
+
+   const Idx inputSize = static_cast<Idx>(input.size());
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(inputSize));
+   std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(inputSize));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+
+   SOFIE_ONNX_QDQ_ResidualAdd::Session<alpaka::TagGpuCudaRt> model(
+      "ONNX_QDQ_ResidualAdd_FromONNX_GPU_ALPAKA.dat");
+   auto result = model.infer(input_d);
+   alpaka::wait(queue);
+   cudaDeviceSynchronize();
+
+   const Idx outputSize = static_cast<Idx>(expected.size());
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(outputSize));
+   alpaka::memcpy(queue, result_h, result);
+   alpaka::wait(queue);
+   const auto *res_ptr = reinterpret_cast<const float *>(alpaka::getPtrNative(result_h));
+
+   int mismatches = 0;
+   for (Idx i = 0; i < outputSize && mismatches < 5; ++i) {
+      if (res_ptr[i] != expected[i]) {
+         ++mismatches;
+         EXPECT_EQ(res_ptr[i], expected[i]) << "at i=" << i;
+      }
+   }
+   EXPECT_EQ(mismatches, 0) << "quantized dense -> residual Add diverged from the exact reference";
 }
 
 TEST(QuantizationContracts, Core)
@@ -3077,4 +3226,304 @@ TEST(QuantizationMLP, MultiLayerQONNXWeaverStyle)
    // The chain must generate without aborting on an orphaned QONNX Quant.
    EXPECT_NO_THROW(model.GenerateGPU_ALPAKA(SOFIE::Options::kBinaryWeightFile));
 #endif
+}
+
+// A strided-batched Gemm with a transposed B operand, which requires the transposed-case
+// leading dimensions. The operator is built directly, as no parser path emits this.
+TEST(QuantizationCodegen, BatchedGemmTransposedBLeadingDimensions)
+{
+   // (batch 2 x 3) x [M=4, K=5] @ [N=6, K=5]^T -> [M=4, N=6]. K != N so a wrong lda is
+   // a different number rather than an accidental match.
+   const std::size_t B = 2, H = 3, M = 4, K = 5, N = 6;
+   SOFIE::RModel model("batched_gemm_transposed_b");
+   model.AddInputTensorInfo("x", SOFIE::ETensorType::FLOAT, std::vector<std::size_t>{B, H, M, K});
+
+   const std::size_t weightCount = B * H * N * K;
+   model.AddInitializedTensor("bw", SOFIE::ETensorType::FLOAT, std::vector<std::size_t>{B, H, N, K},
+                              std::shared_ptr<void>(new float[weightCount],
+                                                    std::default_delete<float[]>()));
+   std::fill_n(static_cast<float *>(model.GetInitializedTensorData("bw").get()), weightCount, 0.5f);
+
+   // alpha=1, beta=0, transA=0, transB=1, and no bias -- the combination that selects the
+   // gemmStridedBatched branch.
+   AddNamedOperator<SOFIE::ROperator_Gemm<float>>(model, "bgemm", 1.0f, 0.0f, 0, 1, "x", "bw", "y");
+   model.AddOutputTensorNameList({"y"});
+
+   ASSERT_NO_THROW(model.Initialize());
+   ASSERT_NO_THROW(model.GenerateGPU_ALPAKA(SOFIE::Options::kBinaryWeightFile));
+   const std::string code = model.ReturnGenerated();
+
+   const auto call = code.find("gemmStridedBatched");
+   ASSERT_NE(call, std::string::npos) << "expected the strided-batched branch for a rank-4 "
+                                         "no-bias Gemm with a per-batch B operand";
+
+   // The leading dimension is the argument immediately after the A_sofie pointer, which is
+   // the ONNX B tensor. transa_sofie is 't' here, so it must be K, not m_sofie (= N).
+   const std::string afterPointer = "deviceBuf_bw), ";
+   const auto at = code.find(afterPointer, call);
+   ASSERT_NE(at, std::string::npos);
+   const std::string tail = code.substr(at + afterPointer.size(), 32);
+   EXPECT_EQ(tail.substr(0, tail.find(',')), std::to_string(K))
+      << "lda must be K for a transposed A_sofie operand; emitted: " << tail;
+}
+
+// Batched activation x activation, both operands runtime tensors, B through a Transpose,
+// a scalar Mul folding into epilogue alpha. Mirrors make_qdq_batched_matmul_fixture.py.
+namespace {
+
+constexpr Idx kBmmB = 32, kBmmH = 8, kBmmT = 32, kBmmD = 16;
+constexpr double kBmmScaleA = 0.0078125, kBmmScaleB = 0.00390625, kBmmScaleOut = 0.00048828125;
+constexpr double kBmmAlpha = 0.25;
+
+// Operand values in grid units, small enough that quantization never clamps -- the
+// accumulator is then exactly the integer dot product of these.
+int BatchedMatMulAValue(std::size_t i)
+{
+   return static_cast<int>((i * 13 + 5) % 97) - 48;
+}
+int BatchedMatMulBValue(std::size_t i)
+{
+   return static_cast<int>((i * 29 + 11) % 83) - 41;
+}
+
+std::size_t BatchedMatMulIndex(std::size_t b, std::size_t h, std::size_t t, std::size_t d)
+{
+   return ((b * kBmmH + h) * kBmmT + t) * kBmmD + d;
+}
+
+} // namespace
+
+class QuantizedBatchedMatMulTest : public QuantizationAlpakaTest {
+protected:
+   // QuantizeLinear is elementwise, so quantizing before or after the transpose agrees;
+   // the accumulator indexes B by [.., n, d] off the untransposed values.
+   std::vector<float> Reference(int clipLoQ, int clipHiQ) const
+   {
+      auto clampTo = [](double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); };
+      const double clipLo = clipLoQ * kBmmScaleOut;
+      const double clipHi = clipHiQ * kBmmScaleOut;
+
+      std::vector<float> expected(kBmmB * kBmmH * kBmmT * kBmmT);
+      for (std::size_t b = 0; b < kBmmB; ++b) {
+         for (std::size_t h = 0; h < kBmmH; ++h) {
+            for (std::size_t m = 0; m < kBmmT; ++m) {
+               for (std::size_t n = 0; n < kBmmT; ++n) {
+                  std::int32_t acc = 0;
+                  for (std::size_t d = 0; d < kBmmD; ++d)
+                     acc += BatchedMatMulAValue(BatchedMatMulIndex(b, h, m, d)) *
+                            BatchedMatMulBValue(BatchedMatMulIndex(b, h, n, d));
+                  double real = acc * kBmmScaleA * kBmmScaleB * kBmmAlpha;
+                  real = clampTo(real, clipLo, clipHi);
+                  const double q = clampTo(std::nearbyint(real / kBmmScaleOut), -128.0, 127.0);
+                  expected[((b * kBmmH + h) * kBmmT + m) * kBmmT + n] =
+                     static_cast<float>(q * kBmmScaleOut);
+               }
+            }
+         }
+      }
+      return expected;
+   }
+
+   auto MakeOperand(int (*value)(std::size_t), double scale)
+   {
+      const Idx count = kBmmB * kBmmH * kBmmT * kBmmD;
+      auto host_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(count));
+      auto *ptr = alpaka::getPtrNative(host_h);
+      for (Idx i = 0; i < count; ++i)
+         ptr[i] = static_cast<float>(value(i) * scale);
+      auto device_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(count));
+      alpaka::memcpy(queue, device_d, host_h);
+      alpaka::wait(queue);
+      return device_d;
+   }
+
+   template <typename TResult>
+   void ExpectExact(TResult &result, const std::vector<float> &expected, const char *what)
+   {
+      const Idx outputSize = static_cast<Idx>(expected.size());
+      auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(outputSize));
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+      const auto *res_ptr = reinterpret_cast<const float *>(alpaka::getPtrNative(result_h));
+
+      int mismatches = 0;
+      for (Idx i = 0; i < outputSize; ++i) {
+         if (res_ptr[i] != expected[i]) {
+            ++mismatches;
+            if (mismatches <= 5)
+               EXPECT_EQ(res_ptr[i], expected[i]) << "at i=" << i;
+         }
+      }
+      EXPECT_EQ(mismatches, 0) << what << " diverged from the exact reference (" << mismatches
+                               << " of " << outputSize << " elements)";
+   }
+};
+
+TEST_F(QuantizedBatchedMatMulTest, MatchesExactReference)
+{
+   auto q_d = MakeOperand(&BatchedMatMulAValue, kBmmScaleA);
+   auto k_d = MakeOperand(&BatchedMatMulBValue, kBmmScaleB);
+
+   SOFIE_ONNX_QDQ_BatchedMatMul::Session<alpaka::TagGpuCudaRt> model(
+      "ONNX_QDQ_BatchedMatMul_FromONNX_GPU_ALPAKA.dat");
+   auto result = model.infer(q_d, k_d);
+   alpaka::wait(queue);
+   cudaDeviceSynchronize();
+
+   ExpectExact(result, Reference(-128, 127), "batched activation x activation MatMul");
+}
+
+// An output Clip narrower than the int8 grid, which the region folds into outputClamp.
+TEST_F(QuantizedBatchedMatMulTest, NarrowOutputClipMatchesExactReference)
+{
+   auto q_d = MakeOperand(&BatchedMatMulAValue, kBmmScaleA);
+   auto k_d = MakeOperand(&BatchedMatMulBValue, kBmmScaleB);
+
+   SOFIE_ONNX_QDQ_BatchedMatMul_NarrowClip::Session<alpaka::TagGpuCudaRt> model(
+      "ONNX_QDQ_BatchedMatMul_NarrowClip_FromONNX_GPU_ALPAKA.dat");
+   auto result = model.infer(q_d, k_d);
+   alpaka::wait(queue);
+   cudaDeviceSynchronize();
+
+   ExpectExact(result, Reference(-64, 63), "batched MatMul with a narrow output clip");
+}
+
+// A Transpose on the output chain: the boundary behind it defines the grid, but the
+// Transpose must not be absorbed, since that would drop the permutation.
+TEST_F(QuantizedBatchedMatMulTest, TransposedOutputChainMatchesExactReference)
+{
+   constexpr double kOutScaleT = 0.001953125;  // 2^-9; no alpha here, so the product is 4x larger
+   auto clampTo = [](double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); };
+
+   // The graph permutes [B, H, T, T] -> [B, T, H, T] and flattens the tail, so the value
+   // computed at (b, h, m, n) must land at [(b*T + m)*H*T + h*T + n].
+   std::vector<float> expected(kBmmB * kBmmH * kBmmT * kBmmT);
+   for (std::size_t b = 0; b < kBmmB; ++b) {
+      for (std::size_t h = 0; h < kBmmH; ++h) {
+         for (std::size_t m = 0; m < kBmmT; ++m) {
+            for (std::size_t n = 0; n < kBmmT; ++n) {
+               std::int32_t acc = 0;
+               for (std::size_t d = 0; d < kBmmD; ++d)
+                  acc += BatchedMatMulAValue(BatchedMatMulIndex(b, h, m, d)) *
+                         BatchedMatMulBValue(BatchedMatMulIndex(b, h, n, d));
+               double real = acc * kBmmScaleA * kBmmScaleB;
+               real = clampTo(real, -128.0 * kOutScaleT, 127.0 * kOutScaleT);
+               const double q = clampTo(std::nearbyint(real / kOutScaleT), -128.0, 127.0);
+               expected[(b * kBmmT + m) * kBmmH * kBmmT + h * kBmmT + n] =
+                  static_cast<float>(q * kOutScaleT);
+            }
+         }
+      }
+   }
+
+   auto q_d = MakeOperand(&BatchedMatMulAValue, kBmmScaleA);
+   auto k_d = MakeOperand(&BatchedMatMulBValue, kBmmScaleB);
+
+   SOFIE_ONNX_QDQ_BatchedMatMul_TransposedOutput::Session<alpaka::TagGpuCudaRt> model(
+      "ONNX_QDQ_BatchedMatMul_TransposedOutput_FromONNX_GPU_ALPAKA.dat");
+   auto result = model.infer(q_d, k_d);
+   alpaka::wait(queue);
+   cudaDeviceSynchronize();
+
+   ExpectExact(result, expected, "batched MatMul with a Transpose on its output chain");
+}
+
+// Two fake-quant boundaries on one grid split by a Reshape, where the region reads the
+// existing int8 carrier. Mirrors make_qdq_carrier_handoff_fixture.py.
+TEST_F(QuantizationAlpakaTest, QdqCarrierHandoffMatchesExactReference)
+{
+   constexpr Idx kB = 32, kT = 32, kK = 128, kN = 128;
+   constexpr double kInScale = 0.0078125, kWeightScale = 0.0078125, kOutScale = 0.015625;
+   constexpr Idx kM = kB * kT;
+
+   auto weightValue = [](std::size_t k, std::size_t n) {
+      return static_cast<int>((k * 23 + n * 11) % 13) - 6;
+   };
+   auto biasValue = [](std::size_t n) {
+      return (static_cast<double>(n % 7) - 3.0) * kInScale * kWeightScale * 8.0;
+   };
+   auto inputValue = [](std::size_t i) {
+      return static_cast<int>((i * 17 + 3) % 61) - 30;
+   };
+   auto clampTo = [](double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); };
+
+   std::vector<float> input(static_cast<std::size_t>(kM) * kK);
+   for (std::size_t i = 0; i < input.size(); ++i)
+      input[i] = static_cast<float>(inputValue(i) * kInScale);
+
+   // Both boundaries are on kInScale and the values are exactly representable, so the second
+   // quantization is the identity and the accumulator is the integer dot product.
+   std::vector<float> expected(static_cast<std::size_t>(kM) * kN);
+   for (std::size_t m = 0; m < kM; ++m) {
+      for (std::size_t n = 0; n < kN; ++n) {
+         std::int32_t acc = 0;
+         for (std::size_t k = 0; k < kK; ++k)
+            acc += inputValue(m * kK + k) * weightValue(k, n);
+         double real = acc * kInScale * kWeightScale + biasValue(n);
+         real = clampTo(real, -128.0 * kOutScale, 127.0 * kOutScale);
+         const double q = clampTo(std::nearbyint(real / kOutScale), -128.0, 127.0);
+         expected[m * kN + n] = static_cast<float>(q * kOutScale);
+      }
+   }
+
+   const Idx inputSize = static_cast<Idx>(input.size());
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(inputSize));
+   std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(inputSize));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+
+   SOFIE_ONNX_QDQ_CarrierHandoff::Session<alpaka::TagGpuCudaRt> model(
+      "ONNX_QDQ_CarrierHandoff_FromONNX_GPU_ALPAKA.dat");
+   auto result = model.infer(input_d);
+   alpaka::wait(queue);
+   cudaDeviceSynchronize();
+
+   const Idx outputSize = static_cast<Idx>(expected.size());
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(outputSize));
+   alpaka::memcpy(queue, result_h, result);
+   alpaka::wait(queue);
+   const auto *res_ptr = reinterpret_cast<const float *>(alpaka::getPtrNative(result_h));
+
+   int mismatches = 0;
+   for (Idx i = 0; i < outputSize && mismatches < 5; ++i) {
+      if (res_ptr[i] != expected[i]) {
+         ++mismatches;
+         EXPECT_EQ(res_ptr[i], expected[i]) << "at i=" << i;
+      }
+   }
+   EXPECT_EQ(mismatches, 0) << "int8 carrier handoff diverged from the exact reference";
+}
+
+// Asserts the carrier handoff engaged, which the numeric test cannot observe because
+// staging the float back to int8 computes the same values.
+TEST(QuantizedCarrierHandoffCodegen, RegionReadsTheUpstreamInt8Carrier)
+{
+   std::ifstream in("ONNX_QDQ_CarrierHandoff_FromONNX_GPU_ALPAKA.hxx");
+   ASSERT_TRUE(in.good());
+   const std::string code((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+   const auto call = code.find("QuantizedGemmCudaLt_Call");
+   ASSERT_NE(call, std::string::npos) << "region did not lower";
+   EXPECT_NE(code.find("inputCarrier = SOFIE::EQuantizedInputCarrier::Int8"), std::string::npos)
+      << "region still stages float->int8 internally; the upstream carrier handoff did not engage";
+   // deviceBuf_aq is the QuantizeLinear output, i.e. the carrier one boundary upstream.
+   EXPECT_NE(code.find("deviceBuf_aq"), std::string::npos)
+      << "region is not reading the upstream int8 carrier tensor";
+}
+
+// Asserts the region lowers to cuBLASLt, which the numeric tests cannot observe: both
+// operands are exactly representable, so an FP32 fallback computes the same numbers.
+TEST(QuantizedBatchedMatMulCodegen, RegionLowersToCublasLt)
+{
+   for (const char *header : {"ONNX_QDQ_BatchedMatMul_FromONNX_GPU_ALPAKA.hxx",
+                              "ONNX_QDQ_BatchedMatMul_NarrowClip_FromONNX_GPU_ALPAKA.hxx",
+                              "ONNX_QDQ_BatchedMatMul_TransposedOutput_FromONNX_GPU_ALPAKA.hxx"}) {
+      std::ifstream in(header);
+      ASSERT_TRUE(in.good()) << "cannot open " << header;
+      const std::string code((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      EXPECT_NE(code.find("QuantizedGemmCudaLt_Call"), std::string::npos)
+         << header << " emits no fused int8 GEMM call: the batched activation x activation "
+                      "region fell back to FP32, so its numeric test proves nothing";
+   }
 }

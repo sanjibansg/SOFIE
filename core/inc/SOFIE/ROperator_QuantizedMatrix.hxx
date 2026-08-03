@@ -112,6 +112,9 @@ struct QuantizedCudaLtMatMulCall {
    // Consuming region's input grid; the epilogue re-quantizes onto it and stores an int8
    // carrier.
    std::optional<QuantizationInfo> outputRequantize;
+   // Effective [qmin, qmax] from an absorbed Clip, when it narrows the grid below the
+   // carrier's bit-width range. Empty means clamp to the carrier range.
+   std::optional<std::pair<std::int64_t, std::int64_t>> outputClamp;
    float alpha = 1.0f;
    float beta = 1.0f;
 };
@@ -194,6 +197,20 @@ inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMul
       out << "      " << call.paramsName << ".n = " << call.paramsName << ".logicalN;\n";
       out << "      " << call.paramsName << ".k = " << call.paramsName << ".logicalK;\n";
    }
+   if (call.shapePolicy.batchCount > 1) {
+      if (paddedExecution) {
+         throw std::runtime_error("SOFIE " + call.boundaryName +
+                                  " cannot combine padded execution with strided batching: the strides below"
+                                  " assume each batch slice is exactly the logical extent");
+      }
+      // Each slice is contiguous, so the stride is just the slice's element count. This
+      // is layout-independent: B holds K*N elements whether it is stored [K,N] or [N,K].
+      const auto &shape = call.shapePolicy;
+      out << "      " << call.paramsName << ".batchCount = " << shape.batchCount << ";\n";
+      out << "      " << call.paramsName << ".batchStrideA = " << (shape.logicalM * shape.logicalK) << ";\n";
+      out << "      " << call.paramsName << ".batchStrideB = " << (shape.logicalK * shape.logicalN) << ";\n";
+      out << "      " << call.paramsName << ".batchStrideC = " << (shape.logicalM * shape.logicalN) << ";\n";
+   }
    out << std::setprecision(std::numeric_limits<double>::max_digits10);
    out << "      " << call.paramsName << ".inputScale = " << call.inputQuant.scale << ";\n";
    out << "      " << call.paramsName << ".weightScale = " << call.weightQuant.scale << ";\n";
@@ -212,8 +229,9 @@ inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMul
    out << "      " << call.paramsName << ".inputQMax = static_cast<std::int32_t>(" << inputRange.second << ");\n";
    out << "      " << call.paramsName << ".biasQMin = static_cast<std::int32_t>(" << biasRange.first << ");\n";
    out << "      " << call.paramsName << ".biasQMax = static_cast<std::int32_t>(" << biasRange.second << ");\n";
-   out << "      " << call.paramsName << ".outputQMin = static_cast<std::int32_t>(" << outputRange.first << ");\n";
-   out << "      " << call.paramsName << ".outputQMax = static_cast<std::int32_t>(" << outputRange.second << ");\n";
+   const auto outputClamp = call.outputClamp.value_or(outputRange);
+   out << "      " << call.paramsName << ".outputQMin = static_cast<std::int32_t>(" << outputClamp.first << ");\n";
+   out << "      " << call.paramsName << ".outputQMax = static_cast<std::int32_t>(" << outputClamp.second << ");\n";
    out << "      " << call.paramsName << ".hasBias = " << (call.hasBias ? "true" : "false") << ";\n";
    out << "      " << call.paramsName << ".hasRelu = " << (call.hasRelu ? "true" : "false") << ";\n";
    out << "      " << call.paramsName << ".maxWorkspaceBytes = SOFIE::kQuantizedCudaLtMaxWorkspaceBytes;\n";

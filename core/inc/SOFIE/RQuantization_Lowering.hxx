@@ -366,6 +366,9 @@ struct QuantizedMatrixShapePolicy {
    std::size_t logicalM = 0;
    std::size_t logicalK = 0;
    std::size_t logicalN = 0;
+   // Under strided batching M/K/N stay per-batch while the MAC counts below are totals,
+   // profitability being a property of the single kernel launch.
+   std::size_t batchCount = 1;
    std::size_t physicalM = 0;
    std::size_t physicalK = 0;
    std::size_t physicalN = 0;
@@ -516,6 +519,9 @@ struct QuantizedLoweringPlan {
    QuantizedResourceRequirements resources;
 
    std::string weightStorageTensor;
+   // weightStorageTensor names a runtime activation rather than a baked constant: the
+   // int8 carrier a QuantizeLinear writes each inference, read directly by codegen.
+   bool weightStorageIsRuntimeTensor = false;
    EQuantizedLayout weightLayout = EQuantizedLayout::UNDEFINED;
    EQuantizedParameterMode weightScaleMode = EQuantizedParameterMode::Scalar;
    std::string weightScaleTensor;
