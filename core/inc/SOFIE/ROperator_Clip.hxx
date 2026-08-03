@@ -51,6 +51,8 @@ private:
    std::vector<Dim> fDimShape;
    bool fIsDynamic = false;
 
+   ETensorType fTensorType = ETensorType::UNDEFINED;
+
    // Compile-time bound values — used when bounds are constant tensors
    // Initialised to the ONNX defaults (no clipping)
    T fMin =  std::numeric_limits<T>::lowest();   // -inf equivalent
@@ -111,6 +113,8 @@ public:
       if (!model.CheckIfTensorAlreadyExist(fNX))
          throw std::runtime_error(
             "SOFIE Clip Op Input Tensor " + fNX + " is not found in model");
+
+      fTensorType = model.GetTensorType(fNX);
 
       // ---- collect shape (static or dynamic, mirrors BasicBinary) -------
       if (model.IsDynamicTensor(fNX)) {
@@ -262,6 +266,32 @@ public:
    }
 
    bool IsElementwise() const override { return true; }
+
+   EFusionMappingType GetFusionMappingType() const override
+   {
+      if (fIsDynamic || (fHasMin && !fMinIsConstant) || (fHasMax && !fMaxIsConstant))
+         return EFusionMappingType::Unsupported;
+
+      return EFusionMappingType::OneToOne;
+   }
+
+   std::vector<size_t> GetFusionDataInputIndices() const override
+   {
+      return {0};
+   }
+
+   bool SupportsFusionTypes(const std::vector<ETensorType> &inputTypes, ETensorType outputType) const override
+   {
+      return inputTypes.size() == 1 && inputTypes[0] == fTensorType && outputType == fTensorType;
+   }
+
+   std::string GetFusionExpr(const std::vector<std::string> &inputs) const override
+   {
+      if (inputs.size() != 1 || GetFusionMappingType() == EFusionMappingType::Unsupported)
+         return "";
+
+      return GetElementwiseExpr(inputs[0]);
+   }
 
    std::string GetElementwiseExpr(const std::string& v) const override
    {

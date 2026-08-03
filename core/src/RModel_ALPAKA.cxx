@@ -21,43 +21,66 @@
 
 namespace SOFIE {
 
-void RModel::FuseGemmActivations_GPU() {
+void RModel::FuseGemmActivations_GPU()
+{
    std::unordered_map<std::string, size_t> consumerCount;
-   for (const auto& op : fOperators)
-      for (const auto& inp : op->GetOpInputTensors())
-         ++consumerCount[std::string(inp)];
 
-   const size_t N = fOperators.size();
-   for (size_t i = 0; i + 1 < N; ++i) {
-      if (fSkipOperators.count(i)) continue;
+   for (const auto &op : fOperators) {
+      for (const auto &inputName : op->GetOpInputTensors())
+         ++consumerCount[std::string(inputName)];
+   }
 
-      auto* gemm = dynamic_cast<ROperator_Gemm<float>*>(fOperators[i].get());
-      if (!gemm) continue;
-      if (gemm->GetActivationType() != EActivationType::UNDEFINED) continue;
+   for (size_t opIdx = 0; opIdx + 1 < fOperators.size(); ++opIdx) {
+      const size_t activationOpIdx = opIdx + 1;
 
-      auto* lrelu = dynamic_cast<ROperator_LeakyRelu<float>*>(fOperators[i + 1].get());
-      auto* relu  = dynamic_cast<ROperator_Relu<float>*>(fOperators[i + 1].get());
-      if (!lrelu && !relu) continue;
+      if (fSkipOperators.count(opIdx) || fSkipOperators.count(activationOpIdx))
+         continue;
 
-      std::string gemmOut = std::string(fOperators[i]->GetOpOutputTensors()[0]);
-      std::string actIn   = std::string(fOperators[i + 1]->GetOpInputTensors()[0]);
-      if (gemmOut != actIn) continue;
+      auto *gemm = dynamic_cast<ROperator_Gemm<float> *>(fOperators[opIdx].get());
 
-      if (consumerCount[gemmOut] != 1) continue;
+      if (!gemm || gemm->GetActivationType() != EActivationType::UNDEFINED)
+         continue;
 
-      std::string actOut = std::string(fOperators[i + 1]->GetOpOutputTensors()[0]);
+      auto *leakyRelu = dynamic_cast<ROperator_LeakyRelu<float> *>(fOperators[activationOpIdx].get());
+      auto *relu = dynamic_cast<ROperator_Relu<float> *>(fOperators[activationOpIdx].get());
 
-      if (lrelu) {
-         gemm->SetActivation(EActivationType::LEAKYRELU, lrelu->GetAlpha());
-      } else {
-         gemm->SetActivation(EActivationType::RELU, 0.f);
-      }
+      if (!leakyRelu && !relu)
+         continue;
 
-      gemm->UpdateFusableTensorName(actOut, [&](const std::string& old) {
-         fFusionIntermediateTensors.insert(old);
+      const auto gemmOutputs = fOperators[opIdx]->GetOpOutputTensors();
+      const auto activationInputs = fOperators[activationOpIdx]->GetOpInputTensors();
+      const auto activationOutputs = fOperators[activationOpIdx]->GetOpOutputTensors();
+
+      if (gemmOutputs.size() != 1 || activationInputs.size() != 1 || activationOutputs.size() != 1)
+         continue;
+
+      const std::string gemmOutput(gemmOutputs[0]);
+      const std::string activationInput(activationInputs[0]);
+      const std::string activationOutput(activationOutputs[0]);
+
+      if (gemmOutput != activationInput)
+         continue;
+
+      if (consumerCount[gemmOutput] != 1)
+         continue;
+
+      if (std::find(fOutputTensorNames.begin(), fOutputTensorNames.end(), gemmOutput) != fOutputTensorNames.end())
+         continue;
+
+      // Native GEMM+ReLU is currently available only through the biased cuBLASLt path.
+      if (relu && !gemm->HasBias())
+         continue;
+
+      if (leakyRelu)
+         gemm->SetActivation(EActivationType::LEAKYRELU, leakyRelu->GetAlpha());
+      else
+         gemm->SetActivation(EActivationType::RELU);
+
+      gemm->UpdateFusableTensorName(activationOutput, [&](const std::string &oldOutput) {
+         fFusionIntermediateTensors.insert(oldOutput);
       });
 
-      fSkipOperators.insert(i + 1);
+      fSkipOperators.insert(activationOpIdx);
    }
 }
 
