@@ -28,6 +28,11 @@ class RModelParser_ONNX {
 public:
    struct OperatorsMapImpl;
 
+   struct MatMulInputInfo {
+      std::string tensorName;
+      int_t transpose = 0;
+   };
+
 private:
 
    bool fVerbose = false;
@@ -37,6 +42,8 @@ private:
    std::unordered_map<std::string, ETensorType> fTensorTypeMap;
    // flag list of fused operators
    std::vector<bool> fFusedOperators;
+   // Maps an absorbed Transpose output to its original input tensor.
+   std::unordered_map<std::string, std::string> fFusedTransposeInputs;
 
 
 public:
@@ -62,6 +69,10 @@ public:
 
    // Get the type of the tensor
    ETensorType GetTensorType(const std::string &name);
+
+   void RegisterFusedTransposeInput(const std::string &transposeOutput, const std::string &transposeInput);
+
+   MatMulInputInfo ConsumeFusedTransposeInput(const std::string &matmulInput);
 
    // Parse the index'th node from the ONNX graph
    std::unique_ptr<ROperator> ParseOperator(const size_t /*index*/, const onnx::GraphProto & /*graphproto*/,

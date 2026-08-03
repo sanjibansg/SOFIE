@@ -672,16 +672,19 @@ namespace SOFIE{
             //   transa_sofie = transB_onnx,  transb_sofie = transA_onnx
             //   m_sofie      = n_onnx,        n_sofie      = m_onnx
             //   A_sofie      = fNB,           B_sofie      = fNA
-            //   lda = m_sofie  (leading dim of A when transA_sofie='n')
-            //   ldb = k        (leading dim of B when transB_sofie='n')
+            //   lda = transA_sofie ? k : m_sofie
+            //   ldb = transB_sofie ? n_sofie : k
             //   ldc = m_sofie  (leading dim of C)
             // ----------------------------------------------------------------
-            size_t m_sofie    = static_cast<size_t>(std::stoi(n));   // ONNX n
-            size_t n_sofie    = static_cast<size_t>(std::stoi(m));   // ONNX m
-            size_t k_val      = static_cast<size_t>(std::stoi(k));
-            size_t lda        = m_sofie;             // transA_sofie='n'
-            size_t ldb        = k_val;               // transB_sofie='n'
-            size_t ldc        = m_sofie;
+            size_t m_sofie = static_cast<size_t>(std::stoi(n)); // ONNX n
+            size_t n_sofie = static_cast<size_t>(std::stoi(m)); // ONNX m
+            size_t k_val = static_cast<size_t>(std::stoi(k));
+
+            // cuBLAS receives the ONNX B operand first, so its transpose flag is fAttrTransB.
+            // It receives the ONNX A operand second, so its transpose flag is fAttrTransA.
+            size_t lda = fAttrTransB ? k_val : m_sofie;
+            size_t ldb = fAttrTransA ? n_sofie : k_val;
+            size_t ldc = m_sofie;
             size_t sA         = m_sofie * k_val;     // stride per batch for fNB
             size_t sB         = k_val  * n_sofie;    // stride per batch for fNA (= strideA_onnx)
             size_t sC         = m_sofie * n_sofie;   // stride per batch for fNY (= strideY)
@@ -762,8 +765,8 @@ namespace SOFIE{
 
          // GEMM+LeakyReLU fusion (GPU): cuBLASLt has no native LeakyReLU epilogue,
          // so we emit a cheap in-place ALPAKA kernel immediately after the GEMM.
-         // This avoids allocating a separate intermediate buffer and saves one
-         // GPU kernel launch compared to a standalone LeakyReLU operator.
+         // This avoids allocating a separate intermediate output buffer, but still
+         // emits one ALPAKA activation kernel after the GEMM call.
          if (fActivation == EActivationType::LEAKYRELU) {
             std::string numElem = ConvertDimShapeToLength(fShapeY);
             out << SP << "//--- GEMM+LeakyReLU in-place fusion\n";
@@ -805,6 +808,8 @@ namespace SOFIE{
 
       // --- Activation fusion accessors (used by FuseGemmActivations_GPU) ---
       EActivationType GetActivationType() const { return fActivation; }
+      bool HasBias() const { return !fNC.empty(); }
+
       /// Set fused activation.  alpha is only meaningful for LEAKYRELU.
       void SetActivation(EActivationType act, float alpha = 0.f) {
          fActivation      = act;

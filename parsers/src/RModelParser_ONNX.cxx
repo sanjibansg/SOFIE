@@ -329,10 +329,129 @@ bool RModelParser_ONNX::IsRegisteredTensorType(const std::string &name)
    return fTensorTypeMap.find(UTILITY::Clean_name(name)) != fTensorTypeMap.end();
 }
 
+void RModelParser_ONNX::RegisterFusedTransposeInput(const std::string &transposeOutput, const std::string &transposeInput)
+{
+   const std::string outputName = UTILITY::Clean_name(transposeOutput);
+   const std::string inputName = UTILITY::Clean_name(transposeInput);
+   const auto [it, inserted] = fFusedTransposeInputs.emplace(outputName, inputName);
+
+   if (!inserted && it->second != inputName)
+      throw std::runtime_error("TMVA::SOFIE ONNX Parser found conflicting Transpose fusions for tensor " + outputName);
+}
+
+   RModelParser_ONNX::MatMulInputInfo
+   RModelParser_ONNX::ConsumeFusedTransposeInput(const std::string &matmulInput)
+{
+   const std::string inputName = UTILITY::Clean_name(matmulInput);
+   const auto transposeIt = fFusedTransposeInputs.find(inputName);
+
+   if (transposeIt == fFusedTransposeInputs.end())
+      return {inputName, 0};
+
+   MatMulInputInfo inputInfo{transposeIt->second, 1};
+   fFusedTransposeInputs.erase(transposeIt);
+   return inputInfo;
+}
+
 ETensorType RModelParser_ONNX::GetTensorType(const std::string &name)
 {
    return fTensorTypeMap[UTILITY::Clean_name(name)];
 }
+
+namespace {
+
+bool IsGraphOutput(const onnx::GraphProto &graph, const std::string &tensorName)
+{
+   for (const auto &output : graph.output()) {
+      if (output.name() == tensorName)
+         return true;
+   }
+
+   return false;
+}
+
+bool TryGetTensorRank(const onnx::GraphProto &graph, const std::string &tensorName, size_t &rank)
+{
+   for (const auto &initializer : graph.initializer()) {
+      if (initializer.name() == tensorName) {
+         rank = initializer.dims_size();
+         return true;
+      }
+   }
+
+   auto tryValueInfo = [&](const onnx::ValueInfoProto &valueInfo) {
+      if (valueInfo.name() != tensorName)
+         return false;
+
+      if (!valueInfo.has_type() || !valueInfo.type().has_tensor_type())
+         return false;
+
+      const auto &tensorType = valueInfo.type().tensor_type();
+
+      if (!tensorType.has_shape())
+         return false;
+
+      rank = tensorType.shape().dim_size();
+      return true;
+   };
+
+   for (const auto &input : graph.input()) {
+      if (tryValueInfo(input))
+         return true;
+   }
+
+   for (const auto &valueInfo : graph.value_info()) {
+      if (tryValueInfo(valueInfo))
+         return true;
+   }
+
+   for (const auto &output : graph.output()) {
+      if (tryValueInfo(output))
+         return true;
+   }
+
+   return false;
+}
+
+bool IsLastTwoAxesTranspose(const onnx::NodeProto &node, const onnx::GraphProto &graph)
+{
+   std::vector<int64_t> permutation;
+   bool hasPermutation = false;
+
+   for (const auto &attribute : node.attribute()) {
+      if (attribute.name() == "perm") {
+         permutation.assign(attribute.ints().begin(), attribute.ints().end());
+         hasPermutation = true;
+         break;
+      }
+   }
+
+   if (!hasPermutation) {
+      size_t rank = 0;
+
+      if (!TryGetTensorRank(graph, node.input(0), rank))
+         return false;
+
+      // The default ONNX permutation reverses every axis. That is equivalent
+      // to a matrix transpose only for rank-two tensors.
+      return rank == 2;
+   }
+
+   if (permutation.size() < 2)
+      return false;
+
+   const size_t rank = permutation.size();
+
+   for (size_t axis = 0; axis + 2 < rank; ++axis) {
+      if (permutation[axis] != static_cast<int64_t>(axis))
+         return false;
+   }
+
+   return permutation[rank - 2] == static_cast<int64_t>(rank - 1) &&
+          permutation[rank - 1] == static_cast<int64_t>(rank - 2);
+}
+
+} // anonymous namespace
 
 // Parse an operator
 std::unique_ptr<ROperator>
@@ -351,8 +470,24 @@ RModelParser_ONNX::ParseOperator(const size_t i, const onnx::GraphProto &graphpr
 
    // try to fuse with following operator in case it is not last one
    if (children.size() == 1) {
-      int idx2 = children.front();
-      if (op_type == "MatMul") {
+      const int idx2 = children.front();
+
+      if (op_type == "Transpose") {
+         const auto &childNode = graphproto.node(idx2);
+
+         const bool validNodeShape = nodeproto.input_size() == 1 && nodeproto.output_size() == 1;
+         const bool childIsMatMul = idx2 < graphproto.node_size() && childNode.op_type() == "MatMul";
+         const bool validMatMulInputs = childIsMatMul && childNode.input_size() == 2;
+         const bool outputIsVisible = validNodeShape && IsGraphOutput(graphproto, nodeproto.output(0));
+         const bool validPermutation = validNodeShape && IsLastTwoAxesTranspose(nodeproto, graphproto);
+         const bool supportedType = validNodeShape && IsRegisteredTensorType(nodeproto.input(0)) &&
+                                    GetTensorType(nodeproto.input(0)) == ETensorType::FLOAT;
+
+         if (validMatMulInputs && !outputIsVisible && validPermutation && supportedType) {
+            RegisterFusedTransposeInput(nodeproto.output(0), nodeproto.input(0));
+            return nullptr;
+         }
+      } else if (op_type == "MatMul") {
         // Fuse MatMul and Add
          if (idx2 < graphproto.node_size() && graphproto.node(idx2).op_type() == "Add") {
             fFusedOperators[idx2] = true;
@@ -405,6 +540,7 @@ RModel RModelParser_ONNX::Parse(std::string filename, bool verbose)
    fVerbose = verbose;
 
    fTensorTypeMap.clear();
+   fFusedTransposeInputs.clear();
 
    auto model = LoadModel(filename);
    if (!model)
@@ -812,8 +948,11 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
    // recursive ParseONNXGraph calls (for If/Loop subgraphs) do not
    // corrupt the parent graph's fused-operator bookkeeping.
    auto savedFusedOperators = std::move(fFusedOperators);
+   auto savedFusedTransposeInputs = std::move(fFusedTransposeInputs);
+
    size_t node_order_exec = 0;
    fFusedOperators = std::vector<bool>(graph.node_size(), false);
+   fFusedTransposeInputs.clear();
    for (int i = 0; i < graph.node_size(); i++) {
       std::string op_type = graph.node(nodesOrder[i]).op_type();
 
@@ -841,6 +980,7 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
    // Restore the parent graph's fFusedOperators (may have been saved as empty
    // for the top-level call, which is fine — we're done with the loop).
    fFusedOperators = std::move(savedFusedOperators);
+   fFusedTransposeInputs = std::move(savedFusedTransposeInputs);
 
    std::vector<std::string> outputnames;
    if (verbose)
