@@ -362,6 +362,232 @@ ETensorType RModelParser_ONNX::GetTensorType(const std::string &name)
 
 namespace {
 
+bool IsGraphOutputForSoftmaxRewrite(const onnx::GraphProto &graph, const std::string &tensorName)
+{
+   for (int i = 0; i < graph.output_size(); ++i) {
+      if (graph.output(i).name() == tensorName)
+         return true;
+   }
+
+   return false;
+}
+
+int FindUniqueConsumerForSoftmaxRewrite(const onnx::GraphProto &graph, const std::string &tensorName)
+{
+   int consumerIdx = -1;
+
+   for (int i = 0; i < graph.node_size(); ++i) {
+      const auto &node = graph.node(i);
+      bool consumesTensor = false;
+
+      for (int j = 0; j < node.input_size(); ++j) {
+         if (node.input(j) == tensorName) {
+            consumesTensor = true;
+            break;
+         }
+      }
+
+      if (!consumesTensor)
+         continue;
+
+      if (consumerIdx != -1)
+         return -1;
+
+      consumerIdx = i;
+   }
+
+   return consumerIdx;
+}
+
+bool ReadSingleInt64TensorForSoftmaxRewrite(const onnx::TensorProto &tensor, int64_t &value)
+{
+   if (tensor.data_type() != onnx::TensorProto_DataType_INT64)
+      return false;
+
+   size_t length = 1;
+
+   for (int i = 0; i < tensor.dims_size(); ++i)
+      length *= static_cast<size_t>(tensor.dims(i));
+
+   if (length != 1)
+      return false;
+
+   if (tensor.int64_data_size() == 1) {
+      value = tensor.int64_data(0);
+      return true;
+   }
+
+   if (tensor.raw_data().size() == sizeof(int64_t)) {
+      std::memcpy(&value, tensor.raw_data().data(), sizeof(int64_t));
+
+      if constexpr (std::endian::native != std::endian::little)
+         value = bswap_value(value);
+
+      return true;
+   }
+
+   return false;
+}
+
+bool TryGetSingleInt64ConstantForSoftmaxRewrite(const onnx::GraphProto &graph,
+                                                const std::string &tensorName,
+                                                int64_t &value)
+{
+   for (int i = 0; i < graph.initializer_size(); ++i) {
+      const auto &initializer = graph.initializer(i);
+
+      if (initializer.name() == tensorName)
+         return ReadSingleInt64TensorForSoftmaxRewrite(initializer, value);
+   }
+
+   for (int i = 0; i < graph.node_size(); ++i) {
+      const auto &node = graph.node(i);
+
+      if (node.op_type() != "Constant" || node.output_size() != 1 || node.output(0) != tensorName)
+         continue;
+
+      for (int j = 0; j < node.attribute_size(); ++j) {
+         const auto &attribute = node.attribute(j);
+
+         if (attribute.name() == "value_int") {
+            value = attribute.i();
+            return true;
+         }
+
+         if (attribute.name() == "value_ints" && attribute.ints_size() == 1) {
+            value = attribute.ints(0);
+            return true;
+         }
+
+         if (attribute.name() == "value" && attribute.has_t())
+            return ReadSingleInt64TensorForSoftmaxRewrite(attribute.t(), value);
+      }
+
+      return false;
+   }
+
+   return false;
+}
+
+bool IsLastAxisReduceMaxForSoftmaxRewrite(const onnx::GraphProto &graph,
+                                         const onnx::NodeProto &node)
+{
+   if (node.op_type() != "ReduceMax")
+      return false;
+
+   int64_t keepdims = 1;
+   int64_t axis = 0;
+   bool hasAxisAttribute = false;
+
+   for (int i = 0; i < node.attribute_size(); ++i) {
+      const auto &attribute = node.attribute(i);
+
+      if (attribute.name() == "keepdims") {
+         keepdims = attribute.i();
+      } else if (attribute.name() == "axes") {
+         if (attribute.ints_size() != 1)
+            return false;
+
+         axis = attribute.ints(0);
+         hasAxisAttribute = true;
+      }
+   }
+
+   if (keepdims != 1)
+      return false;
+
+   const bool hasAxisInput = node.input_size() > 1 && !node.input(1).empty();
+
+   if (hasAxisAttribute && hasAxisInput)
+      return false;
+
+   if (hasAxisInput) {
+      if (!TryGetSingleInt64ConstantForSoftmaxRewrite(graph, node.input(1), axis))
+         return false;
+   } else if (!hasAxisAttribute) {
+      return false;
+   }
+
+   return axis == -1;
+}
+
+bool IsLastAxisSoftmaxForRewrite(const onnx::NodeProto &node)
+{
+   if (node.op_type() != "Softmax")
+      return false;
+
+   int64_t axis = -1;
+
+   for (int i = 0; i < node.attribute_size(); ++i) {
+      if (node.attribute(i).name() == "axis") {
+         axis = node.attribute(i).i();
+         break;
+      }
+   }
+
+   return axis == -1;
+}
+
+bool TryMatchRedundantSoftmaxStabilization(const onnx::GraphProto &graph,
+                                           int reduceMaxIdx,
+                                           int &subIdx,
+                                           int &softmaxIdx)
+{
+   if (reduceMaxIdx < 0 || reduceMaxIdx >= graph.node_size())
+      return false;
+
+   const auto &reduceMaxNode = graph.node(reduceMaxIdx);
+
+   if (reduceMaxNode.input_size() < 1 || reduceMaxNode.output_size() != 1)
+      return false;
+
+   if (!IsLastAxisReduceMaxForSoftmaxRewrite(graph, reduceMaxNode))
+      return false;
+
+   const std::string &inputName = reduceMaxNode.input(0);
+   const std::string &reduceMaxOutput = reduceMaxNode.output(0);
+
+   if (IsGraphOutputForSoftmaxRewrite(graph, reduceMaxOutput))
+      return false;
+
+   subIdx = FindUniqueConsumerForSoftmaxRewrite(graph, reduceMaxOutput);
+
+   if (subIdx < 0)
+      return false;
+
+   const auto &subNode = graph.node(subIdx);
+
+   if (subNode.op_type() != "Sub" || subNode.input_size() != 2 || subNode.output_size() != 1)
+      return false;
+
+   if (subNode.input(0) != inputName || subNode.input(1) != reduceMaxOutput)
+      return false;
+
+   const std::string &subOutput = subNode.output(0);
+
+   if (IsGraphOutputForSoftmaxRewrite(graph, subOutput))
+      return false;
+
+   softmaxIdx = FindUniqueConsumerForSoftmaxRewrite(graph, subOutput);
+
+   if (softmaxIdx < 0)
+      return false;
+
+   const auto &softmaxNode = graph.node(softmaxIdx);
+
+   if (softmaxNode.input_size() != 1 || softmaxNode.output_size() != 1)
+      return false;
+
+   if (softmaxNode.input(0) != subOutput)
+      return false;
+
+   return IsLastAxisSoftmaxForRewrite(softmaxNode);
+}
+
+} // namespace
+
+namespace {
+
 bool IsGraphOutput(const onnx::GraphProto &graph, const std::string &tensorName)
 {
    for (const auto &output : graph.output()) {
@@ -678,6 +904,29 @@ RModelParser_ONNX::ParseOperator(const size_t i, const onnx::GraphProto &graphpr
 
    // skip already fused operators
    if (fFusedOperators[idx]) return nullptr;
+
+   // Softmax already performs its own numerically stable maximum subtraction.
+   // Remove an explicit ReduceMax(X, -1) -> Sub(X, max) stabilization prefix.
+   if (op_type == "ReduceMax") {
+      int subIdx = -1;
+      int softmaxIdx = -1;
+
+      if (TryMatchRedundantSoftmaxStabilization(graphproto, idx, subIdx, softmaxIdx)) {
+         onnx::NodeProto rewrittenSoftmax = graphproto.node(softmaxIdx);
+         rewrittenSoftmax.set_input(0, nodeproto.input(0));
+
+         auto op = ParseSoftmax(*this, rewrittenSoftmax);
+
+         fFusedOperators[subIdx] = true;
+         fFusedOperators[softmaxIdx] = true;
+
+         if (fVerbose) {
+            std::cout << "\tRemoved redundant ReduceMax -> Sub stabilization before Softmax" << std::endl;
+         }
+
+         return op;
+      }
+   }
 
    if (op_type == "ReduceL2") {
       int clipIdx = -1;
