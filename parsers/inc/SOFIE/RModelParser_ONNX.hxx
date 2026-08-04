@@ -44,6 +44,8 @@ private:
    std::vector<bool> fFusedOperators;
    // Maps an absorbed Transpose output to its original input tensor.
    std::unordered_map<std::string, std::string> fFusedTransposeInputs;
+   // Maps the output of a proven transparent operator to its original tensor.
+   std::unordered_map<std::string, std::string> fTensorAliases;
 
 
 public:
@@ -73,6 +75,10 @@ public:
    void RegisterFusedTransposeInput(const std::string &transposeOutput, const std::string &transposeInput);
 
    MatMulInputInfo ConsumeFusedTransposeInput(const std::string &matmulInput);
+
+   void RegisterTensorAlias(const std::string &aliasOutput, const std::string &aliasInput);
+
+   std::string ResolveTensorAlias(const std::string &tensorName) const;
 
    // Parse the index'th node from the ONNX graph
    std::unique_ptr<ROperator> ParseOperator(const size_t /*index*/, const onnx::GraphProto & /*graphproto*/,

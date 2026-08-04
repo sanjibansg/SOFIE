@@ -360,6 +360,45 @@ ETensorType RModelParser_ONNX::GetTensorType(const std::string &name)
    return fTensorTypeMap[UTILITY::Clean_name(name)];
 }
 
+void RModelParser_ONNX::RegisterTensorAlias(const std::string &aliasOutput, const std::string &aliasInput)
+{
+   const std::string outputName = UTILITY::Clean_name(aliasOutput);
+   const std::string inputName = UTILITY::Clean_name(ResolveTensorAlias(aliasInput));
+
+   if (outputName.empty() || inputName.empty())
+      throw std::runtime_error("TMVA::SOFIE cannot register an empty tensor alias");
+
+   if (outputName == inputName)
+      return;
+
+   const auto [it, inserted] = fTensorAliases.emplace(outputName, inputName);
+
+   if (!inserted && it->second != inputName) {
+      throw std::runtime_error("TMVA::SOFIE found conflicting aliases for tensor " + outputName);
+   }
+}
+
+   std::string RModelParser_ONNX::ResolveTensorAlias(const std::string &tensorName) const
+{
+   const std::string originalName = tensorName;
+   std::string currentName = UTILITY::Clean_name(tensorName);
+   std::unordered_set<std::string> visited;
+   bool resolvedAlias = false;
+
+   while (true) {
+      if (!visited.insert(currentName).second)
+         throw std::runtime_error("TMVA::SOFIE found a cycle in tensor aliases");
+
+      const auto aliasIt = fTensorAliases.find(currentName);
+
+      if (aliasIt == fTensorAliases.end())
+         return resolvedAlias ? currentName : originalName;
+
+      currentName = aliasIt->second;
+      resolvedAlias = true;
+   }
+}
+
 namespace {
 
 bool IsGraphOutputForSoftmaxRewrite(const onnx::GraphProto &graph, const std::string &tensorName)
@@ -817,8 +856,7 @@ bool HasLastAxisReduce(const onnx::NodeProto &reduceNode)
    return keepdims == 1 && axes.size() == 1 && axes[0] == -1;
 }
 
-bool TryMatchL2Normalization(const onnx::GraphProto &graph, int reduceIdx,
-   int &clipIdx, int &expandIdx, int &divIdx, float &epsilon)
+bool TryMatchL2Normalization(const onnx::GraphProto &graph, int reduceIdx, int &clipIdx, int &expandIdx, int &divIdx, float &epsilon)
 {
    const auto &reduceNode = graph.node(reduceIdx);
 
@@ -887,79 +925,6 @@ bool TryMatchL2Normalization(const onnx::GraphProto &graph, int reduceIdx,
    return true;
 }
 
-struct TransparentL2AdapterMatch {
-   int adapterIdx = -1;
-   int reduceIdx = -1;
-   int clipIdx = -1;
-   int shapeIdx = -1;
-   int expandIdx = -1;
-   int divIdx = -1;
-   std::string sourceInput;
-   float epsilon = 0.0f;
-};
-
-int FindUniqueConsumerNodeByType(const onnx::GraphProto &graph, const std::string &tensorName,
-                                 const std::string &operatorType)
-{
-   int consumerIdx = -1;
-
-   for (int nodeIdx = 0; nodeIdx < graph.node_size(); ++nodeIdx) {
-      const auto &node = graph.node(nodeIdx);
-      bool consumesTensor = false;
-
-      for (const auto &input : node.input()) {
-         if (input == tensorName) {
-            consumesTensor = true;
-            break;
-         }
-      }
-
-      if (!consumesTensor || node.op_type() != operatorType)
-         continue;
-
-      if (consumerIdx >= 0)
-         return -1;
-
-      consumerIdx = nodeIdx;
-   }
-
-   return consumerIdx;
-}
-
-bool HasOnlyExpectedL2Consumers(const onnx::GraphProto &graph, const std::string &tensorName,
-                                int reduceIdx, int shapeIdx, int divIdx)
-{
-   bool hasReduce = false;
-   bool hasShape = false;
-   bool hasDiv = false;
-
-   for (int nodeIdx = 0; nodeIdx < graph.node_size(); ++nodeIdx) {
-      const auto &node = graph.node(nodeIdx);
-      bool consumesTensor = false;
-
-      for (const auto &input : node.input()) {
-         if (input == tensorName) {
-            consumesTensor = true;
-            break;
-         }
-      }
-
-      if (!consumesTensor)
-         continue;
-
-      if (nodeIdx == reduceIdx)
-         hasReduce = true;
-      else if (nodeIdx == shapeIdx)
-         hasShape = true;
-      else if (nodeIdx == divIdx)
-         hasDiv = true;
-      else
-         return false;
-   }
-
-   return hasReduce && hasShape && hasDiv;
-}
-
 bool TryGetCastTargetType(const onnx::NodeProto &castNode, int64_t &targetType)
 {
    for (const auto &attribute : castNode.attribute()) {
@@ -972,90 +937,55 @@ bool TryGetCastTargetType(const onnx::NodeProto &castNode, int64_t &targetType)
    return false;
 }
 
-bool TryMatchTransparentL2Adapter(RModelParser_ONNX &parser, const onnx::GraphProto &graph,
-                                  int adapterIdx, TransparentL2AdapterMatch &match)
+bool GraphReferencesTensor(const onnx::GraphProto &graph, const std::string &tensorName)
 {
-   match = TransparentL2AdapterMatch{};
+   for (const auto &node : graph.node()) {
+      for (const auto &inputName : node.input()) {
+         if (inputName == tensorName)
+            return true;
+      }
 
-   if (adapterIdx < 0 || adapterIdx >= graph.node_size())
-      return false;
+      for (const auto &attribute : node.attribute()) {
+         if (attribute.has_g() && GraphReferencesTensor(attribute.g(), tensorName))
+            return true;
 
-   const auto &adapterNode = graph.node(adapterIdx);
-   const bool isIdentity = adapterNode.op_type() == "Identity";
-   const bool isCast = adapterNode.op_type() == "Cast";
-
-   if ((!isIdentity && !isCast) || adapterNode.input_size() != 1 ||
-       adapterNode.output_size() != 1)
-      return false;
-
-   const std::string sourceInput = adapterNode.input(0);
-   const std::string normalizedInput = adapterNode.output(0);
-
-   if (sourceInput.empty() || normalizedInput.empty() ||
-       IsGraphOutput(graph, normalizedInput))
-      return false;
-
-   // The existing fused L2 operator currently supports FLOAT only.
-   if (!parser.IsRegisteredTensorType(sourceInput) ||
-       parser.GetTensorType(sourceInput) != ETensorType::FLOAT)
-      return false;
-
-   if (isCast) {
-      int64_t targetType = -1;
-
-      if (!TryGetCastTargetType(adapterNode, targetType) ||
-          targetType != onnx::TensorProto_DataType_FLOAT)
-         return false;
+         for (const auto &nestedGraph : attribute.graphs()) {
+            if (GraphReferencesTensor(nestedGraph, tensorName))
+               return true;
+         }
+      }
    }
 
-   const int reduceIdx =
-      FindUniqueConsumerNodeByType(graph, normalizedInput, "ReduceL2");
+   return false;
+}
 
-   if (reduceIdx < 0)
-      return false;
+bool IsReferencedByNestedGraph(const onnx::GraphProto &graph, const std::string &tensorName)
+{
+   for (const auto &node : graph.node()) {
+      for (const auto &attribute : node.attribute()) {
+         if (attribute.has_g() && GraphReferencesTensor(attribute.g(), tensorName))
+            return true;
 
-   int clipIdx = -1;
-   int expandIdx = -1;
-   int divIdx = -1;
-   float epsilon = 0.0f;
+         for (const auto &nestedGraph : attribute.graphs()) {
+            if (GraphReferencesTensor(nestedGraph, tensorName))
+               return true;
+         }
+      }
+   }
 
-   if (!TryMatchL2Normalization(graph, reduceIdx, clipIdx, expandIdx, divIdx, epsilon))
-      return false;
+   return false;
+}
 
-   const auto &reduceNode = graph.node(reduceIdx);
+onnx::NodeProto ResolveNodeInputs(const RModelParser_ONNX &parser, const onnx::NodeProto &node)
+{
+   onnx::NodeProto resolvedNode = node;
 
-   if (reduceNode.input(0) != normalizedInput)
-      return false;
+   for (int inputIdx = 0; inputIdx < resolvedNode.input_size(); ++inputIdx) {
+      if (!resolvedNode.input(inputIdx).empty())
+         resolvedNode.set_input(inputIdx, parser.ResolveTensorAlias(resolvedNode.input(inputIdx)));
+   }
 
-   const auto &expandNode = graph.node(expandIdx);
-   const int shapeIdx = FindProducerNode(graph, expandNode.input(1));
-
-   if (shapeIdx < 0)
-      return false;
-
-   const auto &shapeNode = graph.node(shapeIdx);
-
-   if (shapeNode.op_type() != "Shape" || shapeNode.input_size() != 1 ||
-       shapeNode.output_size() != 1 || shapeNode.input(0) != normalizedInput)
-      return false;
-
-   if (IsGraphOutput(graph, shapeNode.output(0)) ||
-       FindSingleConsumerNode(graph, shapeNode.output(0)) != expandIdx)
-      return false;
-
-   if (!HasOnlyExpectedL2Consumers(graph, normalizedInput, reduceIdx, shapeIdx, divIdx))
-      return false;
-
-   match.adapterIdx = adapterIdx;
-   match.reduceIdx = reduceIdx;
-   match.clipIdx = clipIdx;
-   match.shapeIdx = shapeIdx;
-   match.expandIdx = expandIdx;
-   match.divIdx = divIdx;
-   match.sourceInput = sourceInput;
-   match.epsilon = epsilon;
-
-   return true;
+   return resolvedNode;
 }
 
 } // anonymous namespace
@@ -1067,13 +997,44 @@ RModelParser_ONNX::ParseOperator(const size_t i, const onnx::GraphProto &graphpr
    if (i >= nodes.size())
       throw std::runtime_error("TMVA::SOFIE - Error in parsing ordered operators " + std::to_string(i) + " is >=  " + std::to_string(nodes.size()));
    int idx = nodes[i];
-   const auto &nodeproto = graphproto.node(idx);
+   const auto &graphNode = graphproto.node(idx);
+   onnx::NodeProto nodeproto = ResolveNodeInputs(*this, graphNode);
    const std::string op_type = nodeproto.op_type();
    if (fVerbose)
       std::cout << "Parsing operator " << op_type << std::endl;
 
    // skip already fused operators
    if (fFusedOperators[idx]) return nullptr;
+
+   // Eliminate operators proven to preserve both values and element type.
+   if ((op_type == "Identity" || op_type == "Cast") && nodeproto.input_size() == 1 && nodeproto.output_size() == 1) {
+      const std::string sourceInput = nodeproto.input(0);
+      const std::string aliasOutput = graphNode.output(0);
+      const bool outputCanBeAliased = !sourceInput.empty() && !aliasOutput.empty() &&
+         !IsGraphOutput(graphproto, aliasOutput)
+         && !IsReferencedByNestedGraph(graphproto, aliasOutput) && IsRegisteredTensorType(sourceInput);
+
+      if (outputCanBeAliased) {
+         const ETensorType sourceType = GetTensorType(sourceInput);
+         bool isTransparent = op_type == "Identity";
+
+         if (op_type == "Cast") {
+            int64_t targetType = -1;
+            isTransparent = TryGetCastTargetType(graphNode, targetType) && targetType == static_cast<int64_t>(sourceType);
+         }
+
+         if (isTransparent) {
+            RegisterTensorAlias(aliasOutput, sourceInput);
+            RegisterTensorType(aliasOutput, sourceType);
+
+            if (fVerbose)
+               std::cout << "\tAliased transparent " << op_type << " output "
+               << aliasOutput << " to " << sourceInput << std::endl;
+
+            return nullptr;
+         }
+      }
+   }
 
    // Softmax already performs its own numerically stable maximum subtraction.
    // Remove an explicit ReduceMax(X, -1) -> Sub(X, max) stabilization prefix.
@@ -1082,7 +1043,7 @@ RModelParser_ONNX::ParseOperator(const size_t i, const onnx::GraphProto &graphpr
       int softmaxIdx = -1;
 
       if (TryMatchRedundantSoftmaxStabilization(graphproto, idx, subIdx, softmaxIdx)) {
-         onnx::NodeProto rewrittenSoftmax = graphproto.node(softmaxIdx);
+         onnx::NodeProto rewrittenSoftmax = ResolveNodeInputs(*this, graphproto.node(softmaxIdx));
          rewrittenSoftmax.set_input(0, nodeproto.input(0));
 
          auto op = ParseSoftmax(*this, rewrittenSoftmax);
@@ -1098,24 +1059,6 @@ RModelParser_ONNX::ParseOperator(const size_t i, const onnx::GraphProto &graphpr
       }
    }
 
-   // A transparent adapter can be removed, but keep the fused
-   // L2Normalization at the original ReduceL2 scheduling position.
-   if (op_type == "Cast" || op_type == "Identity") {
-      TransparentL2AdapterMatch match;
-
-      if (TryMatchTransparentL2Adapter(*this, graphproto, idx, match)) {
-         // Shape may be ordered independently of ReduceL2, so mark it now.
-         // The remaining normalization nodes are marked when ReduceL2 is parsed.
-         fFusedOperators[idx] = true;
-         fFusedOperators[match.shapeIdx] = true;
-
-         if (fVerbose)
-            std::cout << "\tRemoved transparent adapter before L2Normalization" << std::endl;
-
-         return nullptr;
-      }
-   }
-
    if (op_type == "ReduceL2") {
       int clipIdx = -1;
       int expandIdx = -1;
@@ -1123,37 +1066,7 @@ RModelParser_ONNX::ParseOperator(const size_t i, const onnx::GraphProto &graphpr
       float epsilon = 0.0f;
 
       if (TryMatchL2Normalization(graphproto, idx, clipIdx, expandIdx, divIdx, epsilon)) {
-         const int adapterIdx = FindProducerNode(graphproto, nodeproto.input(0));
-         TransparentL2AdapterMatch adapterMatch;
-
-         const bool hasTransparentAdapter =
-            adapterIdx >= 0 &&
-            fFusedOperators[adapterIdx] &&
-            TryMatchTransparentL2Adapter(*this, graphproto, adapterIdx, adapterMatch) &&
-            adapterMatch.reduceIdx == idx;
-
-         std::unique_ptr<ROperator> op;
-
-         if (hasTransparentAdapter) {
-            onnx::NodeProto rewrittenReduce = nodeproto;
-            rewrittenReduce.set_input(0, adapterMatch.sourceInput);
-
-            op = ParseFuseL2Normalization(
-               *this,
-               rewrittenReduce,
-               graphproto.node(divIdx),
-               epsilon
-            );
-
-            fFusedOperators[adapterMatch.shapeIdx] = true;
-         } else {
-            op = ParseFuseL2Normalization(
-               *this,
-               nodeproto,
-               graphproto.node(divIdx),
-               epsilon
-            );
-         }
+         auto op = ParseFuseL2Normalization(*this, nodeproto, graphproto.node(divIdx), epsilon);
 
          fFusedOperators[clipIdx] = true;
          fFusedOperators[expandIdx] = true;
@@ -1164,54 +1077,48 @@ RModelParser_ONNX::ParseOperator(const size_t i, const onnx::GraphProto &graphpr
    }
 
    // try to fuse with following operator in case it is not last one
+   // Try to fuse with the following operator when this node has one child.
    if (children.size() == 1) {
       const int idx2 = children.front();
+      const onnx::NodeProto childNode = ResolveNodeInputs(*this, graphproto.node(idx2));
 
       if (op_type == "Transpose") {
-         const auto &childNode = graphproto.node(idx2);
-
          const bool validNodeShape = nodeproto.input_size() == 1 && nodeproto.output_size() == 1;
-         const bool childIsMatMul = idx2 < graphproto.node_size() && childNode.op_type() == "MatMul";
+         const bool childIsMatMul = childNode.op_type() == "MatMul";
          const bool validMatMulInputs = childIsMatMul && childNode.input_size() == 2;
          const bool outputIsVisible = validNodeShape && IsGraphOutput(graphproto, nodeproto.output(0));
          const bool validPermutation = validNodeShape && IsLastTwoAxesTranspose(nodeproto, graphproto);
-         const bool supportedType = validNodeShape && IsRegisteredTensorType(nodeproto.input(0)) &&
-                                    GetTensorType(nodeproto.input(0)) == ETensorType::FLOAT;
+         const bool supportedType = validNodeShape && IsRegisteredTensorType(nodeproto.input(0)) && GetTensorType(nodeproto.input(0)) == ETensorType::FLOAT;
 
          if (validMatMulInputs && !outputIsVisible && validPermutation && supportedType) {
             RegisterFusedTransposeInput(nodeproto.output(0), nodeproto.input(0));
             return nullptr;
          }
       } else if (op_type == "MatMul") {
-        // Fuse MatMul and Add
-         if (idx2 < graphproto.node_size() && graphproto.node(idx2).op_type() == "Add") {
+         if (childNode.op_type() == "Add") {
             fFusedOperators[idx2] = true;
-            return ParseFuseMatMulAdd(*this, graphproto.node(idx), graphproto.node(idx2));
+            return ParseFuseMatMulAdd(*this, nodeproto, childNode);
          }
-         else {
-            return ParseMatMul(*this, graphproto.node(idx));
-         }
-      } else if (nodeproto.op_type() == "Conv" || nodeproto.op_type() == "ConvTranspose") {
-      // Fuse Conv or ConvTranspose without bias and Add
-         if (idx2 < graphproto.node_size() && graphproto.node(idx2).op_type() == "Add") {
-            if (nodeproto.op_type() == "Conv") {
-               fFusedOperators[idx2] = true;
-               return ParseFuseConvAdd(*this, graphproto.node(idx), graphproto.node(idx2));
-            } else {
-               fFusedOperators[idx2] = true;
-               return ParseFuseConvTransposeAdd(*this, graphproto.node(idx), graphproto.node(idx2));
-            }
-         }
-      } else if (nodeproto.op_type() == "Gemm") {
-         // Fuse Gemm with activation operators
-         if (idx2 < graphproto.node_size() && graphproto.node(idx2).op_type() == "Relu") {
+
+         return ParseMatMul(*this, nodeproto);
+      } else if (op_type == "Conv" || op_type == "ConvTranspose") {
+         if (childNode.op_type() == "Add") {
             fFusedOperators[idx2] = true;
-            return ParseFuseGemmRelu(*this, graphproto.node(idx), graphproto.node(idx2));
+
+            if (op_type == "Conv")
+               return ParseFuseConvAdd(*this, nodeproto, childNode);
+
+            return ParseFuseConvTransposeAdd(*this, nodeproto, childNode);
          }
-      } else if (nodeproto.op_type() == "BatchNormalization") {
-         if (idx2 < graphproto.node_size() && graphproto.node(idx2).op_type() == "Relu") {
+      } else if (op_type == "Gemm") {
+         if (childNode.op_type() == "Relu") {
             fFusedOperators[idx2] = true;
-            return ParseFuseBatchnormRelu(*this, graphproto.node(idx), graphproto.node(idx2));
+            return ParseFuseGemmRelu(*this, nodeproto, childNode);
+         }
+      } else if (op_type == "BatchNormalization") {
+         if (childNode.op_type() == "Relu") {
+            fFusedOperators[idx2] = true;
+            return ParseFuseBatchnormRelu(*this, nodeproto, childNode);
          }
       }
    }
@@ -1236,6 +1143,7 @@ RModel RModelParser_ONNX::Parse(std::string filename, bool verbose)
 
    fTensorTypeMap.clear();
    fFusedTransposeInputs.clear();
+   fTensorAliases.clear();
 
    auto model = LoadModel(filename);
    if (!model)
@@ -1644,10 +1552,12 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
    // corrupt the parent graph's fused-operator bookkeeping.
    auto savedFusedOperators = std::move(fFusedOperators);
    auto savedFusedTransposeInputs = std::move(fFusedTransposeInputs);
+   auto savedTensorAliases = std::move(fTensorAliases);
 
    size_t node_order_exec = 0;
    fFusedOperators = std::vector<bool>(graph.node_size(), false);
    fFusedTransposeInputs.clear();
+   fTensorAliases.clear();
    for (int i = 0; i < graph.node_size(); i++) {
       std::string op_type = graph.node(nodesOrder[i]).op_type();
 
@@ -1676,6 +1586,7 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
    // for the top-level call, which is fine — we're done with the loop).
    fFusedOperators = std::move(savedFusedOperators);
    fFusedTransposeInputs = std::move(savedFusedTransposeInputs);
+   fTensorAliases = std::move(savedTensorAliases);
 
    std::vector<std::string> outputnames;
    if (verbose)
