@@ -887,6 +887,176 @@ bool TryMatchL2Normalization(const onnx::GraphProto &graph, int reduceIdx,
    return true;
 }
 
+struct TransparentL2AdapterMatch {
+   int adapterIdx = -1;
+   int reduceIdx = -1;
+   int clipIdx = -1;
+   int shapeIdx = -1;
+   int expandIdx = -1;
+   int divIdx = -1;
+   std::string sourceInput;
+   float epsilon = 0.0f;
+};
+
+int FindUniqueConsumerNodeByType(const onnx::GraphProto &graph, const std::string &tensorName,
+                                 const std::string &operatorType)
+{
+   int consumerIdx = -1;
+
+   for (int nodeIdx = 0; nodeIdx < graph.node_size(); ++nodeIdx) {
+      const auto &node = graph.node(nodeIdx);
+      bool consumesTensor = false;
+
+      for (const auto &input : node.input()) {
+         if (input == tensorName) {
+            consumesTensor = true;
+            break;
+         }
+      }
+
+      if (!consumesTensor || node.op_type() != operatorType)
+         continue;
+
+      if (consumerIdx >= 0)
+         return -1;
+
+      consumerIdx = nodeIdx;
+   }
+
+   return consumerIdx;
+}
+
+bool HasOnlyExpectedL2Consumers(const onnx::GraphProto &graph, const std::string &tensorName,
+                                int reduceIdx, int shapeIdx, int divIdx)
+{
+   bool hasReduce = false;
+   bool hasShape = false;
+   bool hasDiv = false;
+
+   for (int nodeIdx = 0; nodeIdx < graph.node_size(); ++nodeIdx) {
+      const auto &node = graph.node(nodeIdx);
+      bool consumesTensor = false;
+
+      for (const auto &input : node.input()) {
+         if (input == tensorName) {
+            consumesTensor = true;
+            break;
+         }
+      }
+
+      if (!consumesTensor)
+         continue;
+
+      if (nodeIdx == reduceIdx)
+         hasReduce = true;
+      else if (nodeIdx == shapeIdx)
+         hasShape = true;
+      else if (nodeIdx == divIdx)
+         hasDiv = true;
+      else
+         return false;
+   }
+
+   return hasReduce && hasShape && hasDiv;
+}
+
+bool TryGetCastTargetType(const onnx::NodeProto &castNode, int64_t &targetType)
+{
+   for (const auto &attribute : castNode.attribute()) {
+      if (attribute.name() == "to") {
+         targetType = attribute.i();
+         return true;
+      }
+   }
+
+   return false;
+}
+
+bool TryMatchTransparentL2Adapter(RModelParser_ONNX &parser, const onnx::GraphProto &graph,
+                                  int adapterIdx, TransparentL2AdapterMatch &match)
+{
+   match = TransparentL2AdapterMatch{};
+
+   if (adapterIdx < 0 || adapterIdx >= graph.node_size())
+      return false;
+
+   const auto &adapterNode = graph.node(adapterIdx);
+   const bool isIdentity = adapterNode.op_type() == "Identity";
+   const bool isCast = adapterNode.op_type() == "Cast";
+
+   if ((!isIdentity && !isCast) || adapterNode.input_size() != 1 ||
+       adapterNode.output_size() != 1)
+      return false;
+
+   const std::string sourceInput = adapterNode.input(0);
+   const std::string normalizedInput = adapterNode.output(0);
+
+   if (sourceInput.empty() || normalizedInput.empty() ||
+       IsGraphOutput(graph, normalizedInput))
+      return false;
+
+   // The existing fused L2 operator currently supports FLOAT only.
+   if (!parser.IsRegisteredTensorType(sourceInput) ||
+       parser.GetTensorType(sourceInput) != ETensorType::FLOAT)
+      return false;
+
+   if (isCast) {
+      int64_t targetType = -1;
+
+      if (!TryGetCastTargetType(adapterNode, targetType) ||
+          targetType != onnx::TensorProto_DataType_FLOAT)
+         return false;
+   }
+
+   const int reduceIdx =
+      FindUniqueConsumerNodeByType(graph, normalizedInput, "ReduceL2");
+
+   if (reduceIdx < 0)
+      return false;
+
+   int clipIdx = -1;
+   int expandIdx = -1;
+   int divIdx = -1;
+   float epsilon = 0.0f;
+
+   if (!TryMatchL2Normalization(graph, reduceIdx, clipIdx, expandIdx, divIdx, epsilon))
+      return false;
+
+   const auto &reduceNode = graph.node(reduceIdx);
+
+   if (reduceNode.input(0) != normalizedInput)
+      return false;
+
+   const auto &expandNode = graph.node(expandIdx);
+   const int shapeIdx = FindProducerNode(graph, expandNode.input(1));
+
+   if (shapeIdx < 0)
+      return false;
+
+   const auto &shapeNode = graph.node(shapeIdx);
+
+   if (shapeNode.op_type() != "Shape" || shapeNode.input_size() != 1 ||
+       shapeNode.output_size() != 1 || shapeNode.input(0) != normalizedInput)
+      return false;
+
+   if (IsGraphOutput(graph, shapeNode.output(0)) ||
+       FindSingleConsumerNode(graph, shapeNode.output(0)) != expandIdx)
+      return false;
+
+   if (!HasOnlyExpectedL2Consumers(graph, normalizedInput, reduceIdx, shapeIdx, divIdx))
+      return false;
+
+   match.adapterIdx = adapterIdx;
+   match.reduceIdx = reduceIdx;
+   match.clipIdx = clipIdx;
+   match.shapeIdx = shapeIdx;
+   match.expandIdx = expandIdx;
+   match.divIdx = divIdx;
+   match.sourceInput = sourceInput;
+   match.epsilon = epsilon;
+
+   return true;
+}
 
 } // anonymous namespace
 
@@ -928,6 +1098,24 @@ RModelParser_ONNX::ParseOperator(const size_t i, const onnx::GraphProto &graphpr
       }
    }
 
+   // A transparent adapter can be removed, but keep the fused
+   // L2Normalization at the original ReduceL2 scheduling position.
+   if (op_type == "Cast" || op_type == "Identity") {
+      TransparentL2AdapterMatch match;
+
+      if (TryMatchTransparentL2Adapter(*this, graphproto, idx, match)) {
+         // Shape may be ordered independently of ReduceL2, so mark it now.
+         // The remaining normalization nodes are marked when ReduceL2 is parsed.
+         fFusedOperators[idx] = true;
+         fFusedOperators[match.shapeIdx] = true;
+
+         if (fVerbose)
+            std::cout << "\tRemoved transparent adapter before L2Normalization" << std::endl;
+
+         return nullptr;
+      }
+   }
+
    if (op_type == "ReduceL2") {
       int clipIdx = -1;
       int expandIdx = -1;
@@ -935,11 +1123,43 @@ RModelParser_ONNX::ParseOperator(const size_t i, const onnx::GraphProto &graphpr
       float epsilon = 0.0f;
 
       if (TryMatchL2Normalization(graphproto, idx, clipIdx, expandIdx, divIdx, epsilon)) {
+         const int adapterIdx = FindProducerNode(graphproto, nodeproto.input(0));
+         TransparentL2AdapterMatch adapterMatch;
+
+         const bool hasTransparentAdapter =
+            adapterIdx >= 0 &&
+            fFusedOperators[adapterIdx] &&
+            TryMatchTransparentL2Adapter(*this, graphproto, adapterIdx, adapterMatch) &&
+            adapterMatch.reduceIdx == idx;
+
+         std::unique_ptr<ROperator> op;
+
+         if (hasTransparentAdapter) {
+            onnx::NodeProto rewrittenReduce = nodeproto;
+            rewrittenReduce.set_input(0, adapterMatch.sourceInput);
+
+            op = ParseFuseL2Normalization(
+               *this,
+               rewrittenReduce,
+               graphproto.node(divIdx),
+               epsilon
+            );
+
+            fFusedOperators[adapterMatch.shapeIdx] = true;
+         } else {
+            op = ParseFuseL2Normalization(
+               *this,
+               nodeproto,
+               graphproto.node(divIdx),
+               epsilon
+            );
+         }
+
          fFusedOperators[clipIdx] = true;
          fFusedOperators[expandIdx] = true;
          fFusedOperators[divIdx] = true;
 
-         return ParseFuseL2Normalization(*this, nodeproto, graphproto.node(divIdx), epsilon);
+         return op;
       }
    }
 
