@@ -13,6 +13,10 @@
 #include "input_models/references/Exp.ref.hxx"
 #include "input_models/references/Log.ref.hxx"
 #include "input_models/references/Neg.ref.hxx"
+#include "HardSigmoid_FromONNX_GPU_ALPAKA.hxx"
+#include "HardSwish_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/HardSigmoid.ref.hxx"
+#include "input_models/references/HardSwish.ref.hxx"
 #include "Softplus_FromONNX_GPU_ALPAKA.hxx"
 #include "Elu_FromONNX_GPU_ALPAKA.hxx"
 #include "input_models/references/Elu.ref.hxx"
@@ -355,5 +359,88 @@ TEST_F(SofieAlpakaTest, Elu)
     for (size_t i = 0; i < nOut; ++i) {
         EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
     }
+}
+
+
+TEST_F(SofieAlpakaTest, HardSigmoid)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+   std::vector<float> input({
+      -10.0f, -6.0f, -3.0f, -1.0f, 0.0f, 1.0f, 3.0f, 6.0f, 10.0f, 16.0f, 20.0f, 
+      -4.52299976f, -2.11800003f, -0.68800002f, -0.15099999f, 0.09799999f, 0.43599998f, 
+      1.22300004f, 2.70499992f, 4.33099985f, 8.08300018f, 14.6459999f, 18.2789993f, 25.0f
+   });
+
+   auto A = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+   float *A_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(A));
+
+   for (Idx i = 0; i < input.size(); ++i) {
+      A_ptr[i] = input[i];
+   }
+
+   auto A_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+   alpaka::memcpy(queue, A_d, A);
+   alpaka::wait(queue);
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+   
+   {
+      SOFIE_HardSigmoid::Session<alpaka::TagGpuCudaRt> session("HardSigmoid_FromONNX_GPU_ALPAKA.dat");
+      auto result = session.infer(A_d);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+   
+   float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float *correct = HardSigmoid_ExpectedOutput::outputs;
+
+   for (size_t i = 0; i < input.size(); ++i) {
+      EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE);
+   }
+}
+
+TEST_F(SofieAlpakaTest, HardSwish)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+   std::vector<float> input({
+      -10.0f, -6.0f, -3.0f, -1.0f, 0.0f, 1.0f, 3.0f, 6.0f, 10.0f, 16.0f, 20.0f, 
+      -4.52299976f, -2.11800003f, -0.68800002f, -0.15099999f, 0.09799999f, 0.43599998f, 
+      1.22300004f, 2.70499992f, 4.33099985f, 8.08300018f, 14.6459999f, 18.2789993f, 25.0f
+   });
+
+   auto A = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+   float *A_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(A));
+
+   for (Idx i = 0; i < input.size(); ++i) {
+      A_ptr[i] = input[i];
+   }
+
+   auto A_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+   alpaka::memcpy(queue, A_d, A);
+   alpaka::wait(queue);
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+   
+   {
+      SOFIE_HardSwish::Session<alpaka::TagGpuCudaRt> session("HardSwish_FromONNX_GPU_ALPAKA.dat");
+      auto result = session.infer(A_d);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+   
+   float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float *correct = HardSwish_ExpectedOutput::outputs;
+
+   for (size_t i = 0; i < input.size(); ++i) {
+      EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE);
+   }
 }
 

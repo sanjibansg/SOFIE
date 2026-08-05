@@ -33,6 +33,8 @@ target_include_directories(SOFIE_parsers
 set(sources_cxx
     src/RModelParser_ONNX.cxx
     src/ParseBasicUnary.cxx
+    ParseHardSigmoid.cxx
+    ParseHardSwish.cxx
     src/ParseBasicBinary.cxx
     src/ParseBasicIs.cxx
     src/ParseBatchNormalization.cxx
