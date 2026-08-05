@@ -14,6 +14,7 @@
 #include "SOFIE/RModelProfiler.hxx"
 #include "SOFIE/RWeightFile.hxx"
 #include "SOFIE/SOFIE_common.hxx"
+#include "SOFIE/ROperator_Cast.hxx"
 #include "SOFIE/ROperator_Gemm.hxx"
 #include "SOFIE/ROperator_ONNXQuantizeLinear.hxx"
 #include "SOFIE/ROperator_Transpose.hxx"
@@ -66,6 +67,18 @@ void RModel::BuildLoweredOperatorView(EQuantizedBackend backend)
    fLoweredConsumedOperatorIndices.clear();
    PrepareQuantizedTensorStorage(backend);
    AddLoweredQuantizedOperators(backend);
+   // Canonicalization before any further absorption: the duplicates an exporter emits are
+   // what makes a carrier look like it has several consumers, and several passes below
+   // decline on exactly that. Placed after region lowering rather than before analysis
+   // because the region plans already name specific boundary operators.
+   DeduplicateCarrierDecodes(backend);
+   // Also canonicalization, and before S56: a no-op Clip is still an operator, and S56's walk
+   // stops at one. Dropping it is what lets those chains be seen as the movement they are.
+   DropNoOpClipsBeforeQuantize(backend);
+   // Before the fusion, which would collapse the Quantize that produces a propagated
+   // carrier into a float round trip and leave the rewired movement reading a carrier
+   // nothing writes.
+   PropagateLowPrecisionThroughMovement(backend);
    // Both must only see the boundaries no region absorbed, and dead-code elimination
    // must see the final emit set, so it runs after the fusion rather than before.
    FuseUnabsorbedFakeQuantBoundaries();
@@ -74,6 +87,8 @@ void RModel::BuildLoweredOperatorView(EQuantizedBackend backend)
    EliminateDeadOperators();
    FuseSoftmaxClipBoundaries();
    EliminateDeadOperators();
+   // Last: the residual is only meaningful once every absorption has had its chance.
+   CheckLowPrecisionCarrierFrontier();
 }
 
 void RModel::CanonicaliseBatchedMatMulOperands()
@@ -102,8 +117,8 @@ void RModel::CanonicaliseBatchedMatMulOperands()
       if (gemm == nullptr || gemm->GetTransA() != 0 || gemm->GetTransB() != 0 || gemm->HasBias())
          continue;
 
-      // Walks back from the B operand, through any fake-quant, to the Transpose that lays
-      // it out. Every tensor on the way must be read only here.
+      // Walks back from the B operand, through any low-precision staging, to the Transpose
+      // that lays it out. Every tensor on the way must be read only here.
       std::string cursor = gemm->GetWeightTensorName();
       ROperator_Transpose<float> *transpose = nullptr;
       for (int hop = 0; hop < 3 && !cursor.empty(); ++hop) {
@@ -123,6 +138,15 @@ void RModel::CanonicaliseBatchedMatMulOperands()
          }
          if (auto *quantize = dynamic_cast<ROperator_ONNXQuantizeLinear *>(op)) {
             cursor = quantize->GetInputTensor();
+            continue;
+         }
+         // A Cast stages the operand in a native low-precision graph where the int8
+         // spelling has a fake-quant pair; both retype without moving elements.
+         if (dynamic_cast<ROperator_Cast *>(op) != nullptr) {
+            const auto castInputs = op->GetOpInputTensors();
+            if (castInputs.empty())
+               break;
+            cursor = std::string(castInputs[0]);
             continue;
          }
          break;
@@ -1766,7 +1790,7 @@ void RModel::ReadInitializedTensorsFromFile(long pos) {
             std::string tensor_name = "tensor_" + i.first;
             if (i.second.type() == ETensorType::FLOAT || i.second.type() == ETensorType::INT8 ||
                 i.second.type() == ETensorType::UINT8 || i.second.type() == ETensorType::INT32 ||
-                i.second.type() == ETensorType::INT64) {
+                i.second.type() == ETensorType::INT64 || IsFP8TensorType(i.second.type())) {
                std::string length = std::to_string(ConvertShapeToLength(i.second.shape()));
                fGC += "   ReadTensorFromStream(f, " + tensor_name + ", \"" + tensor_name + "\", " + length + ");\n";
             } else {
@@ -1961,7 +1985,9 @@ long RModel::WriteInitializedTensorsToFile(std::string filename) {
                   f << static_cast<int>(data[idx]) <<  ( (idx < length-1) ? " " : "\n" );
                }
             }
-            else if (i.second.type() == ETensorType::UINT8) {
+            // An FP8 tensor is a byte carrier, so it round-trips through the same
+            // unsigned-byte spelling; the bits are the payload either way.
+            else if (i.second.type() == ETensorType::UINT8 || IsFP8TensorType(i.second.type())) {
                const uint8_t * data = i.second.data<uint8_t>();
                for (size_t idx = 0; idx < length; idx++) {
                   f << static_cast<unsigned int>(data[idx]) <<  ( (idx < length-1) ? " " : "\n" );

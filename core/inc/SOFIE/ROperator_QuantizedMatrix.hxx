@@ -298,6 +298,12 @@ struct QuantizedCudaLtFP8DenseLinearCall {
    std::string m;
    std::string n;
    std::string k;
+   QuantizedMatrixShapePolicy shapePolicy;
+   double inputScale = 1.0;
+   double weightScale = 1.0;
+   // FP8 only: grid step for an absorbed output requantize. 1 leaves the region emitting a
+   // float D, which is what every FP8 region does until the pass half of F2 lands.
+   double outputScale = 1.0;
    EQuantizedComputeProfile computeProfile = EQuantizedComputeProfile::UNDEFINED;
    ELowPrecisionCarrier inputCarrier = ELowPrecisionCarrier::UNDEFINED;
    ELowPrecisionCarrier weightCarrier = ELowPrecisionCarrier::UNDEFINED;
@@ -331,6 +337,10 @@ inline QuantizedCudaLtFP8DenseLinearCall MakeQuantizedCudaLtFP8DenseLinearCall(
    call.m = std::move(m);
    call.n = std::move(n);
    call.k = std::move(k);
+   call.shapePolicy = RequireQuantizedMatrixShapePolicy(plan, "cuBLASLt FP8 dense-linear call");
+   call.inputScale = plan.lowPrecisionInputScale;
+   call.weightScale = plan.lowPrecisionWeightScale;
+   call.outputScale = plan.lowPrecisionOutputScale;
    call.computeProfile = plan.computeProfile;
    call.inputCarrier = plan.inputLowPrecisionCarrier;
    call.weightCarrier = plan.weightLowPrecisionCarrier;
@@ -399,12 +409,37 @@ inline std::string GenerateQuantizedCudaLtFP8DenseLinearCall(const QuantizedCuda
    out << "      // Low-precision lowering capability: " << call.capabilityTag << "\n";
    out << "      // Low-precision lowering reason: " << call.reason << "\n";
    out << "      SOFIE::QuantizedFP8DenseLinearInvocation " << call.paramsName << "{};\n";
-   // NT swaps the cuBLASLt operand roles: m/n are exchanged along with the A/B pointers.
+   const bool paddedExecution = QuantizedShapePolicyUsesPadding(call.shapePolicy.policy);
+   if (paddedExecution && !call.weightIsMatrixA) {
+      throw std::runtime_error("SOFIE " + call.boundaryName +
+                               " pads the output leading dimension, which only the NT operand order supports");
+   }
+   // NT swaps the cuBLASLt operand roles: m/n are exchanged along with the A/B pointers, and
+   // a padded call runs at the physical N while keeping the logical N to slice back with.
    out << "      " << call.paramsName << ".m = static_cast<std::size_t>("
-       << (call.weightIsMatrixA ? call.n : call.m) << ");\n";
+       << (paddedExecution ? std::to_string(call.shapePolicy.physicalN)
+                           : (call.weightIsMatrixA ? call.n : call.m))
+       << ");\n";
    out << "      " << call.paramsName << ".n = static_cast<std::size_t>("
        << (call.weightIsMatrixA ? call.m : call.n) << ");\n";
+   if (paddedExecution) {
+      out << "      " << call.paramsName << ".logicalM = static_cast<std::size_t>(" << call.n << ");\n";
+      out << "      " << call.paramsName << ".paddedExecution = true;\n";
+   }
    out << "      " << call.paramsName << ".k = static_cast<std::size_t>(" << call.k << ");\n";
+   if (call.shapePolicy.batchCount > 1) {
+      // Each slice is contiguous, so the stride is its element count. The A/B strides
+      // follow the same operand swap the m/n above do.
+      const auto &shape = call.shapePolicy;
+      const auto inputStride = shape.logicalM * shape.logicalK;
+      const auto weightStride = shape.logicalK * shape.logicalN;
+      out << "      " << call.paramsName << ".batchCount = " << shape.batchCount << ";\n";
+      out << "      " << call.paramsName << ".batchStrideA = "
+          << (call.weightIsMatrixA ? weightStride : inputStride) << ";\n";
+      out << "      " << call.paramsName << ".batchStrideB = "
+          << (call.weightIsMatrixA ? inputStride : weightStride) << ";\n";
+      out << "      " << call.paramsName << ".batchStrideC = " << (shape.logicalM * shape.logicalN) << ";\n";
+   }
    out << "      " << call.paramsName << ".inputFormat = SOFIE::EQuantizedFP8Format::"
        << QuantizedCudaFP8FormatName(call.inputCarrier, call.boundaryName) << ";\n";
    out << "      " << call.paramsName << ".weightFormat = SOFIE::EQuantizedFP8Format::"
@@ -417,6 +452,16 @@ inline std::string GenerateQuantizedCudaLtFP8DenseLinearCall(const QuantizedCuda
        << std::setprecision(std::numeric_limits<float>::max_digits10) << call.alpha << ");\n";
    out << "      " << call.paramsName << ".beta = static_cast<float>("
        << std::setprecision(std::numeric_limits<float>::max_digits10) << call.beta << ");\n";
+   // Left at their defaults when unit, so an uncalibrated call emits no scale at all.
+   if (call.inputScale != 1.0 || call.weightScale != 1.0) {
+      out << std::setprecision(std::numeric_limits<float>::max_digits10);
+      out << "      " << call.paramsName << ".inputScale = static_cast<float>(" << call.inputScale << ");\n";
+      out << "      " << call.paramsName << ".weightScale = static_cast<float>(" << call.weightScale << ");\n";
+   }
+   if (call.outputScale != 1.0) {
+      out << std::setprecision(std::numeric_limits<float>::max_digits10);
+      out << "      " << call.paramsName << ".outputScale = static_cast<float>(" << call.outputScale << ");\n";
+   }
    out << "      " << call.paramsName << ".hasBias = " << (call.hasBias ? "true" : "false") << ";\n";
    out << "      " << call.paramsName << ".hasRelu = " << (call.hasRelu ? "true" : "false") << ";\n";
    out << "      " << call.paramsName << ".weightIsMatrixA = "

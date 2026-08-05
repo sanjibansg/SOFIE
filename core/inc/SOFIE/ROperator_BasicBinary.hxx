@@ -4,7 +4,9 @@
 #include "SOFIE/SOFIE_common.hxx"
 #include "SOFIE/ROperator.hxx"
 #include "SOFIE/RModel.hxx"
+#include "SOFIE/RQuantization.hxx"
 
+#include <optional>
 #include <sstream>
 
 namespace SOFIE {
@@ -71,6 +73,17 @@ struct BinaryOperatorTrait<T, FMod> {
 
 template <typename T, EBasicBinaryOperator Op>
 class ROperator_BasicBinary final : public ROperator {
+public:
+   // Add and Mul have quantized elementwise kernels and compute on codes; the rest keep the
+   // conservative default. Lets the frontier check tell an unabsorbed boundary from a
+   // legitimate one.
+   ELowPrecisionCarrierSupport CarrierSupport() const override
+   {
+      return (Op == EBasicBinaryOperator::Add || Op == EBasicBinaryOperator::Mul)
+                ? ELowPrecisionCarrierSupport::Arithmetic
+                : ELowPrecisionCarrierSupport::RequiresFloat;
+   }
+
 private:
    int fBroadcastFlag = 0;
    std::string fNA;
@@ -87,6 +100,10 @@ private:
    std::vector<Dim> fDimShapeB;
    std::vector<Dim> fDimShapeY;
 
+   // Grid of an absorbed downstream fake-quant boundary: the kernel applies the boundary's
+   // snap at its store and keeps writing float, so consumers are unaffected.
+   std::optional<QuantizationGrid> fFakeQuantGrid;
+
 public:
    ROperator_BasicBinary() {}
    ROperator_BasicBinary(std::string nameA, std::string nameB, std::string nameY)
@@ -94,6 +111,23 @@ public:
    {
       fInputTensorNames = {fNA, fNB};
       fOutputTensorNames = {fNY};
+   }
+
+   // Absorbs a downstream fake-quant boundary: the snap runs at this kernel's single store
+   // and the boundary stops emitting. A constant-folded output emits no kernel, so it cannot.
+   bool CanFuseFakeQuantOutput() const override { return !fIsOutputConstant; }
+
+   // Adopts the boundary's output tensor; the previous output is left for dead-code
+   // elimination.
+   void FuseFakeQuantOutput(const std::string &output, const QuantizationGrid &grid) override
+   {
+      if (fOutputTensorNames.empty() || std::string(fOutputTensorNames[0]) != fNY) {
+         throw std::runtime_error("TMVA::SOFIE BasicBinary cannot fold a fake-quant boundary: "
+                                  "its output tensor list does not begin with " + fNY);
+      }
+      fFakeQuantGrid = grid;
+      fNY = output;
+      fOutputTensorNames[0] = output;
    }
 
    // type of output given input
@@ -527,7 +561,17 @@ public:
       const auto flattened_index_B =
          makeFlattenedIndex(fShapeB, stridesB, isBScalar, isBContiguous);
 
-      op += "C[idx] = " + BinaryOperatorTrait<T, Op>::Op("A["+flattened_index_A+"]", "B["+flattened_index_B+"]") + ";\n";
+      const auto value =
+         BinaryOperatorTrait<T, Op>::Op("A["+flattened_index_A+"]", "B["+flattened_index_B+"]");
+      if (fFakeQuantGrid) {
+         // The absorbed boundary's snap, applied at the store instead of in a separate kernel
+         // over the same tensor: same arithmetic, one memory round trip earlier.
+         op += "T const out_val = " + value + ";\n";
+         op += FakeQuantRoundTripStatements("out_snapped", "out_val", *fFakeQuantGrid, "");
+         op += "C[idx] = static_cast<T>(out_snapped);\n";
+      } else {
+         op += "C[idx] = " + value + ";\n";
+      }
       op += "}\n}\n};\n";
       return op;
    }

@@ -50,6 +50,27 @@ public:
    // nothing has been inferred downstream yet. See RModel::CanonicaliseBatchedMatMulOperands.
    void SetPerm(std::vector<int_t> perm) { fAttrPerm = std::move(perm); }
 
+   // A transpose permutes elements without reading their values, so it is indifferent to the
+   // type of the bytes it moves and can carry a low-precision code through unchanged. Unlike
+   // a reshape it does emit a kernel and its output is real storage, so it does not alias its
+   // input and CarrierOutputAliasesInput() keeps its default.
+   ELowPrecisionCarrierSupport CarrierSupport() const override
+   {
+      return ELowPrecisionCarrierSupport::ValuePreserving;
+   }
+
+   // Legal after Initialize: only the tensor names change, and the replacements carry the same
+   // shapes as the tensors they stand in for, so the shapes derived there stay valid. Used by
+   // RModel::PropagateLowPrecisionThroughMovement to move this transpose onto the quantized
+   // carrier.
+   void RewireLowPrecisionCarrier(const std::string &nameData, const std::string &nameOutput) override
+   {
+      fNData = nameData;
+      fNOutput = nameOutput;
+      fInputTensorNames = { fNData };
+      fOutputTensorNames = { fNOutput };
+   }
+
    bool PropagatesQuantizationMetadata() const override { return true; }
 
    std::vector<int_t> GetQuantizationMetadataPermutation(std::size_t rank) const override

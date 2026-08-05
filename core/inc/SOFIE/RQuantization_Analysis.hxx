@@ -36,6 +36,9 @@ struct QuantizedDenseLinearPatternMatch {
    std::vector<std::string> reasons;
    bool isMatMul = false;
    bool hasInlineMatMulBias = false;
+   // transB == 1 standing for a physical [.., N, K] operand rather than a transpose the
+   // lowering has to perform.
+   bool hasCanonicalisedOperandB = false;
 };
 
 QuantizedDenseLinearPatternMatch MatchQuantizedDenseLinearPattern(

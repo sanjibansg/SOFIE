@@ -21,6 +21,15 @@ namespace SOFIE{
    template <typename T>
    class ROperator_Gemm final : public ROperator
    {
+   public:
+
+      // Computes on codes, but the product/sum lands on a different grid than the operands, so
+      // it needs a scale contract rather than a retyping; the low-precision kernels for this
+      // family exist. Lets the frontier check tell an unabsorbed boundary from a legitimate one.
+      ELowPrecisionCarrierSupport CarrierSupport() const override
+      {
+         return ELowPrecisionCarrierSupport::Arithmetic;
+      }
 
    private:
       bool fIsDynamic = false;

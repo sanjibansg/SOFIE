@@ -83,8 +83,10 @@ inline std::string GenerateFusedQuantizedMatMulCublasLtFP8Launch(std::string opN
        plan.weightStorageTensor.empty()) {
       throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch requires an optimized Alpaka PlainDevice FP8 plan");
    }
-   if (!QuantizedMatMulShapeIsSingleGemmExecutable(region.shape)) {
-      throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch requires rank-2 or flattenable-projection MatMul");
+   // TrueBatched is admitted here as well: the call emits batchCount and the three strides,
+   // and the FP8 runtime already programs strided-batched layouts.
+   if (!QuantizedMatMulShapeIsRecognized(region.shape)) {
+      throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch requires a recognized MatMul shape");
    }
    const auto &matrixShape =
       RequireQuantizedMatrixShapePolicy(
@@ -94,11 +96,15 @@ inline std::string GenerateFusedQuantizedMatMulCublasLtFP8Launch(std::string opN
        matrixShape.logicalN != region.shape.logicalN) {
       throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch lowering plan shape does not match the MatMul region shape");
    }
+   if (matrixShape.batchCount != region.shape.batchCount) {
+      throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch lowering plan batch count does not match the MatMul region");
+   }
    if (region.inputSourceTensor.empty() || region.outputTensor.empty()) {
       throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch is missing input/output tensors");
    }
-   if (QuantizedEpilogueHasBias(region.epilogue.kind)) {
-      throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch does not support fused bias");
+   const bool fp8HasBias = QuantizedEpilogueHasBias(region.epilogue.kind);
+   if (fp8HasBias && region.epilogue.biasSourceTensor.empty()) {
+      throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch has a bias epilogue with no bias tensor");
    }
    if (region.outputAlpha != 1.0) {
       throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch does not support an absorbed output scale");
@@ -108,8 +114,12 @@ inline std::string GenerateFusedQuantizedMatMulCublasLtFP8Launch(std::string opN
       "ROperator_QuantizedMatMul cuBLASLt FP8 dense-linear boundary " + opName,
       "quantizedMatMulCudaLtFP8State_" + opName, "params_quantizedMatMulFP8_" + opName,
       region.outputTensor, region.inputSourceTensor, plan.weightStorageTensor,
-      "", false, 1.0f, 0.0f, std::to_string(matrixShape.logicalM),
+      region.epilogue.biasSourceTensor, fp8HasBias, 1.0f, fp8HasBias ? 1.0f : 0.0f,
+      std::to_string(matrixShape.logicalM),
       std::to_string(matrixShape.logicalN), std::to_string(matrixShape.logicalK), plan);
+   // The FP8 layouts are column-major, so only the NT operand order leaves the weight at
+   // [N, K] and the result at row-major [M, N]; the weight storage is laid out to match.
+   call.weightIsMatrixA = true;
    return INTERNAL::GenerateQuantizedCudaLtFP8DenseLinearCall(call);
 }
 

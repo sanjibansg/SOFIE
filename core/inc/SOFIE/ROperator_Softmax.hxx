@@ -29,7 +29,10 @@ private:
    // Set when a following Clip, and optionally its QuantizeLinear, are absorbed into
    // pass 3. The absorbed operator's output tensor is written in place of fNY.
    std::string fFusedOutputTensor; // empty means write fNY as usual
-   std::optional<QuantizationInfo> fOutputGrid; // set means write an integer carrier
+   // Set means write a low-precision carrier rather than a float. Held as a QuantizationGrid
+   // rather than a QuantizationInfo so one encode serves int8 and FP8: the grid is the affine
+   // map plus which codes exist, which is the whole of what an encode needs.
+   std::optional<QuantizationGrid> fOutputGrid;
    bool fQuantHasClip = false;
    double fQuantClipLow = 0.0;
    double fQuantClipHigh = 0.0;
@@ -48,7 +51,15 @@ public:
    // Only the register-resident emission can fuse: the staged variant uses Y as scratch
    // for the exponentials, so Y must keep the input's width.
    bool CanFuseClip() const { return SoftmaxUsesRegisterResidentRows(); }
-   bool CanFuseQuantizedOutput() const { return CanFuseClip() && !fLogSoftmax; }
+   // A log-softmax output is not on the grid the boundary describes, so it cannot encode.
+   bool CanFuseQuantizedOutput() const override { return CanFuseClip() && !fLogSoftmax; }
+
+   // The general hook: encode onto `grid` with no clamp of our own. The five-argument
+   // overload below is the Softmax-and-Clip case, which additionally folds the Clip's bounds.
+   void FuseQuantizedOutput(const std::string &carrier, const QuantizationGrid &grid) override
+   {
+      FuseQuantizedOutput(carrier, grid, false, 0.0, 0.0);
+   }
 
    // Absorb a following Clip, writing its output tensor instead of fNY.
    void FuseClip(std::string clipOutput, double clipLow, double clipHigh)
@@ -60,8 +71,9 @@ public:
       fQuantClipHigh = clipHigh;
    }
 
-   // As FuseClip, and additionally quantize onto `grid`, writing `carrier` as an integer.
-   void FuseQuantizedOutput(std::string carrier, const QuantizationInfo &grid, bool hasClip,
+   // As FuseClip, and additionally encode onto `grid`, writing `carrier` as a low-precision
+   // code rather than a float.
+   void FuseQuantizedOutput(std::string carrier, const QuantizationGrid &grid, bool hasClip,
                             double clipLow, double clipHigh)
    {
       FuseClip(std::move(carrier), clipLow, clipHigh);
@@ -371,10 +383,18 @@ public:
                      ExactDoubleLiteral(fQuantClipHigh) + ") ? static_cast<T>(" +
                      ExactDoubleLiteral(fQuantClipHigh) + ") : v);\n";
             }
-            if (fOutputGrid) {
+            if (fOutputGrid && fOutputGrid->IsFloatingPoint()) {
+               // An FP8 grid has no zero point and its own saturation, so the encode is the
+               // scale division followed by the hardware convert -- exactly what
+               // ROperator_ONNXQuantizeLinear emits for a float8 boundary.
+               op += I4 + "auto q = SOFIE::EncodeFP8E4M3(static_cast<float>(static_cast<double>(v) / " +
+                     ExactDoubleLiteral(fOutputGrid->scale) + "));\n";
+               op += I4 + "Y[base + k] = static_cast<TOut>(q);\n";
+            } else if (fOutputGrid) {
                // Exactly the expression ROperator_ONNXQuantizeLinear emits, in the same
                // order and the same types.
-               const auto [qMin, qMax] = QuantizedIntegerRange(*fOutputGrid);
+               const auto qMin = static_cast<std::int64_t>(fOutputGrid->codeMin);
+               const auto qMax = static_cast<std::int64_t>(fOutputGrid->codeMax);
                op += I4 + "double q = nearbyint((static_cast<double>(v) / " +
                      ExactDoubleLiteral(fOutputGrid->scale) + ") + " +
                      std::to_string(fOutputGrid->zeroPoint) + ");\n";

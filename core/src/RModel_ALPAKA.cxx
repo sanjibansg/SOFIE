@@ -1103,6 +1103,15 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
    if (!fIsSubGraph) {
       fGC.clear();
       GenerateHeaderInfo_GPU_ALPAKA(hgname);
+      // S57c. The absorption backlog, in the artifact rather than only in a trace flag, so
+      // it is visible to whoever reads the generated code and can be asserted on. Counts
+      // boundaries next to an operator that could have taken a carrier and did not; it does
+      // not count a Quantize on a LayerNorm's output, which is a separate lever.
+      fGC += "// SOFIE carrier frontier: " + std::to_string(fCarrierFrontierViolations.size()) +
+             " unabsorbed Quantize/Dequantize boundaries\n";
+      for (const auto &violation : fCarrierFrontierViolations)
+         fGC += "//   " + violation.boundaryOperator + " on '" + violation.boundaryTensor +
+                "' owed by " + violation.neighborOperator + "\n";
    }
 
    if (fVerbose)

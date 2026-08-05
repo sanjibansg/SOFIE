@@ -257,37 +257,104 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
       return it->second < operators.size() && !operators[it->second]->IsQuantizationBoundary();
    };
 
-   // Records that a Softmax feeding this region should quantize onto the region's input
-   // grid. Applied later, once the Clip between them is absorbed.
-   auto tryPlanSoftmaxInt8Handoff = [&graph, &operators, &state, &model,
-                                     &fusedInt8HandoffTensors](const QuantizedMatMulRegion &region) {
-      const std::string &tensor = region.inputSourceTensor;
+   // Records that a Softmax feeding this region should encode onto `grid` rather than emit a
+   // float; the application loop consumes the record when it absorbs the boundary.
+   //
+   // The grid is a parameter rather than derived from `region.inputQuant`, because an FP8
+   // region does not keep its scale there: `inputQuant` is integer metadata and stays
+   // default-constructed, with the scale carried in `lowPrecisionInputScale`. Deriving it here
+   // is what confined this to int8.
+   // Takes the tensor rather than the region: Gemm and MatMul regions are distinct types and
+   // nothing here needs either of them beyond the name of the value the producer writes.
+   auto tryPlanCarrierHandoff = [&graph, &operators, &state, &model, &fusedInt8HandoffTensors](
+                                   const std::string &tensor, const QuantizationGrid &grid) {
       if (tensor.empty() || fusedInt8HandoffTensors.count(tensor) != 0)
          return;
-      // Only a per-tensor signed-int8 grid: that is what the Softmax epilogue can emit
-      // and what the consumer reads back without a scale vector.
-      const auto &grid = region.inputQuant;
-      if (grid.granularity != EQuantizationGranularity::PerTensor || grid.bitWidth != 8 ||
-          !grid.isSigned)
+      // Per-tensor only: that is what the Softmax epilogue can emit and what the consumer
+      // reads back without a scale vector.
+      if (grid.granularity != EQuantizationGranularity::PerTensor)
          return;
 
       auto producer = graph.producerByTensor.find(tensor);
+      if (std::getenv("SOFIE_HANDOFF_TRACE") != nullptr) {
+         int kind = -1;
+         if (producer != graph.producerByTensor.end() && producer->second < operators.size())
+            kind = static_cast<int>(operators[producer->second]->GetKind());
+         std::fprintf(stderr, "[handoff] tensor=%s producerKind=%d grid=%s scale=%g\n",
+                      tensor.c_str(), kind, grid.IsFloatingPoint() ? "fp8" : "int", grid.scale);
+      }
       if (producer == graph.producerByTensor.end() || producer->second >= operators.size())
          return;
-      // The Clip is transparent here only because the same fusion that consumes it folds
-      // its clamp into the Softmax; if that fusion declines, this handoff must not happen.
+      // Walk back to the operator that computes the value, past the nodes this fusion is
+      // going to absorb. Two hops exist, and which one appears is a property of the encoding:
+      //
+      //   int8   Softmax -> Clip           -> region reads the Clip's output
+      //   fp8    Softmax -> QuantizeLinear -> region reads the carrier
+      //
+      // The Clip is transparent only because the same fusion folds its clamp into the
+      // Softmax; the boundary is transparent only because the Softmax takes over its encode.
+      // If either fusion declines, this handoff must not happen.
       std::size_t softmaxIndex = producer->second;
+      const auto stepBack = [&](const std::string &sourceTensor) {
+         auto behind = graph.producerByTensor.find(sourceTensor);
+         if (behind == graph.producerByTensor.end() || behind->second >= operators.size())
+            return false;
+         softmaxIndex = behind->second;
+         return true;
+      };
       if (operators[softmaxIndex]->GetKind() == OperatorKind::CLIP) {
          const auto clipInputs = operators[softmaxIndex]->GetOpInputTensors();
-         if (clipInputs.empty())
+         if (clipInputs.empty() || !stepBack(std::string(clipInputs[0])))
             return;
-         auto behindClip = graph.producerByTensor.find(std::string(clipInputs[0]));
-         if (behindClip == graph.producerByTensor.end() || behindClip->second >= operators.size())
+      } else if (operators[softmaxIndex]->IsQuantizationBoundary()) {
+         const std::string source = operators[softmaxIndex]->GetQuantizationSourceTensor();
+         if (source.empty() || !stepBack(source))
             return;
-         softmaxIndex = behindClip->second;
       }
-      auto *softmax = dynamic_cast<ROperator_Softmax *>(operators[softmaxIndex].get());
-      if (softmax == nullptr || !softmax->CanFuseQuantizedOutput())
+      // Plan-time evaluation of the applier's participation conditions. The two answers differ
+      // legitimately -- the graph is rewritten between plan and apply -- so this prints rather
+      // than declines.
+      if (std::getenv("SOFIE_HANDOFF_TRACE") != nullptr) {
+         const auto producerOutputs = operators[softmaxIndex]->GetOpOutputTensors();
+         std::string why;
+         if (producerOutputs.size() != 1)
+            why = "multi_output_producer(" + std::to_string(producerOutputs.size()) + ")";
+         else {
+            const std::string producerOutput(producerOutputs[0]);
+            auto pc = graph.consumersByTensor.find(producerOutput);
+            if (pc == graph.consumersByTensor.end())
+               why = "no_consumer";
+            else if (pc->second.size() != 1) {
+               why = "multiple_consumers(";
+               for (auto ci : pc->second)
+                  why += (ci < operators.size() ? operators[ci]->Name() : "?") + ",";
+               why += ")";
+            }
+            else {
+               const auto bIndex = pc->second.front();
+               if (bIndex >= operators.size())
+                  why = "consumer_out_of_range";
+               else if (operators[bIndex]->GetKind() != OperatorKind::CLIP &&
+                        !operators[bIndex]->IsQuantizationBoundary())
+                  why = "consumer_not_clip_or_boundary(" + operators[bIndex]->Name() + ")";
+               else if (operators[bIndex]->GetOpOutputTensors().size() != 1)
+                  why = "multi_output_boundary";
+               else
+                  why = "would_accept";
+            }
+         }
+         std::fprintf(stderr, "[plan-check] %s -> %s\n",
+                      operators[softmaxIndex]->Name().c_str(), why.c_str());
+      }
+
+      // Asked of the operator rather than of its type: any producer that can encode its own
+      // output qualifies, which is what lets LayerNorm and the residual Add join without
+      // another pass being written for each.
+      if (std::getenv("SOFIE_HANDOFF_TRACE") != nullptr)
+         std::fprintf(stderr, "[handoff-behind] %s canFuse=%d\n",
+                      operators[softmaxIndex]->Name().c_str(),
+                      operators[softmaxIndex]->CanFuseQuantizedOutput() ? 1 : 0);
+      if (!operators[softmaxIndex]->CanFuseQuantizedOutput())
          return;
       // A second reader would still need the float value.
       auto consumers = graph.consumersByTensor.find(tensor);
@@ -298,6 +365,15 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
 
       state.softmaxInt8Handoffs[tensor] = grid;
       fusedInt8HandoffTensors.insert(tensor);
+   };
+
+   // The int8 entry point, unchanged in behaviour: a per-tensor signed-int8 region grid.
+   auto tryPlanSoftmaxInt8Handoff = [&tryPlanCarrierHandoff](const QuantizedMatMulRegion &region) {
+      const auto &info = region.inputQuant;
+      if (info.granularity != EQuantizationGranularity::PerTensor || info.bitWidth != 8 ||
+          !info.isSigned)
+         return;
+      tryPlanCarrierHandoff(region.inputSourceTensor, IntegerGridFrom(info));
    };
 
    // Ops that become a quantized region. A Q/DQ pair bridging two of them keeps its int8
@@ -365,37 +441,101 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
       const bool isQuantizedMatMulSpelling = pattern.isMatMul;
       const bool isMatMulAddSpelling = pattern.hasInlineMatMulBias;
       const bool isMatMulSpelling = pattern.isMatMul && !pattern.hasInlineMatMulBias;
+      const bool hasCanonicalisedOperandB = pattern.hasCanonicalisedOperandB;
       auto matmulShape = std::move(pattern.matmulShape);
 
-      const bool hasNativeLowPrecisionOperands =
-         !info.inputTensor.empty() && !info.weightTensor.empty() &&
-         model.HasLowPrecisionTensorInfo(info.inputTensor) && model.HasLowPrecisionTensorInfo(info.weightTensor);
+      // A Q/DQ graph names the dequantized float at the MatMul, so the low-precision carrier
+      // is one boundary upstream; the bare-operand spelling names it directly.
+      auto resolveLowPrecisionOperand = [&model, &graph, &operators](const std::string &tensor) -> std::string {
+         if (tensor.empty())
+            return {};
+         if (model.HasLowPrecisionTensorInfo(tensor))
+            return tensor;
+         auto producer = graph.producerByTensor.find(tensor);
+         if (producer == graph.producerByTensor.end() || producer->second >= operators.size())
+            return {};
+         auto *dequantize = dynamic_cast<ROperator_ONNXDequantizeLinear *>(operators[producer->second].get());
+         if (dequantize == nullptr)
+            return {};
+         const auto source = dequantize->GetInputTensor();
+         return model.HasLowPrecisionTensorInfo(source) ? source : std::string{};
+      };
+      const std::string nativeInputTensor = resolveLowPrecisionOperand(info.inputTensor);
+      const std::string nativeWeightTensor = resolveLowPrecisionOperand(info.weightTensor);
+      const bool hasNativeLowPrecisionOperands = !nativeInputTensor.empty() && !nativeWeightTensor.empty();
       if (hasNativeLowPrecisionOperands) {
          std::vector<std::string> fp8Reasons;
+         // The region reads the carrier, so a DequantizeLinear that fed it becomes dead.
+         info.inputTensor = nativeInputTensor;
+         info.weightTensor = nativeWeightTensor;
          info.inputSourceTensor = info.inputTensor;
          info.weightSourceTensor = info.weightTensor;
          info.outputTensor = info.gemmOutputTensor;
 
          const auto &inputLowPrecision = model.GetLowPrecisionTensorInfo(info.inputTensor);
          const auto &weightLowPrecision = model.GetLowPrecisionTensorInfo(info.weightTensor);
+         // A calibrated FP8 operand carries its dequantization factor here; the backend
+         // applies it, so only a non-zero zero-point is outside the contract.
+         auto fp8OperandScale = [&fp8Reasons](const LowPrecisionTensorInfo &tensorInfo, const char *role) {
+            if (!tensorInfo.affineQuantization)
+               return 1.0;
+            const auto &quant = *tensorInfo.affineQuantization;
+            if (quant.granularity != EQuantizationGranularity::PerTensor)
+               fp8Reasons.push_back(std::string("native FP8 dense-linear ") + role +
+                                    " scale must be per-tensor");
+            if (quant.zeroPoint != 0)
+               fp8Reasons.push_back(std::string("native FP8 dense-linear ") + role +
+                                    " zero-point must be 0");
+            return quant.scale;
+         };
+         const double fp8InputScale = fp8OperandScale(inputLowPrecision, "input");
+         const double fp8WeightScale = fp8OperandScale(weightLowPrecision, "weight");
          if (inputLowPrecision.carrier != ELowPrecisionCarrier::FP8E4M3)
             fp8Reasons.push_back("native FP8 dense-linear input carrier is not E4M3");
          if (weightLowPrecision.carrier != ELowPrecisionCarrier::FP8E4M3)
             fp8Reasons.push_back("native FP8 dense-linear weight carrier is not E4M3");
-         if (!model.IsInitializedTensor(info.weightSourceTensor))
+         // A batched activation x activation product has no constant to lay out, and its B
+         // operand is already an FP8 carrier written each inference.
+         const bool fp8RuntimeOperandB =
+            isQuantizedMatMulSpelling && !info.weightSourceTensor.empty() &&
+            !model.IsInitializedTensor(info.weightSourceTensor) &&
+            matmulShape.kind == EQuantizedMatMulShapeKind::TrueBatched &&
+            weightLowPrecision.carrier == ELowPrecisionCarrier::FP8E4M3;
+         if (!model.IsInitializedTensor(info.weightSourceTensor) && !fp8RuntimeOperandB)
             fp8Reasons.push_back("native FP8 dense-linear weight tensor must be initialized");
 
          if (isQuantizedMatMulSpelling) {
-            if (isMatMulAddSpelling || !info.biasTensor.empty())
-               fp8Reasons.push_back("native FP8 MatMul lowering does not support fused bias");
-            if (info.alpha != 1.0f || info.beta != 0.0f || info.transA != 0 || info.transB != 0)
-               fp8Reasons.push_back("native FP8 MatMul lowering requires alpha=1, beta=0, transA=0, transB=0");
-            if (!QuantizedMatMulShapeIsSingleGemmExecutable(matmulShape))
+            // Same bias contract as the FP8 Gemm spelling below: an initialized FLOAT
+            // constant, applied by the cuBLASLt epilogue.
+            if (!info.biasTensor.empty()) {
+               if (!model.IsInitializedTensor(info.biasTensor))
+                  fp8Reasons.push_back("native FP8 MatMul fused bias must be an initialized constant tensor");
+               else if (model.GetTensorType(info.biasTensor) != ETensorType::FLOAT)
+                  fp8Reasons.push_back("native FP8 MatMul fused bias must be stored as FLOAT");
+               else
+                  info.biasSourceTensor = info.biasTensor;
+            }
+            // A fused MatMul+Add arrives as a Gemm with beta=1, which is the bias term
+            // rather than a scaling of a pre-existing C.
+            const bool fp8FusedBias = !info.biasSourceTensor.empty();
+            const bool fp8BetaAllowed = info.beta == 0.0f || (fp8FusedBias && info.beta == 1.0f);
+            // A canonicalised transB=1 is the physical [.., N, K] the cuBLASLt TN call
+            // already wants, not a transpose the lowering would have to perform.
+            const bool fp8TransBAllowed = info.transB == 0 || hasCanonicalisedOperandB;
+            if (info.alpha != 1.0f || !fp8BetaAllowed || info.transA != 0 || !fp8TransBAllowed)
+               fp8Reasons.push_back("native FP8 MatMul lowering requires alpha=1, transA=0, an untransposed or "
+                                    "canonicalised operand B, and beta=0 or beta=1 with a fused bias");
+            if (!QuantizedMatMulShapeIsRecognized(matmulShape))
                fp8Reasons.push_back(matmulShape.reason.empty()
-                                      ? "native FP8 MatMul lowering requires rank-2 or flattenable X[...,M,K] @ W[K,N] -> Y[...,M,N]"
+                                      ? "native FP8 MatMul lowering requires rank-2, flattenable, or batched "
+                                        "X[...,M,K] @ W[...,K,N] -> Y[...,M,N]"
                                       : matmulShape.reason);
 
             auto matmul = MakeQuantizedMatMulRegionFromGemmLikeRegion(info);
+            if (fp8FusedBias) {
+               matmul.epilogue.kind = EQuantizedEpilogueKind::Bias;
+               matmul.epilogue.biasSourceTensor = info.biasSourceTensor;
+            }
             matmul.shape = matmulShape;
             auto &plans = state.loweringPlans[opIndex];
             if (fp8Reasons.empty()) {
@@ -404,12 +544,30 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                const auto n = matmulShape.logicalN;
                matmul.status = EQuantizedLoweringStatus::SemanticRecognized;
                matmul.reason = "recognized native FP8 MatMul region; " + matmulShape.reason + "; output carrier is FLOAT";
-               auto shapePolicy = MakeExactFP8DenseLinearShapePolicy(m, k, n);
+               auto shapePolicy = MakeFP8DenseLinearShapePolicy(m, k, n, matmulShape.batchCount);
                auto capability = MakeNativeFP8E4M3TNF32Capability(m, n, k);
                capability.reason = "SOFIE cuBLASLt FP8 E4M3 TN FP32 path selected for native FP8 MatMul";
-               auto alpakaPlan = MakeAlpakaCublasLtFP8Plan(matmul, matmul.weightSourceTensor, capability, shapePolicy);
+               // The attention score x V product is the FP8 region whose input a Softmax
+               // produces, and it is a MatMul rather than a Gemm, so the handoff has to be
+               // offered here as well as on the Gemm path.
+               tryPlanCarrierHandoff(matmul.inputSourceTensor,
+                                     Float8GridFrom(fp8InputScale, EQuantizationGridKind::Float8E4M3));
+
+               // A canonicalised or runtime operand is already [N, K]; a plain MatMul weight
+               // is [K, N] and is transposed into its own storage tensor.
+               const bool fp8TransposedWeightStorage = !fp8RuntimeOperandB && !hasCanonicalisedOperandB;
+               const std::string fp8WeightStorageTensor =
+                  fp8TransposedWeightStorage ? matmul.weightSourceTensor + "_fp8_transposed_device_storage"
+                                             : matmul.weightSourceTensor;
+               auto alpakaPlan = MakeAlpakaCublasLtFP8Plan(matmul, fp8WeightStorageTensor, capability, shapePolicy);
+               alpakaPlan.weightStorageIsRuntimeTensor = fp8RuntimeOperandB;
+               alpakaPlan.lowPrecisionInputScale = fp8InputScale;
+               alpakaPlan.lowPrecisionWeightScale = fp8WeightScale;
                alpakaPlan.reason = matmul.reason + "; " + capability.reason;
-               registerLowPrecisionSourceStorage(matmul.weightTensor, matmul.weightSourceTensor, alpakaPlan.weightLayout);
+               // A runtime operand is its own storage: it is written each inference as an
+               // FP8 carrier, so there is no constant to materialise.
+               if (!fp8RuntimeOperandB && !fp8TransposedWeightStorage)
+                  registerLowPrecisionSourceStorage(matmul.weightTensor, matmul.weightSourceTensor, alpakaPlan.weightLayout);
                plans[EQuantizedBackend::CPU] = MakeUnsupportedLowPrecisionDenseLinearPlan(
                   EQuantizedBackend::CPU, matmul.reason + "; CPU FP8 MatMul lowering is not implemented", true,
                   capability.inputCarrier, capability.weightCarrier, capability.outputCarrier, capability.accumulation,
@@ -456,7 +614,7 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
          const auto inputShape = model.GetTensorShape(info.inputSourceTensor);
          const auto weightShape = model.GetTensorShape(info.weightSourceTensor);
          const auto outputShape = model.GetTensorShape(info.outputTensor);
-         std::size_t fp8M = 0, fp8K = 0, fp8N = 0;
+         std::size_t fp8M = 0, fp8K = 0, fp8N = 0, fp8PaddedN = 0;
          if (inputShape.size() != 2 || weightShape.size() != 2 || outputShape.size() != 2) {
             fp8Reasons.push_back("native FP8 Gemm lowering requires rank-2 input, weight, and output tensors");
          } else {
@@ -480,9 +638,16 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
             if (fp8K % 16 != 0)
                fp8Reasons.push_back("native FP8 Gemm K dimension must be a multiple of 16 for cuBLASLt "
                                     "leading-dimension alignment");
-            if ((fp8N * 4) % 16 != 0)
-               fp8Reasons.push_back("native FP8 Gemm N dimension is not 16-byte aligned for the cuBLASLt "
-                                    "output leading dimension");
+            if ((fp8N * 4) % 16 != 0) {
+               // Padding appends zero rows to an NT weight, which leaves K and so both E4M3
+               // leading dimensions untouched; a TN weight is [K, N] and would not.
+               if (fp8NTSpelling)
+                  fp8PaddedN = PaddedFP8DenseLinearOutputN(fp8N, sizeof(float));
+               else
+                  fp8Reasons.push_back("native FP8 Gemm N dimension is not 16-byte aligned for the cuBLASLt "
+                                       "output leading dimension, and only the transB=1 weight layout can be "
+                                       "padded");
+            }
             if (!info.biasSourceTensor.empty() &&
                 !IsDenseLinearBiasLikeShape(model.GetTensorShape(info.biasSourceTensor), outputShape))
                fp8Reasons.push_back("native FP8 Gemm fused bias is not broadcastable to [M, N]");
@@ -497,18 +662,33 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
             info.reason = fp8NTSpelling
                              ? "recognized native FP8 Gemm region; alpha * X[M,K] * W[N,K]^T + beta * C -> [M,N]"
                              : "recognized native FP8 Gemm region; alpha * A[K,M]^T * B[K,N] + beta * C -> [M,N]";
-            auto shapePolicy = MakeExactFP8DenseLinearShapePolicy(m, k, n);
+            auto shapePolicy = MakeFP8DenseLinearShapePolicy(m, k, n, 1, fp8PaddedN);
             auto capability = MakeNativeFP8E4M3TNF32Capability(m, n, k);
+            if (fp8PaddedN > n)
+               info.reason += "; " + shapePolicy.reason;
 
             // FP8 chaining: emit an E4M3 activation only when the consumer is itself an FP8
             // Gemm, so the pair stays in FP8 without an FP8 Relu or Cast operator.
+            const bool traceChain = std::getenv("SOFIE_FP8_CHAIN_TRACE") != nullptr;
             auto fp8ChainConsumer = [&](const std::string &tensor) -> bool {
                auto consumers = graph.consumersByTensor.find(tensor);
-               if (consumers == graph.consumersByTensor.end() || consumers->second.size() != 1)
+               if (consumers == graph.consumersByTensor.end() || consumers->second.size() != 1) {
+                  if (traceChain)
+                     std::cout << "[SOFIE_FP8_CHAIN_TRACE] " << tensor << ": "
+                               << (consumers == graph.consumersByTensor.end()
+                                      ? "no consumer"
+                                      : "consumers=" + std::to_string(consumers->second.size()))
+                               << "\n";
                   return false;
+               }
                const auto nextIndex = consumers->second.front();
-               if (nextIndex >= operators.size() || operators[nextIndex]->GetKind() != OperatorKind::GEMM)
+               if (nextIndex >= operators.size() || operators[nextIndex]->GetKind() != OperatorKind::GEMM) {
+                  if (traceChain)
+                     std::cout << "[SOFIE_FP8_CHAIN_TRACE] " << tensor << ": consumer is "
+                               << (nextIndex < operators.size() ? operators[nextIndex]->Name() : "out-of-range")
+                               << ", not a GEMM\n";
                   return false;
+               }
                const auto nextInputs = operators[nextIndex]->GetOpInputTensors();
                if (nextInputs.size() < 2)
                   return false;
@@ -556,9 +736,22 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                }
             }
 
-            auto alpakaPlan = MakeAlpakaCublasLtFP8Plan(info, info.weightSourceTensor, capability, shapePolicy);
+            // As the int8 branch does before building its plan: a float producer feeding this
+            // region can encode straight onto the region's input grid instead of emitting a
+            // float for a separate boundary kernel to re-read.
+            tryPlanCarrierHandoff(info.inputSourceTensor,
+                                  Float8GridFrom(fp8InputScale, EQuantizationGridKind::Float8E4M3));
+
+            // A padded weight is a second constant, so it gets its own storage tensor; an
+            // unpadded one is read in place.
+            const std::string fp8WeightStorageTensor =
+               fp8PaddedN > n ? info.weightSourceTensor + "_fp8_padded_device_storage" : info.weightSourceTensor;
+            auto alpakaPlan = MakeAlpakaCublasLtFP8Plan(info, fp8WeightStorageTensor, capability, shapePolicy);
+            alpakaPlan.lowPrecisionInputScale = fp8InputScale;
+            alpakaPlan.lowPrecisionWeightScale = fp8WeightScale;
             alpakaPlan.reason = info.reason + "; " + capability.reason;
-            registerLowPrecisionSourceStorage(info.weightTensor, info.weightSourceTensor, alpakaPlan.weightLayout);
+            if (fp8PaddedN == 0)
+               registerLowPrecisionSourceStorage(info.weightTensor, info.weightSourceTensor, alpakaPlan.weightLayout);
             if (!fp8ChainOutput.empty()) {
                // The next Gemm needs this metadata on its input as well as its weight.
                LowPrecisionTensorInfo activationInfo;
@@ -1179,6 +1372,15 @@ void MaterializeQuantizedDenseLinearWeights(QuantizedStoragePassContext &context
                throw std::runtime_error(
                   "SOFIE quantized Gemm storage requires an initialized rank-2 weight tensor");
             if (QuantizedPlanUsesFP8DenseLinear(*plan)) {
+               const auto &shape = RequireQuantizedMatrixShapePolicy(*plan, "native FP8 Gemm storage");
+               if (QuantizedShapePolicyUsesPadding(shape.policy)) {
+                  context.install(MaterializeLowPrecisionDenseLinearWeightBytes(
+                     region.weightTensor, region.weightSourceTensor, plan->weightStorageTensor,
+                     model.GetLowPrecisionTensorInfo(region.weightSourceTensor), plan->weightLayout, backend,
+                     model.GetInitializedTensorData(region.weightSourceTensor).get(), weightShape,
+                     false, shape.physicalN));
+                  return;
+               }
                context.registerLowPrecision(
                   region.weightTensor, region.weightSourceTensor, plan->weightLayout);
                return;
@@ -1200,6 +1402,13 @@ void MaterializeQuantizedDenseLinearWeights(QuantizedStoragePassContext &context
                throw std::runtime_error(
                   "SOFIE quantized MatMul storage requires an initialized rank-2 weight tensor");
             if (QuantizedPlanUsesFP8DenseLinear(*plan)) {
+               if (plan->weightStorageTensor != region.weightSourceTensor) {
+                  context.install(MaterializeLowPrecisionDenseLinearWeightBytes(
+                     region.weightTensor, region.weightSourceTensor, plan->weightStorageTensor,
+                     model.GetLowPrecisionTensorInfo(region.weightSourceTensor), plan->weightLayout, backend,
+                     model.GetInitializedTensorData(region.weightSourceTensor).get(), weightShape, true));
+                  return;
+               }
                context.registerLowPrecision(
                   region.weightTensor, region.weightSourceTensor, plan->weightLayout);
                return;

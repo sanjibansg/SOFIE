@@ -38,6 +38,7 @@ QuantizedDenseLinearPatternMatch MatchQuantizedDenseLinearPattern(
    // transB == 1 is admitted only for a canonicalised [.., N, K] operand; a plain rank-2
    // Gemm with transB=1 keeps going down the Gemm path.
    const bool canonicalisedOperandB = region.transB == 1 && gemm.IsBatchedOperandBCanonicalised();
+   match.hasCanonicalisedOperandB = canonicalisedOperandB;
    const bool matmul = inputs.size() == 2 && region.alpha == 1.0f && region.beta == 0.0f &&
                        region.transA == 0 && (region.transB == 0 || canonicalisedOperandB);
    match.hasInlineMatMulBias = inputs.size() == 3 && region.alpha == 1.0f && region.beta == 1.0f &&

@@ -131,6 +131,57 @@ inline QuantizationInfo MakeONNXQDQInfo(RModel &model, const std::string &scaleT
    return MakeValidatedQuantizationInfo(spec);
 }
 
+// Host-side E4M3 decode, so a float8 constant can be folded without a CUDA toolchain.
+// e4m3fn: 1 sign, 4 exponent with bias 7, 3 mantissa, no infinities.
+inline float DecodeHostFP8E4M3(std::uint8_t bits)
+{
+   const float sign = (bits & 0x80u) ? -1.0f : 1.0f;
+   const unsigned exponent = (bits >> 3) & 0x0Fu;
+   const unsigned mantissa = bits & 0x07u;
+   if (exponent == 0x0Fu && mantissa == 0x07u)
+      return std::numeric_limits<float>::quiet_NaN();
+   if (exponent == 0)
+      return sign * std::ldexp(static_cast<float>(mantissa) / 8.0f, -6);
+   return sign * std::ldexp(1.0f + static_cast<float>(mantissa) / 8.0f, static_cast<int>(exponent) - 7);
+}
+
+// A float8 Q/DQ pair carries a scale but no integer grid: the ONNX zero-point selects the
+// quantized type rather than offsetting it, so only the scale survives into the contract.
+inline LowPrecisionTensorInfo MakeONNXFP8TensorInfo(RModel &model, const std::string &scaleTensor,
+                                                    const std::string &zeroPointTensor,
+                                                    ETensorType carrierType, const std::string &sourceTensor,
+                                                    const std::string &opName)
+{
+   if (!model.IsInitializedTensor(scaleTensor))
+      throw std::runtime_error("SOFIE " + opName + " float8 scale must be an initialized tensor");
+   const auto scales = GetFloatScaleInitializer(model, scaleTensor, opName);
+   if (scales.size() != 1)
+      throw std::runtime_error("SOFIE " + opName + " float8 quantization supports a per-tensor scale only");
+   if (!zeroPointTensor.empty()) {
+      if (!model.IsInitializedTensor(zeroPointTensor))
+         throw std::runtime_error("SOFIE " + opName + " float8 zero-point must be an initialized tensor");
+      for (auto byte : model.GetTensorData<std::uint8_t>(zeroPointTensor)) {
+         if (byte != 0)
+            throw std::runtime_error("SOFIE " + opName + " float8 zero-point must be zero");
+      }
+   }
+
+   QuantizationInfo affine;
+   affine.scale = static_cast<double>(scales[0]);
+   affine.zeroPoint = 0;
+   affine.granularity = EQuantizationGranularity::PerTensor;
+   affine.scaleTensor = scaleTensor;
+   affine.zeroPointTensor = zeroPointTensor;
+
+   auto info = LowPrecisionTensorInfoFromFP8Carrier(
+      carrierType == ETensorType::FLOAT8E5M2 || carrierType == ETensorType::FLOAT8E5M2FNUZ
+         ? ELowPrecisionCarrier::FP8E5M2
+         : ELowPrecisionCarrier::FP8E4M3,
+      sourceTensor, "SOFIE " + opName + " float8 Q/DQ boundary");
+   info.affineQuantization = affine;
+   return info;
+}
+
 inline double ScaleForElement(const QuantizationInfo &info, RModel &model, const std::vector<size_t> &shape,
                               std::size_t linearIndex)
 {
@@ -188,6 +239,9 @@ private:
    int fAxis = -1;
    std::vector<size_t> fShape;
    QuantizationInfo fInfo;
+   // A float8 boundary carries a scale rather than an integer grid, so fInfo stays unset.
+   bool fIsFP8 = false;
+   double fFP8Scale = 1.0;
 
    // Set when this boundary emits the whole fake-quant round trip as one kernel writing
    // the float result, with the Clip and trailing DequantizeLinear suppressed.
@@ -222,6 +276,45 @@ public:
    const std::string &GetScaleTensor() const { return fNScale; }
    const std::string &GetZeroPointTensor() const { return fNZeroPoint; }
    const QuantizationInfo &GetQuantizationInfo() const { return fInfo; }
+   // A float8 boundary carries a scale and no integer grid, so fInfo is never populated
+   // for one. Anything comparing grids has to ask this first, or it compares defaults.
+   bool IsFP8Boundary() const { return fIsFP8; }
+   double GetFP8Scale() const { return fFP8Scale; }
+
+   // The grid this boundary encodes onto, in the one representation that covers both
+   // encodings. Prefer this over GetQuantizationInfo/IsFP8Boundary/GetFP8Scale: those three
+   // only mean anything together, and every pass that took them apart got it wrong at least
+   // once. See QuantizationGrid in RQuantization.hxx.
+   QuantizationGrid GetGrid() const
+   {
+      QuantizationGrid grid;
+      if (fIsFP8) {
+         grid.kind = fOutputType == ETensorType::FLOAT8E5M2 || fOutputType == ETensorType::FLOAT8E5M2FNUZ
+                        ? EQuantizationGridKind::Float8E5M2
+                        : EQuantizationGridKind::Float8E4M3;
+         grid.scale = fFP8Scale;
+         grid.zeroPoint = 0;
+         grid.granularity = EQuantizationGranularity::PerTensor;
+         // E4M3 tops out at 448 and E5M2 at 57344; both are symmetric and have no infinity
+         // in the ONNX "fn" spellings, so the extreme code is the largest finite value.
+         const double limit = grid.kind == EQuantizationGridKind::Float8E4M3 ? 448.0 : 57344.0;
+         grid.codeMin = -limit;
+         grid.codeMax = limit;
+         return grid;
+      }
+      if (fInfo.bitWidth == 0)
+         return grid;   // undefined: not a boundary whose grid anyone may compare
+      grid.kind = EQuantizationGridKind::Integer;
+      grid.scale = fInfo.scale;
+      grid.zeroPoint = fInfo.zeroPoint;
+      grid.granularity = fInfo.granularity;
+      grid.rounding = fInfo.rounding;
+      const auto [qMin, qMax] = QuantizedIntegerRange(fInfo);
+      grid.codeMin = static_cast<double>(qMin);
+      grid.codeMax = static_cast<double>(qMax);
+      return grid;
+   }
+
 
    // Emits one kernel for Clip? -> Quantize -> Dequantize, composing their arithmetic in
    // the same order and precision, so the result matches running them separately.
@@ -240,6 +333,9 @@ public:
          fInputTensorNames[0] = fFusedClipInput;
    }
    bool IsFakeQuantRoundTripFused() const { return !fFusedDequantizedOutput.empty(); }
+   // Whether the fused round trip also carries an absorbed Clip. A fold that ignored this
+   // would drop the clamp, so the folding pass asks before taking the boundary.
+   bool FakeQuantRoundTripHasClip() const { return fFusedHasClip; }
 
    // Absorbs the preceding Clip while still emitting the int8 carrier, for a boundary
    // whose trailing DequantizeLinear must stay because a lowered region reads the carrier.
@@ -251,6 +347,21 @@ public:
       fFusedClipHigh = clipHigh;
       if (!fFusedClipInput.empty() && !fInputTensorNames.empty())
          fInputTensorNames[0] = fFusedClipInput;
+   }
+
+   // S57i-a. Takes over the input of a Clip that cannot clamp anything, without recording
+   // the clamp -- distinct from FuseClipOnly, which keeps it. A Clip to +/-X in front of a
+   // Quantize whose own grid saturates at +/-X removes nothing, so dropping it is exact.
+   //
+   // The point is not the arithmetic, which FuseClipOnly already made free. It is that the
+   // Clip stops being an operator in the graph: every pass that walks value-preserving
+   // chains stops at a Clip, so leaving a no-op one in place silently blocks the analyses
+   // downstream. That is what it was doing to the idempotence walk.
+   void BypassNoOpClip(const std::string &clipInput)
+   {
+      fNX = clipInput;
+      if (!fInputTensorNames.empty())
+         fInputTensorNames[0] = clipInput;
    }
 
    // Marks the round trip as the identity, for a value already on this grid: Q(DQ(q)) is
@@ -270,6 +381,16 @@ public:
       if (!model.CheckIfTensorAlreadyExist(fNX))
          throw std::runtime_error("SOFIE ONNX QuantizeLinear input tensor " + fNX + " is not found in model");
       fShape = model.GetTensorShape(fNX);
+      if (IsFP8TensorType(fOutputType)) {
+         fIsFP8 = true;
+         auto fp8Info = DETAIL::MakeONNXFP8TensorInfo(model, fNScale, fNZeroPoint, fOutputType, fNX,
+                                                      "ONNX QuantizeLinear");
+         fFP8Scale = fp8Info.affineQuantization->scale;
+         model.AddLowPrecisionTensorInfo(fNY, std::move(fp8Info));
+         model.AddIntermediateTensor(fNY, fOutputType, fShape);
+         model.AddNeededStdLib("cstdint");
+         return;
+      }
       fInfo = DETAIL::MakeONNXQDQInfo(model, fNScale, fNZeroPoint, fOutputType, fShape, fAxis,
                                       "ONNX QuantizeLinear");
       model.AddQuantizationInfo(fNY, fInfo);
@@ -280,6 +401,8 @@ public:
 
    std::string Generate(std::string OpName) override
    {
+      if (fIsFP8)
+         throw std::runtime_error("SOFIE ONNX float8 Q/DQ code generation is not implemented; the boundary must be absorbed by a low-precision region");
       OpName = "op_" + OpName;
       if (fInfo.granularity != EQuantizationGranularity::PerTensor) {
          throw std::runtime_error("SOFIE ONNX QuantizeLinear literal code generation supports scalar parameters only; vector parameters require fused lowering");
@@ -303,6 +426,40 @@ public:
    {
       if (fIsOutputConstant || fFusedIsIdentity)
          return "";
+      if (fIsFP8) {
+         // The float8 boundary is an encode, not a grid: divide by the scale and let the
+         // E4M3 conversion saturate, which is what the ONNX saturate default asks for.
+         OpName = "op_" + OpName;
+         std::string op = "\n//------ ONNX_QUANTIZELINEAR_FP8_KERNEL_ALPAKA " + OpName + "\n";
+         op += SP + "struct QuantizeLinearKernel_" + OpName + " {\n";
+         op += SP + SP + "template<typename TAcc, typename TIn, typename TOut>\n";
+         op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, TIn const * x, TOut * y, "
+                         "std::size_t const length) const {\n";
+         op += SP + SP + SP + "auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+         op += SP + SP + SP + "if (idx >= length) return;\n";
+         op += SP + SP + SP + "double v = static_cast<double>(x[idx]);\n";
+         if (fFusedHasClip) {
+            // The absorbed Clip runs before the quantize, exactly where it sat in the graph.
+            op += SP + SP + SP + "v = v < " + DETAIL::ExactDoubleLiteral(fFusedClipLow) + " ? " +
+                  DETAIL::ExactDoubleLiteral(fFusedClipLow) + " : (v > " +
+                  DETAIL::ExactDoubleLiteral(fFusedClipHigh) + " ? " +
+                  DETAIL::ExactDoubleLiteral(fFusedClipHigh) + " : v);\n";
+         }
+         op += SP + SP + SP + "auto q = SOFIE::EncodeFP8E4M3(static_cast<float>(v / " +
+               DETAIL::ExactDoubleLiteral(fFP8Scale) + "));\n";
+         if (IsFakeQuantRoundTripFused()) {
+            // The absorbed DequantizeLinear: decoding here is what makes the pair a
+            // fake-quant. Writing the carrier instead would leave an E4M3 code sitting in a
+            // float tensor, which reads as plausible small integers rather than as an error.
+            op += SP + SP + SP + "y[idx] = static_cast<TOut>(SOFIE::DecodeFP8E4M3(q) * " +
+                  DETAIL::ExactDoubleLiteral(fFP8Scale) + ");\n";
+         } else {
+            op += SP + SP + SP + "y[idx] = static_cast<TOut>(q);\n";
+         }
+         op += SP + SP + "}\n";
+         op += SP + "};\n";
+         return op;
+      }
       DETAIL::RequirePerTensorQDQForGpu(fInfo, "ONNX QuantizeLinear");
       OpName = "op_" + OpName;
       const auto [qMin, qMax] = QuantizedIntegerRange(fInfo);
@@ -385,10 +542,14 @@ private:
    std::string fNScale;
    std::string fNZeroPoint;
    std::string fNY;
+   std::string fDuplicateDecodeOf;   // S57h: output of the decode this one repeats
    ETensorType fInputType = ETensorType::UNDEFINED;
    int fAxis = -1;
    std::vector<size_t> fShape;
    QuantizationInfo fInfo;
+   // A float8 boundary carries a scale rather than an integer grid, so fInfo stays unset.
+   bool fIsFP8 = false;
+   double fFP8Scale = 1.0;
 
    template <class T>
    std::vector<float> DequantizeInitializedTensor(RModel &model) const
@@ -426,6 +587,66 @@ public:
    const std::string &GetZeroPointTensor() const { return fNZeroPoint; }
    const QuantizationInfo &GetQuantizationInfo() const { return fInfo; }
 
+   // S57h. An exporter emits one DequantizeLinear per consumer, so a carrier read by three
+   // operators is decoded three times into three identical tensors. This one decodes what
+   // `survivor` already decoded -- same carrier, same grid -- so its output is that tensor
+   // under another name.
+   //
+   // Marked rather than deleted because SOFIE has no generic consumer rewiring: pointing
+   // this operator's readers at `survivor` would mean editing operators we do not own. A
+   // view costs nothing, changes no consumer, and keeps the name resolving -- the same
+   // trick ROperator_Reshape uses. See RModel::DeduplicateCarrierDecodes.
+   void MarkAsDuplicateDecodeOf(const std::string &survivor)
+   {
+      fDuplicateDecodeOf = survivor;
+      // The dependency really has moved: this operator no longer touches the carrier, it
+      // views the survivor's already-decoded output. Saying so is not bookkeeping -- the
+      // round-trip fusion counts a carrier's consumers to decide whether it can collapse a
+      // pair, and a duplicate still claiming to read the carrier keeps that carrier looking
+      // ambiguous and blocks the fusion it was supposed to unblock.
+      fInputTensorNames = { fDuplicateDecodeOf };
+   }
+   bool IsDuplicateDecode() const { return !fDuplicateDecodeOf.empty(); }
+   // A float8 boundary carries a scale and no integer grid, so fInfo is never populated
+   // for one. Anything comparing grids has to ask this first, or it compares defaults.
+   bool IsFP8Boundary() const { return fIsFP8; }
+   double GetFP8Scale() const { return fFP8Scale; }
+
+   // The grid this boundary encodes onto, in the one representation that covers both
+   // encodings. Prefer this over GetQuantizationInfo/IsFP8Boundary/GetFP8Scale: those three
+   // only mean anything together, and every pass that took them apart got it wrong at least
+   // once. See QuantizationGrid in RQuantization.hxx.
+   QuantizationGrid GetGrid() const
+   {
+      QuantizationGrid grid;
+      if (fIsFP8) {
+         grid.kind = fInputType == ETensorType::FLOAT8E5M2 || fInputType == ETensorType::FLOAT8E5M2FNUZ
+                        ? EQuantizationGridKind::Float8E5M2
+                        : EQuantizationGridKind::Float8E4M3;
+         grid.scale = fFP8Scale;
+         grid.zeroPoint = 0;
+         grid.granularity = EQuantizationGranularity::PerTensor;
+         // E4M3 tops out at 448 and E5M2 at 57344; both are symmetric and have no infinity
+         // in the ONNX "fn" spellings, so the extreme code is the largest finite value.
+         const double limit = grid.kind == EQuantizationGridKind::Float8E4M3 ? 448.0 : 57344.0;
+         grid.codeMin = -limit;
+         grid.codeMax = limit;
+         return grid;
+      }
+      if (fInfo.bitWidth == 0)
+         return grid;   // undefined: not a boundary whose grid anyone may compare
+      grid.kind = EQuantizationGridKind::Integer;
+      grid.scale = fInfo.scale;
+      grid.zeroPoint = fInfo.zeroPoint;
+      grid.granularity = fInfo.granularity;
+      grid.rounding = fInfo.rounding;
+      const auto [qMin, qMax] = QuantizedIntegerRange(fInfo);
+      grid.codeMin = static_cast<double>(qMin);
+      grid.codeMax = static_cast<double>(qMax);
+      return grid;
+   }
+
+
    std::vector<ETensorType> TypeInference(std::vector<ETensorType>) override { return {ETensorType::FLOAT}; }
    std::vector<std::vector<size_t>> ShapeInference(std::vector<std::vector<size_t>> input) override
    {
@@ -438,6 +659,32 @@ public:
       if (!model.CheckIfTensorAlreadyExist(fNX))
          throw std::runtime_error("SOFIE ONNX DequantizeLinear input tensor " + fNX + " is not found in model");
       fShape = model.GetTensorShape(fNX);
+      if (IsFP8TensorType(fInputType)) {
+         fIsFP8 = true;
+         // The carrier is the input, whether a QuantizeLinear wrote it or it arrived as a
+         // DQ-only constant, so the contract is registered there rather than on the output.
+         // Registered unconditionally: the parser already derives a carrier from the ONNX
+         // type alone, and that one has no scale, so it has to be replaced rather than kept.
+         model.AddLowPrecisionTensorInfo(
+            fNX, DETAIL::MakeONNXFP8TensorInfo(model, fNScale, fNZeroPoint, fInputType, fNX,
+                                               "ONNX DequantizeLinear"));
+         fFP8Scale = model.GetLowPrecisionTensorInfo(fNX).affineQuantization->scale;
+         // Folded to float exactly as an integer carrier is, so the emitted operator set is
+         // unchanged; the FP8 bytes stay reachable through the contract registered on fNX.
+         if (model.IsInitializedTensor(fNX)) {
+            const auto scale = static_cast<float>(model.GetLowPrecisionTensorInfo(fNX).affineQuantization->scale);
+            const auto bytes = model.GetTensorData<std::uint8_t>(fNX);
+            std::vector<float> values(bytes.size());
+            for (std::size_t i = 0; i < bytes.size(); ++i)
+               values[i] = DETAIL::DecodeHostFP8E4M3(bytes[i]) * scale;
+            model.AddConstantTensor(fNY, fShape, values);
+            fIsOutputConstant = true;
+         } else {
+            model.AddIntermediateTensor(fNY, ETensorType::FLOAT, fShape);
+         }
+         model.AddNeededStdLib("cstdint");
+         return;
+      }
       fInfo = DETAIL::MakeONNXQDQInfo(model, fNScale, fNZeroPoint, fInputType, fShape, fAxis,
                                       "ONNX DequantizeLinear");
       model.AddQuantizationInfo(fNY, fInfo);
@@ -465,6 +712,8 @@ public:
 
    std::string Generate(std::string OpName) override
    {
+      if (fIsFP8)
+         throw std::runtime_error("SOFIE ONNX float8 Q/DQ code generation is not implemented; the boundary must be absorbed by a low-precision region");
       OpName = "op_" + OpName;
       if (fInfo.granularity != EQuantizationGranularity::PerTensor) {
          throw std::runtime_error("SOFIE ONNX DequantizeLinear literal code generation supports scalar parameters only; vector parameters require fused lowering");
@@ -487,8 +736,27 @@ public:
    // Initialize, so those instances generate nothing.
    std::string Generate_GPU_Kernel_ALPAKA(std::string OpName) override
    {
+      if (IsDuplicateDecode())
+         return "";
+
       if (fIsOutputConstant)
          return "";
+      if (fIsFP8) {
+         // The float8 boundary is a decode, not a grid: read the carrier and scale it.
+         OpName = "op_" + OpName;
+         std::string op = "\n//------ ONNX_DEQUANTIZELINEAR_FP8_KERNEL_ALPAKA " + OpName + "\n";
+         op += SP + "struct DequantizeLinearKernel_" + OpName + " {\n";
+         op += SP + SP + "template<typename TAcc, typename TIn, typename TOut>\n";
+         op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, TIn const * x, TOut * y, "
+                         "std::size_t const length) const {\n";
+         op += SP + SP + SP + "auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+         op += SP + SP + SP + "if (idx >= length) return;\n";
+         op += SP + SP + SP + "y[idx] = static_cast<TOut>(SOFIE::DecodeFP8E4M3(x[idx]) * " +
+               DETAIL::ExactDoubleLiteral(fFP8Scale) + "f);\n";
+         op += SP + SP + "}\n";
+         op += SP + "};\n";
+         return op;
+      }
       DETAIL::RequirePerTensorQDQForGpu(fInfo, "ONNX DequantizeLinear");
       OpName = "op_" + OpName;
       std::string op = "\n//------ ONNX_DEQUANTIZELINEAR_KERNEL_ALPAKA " + OpName + "\n";
@@ -510,6 +778,8 @@ public:
       if (fIsOutputConstant)
          return "";
       OpName = "op_" + OpName;
+      if (IsDuplicateDecode())
+         return "";
       return SP + "DequantizeLinearKernel_" + OpName + " dequantizeLinearKernel_" + OpName + ";\n";
    }
 
@@ -520,6 +790,14 @@ public:
       OpName = "op_" + OpName;
       const auto length = ConvertShapeToLength(fShape);
       std::stringstream out;
+      if (IsDuplicateDecode()) {
+         out << "\n//------ ONNX_DEQUANTIZELINEAR_ALPAKA " << OpName
+             << " (duplicate decode: view over " << fDuplicateDecodeOf << ")\n";
+         out << SP << "auto deviceBuf_" << fNY << " = alpaka::createView(devAcc, "
+             << "alpaka::getPtrNative(deviceBuf_" << fDuplicateDecodeOf
+             << "), static_cast<Idx>(" << length << "));\n";
+         return out.str();
+      }
       out << "\n//------ ONNX_DEQUANTIZELINEAR_ALPAKA " << OpName << "\n";
       out << SP << "auto const elementsPerGrid_" << fNY << " = Vec::all(Idx{" << length << "});\n";
       out << SP << "auto const workDiv_" << fNY << " = sofie_workdiv(elementsPerGrid_" << fNY << ");\n";

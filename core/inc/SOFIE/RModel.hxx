@@ -9,6 +9,20 @@
 
 namespace SOFIE {
 
+// S57c. One surviving Quantize/Dequantize kernel that no adjacent operator asked for.
+//
+// A boundary is *justified* when a neighbour on its float side reports RequiresFloat: the
+// value has to become real there, so encoding or decoding it is the model, not our overhead.
+// Every other surviving boundary is absorption we have not done, and this names the operator
+// that should have done it. The list is meant to be a burn-down, not an error log -- it
+// starts long, and the point is that it cannot silently grow.
+struct CarrierFrontierViolation {
+   std::string boundaryOperator;   // "QuantizeLinear" / "DequantizeLinear"
+   std::string boundaryTensor;     // the carrier it produces or consumes
+   std::string neighborOperator;   // the operator that should have absorbed it
+   ELowPrecisionCarrierSupport neighborSupport = ELowPrecisionCarrierSupport::RequiresFloat;
+};
+
 class RModel final : public RModel_Base {
 
    friend class RModelProfiler;
@@ -79,6 +93,7 @@ private:
    std::unordered_map<size_t, size_t> fOpToFusionGroupIdx; ///<!  op_idx -> fusion group index
    std::set<std::string> fFusionIntermediateTensors;        ///<!  intermediate tensors whose alloc is skipped
    std::set<size_t>      fSkipOperators;                    ///<!  ops swallowed by a preceding fusion (e.g. GEMM+LeakyReLU)
+   std::vector<CarrierFrontierViolation> fCarrierFrontierViolations; ///<!
    void ComputeEltwiseFusionGroups();
    /// GPU-only pass: fuse GEMM→LeakyReLU (and GEMM→ReLU where not already
    /// handled by the ONNX parser) into a single in-place kernel sequence.
@@ -87,6 +102,19 @@ private:
    void PrepareQuantizedTensorStorage(EQuantizedBackend backend);
    void AddQuantizedGeneratedHeaders(EQuantizedBackend backend = EQuantizedBackend::CPU);
    void AddLoweredQuantizedOperators(EQuantizedBackend backend = EQuantizedBackend::CPU);
+   void SetKnownTensorType(const std::string &tensorName, ETensorType type);
+   // S57h canonicalization: collapses DequantizeLinear nodes that decode the same carrier on
+   // the same grid, which an exporter duplicates once per consumer.
+   void DeduplicateCarrierDecodes(EQuantizedBackend backend = EQuantizedBackend::CPU);
+   // S57i-a canonicalization: drops a Clip that cannot clamp anything because the
+   // QuantizeLinear it feeds already saturates at the same bound.
+   void DropNoOpClipsBeforeQuantize(EQuantizedBackend backend = EQuantizedBackend::CPU);
+   // S57c: records every surviving Q/DQ boundary that no adjacent operator asked for.
+   void CheckLowPrecisionCarrierFrontier();
+   // Moves a Reshape/Transpose run onto the quantized carrier and deletes the Dequantize/
+   // Quantize pair that bracketed it. Runs before the fusion below, which would otherwise
+   // collapse the carrier's producer into a float round trip.
+   void PropagateLowPrecisionThroughMovement(EQuantizedBackend backend = EQuantizedBackend::CPU);
    // Collapses each surviving Clip? -> Quantize -> Dequantize into one kernel. Runs last,
    // so it only sees boundaries no region absorbed.
    void FuseUnabsorbedFakeQuantBoundaries();
@@ -116,6 +144,13 @@ public:
    RModel(std::string function_name) : RModel_Base(function_name) {}
 
    int Verbose() const { return fVerbose;}
+
+   // S57c. Surviving Q/DQ boundaries that no adjacent operator asked for -- the absorption
+   // backlog, populated by the last stage of BuildLoweredOperatorView.
+   const std::vector<CarrierFrontierViolation> &GetCarrierFrontierViolations() const
+   {
+      return fCarrierFrontierViolations;
+   }
 
    std::vector<size_t> GetTensorShape(const std::string & name) const;
    std::vector<Dim> GetDimTensorShape(const std::string & name) const;

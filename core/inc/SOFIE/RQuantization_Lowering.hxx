@@ -526,6 +526,14 @@ struct QuantizedLoweringPlan {
    EQuantizedParameterMode weightScaleMode = EQuantizedParameterMode::Scalar;
    std::string weightScaleTensor;
    std::string weightZeroPointTensor;
+   // Per-tensor dequantization factors for a native low-precision operand pair, carried as
+   // values because the backend applies them itself rather than reading a graph tensor.
+   double lowPrecisionInputScale = 1.0;
+   double lowPrecisionWeightScale = 1.0;
+   // Grid step the region encodes its output onto when it writes an FP8 carrier rather than
+   // a float D. 1 means the region emits float and no D scale is programmed. Set only by
+   // FP8 output-requantize absorption (F2).
+   double lowPrecisionOutputScale = 1.0;
 
    std::vector<std::size_t> consumedOperatorIndices;
    bool preservesQuantizationSemantics = false;

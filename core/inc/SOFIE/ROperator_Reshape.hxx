@@ -50,6 +50,33 @@ public:
 
    bool PropagatesQuantizationMetadata() const override { return true; }
 
+   const std::string &GetInputTensor() const { return fNData; }
+   const std::string &GetOutputTensor() const { return fNOutput; }
+
+   // A reshape only relabels the extents of a buffer, so it never reads the bytes it moves
+   // and is indifferent to their type. On the device it emits a non-owning view rather than
+   // a kernel, which means its output *is* its input's storage -- the arena has to be told.
+   ELowPrecisionCarrierSupport CarrierSupport() const override
+   {
+      return ELowPrecisionCarrierSupport::ValuePreserving;
+   }
+   bool CarrierOutputAliasesInput() const override { return true; }
+
+   // Legal after Initialize: only the tensor names change, and the replacements carry the
+   // same shapes as the tensors they stand in for, so the shapes derived there stay valid.
+   // Used by RModel::PropagateLowPrecisionThroughMovement to move this reshape onto the
+   // quantized carrier. fNInput2 is the shape/axes operand, which is unrelated to the data
+   // being moved and is kept as it was.
+   void RewireLowPrecisionCarrier(const std::string &nameData, const std::string &nameOutput) override
+   {
+      fNData = nameData;
+      fNOutput = nameOutput;
+      fInputTensorNames = { fNData };
+      if (!fNInput2.empty())
+         fInputTensorNames.emplace_back(fNInput2);
+      fOutputTensorNames = { fNOutput };
+   }
+
    std::vector<int_t> GetQuantizationMetadataAxisMap(
       const std::vector<std::size_t> &sourceShape,
       const std::vector<std::size_t> &targetShape) const override

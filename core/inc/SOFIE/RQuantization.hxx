@@ -65,6 +65,74 @@ inline bool SameQuantizationGrid(const QuantizationInfo &a, const QuantizationIn
           a.rounding == b.rounding;
 }
 
+// One description of the grid a quantization boundary encodes onto, covering both the
+// integer and the float8 case.
+//
+// These were separate representations, and the split was a standing source of bugs rather
+// than a design. An integer boundary keeps its parameters in a QuantizationInfo; a float8
+// boundary leaves that struct default-constructed and carries a bare scale beside it. So
+// every pass that compares two boundaries had to ask `IsFP8Boundary()` first and branch,
+// because comparing the integer fields of two float8 boundaries compares defaults and
+// silently reports that two unrelated grids match. That fork caused defects in the movement
+// pass, the fusion pass and the GEMM output-carrier pass.
+//
+// The observation that removes the fork: both kinds are the same affine map `value = (code -
+// zeroPoint) * scale`, differing only in *which codes are representable*. Naming the extreme
+// codes makes that the only difference, and everything a pass actually asks -- do these two
+// boundaries agree, how large a value can this grid hold -- stops depending on the encoding.
+// The grid's own vocabulary rather than the lowering layer's ELowPrecisionCarrier: this
+// header is included before that enum exists, and from inside a namespace in places, so
+// reaching for it here reintroduces the include cycle that already had to be unpicked once.
+enum class EQuantizationGridKind { Undefined = 0, Integer = 1, Float8E4M3 = 2, Float8E5M2 = 3 };
+
+struct QuantizationGrid {
+   EQuantizationGridKind kind = EQuantizationGridKind::Undefined;
+   double scale = 1.0;
+   std::int64_t zeroPoint = 0;   // float8 selects its type by zero-point *type*, so this is 0
+   EQuantizationGranularity granularity = EQuantizationGranularity::PerTensor;
+   EQuantizationRoundingMode rounding = EQuantizationRoundingMode::UNDEFINED;
+   // Extremes of the representable code set: -128/127 for int8, -448/448 for E4M3. Held as
+   // double because a float8 code set is not integral.
+   double codeMin = 0.0;
+   double codeMax = 0.0;
+
+   bool IsDefined() const { return kind != EQuantizationGridKind::Undefined; }
+   bool IsFloatingPoint() const
+   {
+      return kind == EQuantizationGridKind::Float8E4M3 || kind == EQuantizationGridKind::Float8E5M2;
+   }
+};
+
+// Two boundaries are the same grid when a value encoded by one is decoded unchanged by the
+// other. codeMin/codeMax follow from the carrier, so comparing the carrier covers them.
+inline bool SameGrid(const QuantizationGrid &a, const QuantizationGrid &b)
+{
+   // codeMin/codeMax are compared rather than assumed to follow from the kind: the kind
+   // says integer, not how many bits or whether signed, so two widths would otherwise match.
+   return a.IsDefined() && b.IsDefined() && a.kind == b.kind &&
+          a.granularity == EQuantizationGranularity::PerTensor &&
+          b.granularity == EQuantizationGranularity::PerTensor && a.scale == b.scale &&
+          a.zeroPoint == b.zeroPoint && a.rounding == b.rounding && a.codeMin == b.codeMin &&
+          a.codeMax == b.codeMax;
+}
+
+// The real-valued interval this grid can represent. Asymmetric for an offset grid, which is
+// why this returns both ends rather than a magnitude.
+inline std::pair<double, double> GridInterval(const QuantizationGrid &grid)
+{
+   return {(grid.codeMin - static_cast<double>(grid.zeroPoint)) * grid.scale,
+           (grid.codeMax - static_cast<double>(grid.zeroPoint)) * grid.scale};
+}
+
+// The largest magnitude this grid can hold. What a saturation check wants, and the reason
+// the no-op Clip pass needed two spellings before: `QuantizedIntegerRange` scaled for int8,
+// `448 * scale` for E4M3. Both are this.
+inline double GridMagnitude(const QuantizationGrid &grid)
+{
+   const auto [low, high] = GridInterval(grid);
+   return std::max(std::abs(low), std::abs(high));
+}
+
 inline std::pair<std::int64_t, std::int64_t> QuantizedIntegerRange(const QuantizationInfo &info)
 {
    if (info.bitWidth == 0 || info.bitWidth >= 63) {
@@ -78,6 +146,106 @@ inline std::pair<std::int64_t, std::int64_t> QuantizedIntegerRange(const Quantiz
    const std::int64_t qmax = (std::int64_t{1} << info.bitWidth) - 1;
    const std::int64_t qmin = info.narrow ? 1 : 0;
    return {qmin, qmax};
+}
+
+// Lifts the integer metadata a region carries into the encoding-agnostic grid. Passes that
+// only need "what does an encode onto this look like" should take the grid, so the same code
+// serves int8 and FP8; QuantizationInfo additionally carries frontend provenance (the scale
+// and zero-point tensor names, the axis) that an encode has no use for.
+inline QuantizationGrid IntegerGridFrom(const QuantizationInfo &info)
+{
+   const auto [qMin, qMax] = QuantizedIntegerRange(info);
+   QuantizationGrid grid;
+   grid.kind = EQuantizationGridKind::Integer;
+   grid.scale = info.scale;
+   grid.zeroPoint = info.zeroPoint;
+   grid.granularity = info.granularity;
+   grid.rounding = info.rounding;
+   grid.codeMin = static_cast<double>(qMin);
+   grid.codeMax = static_cast<double>(qMax);
+   return grid;
+}
+
+// The float8 counterpart, for the places that hold only a scale because a float8 boundary
+// carries nothing else: no zero point, and a code set fixed by the format. Kept beside
+// IntegerGridFrom so the two ways of naming a grid stay in one place.
+inline QuantizationGrid Float8GridFrom(double scale, EQuantizationGridKind kind)
+{
+   QuantizationGrid grid;
+   grid.kind = kind;
+   grid.scale = scale;
+   grid.zeroPoint = 0;
+   grid.granularity = EQuantizationGranularity::PerTensor;
+   // E4M3 tops out at 448 and E5M2 at 57344; both symmetric, no infinity in the ONNX "fn"
+   // spellings, so the extreme code is the largest finite value.
+   const double limit = kind == EQuantizationGridKind::Float8E5M2 ? 57344.0 : 448.0;
+   grid.codeMin = -limit;
+   grid.codeMax = limit;
+   return grid;
+}
+
+// Emits the statements a fused fake-quant boundary computes -- encode onto the grid, then
+// decode straight back -- writing the result into `resultVar`. `valueExpr` is read once.
+//
+// This exists so an operator folding a boundary into its own epilogue emits *the same
+// arithmetic the boundary would have emitted*, rather than a second spelling of it that
+// happens to agree on the values anyone thought to check. It mirrors
+// ROperator_ONNXQuantizeLinear's round-trip bodies statement for statement; the two must be
+// changed together, and a fixture that folds and one that does not must agree bit for bit.
+//
+// `indent` is prepended to each line. The caller declares nothing: this emits the declaration.
+inline std::string FakeQuantRoundTripStatements(const std::string &resultVar,
+                                                const std::string &valueExpr,
+                                                const QuantizationGrid &grid,
+                                                const std::string &indent)
+{
+   std::string op;
+   if (grid.IsFloatingPoint()) {
+      // Float8 has no zero point and saturates inside the convert, so the round trip is the
+      // scale division, the hardware convert, and the scale back.
+      const std::string scale = ExactDoubleLiteral(grid.scale);
+      op += indent + "float const " + resultVar + " = static_cast<float>(SOFIE::DecodeFP8E4M3(" +
+            "SOFIE::EncodeFP8E4M3(static_cast<float>(static_cast<double>(" + valueExpr + ") / " +
+            scale + "))) * " + scale + ");\n";
+      return op;
+   }
+   const std::string scale = ExactDoubleLiteral(grid.scale);
+   const std::string zp = std::to_string(grid.zeroPoint);
+   const std::string qMin = std::to_string(static_cast<std::int64_t>(grid.codeMin));
+   const std::string qMax = std::to_string(static_cast<std::int64_t>(grid.codeMax));
+   op += indent + "double " + resultVar + "_q = nearbyint((static_cast<double>(" + valueExpr +
+         ") / " + scale + ") + " + zp + ");\n";
+   op += indent + resultVar + "_q = (" + resultVar + "_q < " + qMin + ") ? " + qMin + " : ((" +
+         resultVar + "_q > " + qMax + ") ? " + qMax + " : " + resultVar + "_q);\n";
+   op += indent + "double const " + resultVar + " = (" + resultVar + "_q - " + zp + ") * " + scale + ";\n";
+   return op;
+}
+
+// Encode-only counterpart of FakeQuantRoundTripStatements: writes the CODE rather than the
+// snapped float. Shared so an absorbing producer emits the boundary's own arithmetic instead of
+// a second spelling of it -- the two emitters differ only in whether the decode half follows.
+inline std::string EncodeToGridStatements(const std::string &destExpr, const std::string &valueExpr,
+                                          const QuantizationGrid &grid, const std::string &indent)
+{
+   std::string op;
+   if (grid.IsFloatingPoint()) {
+      const std::string scale = ExactDoubleLiteral(grid.scale);
+      op += indent + destExpr + " = SOFIE::EncodeFP8E4M3(static_cast<float>(static_cast<double>(" +
+            valueExpr + ") / " + scale + "));\n";
+      return op;
+   }
+   const std::string scale = ExactDoubleLiteral(grid.scale);
+   const std::string zp = std::to_string(grid.zeroPoint);
+   const std::string qMin = std::to_string(static_cast<std::int64_t>(grid.codeMin));
+   const std::string qMax = std::to_string(static_cast<std::int64_t>(grid.codeMax));
+   op += indent + "{\n";
+   op += indent + "   double q = nearbyint((static_cast<double>(" + valueExpr + ") / " + scale +
+         ") + " + zp + ");\n";
+   op += indent + "   q = (q < " + qMin + ") ? " + qMin + " : ((q > " + qMax + ") ? " + qMax + " : q);\n";
+   op += indent + "   " + destExpr + " = static_cast<std::remove_reference_t<decltype(" + destExpr +
+         ")>>(q);\n";
+   op += indent + "}\n";
+   return op;
 }
 
 inline std::int64_t QuantizeScalarToIntegerGrid(float value, const QuantizationInfo &info)
@@ -415,9 +583,11 @@ struct QuantizationModelState {
    std::unordered_map<std::size_t, QuantizedRegion> regions;
    std::unordered_map<std::size_t, std::unordered_map<EQuantizedBackend, QuantizedLoweringPlan>> loweringPlans;
    std::vector<std::string> metadataDiagnostics;
-   // Grids for Softmax operators that should write an int8 carrier, keyed by the tensor
-   // each writes. Decided when planning the consumer, applied when the Clip is absorbed.
-   std::unordered_map<std::string, QuantizationInfo> softmaxInt8Handoffs;
+   // Grids for producing operators that should write a low-precision carrier instead of a
+   // float, keyed by the tensor each writes. Decided when planning the consumer, applied when
+   // the producer absorbs the boundary. Keyed on QuantizationGrid so one map serves int8 and
+   // FP8; today only Softmax reads it.
+   std::unordered_map<std::string, QuantizationGrid> softmaxInt8Handoffs;
 
    void ClearDerivedAnalysis()
    {

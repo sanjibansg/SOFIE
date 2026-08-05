@@ -2,7 +2,11 @@
 #define SOFIE_ROPERATOR_LAYERNORMALIZATION
 
 #include "SOFIE/RModel.hxx"
+#include "SOFIE/RQuantization.hxx"
 #include "SOFIE/SOFIE_common.hxx"
+#include <cstdio>
+#include <cstdlib>
+#include <optional>
 #include <sstream>
 #include <string>
 
@@ -46,6 +50,10 @@ private:
    std::string fAxesLength;
 
    std::string fType;
+
+   // Grid of an absorbed downstream fake-quant boundary: the kernel applies the boundary's
+   // snap in its epilogue and keeps writing float, so consumers are unaffected.
+   std::optional<QuantizationGrid> fFakeQuantGrid;
 
 public:
    ROperator_LayerNormalization() {}
@@ -166,6 +174,23 @@ public:
       //    }
       // }
       model.AddNeededStdLib("cmath");
+   }
+
+   // Absorbs a downstream fake-quant boundary: the snap runs before the store and the
+   // boundary stops emitting. Output type and consumers are unchanged.
+   bool CanFuseFakeQuantOutput() const override { return true; }
+
+   // Adopts the boundary's output tensor; the previous output is left for dead-code
+   // elimination.
+   void FuseFakeQuantOutput(const std::string &output, const QuantizationGrid &grid) override
+   {
+      if (fOutputTensorNames.empty() || std::string(fOutputTensorNames[0]) != fNY) {
+         throw std::runtime_error("TMVA::SOFIE LayerNormalization cannot fold a fake-quant "
+                                  "boundary: its output tensor list does not begin with " + fNY);
+      }
+      fFakeQuantGrid = grid;
+      fNY = output;
+      fOutputTensorNames[0] = output;
    }
 
    std::string GenerateInitCode() override
@@ -539,7 +564,21 @@ public:
             op += SP + SP + SP + SP + "out_val += bias[bias_base + b_norm_offset];\n";
          }
 
-         op += SP + SP + SP + SP + "Y[norm_idx] = out_val;\n";
+         // Distinguishes "this path did not run" from "a stale library supplied an older body";
+         // class-template members merge at link, so the two are otherwise indistinguishable.
+         // Off unless SOFIE_LAYERNORM_TRACE is set.
+         if (std::getenv("SOFIE_LAYERNORM_TRACE")) {
+            std::fprintf(stderr, "[LN-TRACE] %s parallel-path epilogue, grid=%s\n", kname.c_str(),
+                         fFakeQuantGrid ? "SET" : "unset");
+         }
+
+         if (fFakeQuantGrid) {
+            op += FakeQuantRoundTripStatements("out_snapped", "out_val", *fFakeQuantGrid,
+                                               SP + SP + SP + SP);
+            op += SP + SP + SP + SP + "Y[norm_idx] = static_cast<T>(out_snapped);\n";
+         } else {
+            op += SP + SP + SP + SP + "Y[norm_idx] = out_val;\n";
+         }
          op += SP + SP + SP + "}\n";  // end in_range
 
       } else {
@@ -658,7 +697,14 @@ public:
             op += ";\n";
             op += SP + SP + SP + SP + SP + "val += bias[b_idx];\n";
          }
-         op += SP + SP + SP + SP + SP + "Y[norm_idx] = val;\n";
+         // The serial fallback applies the same snap as the parallel path.
+         if (fFakeQuantGrid) {
+            op += FakeQuantRoundTripStatements("val_snapped", "val", *fFakeQuantGrid,
+                                               SP + SP + SP + SP + SP);
+            op += SP + SP + SP + SP + SP + "Y[norm_idx] = static_cast<T>(val_snapped);\n";
+         } else {
+            op += SP + SP + SP + SP + SP + "Y[norm_idx] = val;\n";
+         }
          for (size_t j = fAxis; j < fSize; ++j) op += SP + SP + SP + SP + "}\n";
 
          op += SP + SP + SP + "}\n";  // end row loop

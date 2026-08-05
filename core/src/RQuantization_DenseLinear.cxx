@@ -36,19 +36,33 @@ bool IsScalarZeroPointZero(const QuantizationInfo &info)
 
 } // namespace
 
-QuantizedMatrixShapePolicy MakeExactFP8DenseLinearShapePolicy(std::size_t m, std::size_t k, std::size_t n)
+std::size_t PaddedFP8DenseLinearOutputN(std::size_t n, std::size_t outputElementBytes)
+{
+   if (outputElementBytes == 0 || outputElementBytes > kCublasLtFP8LeadingDimensionBytes)
+      return n;
+   return RoundUpToMultiple(n, kCublasLtFP8LeadingDimensionBytes / outputElementBytes);
+}
+
+QuantizedMatrixShapePolicy MakeFP8DenseLinearShapePolicy(std::size_t m, std::size_t k, std::size_t n,
+                                                         std::size_t batchCount, std::size_t physicalN)
 {
    QuantizedMatrixShapePolicy policy;
-   policy.policy = EQuantizedShapePolicy::Exact;
    policy.logicalM = m;
    policy.logicalK = k;
    policy.logicalN = n;
+   policy.batchCount = batchCount == 0 ? 1 : batchCount;
    policy.physicalM = m;
    policy.physicalK = k;
-   policy.physicalN = n;
-   policy.logicalMacs = m * k * n;
-   policy.physicalMacs = policy.logicalMacs;
-   policy.reason = "native FP8 dense-linear shape is exact";
+   policy.physicalN = physicalN < n ? n : physicalN;
+   policy.policy = policy.physicalN > n ? EQuantizedShapePolicy::Padded : EQuantizedShapePolicy::Exact;
+   policy.logicalMacs = policy.batchCount * m * k * n;
+   policy.physicalMacs = policy.batchCount * m * k * policy.physicalN;
+   policy.reason = policy.physicalN > n
+                      ? "native FP8 dense-linear shape pads N=" + std::to_string(n) + " to " +
+                           std::to_string(policy.physicalN) + " for the cuBLASLt output leading dimension"
+                      : "native FP8 dense-linear shape is exact";
+   if (policy.batchCount > 1)
+      policy.reason += ", batch count=" + std::to_string(policy.batchCount);
    return policy;
 }
 
@@ -757,8 +771,16 @@ void PopulateDenseLinearResourceRequirements(QuantizedLoweringPlan &plan, bool h
       kQuantizedCudaLtMaxWorkspaceBytes, cudaAlignment, true,
       "maximum cuBLASLt heuristic workspace capacity");
 
-   if (QuantizedPlanUsesFP8DenseLinear(plan))
+   if (QuantizedPlanUsesFP8DenseLinear(plan)) {
+      if (QuantizedShapePolicyUsesPadding(shape.policy)) {
+         AddQuantizedResourceRequirement(
+            plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::OutputStaging,
+            EQuantizedResourceLifetime::Invocation, plan.outputStorage,
+            bytes(plan.outputStorage, batchCount * shape.logicalM * physicalN), cudaAlignment, true,
+            "padded FP8 output staging buffer");
+      }
       return;
+   }
 
    AddQuantizedResourceRequirement(
       plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::InputStaging,

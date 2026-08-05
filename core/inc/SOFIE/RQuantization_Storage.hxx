@@ -44,6 +44,14 @@ MaterializedQuantizedTensor MaterializeLowPrecisionWeightBytes(
    EQuantizedBackend backend, const void *sourceData,
    const std::vector<std::size_t> &sourceShape);
 
+// Lays a constant low-precision weight out as the [N, K] rows the FP8 call reads, from a
+// [K, N] source when transposeSource is set, zero-filling up to paddedRows.
+MaterializedQuantizedTensor MaterializeLowPrecisionDenseLinearWeightBytes(
+   std::string logicalTensor, std::string sourceTensor, std::string storageTensor,
+   const LowPrecisionTensorInfo &lowPrecision, EQuantizedLayout layout,
+   EQuantizedBackend backend, const void *sourceData,
+   const std::vector<std::size_t> &sourceShape, bool transposeSource, std::size_t paddedRows = 0);
+
 MaterializedQuantizedTensor MaterializeLowPrecisionConvWeight(
    const QuantizedConvRegion &region, const QuantizedLoweringPlan &plan,
    EQuantizedBackend backend, const void *sourceData,

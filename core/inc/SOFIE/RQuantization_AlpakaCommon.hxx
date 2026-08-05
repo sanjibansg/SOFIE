@@ -12,12 +12,27 @@
 
 #if defined(SOFIE_USE_CUBLASLT) || defined(ALPAKA_ACC_GPU_CUDA_ENABLED)
 #include <cuda_runtime.h>
+#include <cuda_fp8.h>
 #endif
 
 namespace SOFIE {
 
 #if defined(SOFIE_USE_CUBLASLT) || defined(ALPAKA_ACC_GPU_CUDA_ENABLED)
 using QuantizedGemmCudaStream = cudaStream_t;
+
+// An FP8 tensor is carried as raw bytes, so converting one needs the E4M3 encoding
+// rather than the numeric conversion a byte-typed buffer would otherwise get.
+__host__ __device__ inline std::uint8_t EncodeFP8E4M3(float value)
+{
+   return static_cast<std::uint8_t>(__nv_fp8_e4m3(value).__x);
+}
+
+__host__ __device__ inline float DecodeFP8E4M3(std::uint8_t value)
+{
+   __nv_fp8_e4m3 encoded;
+   encoded.__x = static_cast<__nv_fp8_storage_t>(value);
+   return static_cast<float>(encoded);
+}
 #else
 using QuantizedGemmCudaStream = void *;
 #endif
@@ -179,6 +194,18 @@ struct QuantizedFP8DenseLinearInvocation {
    std::size_t m = 0;
    std::size_t n = 0;
    std::size_t k = 0;
+   // NT spelling puts N in m, so a padded call runs at m and writes back logicalM columns.
+   std::size_t logicalM = 0;
+   bool paddedExecution = false;
+   // Per-tensor dequantization factors for the E4M3 operands, applied by cuBLASLt itself.
+   // 1 means the operand carries its values directly and no scale pointer is programmed.
+   float inputScale = 1.0f;
+   float weightScale = 1.0f;
+   // Requantization factor for an FP8 D, i.e. the scale of the grid the output is being
+   // encoded onto. cuBLASLt multiplies D by the programmed D scale before narrowing to E4M3,
+   // so the pointer carries 1/outputScale. 1 leaves it unprogrammed, which is what a float
+   // D wants. No pass programs it; the emitted value is always 1.0f.
+   float outputScale = 1.0f;
    std::size_t batchCount = 1;
    std::int64_t batchStrideA = 0;
    std::int64_t batchStrideB = 0;

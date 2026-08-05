@@ -149,6 +149,43 @@ MaterializedQuantizedTensor MaterializeLowPrecisionWeightBytes(
    return result;
 }
 
+MaterializedQuantizedTensor MaterializeLowPrecisionDenseLinearWeightBytes(
+   std::string logicalTensor, std::string sourceTensor, std::string storageTensor,
+   const LowPrecisionTensorInfo &lowPrecision, EQuantizedLayout layout,
+   EQuantizedBackend backend, const void *sourceData,
+   const std::vector<std::size_t> &sourceShape, bool transposeSource, std::size_t paddedRows)
+{
+   if (sourceShape.size() != 2)
+      throw std::runtime_error("SOFIE low-precision dense-linear storage requires a rank-2 weight tensor");
+   if (sourceData == nullptr)
+      throw std::runtime_error("SOFIE low-precision dense-linear storage received null source data");
+   const auto n = transposeSource ? sourceShape[1] : sourceShape[0];
+   const auto k = transposeSource ? sourceShape[0] : sourceShape[1];
+   const auto rows = paddedRows < n ? n : paddedRows;
+
+   const auto storage = MakeLowPrecisionTensorStorage(std::move(logicalTensor), std::move(sourceTensor),
+                                                      std::move(storageTensor), lowPrecision, layout,
+                                                      {rows, k}, backend);
+   if (QuantizedStorageElementSize(storage.storageType) != 1)
+      throw std::runtime_error("SOFIE low-precision dense-linear storage requires a single-byte carrier");
+   const auto *source = static_cast<const std::uint8_t *>(sourceData);
+   MaterializedQuantizedTensor result;
+   result.storage = storage;
+   // Rows past N feed only output columns the call discards, and zero is the one value that
+   // cannot overflow the accumulation on the way there.
+   result.bytes.assign(rows * k, 0);
+   if (transposeSource) {
+      for (std::size_t row = 0; row < k; ++row)
+         for (std::size_t column = 0; column < n; ++column)
+            result.bytes[column * k + row] = source[row * n + column];
+   } else {
+      std::memcpy(result.bytes.data(), source, n * k);
+   }
+   result.tensorType = TensorTypeForQuantizedStorage(storage.storageType);
+   ValidateMaterializedQuantizedTensor(result);
+   return result;
+}
+
 MaterializedQuantizedTensor MaterializeLowPrecisionConvWeight(
    const QuantizedConvRegion &region, const QuantizedLoweringPlan &plan,
    EQuantizedBackend backend, const void *sourceData,

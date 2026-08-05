@@ -86,7 +86,11 @@ QuantizedDenseLinearProfileAssessment AssessDenseLinearComputeProfile(
 
 QuantizedMatrixShapePolicy MakeCublasLtShapePolicy(std::size_t m, std::size_t k, std::size_t n,
                                                    std::size_t batchCount = 1);
-QuantizedMatrixShapePolicy MakeExactFP8DenseLinearShapePolicy(std::size_t m, std::size_t k, std::size_t n);
+// cuBLASLt FP8 accepts a matmul only when every leading dimension is 16-byte aligned.
+constexpr std::size_t kCublasLtFP8LeadingDimensionBytes = 16;
+std::size_t PaddedFP8DenseLinearOutputN(std::size_t n, std::size_t outputElementBytes);
+QuantizedMatrixShapePolicy MakeFP8DenseLinearShapePolicy(std::size_t m, std::size_t k, std::size_t n,
+                                                         std::size_t batchCount = 1, std::size_t physicalN = 0);
 QuantizedDenseLinearBackendCapability MakeNativeFP8E4M3TNF32Capability(std::size_t m, std::size_t n, std::size_t k);
 
 bool IsProfitableCublasLtPaddedDenseLinearPolicy(const QuantizedMatrixShapePolicy &policy);
