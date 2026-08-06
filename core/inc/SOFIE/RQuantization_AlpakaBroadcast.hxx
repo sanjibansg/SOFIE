@@ -5,18 +5,8 @@
 
 #include <cstddef>
 
-// Canonical row-major multidirectional broadcast primitive for the quantized
-// backend. It is the runtime twin of the compile-time-unrolled offset
-// expression base SOFIE emits for ROperator_BasicBinary (the S32a.2 form):
-//
-//   offset = sum_axis ((idx / outputStride[axis]) % outputExtent[axis]) * operandStride[axis]
-//
-// A broadcast axis carries a zero operand stride and contributes nothing. Every
-// quantized operator that broadcasts two operands (elementwise Add/Mul today,
-// future Sub / activation boundaries) shares this one implementation so the
-// contract cannot drift. A later base-SOFIE consolidation could route
-// ROperator_BasicBinary through the same primitive; that is tracked as an
-// upstream cleanup rather than owned here.
+// Canonical row-major multidirectional broadcast primitive, shared by every quantized
+// two-operand broadcast; matches the offset contract of base SOFIE's ROperator_BasicBinary.
 
 namespace SOFIE {
 
@@ -25,8 +15,7 @@ namespace SOFIE {
 namespace INTERNAL {
 
 // Fills row-major contiguous strides for one operand against the output rank.
-// operandExtent is right-aligned and padded with 1; a size-1 axis broadcasts
-// and receives a zero stride. Host-side; called once per invocation.
+// operandExtent is right-aligned and 1-padded; a size-1 axis receives a zero stride.
 inline void QuantizedFillBroadcastStrides(const std::size_t *operandExtent,
                                           std::size_t *operandStride, int rank)
 {

@@ -111,11 +111,8 @@ void RModel::AnalyzeQuantizedRegions()
       fInitializedTensors.erase(name);
    fQuantizationState.ClearDerivedAnalysis();
 
-   // Value-preserving operators carry quantization metadata forward without
-   // changing the numerical interpretation of the tensor. Single-input aliases
-   // copy metadata directly; layout permutations remap per-axis metadata. Multi-
-   // input aliases, such as Concat, propagate only when all inputs describe the
-   // same quantization contract.
+   // Value-preserving operators carry quantization metadata forward: aliases copy it, layout
+   // permutations remap per-axis contracts, multi-input aliases require all inputs to agree.
    auto sameQuantizationInfo = [](const QuantizationInfo &lhs, const QuantizationInfo &rhs) {
       return lhs.bitWidth == rhs.bitWidth && lhs.isSigned == rhs.isSigned && lhs.narrow == rhs.narrow &&
              lhs.scale == rhs.scale && lhs.zeroPoint == rhs.zeroPoint && lhs.scaleTensor == rhs.scaleTensor &&
@@ -435,11 +432,8 @@ void RModel::AddLoweredQuantizedOperators(EQuantizedBackend backend)
                                                              const std::string &inputSourceTensor,
                                                              const std::string &outputTensor,
                                                              std::unique_ptr<ROperator> lowered) {
-      // Retype the input source to the quantized carrier only for a real-valued
-      // activation input. A weight-only family (Gather) exposes its carrier
-      // through the weight/table slot while its runtime input is an integer index
-      // tensor, which must keep its INT32/INT64 type rather than be reinterpreted
-      // as an int8/fp8 carrier.
+      // Retype the input source to the carrier only for a real-valued activation input; a
+      // weight-only family's (Gather) runtime input is an index tensor and keeps its type.
       if (QuantizedPlanExposesQuantizedInputCarrier(plan)) {
          const auto currentInputType = GetTensorType(inputSourceTensor);
          const bool isIndexInput = currentInputType == ETensorType::INT32 ||
@@ -518,7 +512,7 @@ void RModel::FuseSoftmaxClipBoundaries()
 
    std::unordered_set<std::string> applied;
    // Names the condition declining each candidate. Trace-only; decisions are unchanged.
-   const bool traceApply = std::getenv("SOFIE_HANDOFF_TRACE") != nullptr;
+   const bool traceApply = QuantizationTraceEnabled();
    auto declineApply = [traceApply](const std::string &who, const char *why) {
       if (traceApply)
          std::fprintf(stderr, "[apply-decline] %s: %s\n", who.c_str(), why);
@@ -526,9 +520,8 @@ void RModel::FuseSoftmaxClipBoundaries()
    for (std::size_t index = 0; index < fOperators.size(); ++index) {
       if (!alive(index))
          continue;
-      // Two capabilities, deliberately separate. Folding a Clip is a Softmax-and-Clip idiom
-      // the int8 exports carry; encoding the output is the general one any producer can
-      // implement. An operator with only the second still absorbs its boundary.
+      // Two separate capabilities: folding a Clip is the Softmax-and-Clip int8 idiom;
+      // encoding the output is general, and alone still absorbs the boundary.
       auto *softmax = dynamic_cast<ROperator_Softmax *>(fOperators[index].get());
       const bool canFoldClip = softmax != nullptr && softmax->CanFuseClip();
       const bool canEncodeOutput = fOperators[index]->CanFuseQuantizedOutput();
@@ -548,9 +541,8 @@ void RModel::FuseSoftmaxClipBoundaries()
       if (consumer == consumers.end() || consumer->second.size() != 1)
          { declineApply(fOperators[index]->Name(),
                         consumer == consumers.end() ? "no_consumer" : "multiple_consumers"); continue; }
-      // The absorbed node is a Clip on the int8 path and a QuantizeLinear on the FP8 one --
-      // the same absorption reached through the shape each encoding actually emits. Only the
-      // clamp differs: a Clip contributes one, a boundary encodes without clamping.
+      // The absorbed node is a Clip on the int8 path and a QuantizeLinear on the FP8 one;
+      // only the clamp differs -- a Clip contributes one, a boundary encodes without.
       const std::size_t absorbedIndex = consumer->second.front();
       if (!alive(absorbedIndex))
          { declineApply(fOperators[index]->Name(), "absorbed_node_not_alive"); continue; }
@@ -589,30 +581,92 @@ void RModel::FuseSoftmaxClipBoundaries()
       applied.insert(fusedOutput);
    }
 
-   // A planned handoff whose rewrite did not happen would leave the region loading a
-   // buffer nothing writes as int8, so the mismatch is raised rather than emitted.
+   // The safety half of the one-authority design: when the applier declined a handoff the
+   // planner recorded, the pair's Quantize is revived and the region reads its carrier.
    for (const auto &handoff : fQuantizationState.softmaxInt8Handoffs) {
-      if (applied.count(handoff.first) == 0)
+      if (applied.count(handoff.first) != 0)
+         continue;
+
+      bool recovered = false;
+      for (std::size_t dqIndex = 0; dqIndex < fOperators.size() && !recovered; ++dqIndex) {
+         auto *dequantize = dynamic_cast<ROperator_ONNXDequantizeLinear *>(fOperators[dqIndex].get());
+         if (dequantize == nullptr || dequantize->GetOutputTensor() != handoff.first)
+            continue;
+         const std::string carrier = dequantize->GetInputTensor();
+         if (carrier.empty())
+            break;
+         for (std::size_t qIndex = 0; qIndex < fOperators.size(); ++qIndex) {
+            auto *quantize = dynamic_cast<ROperator_ONNXQuantizeLinear *>(fOperators[qIndex].get());
+            if (quantize == nullptr || quantize->GetOutputTensor() != carrier)
+               continue;
+            // The region wants codes on the planned grid; the carrier holds codes on the
+            // Quantize's grid. Anything but exact agreement is not a recovery.
+            if (!SameGrid(quantize->GetGrid(), handoff.second))
+               break;
+            std::size_t rebound = 0;
+            for (auto &lowered : fLoweredOperators) {
+               if (lowered.second &&
+                   lowered.second->RebindPlannedCarrierInput(handoff.first, carrier))
+                  ++rebound;
+            }
+            if (rebound == 0)
+               break;
+            fLoweredConsumedOperatorIndices.erase(qIndex);
+            recovered = true;
+            if (QuantizationTraceEnabled())
+               std::fprintf(stderr, "[handoff-recover] %s -> %s (%zu region(s), Quantize revived)\n",
+                            handoff.first.c_str(), carrier.c_str(), rebound);
+            break;
+         }
+      }
+
+      if (!recovered)
          throw std::runtime_error(
             "SOFIE quantization planned a Softmax int8 handoff for tensor '" + handoff.first +
-            "' but the Softmax/Clip fusion did not apply it; the consuming region would read a "
-            "carrier nothing writes");
+            "' but the Softmax/Clip fusion did not apply it and no same-grid carrier was "
+            "recoverable; the consuming region would read a carrier nothing writes");
+   }
+
+   // The consumer-side twin of the absorption above: a dequantize whose float is read by
+   // one operator that can decode at the load loses its kernel to that consumer.
+   for (std::size_t dqIndex = 0; dqIndex < fOperators.size(); ++dqIndex) {
+      if (!alive(dqIndex))
+         continue;
+      auto *dequantize = dynamic_cast<ROperator_ONNXDequantizeLinear *>(fOperators[dqIndex].get());
+      if (dequantize == nullptr)
+         continue;
+      const auto &grid = dequantize->GetGrid();
+      if (!IsPerTensorE4M3(grid))
+         continue;
+      const std::string floatOut = dequantize->GetOutputTensor();
+      const std::string carrier = dequantize->GetInputTensor();
+      if (floatOut.empty() || carrier.empty())
+         continue;
+      // A graph output still has to be materialised as the float the signature declares.
+      if (std::find(fOutputTensorNames.begin(), fOutputTensorNames.end(), floatOut) !=
+          fOutputTensorNames.end())
+         continue;
+      auto reader = consumers.find(floatOut);
+      if (reader == consumers.end() || reader->second.size() != 1)
+         continue;
+      const std::size_t readerIndex = reader->second.front();
+      auto lowered = fLoweredOperators.find(readerIndex);
+      ROperator *consumer = lowered != fLoweredOperators.end()
+                               ? lowered->second.get()
+                               : (alive(readerIndex) ? fOperators[readerIndex].get() : nullptr);
+      if (consumer == nullptr || !consumer->CanFuseDequantizedInput())
+         continue;
+      if (consumer->FuseDequantizedInput(floatOut, carrier, grid)) {
+         fLoweredConsumedOperatorIndices.insert(dqIndex);
+         if (QuantizationTraceEnabled())
+            std::fprintf(stderr, "[decode-fuse] %s reads %s at the load\n",
+                         consumer->Name().c_str(), carrier.c_str());
+      }
    }
 }
 
-// S57i-a. A saturation Clip in front of a QuantizeLinear whose grid already saturates at the
-// same bound cannot clamp anything: the quantize clamps regardless. Measured on ParT, 158 of
-// 174 such Clips are in this position.
-//
-// FuseUnabsorbedFakeQuantBoundaries already makes the clamp free by absorbing it into the Q
-// kernel, so this is not about arithmetic. It is that an absorbed Clip is still an *operator
-// in the graph*, and every pass that walks value-preserving chains stops at one -- Clip is
-// RequiresFloat, correctly, because in general it does change values. A no-op Clip therefore
-// blocks analyses for a clamp it never performs, which is exactly what it was doing to the
-// idempotence chains S56 would otherwise take.
-//
-// Exact by inspection rather than by tolerance: if the Clip's range contains the grid's, no
-// input can reach a bound the quantize would not have clamped to anyway.
+// A Clip whose range contains its QuantizeLinear's grid range cannot clamp anything, yet as
+// an operator it stops every value-preserving chain walk; dropping it unblocks those walks.
 void RModel::DropNoOpClipsBeforeQuantize(EQuantizedBackend backend)
 {
    if (backend != EQuantizedBackend::ALPAKA)
@@ -694,9 +748,8 @@ void RModel::DropNoOpClipsBeforeQuantize(EQuantizedBackend backend)
           !readScalar(std::string(clipInputs[2]), high))
          continue;
 
-      // The real-valued interval this Quantize can represent. One spelling for both
-      // encodings: the grid carries its own extreme codes, so nothing here asks whether the
-      // boundary is float8.
+      // The real-valued interval this Quantize can represent; the grid carries its own
+      // extreme codes, so nothing here asks whether the boundary is float8.
       const auto grid = quantize->GetGrid();
       if (!grid.IsDefined() || grid.granularity != EQuantizationGranularity::PerTensor)
          continue;
@@ -719,22 +772,8 @@ void RModel::DropNoOpClipsBeforeQuantize(EQuantizedBackend backend)
                 << "   kept (really saturates): " << keptSaturating << "\n";
 }
 
-// S57h. Canonicalization, not optimization: the graph arrives with redundancy the exporter
-// put there, and every absorption pass downstream has been optimizing around it.
-//
-// A Q/DQ exporter emits one DequantizeLinear per consumer, so one carrier read by three
-// operators is decoded three times into three identical float tensors -- the node names say
-// so, they arrive called `/duplicated_token_0` and friends. Measured on ParT, this is the
-// single largest class of surviving boundary on both encodings (123 FP8 / 99 int8), larger
-// than the elementwise and epilogue items combined.
-//
-// It is worth more than its own kernel count. A carrier with several consumers is exactly
-// what trips `ambiguous_carrier_consumer` in FuseUnabsorbedFakeQuantBoundaries (24 FP8 / 8
-// int8 declines), so collapsing the duplicates does not just remove kernels, it removes a
-// decline category: the duplicates *are* the ambiguity.
-//
-// Exact by construction -- same carrier, same grid, therefore byte-identical output -- so it
-// needs no scale contract and meets S56's standard rather than a tolerance.
+// A Q/DQ exporter emits one DequantizeLinear per consumer of the same carrier; collapsing
+// the duplicates onto one decode is exact and removes the multi-consumer ambiguity downstream.
 void RModel::DeduplicateCarrierDecodes(EQuantizedBackend backend)
 {
    // The device form of a duplicate is a view, which is an Alpaka construct; the CPU path
@@ -781,20 +820,16 @@ void RModel::DeduplicateCarrierDecodes(EQuantizedBackend backend)
       DecodeKey key{dequantize->GetInputTensor(), dequantize->GetScaleTensor(),
                     dequantize->GetZeroPointTensor(), decodeGrid.IsFloatingPoint(),
                     decodeGrid.scale};
-      // A float8 boundary has no integer grid, so its fInfo is default-constructed; the
-      // scale tensor name and the FP8 scale are what identify it. An integer boundary is
-      // identified by its scale and zero-point tensors, which is stricter than comparing the
-      // grids: two boundaries sharing tensors necessarily share values.
+      // A float8 boundary is identified by its scale tensor and FP8 scale, an integer one by
+      // its scale and zero-point tensors: shared tensors necessarily share values.
       auto [it, inserted] = survivors.emplace(key, index);
       if (inserted)
          continue;
 
       const auto &survivorOutput = fOperators[it->second]->GetOpOutputTensors().front();
       dequantize->MarkAsDuplicateDecodeOf(std::string(survivorOutput));
-      // The duplicate's output is now the survivor's storage. The pooled carrier arena has
-      // to be told, or it sizes the survivor's lifetime from the survivor's own last use --
-      // which the view outlives -- and hands those bytes to a later tensor. Exactly the
-      // hazard S56 hit with Reshape.
+      // The duplicate's output is now the survivor's storage; the pooled carrier arena must
+      // be told, or it sizes the survivor's lifetime from its own last use alone.
       AddAliasTensor(dequantize->GetOutputTensor(), std::string(survivorOutput));
       ++deduplicated;
    }
@@ -804,33 +839,12 @@ void RModel::DeduplicateCarrierDecodes(EQuantizedBackend backend)
                 << "\n";
 }
 
-// A Q/DQ graph brackets every Reshape and Transpose in float, because the ONNX form has no
-// way to say "move these codes":
-//
-//     c -(DequantizeLinear)-> xf -(move)+-> yf -(QuantizeLinear)-> d
-//
-// Both boundaries exist only so the movement can run on real values, but a Reshape is a
-// view and a Transpose is a permutation -- neither one reads the value it moves. Rewiring
-// the chain onto the carrier
-//
-//     c -(move)+-> d
-//
-// deletes the pair outright rather than fusing it, which is the difference between making
-// the round trip cheap and making it disappear. The rewrite is exact, not approximate: the
-// two boundaries share a grid, so Q(DQ(c)) == c for every code already on that grid, and
-// the bytes that arrive at d are the same bytes that left c.
-//
-// Runs before FuseUnabsorbedFakeQuantBoundaries, which would otherwise collapse the very Q
-// that produces c into a float-valued round trip and leave the rewired movement reading a
-// carrier nothing writes. That ordering is also what makes the interaction safe in the
-// other direction: after this pass the movement operator is c's only consumer and is not a
-// DequantizeLinear, so the fusion pass declines c on `consumer_not_live_dq` and c survives
-// as a real carrier.
+// Rewires a DQ -> movement -> Q chain onto the carrier so the movement moves codes and the
+// boundary pair dies; exact because both boundaries share a grid, so Q(DQ(c)) == c.
 void RModel::PropagateLowPrecisionThroughMovement(EQuantizedBackend backend)
 {
-   // Verified on the Alpaka path only. The device forms are type-agnostic there (a view and
-   // a templated kernel); the CPU quantized storage layouts have not been checked against a
-   // movement operator, so the rewrite is not offered for them.
+   // Verified on the Alpaka path only, where the device forms are type-agnostic; the CPU
+   // quantized storage layouts are unchecked, so the rewrite is not offered there.
    if (backend != EQuantizedBackend::ALPAKA)
       return;
    // A subgraph body can read a tensor that does not appear in its operator's inputs, so
@@ -890,12 +904,11 @@ void RModel::PropagateLowPrecisionThroughMovement(EQuantizedBackend backend)
 
       // Walk the movement run. Each hop must be the sole reader of the value it consumes,
       // or the float form is still needed and deleting the boundary would strand it.
-      constexpr int kMaxHops = 8;
       constexpr auto kNoOperator = static_cast<std::size_t>(-1);
       std::vector<std::size_t> movements;
       std::size_t quantizeIndex = kNoOperator;
       std::string cursor = dequantize->GetOutputTensor();
-      for (int hop = 0; hop < kMaxHops; ++hop) {
+      for (int hop = 0; hop < kQuantizationWalkMaxHops; ++hop) {
          if (graphOutputs.count(cursor) != 0)
             break;
          auto readers = consumers.find(cursor);
@@ -932,10 +945,8 @@ void RModel::PropagateLowPrecisionThroughMovement(EQuantizedBackend backend)
       if (quantize->IsOutputConstant())
          { decline("terminal_quantize_is_constant"); continue; }
 
-      // Same grid on both ends, or the pair is not a round trip and moving the codes
-      // through would silently reinterpret them. SameGrid covers both encodings and also
-      // requires per-tensor on both sides -- a per-channel grid names an axis, and a
-      // Transpose permutes axes, so its scales would stop lining up with the data.
+      // Same grid on both ends, or moving the codes through would reinterpret them; SameGrid
+      // also requires per-tensor, since a Transpose would unseat a per-channel axis.
       const auto decodeGrid = dequantize->GetGrid();
       const auto encodeGrid = quantize->GetGrid();
       const bool dequantizeIsFP8 = decodeGrid.IsFloatingPoint();
@@ -955,11 +966,8 @@ void RModel::PropagateLowPrecisionThroughMovement(EQuantizedBackend backend)
       auto rewire = [this](std::size_t opIndex, const std::string &input, const std::string &output) {
          auto *op = fOperators[opIndex].get();
          op->RewireLowPrecisionCarrier(input, output);
-         // An operator whose device form emits a view over its source rather than its own
-         // buffer makes the two names one allocation. Saying so keeps both out of the pooled
-         // carrier arena: the pool packs by lifetime, and it computes the source's lifetime
-         // from the source's own last use, which the view outlives. Left unsaid, a later
-         // carrier gets handed the source's bytes while the view is still reading them.
+         // A device form that emits a view makes the two names one allocation; declaring the
+         // alias keeps the pooled carrier arena from ending the source's lifetime early.
          if (op->CarrierOutputAliasesInput())
             AddAliasTensor(output, input);
       };
@@ -977,9 +985,8 @@ void RModel::PropagateLowPrecisionThroughMovement(EQuantizedBackend backend)
          input = output;
       }
 
-      // The DequantizeLinear's output is now unread, so dead-code elimination would drop it
-      // on its own; the QuantizeLinear has to go explicitly, because its output is read and
-      // leaving it would give the target two writers.
+      // The DequantizeLinear dies to dead-code elimination on its own; the QuantizeLinear
+      // must go explicitly, or its still-read output would give the target two writers.
       fLoweredConsumedOperatorIndices.insert(index);
       fLoweredConsumedOperatorIndices.insert(quantizeIndex);
       ++propagatedChains;
@@ -1077,9 +1084,8 @@ void RModel::FuseUnabsorbedFakeQuantBoundaries()
       auto *quantize = dynamic_cast<ROperator_ONNXQuantizeLinear *>(fOperators[index].get());
       if (quantize == nullptr || quantize->IsOutputConstant())
          continue;
-      // A float8 boundary has no integer grid, so its fInfo is default-constructed and every
-      // grid comparison below would compare defaults rather than the real scales. One grid
-      // representation covers both encodings, so nothing here forks on the carrier.
+      // A float8 boundary's fInfo is default-constructed; one grid representation covers
+      // both encodings, so nothing here forks on the carrier.
       const auto encodeGrid = quantize->GetGrid();
       const bool quantizeIsFP8 = encodeGrid.IsFloatingPoint();
       if (!quantizeIsFP8 && encodeGrid.granularity != EQuantizationGranularity::PerTensor)
@@ -1089,10 +1095,8 @@ void RModel::FuseUnabsorbedFakeQuantBoundaries()
       if (graphOutputs.count(carrier) != 0)
          { decline("carrier_is_graph_output"); continue; }
 
-      // Optional preceding Clip, likewise only when this Q is its sole reader. Found before
-      // the round-trip analysis rather than after, because the two absorptions are
-      // independent: the Clip is a clamp on the values entering this Q and stays absorbable
-      // however the carrier leaving it is consumed.
+      // Optional preceding Clip, likewise only when this Q is its sole reader; the Clip
+      // stays absorbable however the carrier leaving the Q is consumed.
       std::string clipInput;
       double clipLow = 0.0;
       double clipHigh = 0.0;
@@ -1116,11 +1120,8 @@ void RModel::FuseUnabsorbedFakeQuantBoundaries()
          }
       }
 
-      // Declining the round trip is not declining the Clip. Wherever this Q goes on
-      // emitting -- because a lowered region reads its carrier, or because
-      // PropagateLowPrecisionThroughMovement rewired a Reshape/Transpose onto it -- the
-      // clamp still belongs in its kernel, and leaving it outside costs a launch per
-      // boundary. Only paths that keep the Q alive may use this.
+      // Declining the round trip is not declining the Clip: wherever this Q goes on
+      // emitting, the clamp still belongs in its kernel. Only paths keeping the Q alive use this.
       auto declineKeepingCarrier = [&](const char *reason) {
          if (hasClip) {
             quantize->FuseClipOnly(clipInput, clipLow, clipHigh);
@@ -1179,10 +1180,8 @@ void RModel::FuseUnabsorbedFakeQuantBoundaries()
       quantize->FuseFakeQuantRoundTrip(dequantize->GetOutputTensor(), clipInput, hasClip, clipLow, clipHigh);
       ++fusedRoundTrips;
 
-      // Fold candidate: this boundary now writes a snapped FLOAT, so a producer applying the
-      // snap in its own epilogue absorbs it with no carrier and no type change. Collected
-      // rather than acted on, because the fold rewrites the outputs this loop iterates over.
-      // Clipped boundaries are excluded: the clamp is part of the boundary's arithmetic.
+      // Fold candidate: collected rather than acted on, because the fold rewrites the outputs
+      // this loop iterates over. Clipped boundaries are excluded -- the clamp is arithmetic.
       if (hasClip)
          ++clippedRoundTrips;
       if (!hasClip)
@@ -1193,7 +1192,7 @@ void RModel::FuseUnabsorbedFakeQuantBoundaries()
       // walked through; Clip is not, since it can change values.
       if (!hasClip) {
          std::string cursor = quantize->GetInputTensor();
-         for (int hop = 0; hop < 4; ++hop) {
+         for (int hop = 0; hop < kQuantizationWalkMaxHops; ++hop) {
             auto upstream = producer.find(cursor);
             if (upstream == producer.end())
                break;
@@ -1224,13 +1223,8 @@ void RModel::FuseUnabsorbedFakeQuantBoundaries()
          fLoweredConsumedOperatorIndices.insert(clipIndex);
    }
 
-   // ---- Round-trip fold ---------------------------------------------------------------------
-   //
-   // A fused fake-quant boundary writes `Decode(Encode(v/scale))*scale`, a float on the grid,
-   // so a producer applying the same snap in its own epilogue absorbs the boundary outright:
-   // one launch and one memory round trip fewer, with no carrier, no type change, and no grid
-   // propagation. The producer adopts the boundary's output tensor, because operators own
-   // their output names and there is no input-rewiring hook.
+   // Round-trip fold: a producer applying the fake-quant snap in its own epilogue absorbs
+   // the boundary outright, adopting its output tensor -- no carrier, no type change.
    std::size_t foldedRoundTrips = 0;
    std::map<std::string, int> unfoldableProducers;
    for (const auto &fold : roundTripFolds) {
@@ -1246,9 +1240,8 @@ void RModel::FuseUnabsorbedFakeQuantBoundaries()
             ++unfoldableProducers[producerOp->Name()];
          continue;
       }
-      // After the fold the producer's own output tensor is gone, so anything else reading it --
-      // another operator, or the graph itself -- would lose its value. Both are fatal, not
-      // merely suboptimal, so they are guards rather than heuristics.
+      // After the fold the producer's own output tensor is gone, so any other reader --
+      // operator or graph output -- would lose its value; both guards are correctness.
       auto readers = consumers.find(fold.source);
       if (readers == consumers.end() || readers->second.size() != 1)
          continue;
@@ -1278,19 +1271,8 @@ void RModel::FuseUnabsorbedFakeQuantBoundaries()
    }
 }
 
-// S57c. Every surviving Quantize/Dequantize kernel is either the frontier or a failure to
-// absorb, and until now nothing distinguished them. This does.
-//
-// A boundary is justified when an operator on its *float* side reports RequiresFloat -- the
-// value genuinely has to become real there, so the conversion is the model rather than our
-// overhead. For a Dequantize that means a consumer of its float output; for a Quantize, the
-// producer of its float input; for a fused round trip, which is float-to-float, either end
-// will do. Anything else is an unabsorbed boundary, recorded against the operator that
-// should have taken it.
-//
-// This is deliberately not gated on whether the absorption is currently *implementable*. A
-// region that declined on shape is still an unabsorbed boundary, and hiding it behind "we
-// had a reason" is how a residual stops being tracked.
+// Classifies every surviving boundary: justified when an operator on its float side reports
+// RequiresFloat, otherwise recorded as unabsorbed against the operator that could take it.
 void RModel::CheckLowPrecisionCarrierFrontier()
 {
    fCarrierFrontierViolations.clear();
@@ -1327,9 +1309,8 @@ void RModel::CheckLowPrecisionCarrierFrontier()
       return fLoweredOperators.find(index) != fLoweredOperators.end();
    };
 
-   // Boundaries a float-requiring operator justified, keyed by that operator. These are not
-   // violations -- float genuinely exists on one side -- but each is a kernel that operator
-   // could absorb into its output stage instead. S57g's population.
+   // Boundaries a float-requiring operator justified, keyed by that operator; each is still
+   // a kernel that operator could absorb into its own output stage.
    std::map<std::string, int> epilogueCandidates;
    // Boundaries whose float side reaches another boundary: a decode that exists only so the
    // next encode can run, i.e. a rescale written as a round trip. Its own mechanism.
@@ -1337,15 +1318,8 @@ void RModel::CheckLowPrecisionCarrierFrontier()
    std::map<std::string, int> boundaryChainShapes;
    std::vector<std::string> boundaryChainExamples;
 
-   // Launch-space decomposition. Every other count in this file is in *boundary* space, but
-   // the cost is in kernels: 148 fake-quant launches, 301 us, 29% of GPU time. The two are
-   // not the same population -- most surviving boundaries are already fused in pairs, so
-   // removing one can *add* a kernel. Optimizing the boundary count without this mapping is
-   // what made S57i-b remove 14 kernels and cost 5% latency.
-   //
-   // These kernels are memory-bound: each reads a tensor and writes one, so element count is
-   // the cost proxy. Emitted per boundary with the operators on each side, so the work can be
-   // ranked by modelled bytes rather than by how many boundaries a bucket happens to contain.
+   // Launch-space decomposition: boundary counts and kernel counts are different populations,
+   // and these memory-bound kernels cost by element count, so each entry carries both.
    const bool traceCost = std::getenv("SOFIE_BOUNDARY_COST_TRACE") != nullptr;
    auto opFamily = [](const ROperator *o) -> std::string {
       if (o == nullptr)
@@ -1403,17 +1377,13 @@ void RModel::CheckLowPrecisionCarrierFrontier()
             floatSide.push_back(source->second);
       }
 
-      // Walk *through* value-preserving operators before judging. A Quantize fed by a
-      // Reshape fed by a model input is not an unabsorbed boundary: the value arrives as
-      // float from outside, so it has to be encoded once no matter which side of the
-      // reshape that happens on. Only reaching an Arithmetic operator means the boundary
-      // could have been consumed and was not.
+      // Walk through value-preserving operators before judging: a value arriving as float
+      // from a model edge must be encoded once wherever the reshape sits.
       constexpr int kMaxWalk = 8;
       bool justified = false;
       std::size_t owed = static_cast<std::size_t>(-1);
-      // S57g sizing: which operator's float requirement justified this boundary. A boundary
-      // justified by a model edge leaves this unset -- nothing can fold it. One justified by
-      // an operator is a candidate for that operator absorbing the encode into its epilogue.
+      // Which operator's float requirement justified this boundary; unset for a model edge,
+      // where nothing can fold it.
       std::size_t justifiedBy = static_cast<std::size_t>(-1);
       bool boundaryChain = false;
       std::string boundaryChainShape;
@@ -1426,11 +1396,8 @@ void RModel::CheckLowPrecisionCarrierFrontier()
                justified = true;
                break;
             }
-            // A boundary is not the frontier. Reaching another Quantize/Dequantize means
-            // this pair decodes only so the next one can re-encode -- a grid conversion
-            // spelled as a round trip. It is neither owed by an arithmetic operator nor
-            // foldable into a float one, so it gets its own bucket rather than being
-            // counted as legitimate, which is what an earlier version of this did.
+            // Reaching another Quantize/Dequantize means this pair decodes only so the next
+            // can re-encode -- a grid conversion spelled as a round trip; its own bucket.
             const auto *cursorOperator = emitted(cursor);
             if (dynamic_cast<const ROperator_ONNXQuantizeLinear *>(cursorOperator) != nullptr ||
                 dynamic_cast<const ROperator_ONNXDequantizeLinear *>(cursorOperator) != nullptr) {
@@ -1491,10 +1458,8 @@ void RModel::CheckLowPrecisionCarrierFrontier()
          }
          if (justified && justifiedBy != static_cast<std::size_t>(-1)) {
             const auto *by = emitted(justifiedBy);
-            // Grouped by family rather than instance: the question is which operator kind
-            // holds the population, and the per-node names answer "which node". GetKind() is
-            // UNDEFINED for most operators, so the ONNX node name is what actually carries
-            // the family -- strip the trailing _<index> the parser appends.
+            // Grouped by family rather than instance; GetKind() is UNDEFINED for most
+            // operators, so the ONNX node name minus the parser's _<index> carries the family.
             if (by != nullptr) {
                std::string family = by->Name();
                auto cut = family.find_last_of('_');
@@ -1515,12 +1480,8 @@ void RModel::CheckLowPrecisionCarrierFrontier()
    }
 
    if (std::getenv("SOFIE_CARRIER_FRONTIER_TRACE") != nullptr) {
-      // Reported against the total, because the ratio is the honest reading. This check
-      // scores one thing: a boundary next to an operator that could have consumed a carrier
-      // and did not. It does *not* score a Quantize sitting on the output of a LayerNorm or
-      // Softmax -- that one is "justified" only in the sense that float really exists on one
-      // side, and folding the encode into that operator's epilogue is a separate lever this
-      // number will never move. Do not read a low count as "nothing left to absorb".
+      // Scores only boundaries an operator could have consumed and did not; a justified
+      // encode a producer could still fold is a separate lever this number never moves.
       std::size_t surviving = 0;
       for (std::size_t index = 0; index < fOperators.size(); ++index) {
          const auto *op = emitted(index);
@@ -1576,11 +1537,8 @@ void RModel::AddQuantizedGeneratedHeaders(EQuantizedBackend backend)
       if (backend == EQuantizedBackend::CPU && QuantizedPlanUsesPrequantizedWeights(plan) &&
           plan.weightLayout == EQuantizedLayout::PackedCPU)
          AddNeededCustomHeader("SOFIE/SOFIE_Quantized.hxx");
-      // Any optimized ALPAKA plan emits a *_Call into the Alpaka quantized
-      // facade, so the facade header is required whether or not the plan carries
-      // a prequantized weight/table constant. Weightless plans (e.g. a
-      // two-activation elementwise Add/Mul) are optimized but do not satisfy the
-      // plain-device prequantized-weight predicate, so gate on optimization.
+      // Any optimized ALPAKA plan emits a *_Call into the Alpaka quantized facade, weight
+      // or no weight, so the header requirement gates on optimization alone.
       if (backend == EQuantizedBackend::ALPAKA && IsQuantizedLoweringOptimized(plan.status)) {
          AddNeededCustomHeader("SOFIE/SOFIE_QuantizedAlpaka.hxx");
       }

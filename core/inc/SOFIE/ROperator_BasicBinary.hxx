@@ -74,9 +74,8 @@ struct BinaryOperatorTrait<T, FMod> {
 template <typename T, EBasicBinaryOperator Op>
 class ROperator_BasicBinary final : public ROperator {
 public:
-   // Add and Mul have quantized elementwise kernels and compute on codes; the rest keep the
-   // conservative default. Lets the frontier check tell an unabsorbed boundary from a
-   // legitimate one.
+   // Add and Mul have quantized elementwise kernels and compute on codes; the rest keep
+   // the conservative float default.
    ELowPrecisionCarrierSupport CarrierSupport() const override
    {
       return (Op == EBasicBinaryOperator::Add || Op == EBasicBinaryOperator::Mul)
@@ -103,6 +102,9 @@ private:
    // Grid of an absorbed downstream fake-quant boundary: the kernel applies the boundary's
    // snap at its store and keeps writing float, so consumers are unaffected.
    std::optional<QuantizationGrid> fFakeQuantGrid;
+   // Grids of carrier operands adopted at the load; an unset operand reads plain values.
+   std::optional<QuantizationGrid> fInputGridA;
+   std::optional<QuantizationGrid> fInputGridB;
 
 public:
    ROperator_BasicBinary() {}
@@ -121,13 +123,32 @@ public:
    // elimination.
    void FuseFakeQuantOutput(const std::string &output, const QuantizationGrid &grid) override
    {
-      if (fOutputTensorNames.empty() || std::string(fOutputTensorNames[0]) != fNY) {
-         throw std::runtime_error("TMVA::SOFIE BasicBinary cannot fold a fake-quant boundary: "
-                                  "its output tensor list does not begin with " + fNY);
-      }
+      AdoptFusedOutputName(fNY, fOutputTensorNames, output, "BasicBinary");
       fFakeQuantGrid = grid;
-      fNY = output;
-      fOutputTensorNames[0] = output;
+   }
+
+   // Reads a carrier operand directly, decoding at the load with the pair's own scale --
+   // the same arithmetic the dequantize kernel emits, one memory round trip earlier.
+   bool CanFuseDequantizedInput() const override { return !fIsOutputConstant; }
+
+   bool FuseDequantizedInput(const std::string &from, const std::string &carrier,
+                             const QuantizationGrid &grid) override
+   {
+      // Only the E4M3 decode has an inline spelling here; an affine grid also carries a
+      // zero point, and E5M2 would need its own decode.
+      if (!IsPerTensorE4M3(grid))
+         return false;
+      if (fNA == from && !fInputGridA) {
+         fNA = carrier;
+         fInputGridA = grid;
+      } else if (fNB == from && !fInputGridB) {
+         fNB = carrier;
+         fInputGridB = grid;
+      } else {
+         return false;
+      }
+      fInputTensorNames = {fNA, fNB};
+      return true;
    }
 
    // type of output given input
@@ -492,8 +513,8 @@ public:
       std::string op;
       op = "\n//------ "+opName+"_"+BinaryOperatorTrait<T, Op>::Name()+"_KERNEL_ALPAKA\n";
       op += SP + "struct Binary"+opName+BinaryOperatorTrait<T, Op>::Name()+"Kernel {\n";
-      op += SP + SP + "template<typename TAcc, typename T>\n";
-      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * A, T const * B, T * C) const {\n";
+      op += SP + SP + "template<typename TAcc, typename TA, typename TB, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, TA const * A, TB const * B, T * C) const {\n";
       op += SP + SP + SP + "auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
       op += SP + SP + SP + "if (idx < " + std::to_string(ConvertShapeToLength(fShapeY)) + ") {\n";
       auto stridesA = UTILITY::ComputeStrideFromShape(fShapeA);
@@ -561,8 +582,21 @@ public:
       const auto flattened_index_B =
          makeFlattenedIndex(fShapeB, stridesB, isBScalar, isBContiguous);
 
+      // A carrier operand decodes at the load with the pair's own scale. In one kernel the
+      // compiler keeps this wider than the two-kernel spelling, within one code step.
+      std::string decodes;
+      auto operandExpr = [&decodes](const std::string &load, const char *name,
+                                    const std::optional<QuantizationGrid> &grid) {
+         if (!grid)
+            return load;
+         decodes += "T const " + std::string(name) + "_decoded = static_cast<T>(SOFIE::DecodeFP8E4M3(" +
+                    load + ") * " + ExactDoubleLiteral(grid->scale) + "f);\n";
+         return std::string(name) + "_decoded";
+      };
       const auto value =
-         BinaryOperatorTrait<T, Op>::Op("A["+flattened_index_A+"]", "B["+flattened_index_B+"]");
+         BinaryOperatorTrait<T, Op>::Op(operandExpr("A["+flattened_index_A+"]", "a", fInputGridA),
+                                        operandExpr("B["+flattened_index_B+"]", "b", fInputGridB));
+      op += decodes;
       if (fFakeQuantGrid) {
          // The absorbed boundary's snap, applied at the store instead of in a separate kernel
          // over the same tensor: same arithmetic, one memory round trip earlier.

@@ -120,6 +120,7 @@ inline std::string GenerateFusedQuantizedMatMulCublasLtFP8Launch(std::string opN
    // The FP8 layouts are column-major, so only the NT operand order leaves the weight at
    // [N, K] and the result at row-major [M, N]; the weight storage is laid out to match.
    call.weightIsMatrixA = true;
+   call.hasRelu = QuantizedEpilogueHasRelu(region.epilogue.kind);
    return INTERNAL::GenerateQuantizedCudaLtFP8DenseLinearCall(call);
 }
 
@@ -141,6 +142,13 @@ public:
          fInputTensorNames.emplace_back(fRegion.epilogue.biasSourceTensor);
       }
       fOutputTensorNames = { fRegion.outputTensor };
+   }
+
+   // The region reads its handoff tensor by this name everywhere -- the name list here and
+   // the invocation built at Generate time both derive from fRegion.inputSourceTensor.
+   bool RebindPlannedCarrierInput(const std::string &from, const std::string &to) override
+   {
+      return INTERNAL::RebindRegionCarrierInput(fRegion, fInputTensorNames, from, to);
    }
 
    std::vector<std::string> GetStdLibs() override { return { "cstdint", "vector" }; }

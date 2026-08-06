@@ -378,19 +378,14 @@ QuantizedLoweringPlan MakeAlpakaConvCandidatePlan(
                SaturatingResourceProduct({physicalN, sizeof(float)}),
                cudaAlignment, true, "per-group bias-to-output offset for padded execution");
          }
-         // An exact-shape plan whose untiled arena exceeds the reusable-scratch
-         // budget is not rejected: it switches to tiled execution, which bounds
-         // im2col staging and the accumulator by the row tile instead of the
-         // model shape. Padded plans keep their per-group path and the
-         // existing budget enforcement.
+         // An exact-shape plan whose untiled arena exceeds the budget switches to tiled
+         // execution; padded plans keep their per-group path and the budget enforcement.
          if (plan.matrixShapePolicy->policy == EQuantizedShapePolicy::Exact) {
             std::string budgetReason;
             if (!QuantizedConvResourcesWithinBudget(plan, budgetReason)) {
                const auto groups = region.attributes.group;
-               // Per-row cost of a tile: two staging buffers, the provider's
-               // tile input buffer, and the INT32 accumulator. The tile is
-               // sized so the whole tiled arena fits in half the budget, and
-               // each staging buffer additionally respects the tile cap.
+               // Per-row tile cost: two staging buffers, the tile input buffer, the INT32
+               // accumulator; the tiled arena fits half the budget, staging respects the tile cap.
                const std::size_t perRowBytes =
                   SaturatingResourceProduct({2, groups, k}) + k +
                   SaturatingResourceProduct({groups, n, sizeof(std::int32_t)});

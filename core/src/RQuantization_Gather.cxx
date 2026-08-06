@@ -67,10 +67,8 @@ std::vector<double> ReadGatherChannelScales(RModel &model, const QuantizationInf
    return std::vector<double>(values.begin(), values.end());
 }
 
-// Quantizes a float gather table into its int8/uint8 carrier with a plain
-// row-major layout (no transform). Per-tensor uses the scalar affine contract;
-// per-channel resolves each element's scale from the quantization axis stride
-// (channel = (flatIndex / inner) % axisLength) and is symmetric (zero point 0).
+// Quantizes a float gather table into its int8/uint8 carrier, plain row-major. Per-tensor
+// uses the scalar affine contract; per-channel is symmetric with the scale resolved per element.
 MaterializedQuantizedTensor MaterializeQuantizedGatherTable(
    const QuantizedGatherRegion &region, const QuantizedLoweringPlan &plan,
    EQuantizedBackend backend, const float *sourceData,
@@ -160,9 +158,8 @@ void DiscoverQuantizedGatherRegions(QuantizationPassContext &context)
          region.tableQuant = model.GetQuantizationInfo(tableTensor);
          CheckQuantizationInfo(*region.tableQuant, "gather table", reasons);
          if (region.tableQuant->granularity == EQuantizationGranularity::PerChannel) {
-            // Per-channel is supported for any quantization axis (before, at, or
-            // after the gather axis) as long as it is symmetric; the runtime
-            // resolves the channel from the table's quantization-axis stride.
+            // Per-channel supports any quantization axis as long as it is symmetric; the
+            // runtime resolves the channel from the table's quantization-axis stride.
             const auto quantAxis = region.tableQuant->axis;
             if (quantAxis < 0 || static_cast<std::size_t>(quantAxis) >= region.tableShape.size())
                reasons.push_back("per-channel gather table quantization axis is out of range");
@@ -187,9 +184,8 @@ void DiscoverQuantizedGatherRegions(QuantizationPassContext &context)
       } else {
          region.tableLowPrecision = model.GetLowPrecisionTensorInfo(tableTensor);
          region.tableSourceTensor = tableTensor;
-         // The FP8 gather kernel reads a native E4M3 carrier and dequantizes to
-         // FP32; other low-precision carriers (E5M2) are not yet supported and
-         // must not be silently reinterpreted as E4M3.
+         // The FP8 gather kernel reads a native E4M3 carrier and dequantizes to FP32; other
+         // low-precision carriers (E5M2) must not be silently reinterpreted as E4M3.
          if (region.tableLowPrecision->carrier != ELowPrecisionCarrier::FP8E4M3)
             reasons.push_back("weight-only Gather low-precision table carrier is not E4M3");
       }
@@ -238,12 +234,8 @@ void DiscoverQuantizedGatherRegions(QuantizationPassContext &context)
       alpaka.isMetadataOnly = false;
       alpaka.outputStorage = EQuantizedStorageType::FloatCarrier;
       alpaka.weightLayout = EQuantizedLayout::Plain;
-      // The table is materialized into a dedicated weight-storage tensor so the
-      // lowered kernel reads it in its real int8/uint8/fp8 carrier and the tensor
-      // is externalized to the binary weight file. A float ONNX source (QONNX
-      // fake-quant) or an fp8 source that would otherwise be inlined both need a
-      // distinct storage tensor; a source already in the affine carrier is used
-      // in place (metadata-only registration).
+      // The table is materialized into a dedicated weight-storage tensor read in its real
+      // int8/uint8/fp8 carrier; a source already in the affine carrier is used in place.
       const std::string dedicatedStorage = region.tableSourceTensor + "_quantized_gather_storage";
       if (fp8) {
          alpaka.weightStorageTensor = dedicatedStorage;
@@ -340,9 +332,8 @@ QuantizedGatherCodegenContext MakeQuantizedGatherCodegenContext(
    RModel &model, const QuantizedGatherRegion &region, const QuantizedLoweringPlan &plan)
 {
    QuantizedGatherCodegenContext context;
-   // The codegen carrier comes from the resolved weight-storage tensor (int8/
-   // uint8/fp8), which the materialization step has by now installed, rather than
-   // from the ONNX source tensor (which may still be the pre-quantization float).
+   // The codegen carrier comes from the resolved weight-storage tensor (int8/uint8/fp8),
+   // not from the ONNX source tensor, which may still be the pre-quantization float.
    context.tableSourceType = plan.weightStorageTensor.empty()
                                 ? ETensorType::UNDEFINED : model.GetTensorType(plan.weightStorageTensor);
    context.indicesType = region.indicesTensor.empty()

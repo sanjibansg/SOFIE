@@ -17,9 +17,8 @@
 
 namespace SOFIE {
 
-// Fallback for qonnx.custom_op.general::Quant.
-// Operator implements fake quantization: values are rounded and clamped to
-// the quantized integer grid, then converted back to the floating carrier type.
+// Fallback for qonnx.custom_op.general::Quant: fake quantization -- values are rounded and
+// clamped to the quantized integer grid, then converted back to the floating carrier type.
 class ROperator_QONNXQuant final : public ROperator {
 private:
    std::string fNX;

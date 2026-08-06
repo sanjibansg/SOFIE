@@ -656,8 +656,7 @@ QuantizedDenseLinearBackendCapability AssessCublasLtDenseLinearCapability(
                                                                    : operands.shapeReason;
       capability.profile = computeProfile.profile;
       capability.reason = JoinCapabilityReasons(semanticReasons);
-      // Batching is no longer the blocker, so do not keep claiming it is: the reasons
-      // above say what actually failed.
+      // The tag names the profile as the failure; the reasons above carry the specifics.
       capability.tag = operands.requiresBatchedLowering ? "cublaslt_dense_linear_batched_profile_unsupported"
                                                         : "cublaslt_dense_linear_profile_unsupported";
       return capability;
@@ -1098,7 +1097,7 @@ QuantizedLoweringPlan MakeAlpakaCublasLtFP8Plan(
    plan.weightStorageTensor = weightStorageTensor;
    plan.weightLayout = EQuantizedLayout::PlainDevice;
    plan.matrixShapePolicy = shapePolicy;
-   plan.consumedOperatorIndices = { region.gemmOpIndex };
+   plan.consumedOperatorIndices = QuantizedRegionConsumedOperatorIndices(region);
    plan.preservesQuantizationSemantics = capability.executable;
    plan.isMetadataOnly = !capability.executable;
    plan.suppressesGraphOperators = capability.executable;

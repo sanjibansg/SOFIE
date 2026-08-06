@@ -67,17 +67,14 @@ void RModel::BuildLoweredOperatorView(EQuantizedBackend backend)
    fLoweredConsumedOperatorIndices.clear();
    PrepareQuantizedTensorStorage(backend);
    AddLoweredQuantizedOperators(backend);
-   // Canonicalization before any further absorption: the duplicates an exporter emits are
-   // what makes a carrier look like it has several consumers, and several passes below
-   // decline on exactly that. Placed after region lowering rather than before analysis
-   // because the region plans already name specific boundary operators.
+   // Canonicalization before any further absorption: duplicated decodes are what make a
+   // carrier look multi-consumer, and several passes below decline on exactly that.
    DeduplicateCarrierDecodes(backend);
-   // Also canonicalization, and before S56: a no-op Clip is still an operator, and S56's walk
-   // stops at one. Dropping it is what lets those chains be seen as the movement they are.
+   // Also canonicalization: a no-op Clip is still an operator, and the movement walk stops
+   // at one. Dropping it lets those chains be seen as the movement they are.
    DropNoOpClipsBeforeQuantize(backend);
-   // Before the fusion, which would collapse the Quantize that produces a propagated
-   // carrier into a float round trip and leave the rewired movement reading a carrier
-   // nothing writes.
+   // Before the fusion, which would collapse the Quantize producing a propagated carrier
+   // and leave the rewired movement reading a carrier nothing writes.
    PropagateLowPrecisionThroughMovement(backend);
    // Both must only see the boundaries no region absorbed, and dead-code elimination
    // must see the final emit set, so it runs after the fusion rather than before.

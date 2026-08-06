@@ -11,9 +11,8 @@ namespace SOFIE {
 
 class RModel;
 
-// Recognizes weight-only quantized/low-precision Gather over a constant table
-// and builds its direct-kernel lowering plan in place. Indices stay integral;
-// unsupported cases stay metadata-recognized with a factual rejection reason.
+// Recognizes weight-only quantized/low-precision Gather over a constant table and builds its
+// plan in place; indices stay integral, unsupported cases keep a factual rejection reason.
 void DiscoverQuantizedGatherRegions(QuantizationPassContext &context);
 
 // Registers metadata-only storage for the constant table so it is protected

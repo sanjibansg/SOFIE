@@ -31,9 +31,8 @@ std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedE
 
 namespace {
 
-// One resolved elementwise operand: its quantized carrier tensor, the physical
-// source consumed by the kernel, the producing boundary (if any), and its
-// affine or low-precision metadata.
+// One resolved elementwise operand: its quantized carrier tensor, the physical source the
+// kernel consumes, the producing boundary (if any), and its affine or low-precision metadata.
 struct ElementwiseOperand {
    bool resolved = false;
    std::string carrierTensor;
@@ -72,9 +71,8 @@ ElementwiseOperand ResolveOperand(RModel &model, const QuantizationGraphIndex &g
    if (model.HasQuantizationInfo(tensor)) {
       operand.affine = model.GetQuantizationInfo(tensor);
       CheckQuantizationInfo(*operand.affine, role, reasons);
-      // The direct kernel applies one scale/zero point per operand; a per-axis
-      // operand cannot be expressed by the per-tensor invocation and is left
-      // recognized-but-unlowered rather than silently using the scalar field.
+      // The direct kernel applies one scale/zero point per operand; a per-axis operand
+      // stays recognized-but-unlowered rather than silently using the scalar field.
       if (operand.affine->granularity != EQuantizationGranularity::PerTensor)
          reasons.push_back(role + " uses per-channel quantization, which the elementwise family does not support");
       resolveBoundary(role);
@@ -146,10 +144,8 @@ void BuildElementwisePlans(QuantizationModelState &state, QuantizedElementwiseRe
                       " lowered to a direct requantization kernel";
    }
 
-   // A constant operand B is already in its physical carrier form (the DQ/Cast
-   // source). Point the storage tensor at it so the shared prune/protect and
-   // binary-externalization path keeps it live and out of the C++ source; the
-   // materialization step below registers it metadata-only (no conversion).
+   // A constant operand B is already in its physical carrier form (the DQ/Cast source);
+   // pointing the storage tensor at it keeps it live, externalized, and unconverted.
    if (region.operandBIsConstant) {
       alpaka.weightStorageTensor = region.operandBSourceTensor;
       alpaka.weightLayout = EQuantizedLayout::Plain;
@@ -167,9 +163,8 @@ void BuildElementwisePlans(QuantizationModelState &state, QuantizedElementwiseRe
 
 } // namespace
 
-// Registers metadata-only storage for a constant operand B so it is protected
-// from pruning and externalized to the binary weight file. The constant is
-// already in its physical carrier form, so no conversion or transpose occurs.
+// Registers metadata-only storage for a constant operand B, protecting it from pruning and
+// externalizing it; the constant is already in carrier form, so nothing is converted.
 void MaterializeQuantizedElementwiseWeights(QuantizedStoragePassContext &context)
 {
    auto &model = context.model;
@@ -240,9 +235,8 @@ void DiscoverQuantizedElementwiseRegions(QuantizationPassContext &context)
       auto operandA = ResolveOperand(model, graph, operators, tensorA, opIndex, "elementwise input", reasons);
       auto operandB = ResolveOperand(model, graph, operators, tensorB, opIndex, "elementwise operand B", reasons);
 
-      // Add and Mul are commutative, so a constant operand is canonicalized into
-      // the B slot where it reuses the shared weight-storage/externalization
-      // path; the activation stays in the input slot.
+      // Add and Mul are commutative, so a constant operand is canonicalized into the B slot
+      // (the shared weight-storage path); the activation stays in the input slot.
       const bool aIsConstant = model.IsInitializedTensor(operandA.sourceTensor);
       const bool bIsConstant = model.IsInitializedTensor(operandB.sourceTensor);
       if (aIsConstant && !bIsConstant)

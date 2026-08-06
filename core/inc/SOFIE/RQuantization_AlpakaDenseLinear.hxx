@@ -50,9 +50,8 @@ struct QuantizedGemmCudaLtFP8State {
    // cuBLASLt reads the operand scales from device memory, and the scratch arena is reused
    // between calls, so they live with the descriptor instead.
    float *fOperandScales = nullptr;
-   // A bias folded into the cuBLASLt epilogue, replacing a whole m*n kernel launch per GEMM.
-   // It is held in BF16 because that is the only bias type the FP8 heuristic accepts; the
-   // conversion runs once, so the buffer outlives the descriptor rebuilds Reset() performs.
+   // A bias folded into the cuBLASLt epilogue, held in BF16 (the only bias type the FP8
+   // heuristic accepts); converted once, outliving the descriptor rebuilds Reset() performs.
    void *fFusedBias = nullptr;
    const float *fFusedBiasSource = nullptr;
    bool fFuseBias = false;
@@ -237,15 +236,8 @@ inline cudaDataType_t QuantizedGemmCudaLtFP8_OutputDataType(EQuantizedFP8OutputC
    return CUDA_R_32F;
 }
 
-// Whether cuBLASLt is given a D scale, which happens exactly when D is narrowed to FP8 and
-// the output grid is not unit. It decides two things that must agree:
-//
-//   - the descriptor programs D_SCALE_POINTER, and
-//   - the output buffer therefore holds CODES rather than values, so a bias expressed in
-//     value units has to be divided by the output scale before it can be added to one.
-//
-// It lived in two places and the second copy did not exist, which is how the bias epilogue
-// came to add a value-unit bias to a code. One definition, read by both.
+// Whether cuBLASLt is given a D scale: exactly when D narrows to FP8 on a non-unit grid.
+// The output then holds CODES, so a value-unit bias divides by the output scale first.
 inline bool QuantizedGemmCudaLtFP8_ProgramsOutputScale(const QuantizedFP8DenseLinearInvocation &params)
 {
    const auto type = QuantizedGemmCudaLtFP8_OutputDataType(params.outputCarrier);
@@ -306,9 +298,8 @@ inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &, QuantizedGemmCu
 
 namespace INTERNAL {
 
-// CheckCudaStatus, QuantizedCudaClamp, and QuantizedCudaQuantizeClamp are shared
-// primitives in RQuantization_AlpakaPrimitives.hxx. CheckCublasLtStatus stays
-// here because it is cuBLASLt-specific.
+// CheckCudaStatus, QuantizedCudaClamp, and QuantizedCudaQuantizeClamp are shared primitives
+// in RQuantization_AlpakaPrimitives.hxx; CheckCublasLtStatus is cuBLASLt-specific.
 inline void CheckCublasLtStatus(cublasStatus_t status, const char *where)
 {
    if (status != CUBLAS_STATUS_SUCCESS) {
@@ -406,10 +397,8 @@ __global__ void QuantizedGemmCudaQuantizedEpilogueKernel(OutputT *__restrict__ o
    output[idx] = static_cast<OutputT>(yq);
 }
 
-// Logical output extent: a padded GEMM keeps its physical row stride in params.n, so the
-// epilogue slices [logicalM, logicalN] out of the padded accumulator.
-// The extent covers the whole strided batch, matching the batchCount*M*N threads the
-// caller launched. Batched execution is never padded, so logical equals physical here.
+// Logical output extent over the whole strided batch: a padded GEMM keeps its physical row
+// stride in params.n, so the epilogue slices [logicalM, logicalN] out of the accumulator.
 __device__ inline std::size_t QuantizedGemmCudaLogicalElements(const QuantizedDenseLinearInvocation &params)
 {
    const std::size_t cols = params.logicalN != 0 ? params.logicalN : params.n;
@@ -487,17 +476,17 @@ __device__ inline OutputT QuantizedGemmCudaFP8OutputFromFloat(float value)
    return static_cast<OutputT>(value);
 }
 
-// biasToOutputUnits converts the bias from the value units the graph expresses it in to
-// whatever units `output` holds -- 1 when the GEMM wrote values, 1/outputScale when it
-// narrowed to FP8 and the buffer holds codes. The caller computes it from the one shared
-// condition; see QuantizedGemmCudaLtFP8_ProgramsOutputScale.
+// biasToOutputUnits converts the bias from value units to the units `output` holds -- 1 when
+// the GEMM wrote values, 1/outputScale when it narrowed to FP8 and the buffer holds codes.
 template <typename OutputT>
 __global__ void QuantizedGemmCudaLtFP8BiasEpilogueKernel(OutputT *__restrict__ output,
                                                          const float *__restrict__ bias,
                                                          float biasToOutputUnits,
                                                          QuantizedFP8DenseLinearInvocation params)
 {
-   const std::size_t elements = params.m * params.n;
+   // Batched slices are contiguous, so one flat index covers them; only the clamp reaches
+   // here batched, since no bias-bearing batched FP8 call exists.
+   const std::size_t elements = params.m * params.n * (params.batchCount > 1 ? params.batchCount : 1);
    const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
    if (idx >= elements)
       return;
@@ -514,6 +503,8 @@ __global__ void QuantizedGemmCudaLtFP8BiasEpilogueKernel(OutputT *__restrict__ o
    // Relu commutes with the positive scale above, so testing the code is testing the value.
    if (params.hasRelu && !(value > 0.0f))
       value = 0.0f;
+   if (params.hasOutputClamp)
+      value = fminf(fmaxf(value, params.outputClampLow), params.outputClampHigh);
    output[idx] = QuantizedGemmCudaFP8OutputFromFloat<OutputT>(value);
 }
 
@@ -553,15 +544,13 @@ inline void QuantizedGemmCudaLtFP8ApplyBiasEpilogue(QuantizedGemmCudaStream stre
                                                      const QuantizedFP8DenseLinearInvocation &params)
 {
    const bool appliesBias = params.hasBias && bias != nullptr && params.beta != 0.0f;
-   if (!appliesBias && !params.hasRelu)
+   if (!appliesBias && !params.hasRelu && !params.hasOutputClamp)
       return;
-   const std::size_t elements = params.m * params.n;
+   const std::size_t elements = params.m * params.n * (params.batchCount > 1 ? params.batchCount : 1);
    if (elements == 0)
       return;
-   // When a D scale was programmed the GEMM narrowed D to FP8, so `output` holds codes and a
-   // value-unit bias must be converted before it is added to one. cuBLASLt's own fused
-   // epilogue adds the bias to the accumulator and scales afterwards, which is the same
-   // arithmetic; this is what makes the two paths agree.
+   // With a programmed D scale `output` holds codes, so the value-unit bias converts first;
+   // cuBLASLt's fused epilogue adds bias to the accumulator then scales, the same arithmetic.
    const float biasToOutputUnits =
       QuantizedGemmCudaLtFP8_ProgramsOutputScale(params) ? 1.0f / params.outputScale : 1.0f;
    constexpr int threads = 256;
@@ -694,30 +683,17 @@ inline void QuantizedGemmCudaLtFP8State::ResetFusedBias() noexcept
    fFuseBias = false;
 }
 
-// Decides whether this call's bias can ride in the cuBLASLt epilogue, and if so materialises
-// it in BF16. Returns whether the caller may skip QuantizedGemmCudaLtFP8ApplyBiasEpilogue.
-//
-// Must run before Initialize(): the epilogue is an input to the heuristic query, and an
-// algorithm chosen without it is not guaranteed to support it.
+// Decides whether this call's bias can ride in the cuBLASLt epilogue, materialising it in
+// BF16. Must run before Initialize(): the epilogue is an input to the heuristic query.
 inline bool QuantizedGemmCudaLtFP8State::TryFuseBias(const float *bias,
                                                       const QuantizedFP8DenseLinearInvocation &params,
                                                       QuantizedGemmCudaStream stream)
 {
-   // Guards are deliberately narrow: each one marks a case where the fused epilogue is not
-   // known to be identical to QuantizedGemmCudaLtFP8BiasEpilogueKernel, not a case where it
-   // is known to differ.
-   //  - weightIsMatrixA: cuBLASLt adds the bias along the rows of D. Only under this
-   //    spelling are D's rows the output features, which is what the bias is indexed by.
-   //  - paddedExecution: the kernel skips padded columns; the fused epilogue cannot.
-   //  - batchCount > 1: no bias-bearing batched GEMM exists to test against.
-   //
-   // A programmed D scale used to be excluded too, on the belief that cuBLASLt's ordering
-   // differed from the kernel's. Measured: cuBLASLt adds the bias to the accumulator and
-   // applies the D scale afterwards, which is the correct reading, and the kernel now
-   // converts the bias into code units to match. Both paths agree, so the exclusion is gone.
+   // Each guard marks a case where the fused epilogue is not known to match the standalone
+   // kernel; an output clamp always needs the kernel, which keeps bias-then-clamp order.
    const bool eligible = params.hasBias && bias != nullptr && params.beta != 0.0f &&
                          params.weightIsMatrixA && !params.paddedExecution &&
-                         params.batchCount <= 1;
+                         params.batchCount <= 1 && !params.hasOutputClamp;
    if (!eligible) {
       if (fFuseBias)
          ResetFusedBias();
@@ -728,11 +704,8 @@ inline bool QuantizedGemmCudaLtFP8State::TryFuseBias(const float *bias,
 
    ResetFusedBias();
 
-   // The bias is produced on the alpaka queue -- uploaded at session init, or written by a
-   // dequantize kernel. A cudaMemcpy on another stream is not ordered against that work, so
-   // reading it without this wait samples whatever the buffer held beforehand. Zeros survive
-   // a BF16 round trip exactly, so the exactness check below would pass on unwritten memory
-   // and license a wrong bias.
+   // The bias is produced on the alpaka queue; a cudaMemcpy on another stream is not ordered
+   // against that work, and zeros would pass the exactness check below on unwritten memory.
    INTERNAL::CheckCudaStatus(cudaStreamSynchronize(stream), "cudaStreamSynchronize(FP8 fused bias)");
 
    const std::size_t features = params.m;
@@ -742,8 +715,7 @@ inline bool QuantizedGemmCudaLtFP8State::TryFuseBias(const float *bias,
       "cudaMemcpy(FP8 fused bias readback)");
 
    // BF16 is the only bias type the FP8 heuristic accepts, so a bias that does not survive
-   // the narrowing exactly cannot be fused without changing the result. Refusing is free:
-   // the standalone epilogue kernel still runs.
+   // the narrowing exactly cannot be fused; the standalone epilogue kernel still runs.
    std::vector<__nv_bfloat16> narrowed(features);
    for (std::size_t i = 0; i < features; ++i) {
       const float wanted = params.beta * host[i];
@@ -794,16 +766,13 @@ inline void QuantizedGemmCudaLtFP8State::Initialize(const QuantizedFP8DenseLinea
                                     "cublasLtMatmulDescSetAttribute(FP8 transB)");
 
       // Unit scales are left unprogrammed so an uncalibrated call keeps the exact operand
-      // path its bit-exact tests cover.
-      // The D scale only means anything when D is narrowed to FP8; a float D carries the
-      // dequantized value directly and must not be rescaled.
+      // path; the D scale only means anything when D narrows to FP8, never for a float D.
       const bool programOutputScale = QuantizedGemmCudaLtFP8_ProgramsOutputScale(params);
       if (params.inputScale != 1.0f || params.weightScale != 1.0f || programOutputScale) {
          const float aScale = params.weightIsMatrixA ? params.weightScale : params.inputScale;
          const float bScale = params.weightIsMatrixA ? params.inputScale : params.weightScale;
-         // Every scale pointer must be 16-byte aligned. Packing floats adjacently leaves the
-         // second at base+4, which cuBLASLt 12.8 tolerated and 12.9 rejects with
-         // NOT_SUPPORTED, so each scalar gets its own 16-byte slot.
+         // Every scale pointer must be 16-byte aligned -- cuBLASLt 12.9 rejects base+4
+         // packing with NOT_SUPPORTED -- so each scalar gets its own 16-byte slot.
          constexpr std::size_t kScaleStride = 16u / sizeof(float);
          float scales[3u * kScaleStride] = {};
          scales[0] = aScale;
@@ -833,9 +802,8 @@ inline void QuantizedGemmCudaLtFP8State::Initialize(const QuantizedFP8DenseLinea
          }
       }
 
-      // The epilogue has to be programmed before the heuristic query below: it is part of
-      // the problem cuBLASLt is selecting an algorithm for, and an algorithm chosen without
-      // it may not support it.
+      // The epilogue must be programmed before the heuristic query below: an algorithm
+      // chosen without it may not support it.
       if (fFuseBias && fFusedBias != nullptr) {
          const cublasLtEpilogue_t epilogue =
             params.hasRelu ? CUBLASLT_EPILOGUE_RELU_BIAS : CUBLASLT_EPILOGUE_BIAS;
@@ -937,10 +905,8 @@ inline void QuantizedGemmCudaLtFP8State::PrepareScratch(const QuantizedFP8DenseL
                        : nullptr;
 }
 
-// Prints every descriptor and layout attribute cuBLASLt actually holds, so a call that
-// fails inside a generated model can be diffed attribute by attribute against the same
-// invocation driven standalone. Enabled by SOFIE_FP8_DUMP; the two dumps are meant to be
-// compared as text, which is why every value is printed unconditionally and in a fixed order.
+// Prints every descriptor and layout attribute cuBLASLt holds, unconditionally and in a
+// fixed order so two dumps diff as text. Enabled by SOFIE_FP8_DUMP.
 inline void QuantizedGemmCudaLtFP8State::DumpDescriptors(const char *tag, const void *input,
                                                          const void *weight, const void *target) const
 {
@@ -998,9 +964,8 @@ inline void QuantizedGemmCudaLtFP8State::DumpDescriptors(const char *tag, const 
                reinterpret_cast<std::uintptr_t>(target) % 16u);
    std::printf("  workspace=%p bytes=%zu  heuristics=%d  scaleBuffer=%p\n", fWorkspace,
                fWorkspaceAllocatedBytes, fHeuristicResultCount, static_cast<const void *>(fOperandScales));
-   // cuBLASLt binds a handle to whichever device was current when it was created, and
-   // rejects operands that live on a different one. On a four-GPU node that mismatch is
-   // invisible in every attribute above, so residency is asked for directly.
+   // cuBLASLt binds a handle to the device current at creation and rejects operands living
+   // on another one; that is invisible in the attributes above, so residency is asked directly.
    int currentDevice = -1;
    cudaGetDevice(&currentDevice);
    auto residency = [](const char *name, const void *pointer) {
@@ -1110,16 +1075,13 @@ inline void QuantizedGemmCudaLtFP8State::Execute(void *output, const void *input
       throw std::runtime_error("SOFIE FP8 cuBLASLt dense-linear padded call has no output staging buffer");
    Autotune(target, input, weight, params, stream);
    // Set SOFIE_FP8_DUMP to print every descriptor, layout, pointer and residency fact
-   // cuBLASLt holds at this call. Kept because it is what identified the 12.8/12.9
-   // divergence: it is the only way to establish that two calls differ in nothing visible.
+   // cuBLASLt holds at this call.
    if (const char *tag = std::getenv("SOFIE_FP8_DUMP"))
       DumpDescriptors(tag, input, weight, target);
    const float alpha = params.alpha;
    const float beta = 0.0f;
-   // The geometry travels with the status: one of these calls per dense region, and a bare
-   // code cannot say which.
-   // A heuristic candidate is a suggestion, not a guarantee: cuBLASLt can return algorithms
-   // that reject the full descriptor at execution, so the list is walked until one runs.
+   // The geometry travels with the status: a bare code cannot say which call failed. A
+   // heuristic candidate may still reject the full descriptor, so the list is walked until one runs.
    auto launch = [&](const cublasLtMatmulAlgo_t &algo) {
       return cublasLtMatmul(fHandle, fOperation, &alpha, input, fALayout, weight, fBLayout,
                             &beta, target, fCLayout, target, fDLayout, &algo, fWorkspace,
@@ -1136,10 +1098,8 @@ inline void QuantizedGemmCudaLtFP8State::Execute(void *output, const void *input
       }
    }
 
-   // cuBLASLt reports a context that is already in an error state as a rejection of this
-   // call, so an unrelated earlier kernel failure arrives here wearing this call's name.
-   // The entry error distinguishes the two and is peeked, not consumed, to leave the
-   // context exactly as the failure found it.
+   // cuBLASLt reports an already-errored context as a rejection of this call, so the entry
+   // error is peeked -- not consumed -- to tell an earlier failure from this call's own.
    const std::string where = "cublasLtMatmul(FP8) m=" + std::to_string(params.m) +
                              " n=" + std::to_string(params.n) + " k=" + std::to_string(params.k) +
                              " batch=" + std::to_string(params.batchCount) +
@@ -1445,13 +1405,11 @@ struct QuantizedGemmCudaLtState {
    std::int64_t fBatchStrideC = 0;
    bool fAColumnMajorInput = false;
    bool fInitialized = false;
-   // Remembers a provider rejection of the direct column-major input layout so
-   // an ineligible shape is probed once, not on every inference. Deliberately
-   // survives Reset(): the shape bound to this state does not change.
+   // Remembers a provider rejection of the direct column-major input layout so an ineligible
+   // shape is probed once. Survives Reset(): the shape bound to this state does not change.
    bool fDirectInputLayoutUnsupported = false;
-   // Tiled-Conv staging pipeline: an internal non-blocking stream and
-   // dependency events let the next tile's im2col staging overlap the current
-   // tile's GEMM and epilogue. Created on first tiled execution.
+   // Tiled-Conv staging pipeline: an internal stream and dependency events overlap the next
+   // tile's im2col staging with the current tile's GEMM and epilogue.
    cudaStream_t fTileStagingStream = nullptr;
    cudaEvent_t fTileEntryEvent = nullptr;
    cudaEvent_t fTileStagingDoneEvents[2] = {nullptr, nullptr};
@@ -1579,10 +1537,8 @@ struct QuantizedGemmCudaLtState {
       InitializeInternal(params, true);
    }
 
-   // Attempts initialization for the direct column-major input layout of a
-   // unit-kernel Conv. Returns false, leaving the state reset, when the
-   // provider reports no algorithm for the requested layout; the caller then
-   // falls back to staged im2col execution.
+   // Attempts initialization for a unit-kernel Conv's direct column-major input layout;
+   // returns false, leaving the state reset, when the provider has no algorithm for it.
    bool TryInitializeDirectInput(const QuantizedDenseLinearInvocation &params)
    {
       if (fDirectInputLayoutUnsupported)
@@ -2112,9 +2068,8 @@ inline void QuantizedGemmCudaLtFP8_Call(QuantizedGemmCudaLtFP8State &state, Quan
 #ifndef SOFIE_USE_CUBLASLT
    throw std::runtime_error("SOFIE FP8 cuBLASLt dense-linear path was selected, but SOFIE_USE_CUBLASLT is not enabled");
 #else
-   // Folding the bias into the cuBLASLt epilogue removes one m*n kernel launch per dense
-   // layer. It has to be decided before Execute, which is where the descriptor is built and
-   // the algorithm chosen.
+   // Folding the bias into the cuBLASLt epilogue removes one m*n launch per dense layer; it
+   // must be decided before Execute, where the descriptor is built and the algorithm chosen.
    const bool biasIsFused = state.TryFuseBias(bias, params, stream);
    state.Execute(output, input, weight, params, stream);
    // The epilogue applies where the GEMM wrote, which is staging for a padded call.

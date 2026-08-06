@@ -16,16 +16,13 @@ namespace SOFIE {
 
 class RModel;
 
-// Matrix-based Conv materializes im2col, matrix-output, accumulator, and
-// cuBLASLt workspace segments in one reusable invocation arena. Reject plans
-// whose declared arena exceeds this bound before code generation allocates it.
+// Bound on the reusable invocation arena (im2col, matrix-output, accumulator, cuBLASLt
+// workspace); plans declaring a larger arena are rejected before code generation.
 inline constexpr std::size_t kQuantizedConvMaxReusableScratchBytes =
    512ULL * 1024ULL * 1024ULL;
 
-// Exact-shape plans whose untiled arena exceeds the budget switch to tiled
-// execution: im2col staging, the strided-batch GEMM, and the epilogue run per
-// row tile, so the arena is bounded by the tile instead of the model shape.
-// Each of the two staging buffers targets this many bytes per tile.
+// Per-tile byte target for each of the two staging buffers; exact-shape plans whose
+// untiled arena exceeds the budget run im2col, GEMM, and epilogue per row tile.
 inline constexpr std::size_t kQuantizedConvIm2ColTileBytes = 64ULL * 1024ULL * 1024ULL;
 
 // Row tiles stay multiples of this quantum so full tiles keep one GEMM shape;

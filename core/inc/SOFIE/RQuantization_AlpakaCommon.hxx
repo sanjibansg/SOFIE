@@ -201,10 +201,8 @@ struct QuantizedFP8DenseLinearInvocation {
    // 1 means the operand carries its values directly and no scale pointer is programmed.
    float inputScale = 1.0f;
    float weightScale = 1.0f;
-   // Requantization factor for an FP8 D, i.e. the scale of the grid the output is being
-   // encoded onto. cuBLASLt multiplies D by the programmed D scale before narrowing to E4M3,
-   // so the pointer carries 1/outputScale. 1 leaves it unprogrammed, which is what a float
-   // D wants. No pass programs it; the emitted value is always 1.0f.
+   // Scale of the grid an FP8 D is encoded onto; the D-scale pointer carries 1/outputScale.
+   // 1 leaves it unprogrammed, which is what a float D wants.
    float outputScale = 1.0f;
    std::size_t batchCount = 1;
    std::int64_t batchStrideA = 0;
@@ -223,6 +221,11 @@ struct QuantizedFP8DenseLinearInvocation {
    // Relu applied by the FP8 epilogue; there is no FP8 Relu operator, so an E4M3 layer
    // chain depends on it.
    bool hasRelu = false;
+   // Output clamp in output units (codes when a D scale is programmed), from a Clip
+   // absorbed with its quantize boundary; clip-then-encode equals encode-then-clamp.
+   bool hasOutputClamp = false;
+   float outputClampLow = 0.0f;
+   float outputClampHigh = 0.0f;
    // NT spelling: the weight is cuBLASLt's A operand with m/n exchanged, so the bias index
    // is idx % m.
    bool weightIsMatrixA = false;
@@ -274,10 +277,8 @@ struct QuantizedDenseLinearInvocation {
    bool enableAutotuning = true;
    int autotuneIterations = 3;
    double accumulatorToOutputScale = 0.0;
-   // When true, the A operand is stored column-major as [k, m] with leading
-   // dimension m. This is the layout of an NCHW unit-kernel Conv input block,
-   // which lets eligible 1x1 Conv consume its input directly without im2col
-   // staging. Provider support for this layout is shape-dependent.
+   // When true, the A operand is stored column-major as [k, m]: the NCHW unit-kernel Conv
+   // input layout, consumed directly without im2col staging. Provider support is shape-dependent.
    bool aColumnMajorInput = false;
 };
 
@@ -300,15 +301,11 @@ struct QuantizedConvolutionInvocation {
    std::size_t dilationWidth = 1;
    std::size_t padTop = 0;
    std::size_t padLeft = 0;
-   // Plan-time candidacy for consuming the NCHW input directly as the GEMM
-   // operand of a unit-kernel Conv (im2col elided). The runtime verifies the
-   // geometry and falls back to staged im2col when the provider reports no
-   // algorithm for the direct layout.
+   // Plan-time candidacy for consuming the NCHW input directly as a unit-kernel Conv's GEMM
+   // operand; the runtime falls back to staged im2col when the provider has no algorithm.
    bool unitKernelDirectInputCandidate = false;
-   // When nonzero, exact INT8 matrix execution runs in row tiles of this size:
-   // im2col staging, the strided-batch GEMM, and the epilogue each process
-   // one tile so reusable scratch is bounded by the tile, not the model shape.
-   // Zero keeps the single-shot execution used by in-budget shapes.
+   // When nonzero, exact INT8 execution runs staging, GEMM, and epilogue in row tiles of
+   // this size so reusable scratch is bounded by the tile; zero keeps single-shot execution.
    std::size_t im2colTileRows = 0;
 };
 
@@ -326,12 +323,8 @@ enum class EQuantizedElementwiseOp {
 // kQuantizedElementwiseMaxRank is defined in RQuantization.hxx and shared with
 // the host region/codegen side.
 
-// Provider-neutral descriptor for a quantized/low-precision elementwise Add/Mul
-// with NumPy multidirectional broadcasting. Operand extents are right-aligned
-// and padded with 1; the call boundary derives the row-major strides and total
-// element count so generated code only emits extents. INT8 uses the affine
-// scale/zero-point requantization path; FP8 dequantizes E4M3 operands to FP32,
-// applies the op, and writes the output carrier.
+// Provider-neutral descriptor for a quantized/low-precision elementwise Add/Mul with NumPy
+// broadcasting. Extents are right-aligned and padded with 1; strides derive at the call boundary.
 struct QuantizedElementwiseInvocation {
    EQuantizedElementwiseOp op = EQuantizedElementwiseOp::Add;
    int rank = 0;
@@ -343,9 +336,8 @@ struct QuantizedElementwiseInvocation {
    std::size_t inputStride[kQuantizedElementwiseMaxRank] = {};
    std::size_t operandBStride[kQuantizedElementwiseMaxRank] = {};
    std::size_t elements = 0;
-   // Derived at the call boundary: true when an operand shares the output shape
-   // on every axis (no broadcast), so its element offset is the linear index and
-   // the per-element mixed-radix offset computation can be skipped.
+   // Derived at the call boundary: true when an operand shares the output shape on every
+   // axis, so its element offset is the linear index with no mixed-radix computation.
    bool inputContiguous = false;
    bool operandBContiguous = false;
 
@@ -365,23 +357,16 @@ struct QuantizedElementwiseInvocation {
    bool hasRelu = false;
 };
 
-// Provider-neutral descriptor for a weight-only quantized/low-precision Gather.
-// Any ONNX Gather (arbitrary axis, index rank, negative indices) collapses to
-// three ranges: outer (table dims before axis), the gathered axis of length
-// axisLength, and inner (table dims after axis); the flattened index tensor has
-// indexCount entries. Output element (o, p, i) reads table[(o*axisLength +
-// idx[p]) * inner + i] and dequantizes it. Indices are integral (int32/int64).
+// Provider-neutral descriptor for a weight-only quantized Gather, collapsed to outer/axis/
+// inner ranges: output element (o, p, i) dequantizes table[(o*axisLength + idx[p])*inner + i].
 struct QuantizedGatherInvocation {
    std::size_t outer = 1;
    std::size_t axisLength = 0;
    std::size_t inner = 1;
    std::size_t indexCount = 0;
 
-   // Per-tensor scale/zero point when perChannel is false. When perChannel is
-   // true the scale/zeroPoint device vectors are indexed by the table's
-   // quantization axis: the channel of the dequantized element is
-   // (dataFlatIndex / quantAxisStride) % quantAxisLength, which resolves the axis
-   // coordinate whether the quant axis lies before, at, or after the gather axis.
+   // Per-tensor scale/zero point when perChannel is false; when true, the device vectors
+   // are indexed by (dataFlatIndex / quantAxisStride) % quantAxisLength.
    double scale = 1.0;
    std::int32_t zeroPoint = 0;
    bool perChannel = false;

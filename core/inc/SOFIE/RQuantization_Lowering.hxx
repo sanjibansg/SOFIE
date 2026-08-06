@@ -189,9 +189,8 @@ struct QuantizedCarrierMemoryPlan {
    std::size_t unpooledBytes = 0;
 };
 
-// Assign graph-value carriers to stable byte-arena slots. A slot becomes reusable
-// only after its previous value's final consumer, so input and output values used
-// by the same operator can never alias.
+// Assigns graph-value carriers to stable byte-arena slots; a slot becomes reusable only
+// after its previous value's final consumer, so one operator's input and output never alias.
 inline QuantizedCarrierMemoryPlan PlanQuantizedCarrierMemory(
    std::vector<QuantizedCarrierLifetime> lifetimes)
 {
@@ -377,10 +376,8 @@ struct QuantizedMatrixShapePolicy {
    std::size_t minimumOptimizedMacs = 0;
    bool belowMinimumWork = false;
    double paddingWorkRatio = 1.0;
-   // Nonzero selects tiled matrix execution: staging, GEMM, and epilogue run
-   // per row tile so reusable scratch is bounded by the tile instead of the
-   // full logical M. Chosen only when the untiled plan would exceed the
-   // reusable-scratch budget.
+   // Nonzero selects tiled matrix execution, bounding reusable scratch by the row tile;
+   // chosen only when the untiled plan would exceed the reusable-scratch budget.
    std::size_t im2colTileRows = 0;
    std::string reason;
 };
@@ -531,9 +528,12 @@ struct QuantizedLoweringPlan {
    double lowPrecisionInputScale = 1.0;
    double lowPrecisionWeightScale = 1.0;
    // Grid step the region encodes its output onto when it writes an FP8 carrier rather than
-   // a float D. 1 means the region emits float and no D scale is programmed. Set only by
-   // FP8 output-requantize absorption (F2).
+   // a float D. 1 means the region emits float and no D scale is programmed.
    double lowPrecisionOutputScale = 1.0;
+   // Output clamp in output units, from a Clip absorbed with the quantize boundary.
+   bool lowPrecisionOutputClampEnabled = false;
+   double lowPrecisionOutputClampLow = 0.0;
+   double lowPrecisionOutputClampHigh = 0.0;
 
    std::vector<std::size_t> consumedOperatorIndices;
    bool preservesQuantizationSemantics = false;
@@ -541,12 +541,8 @@ struct QuantizedLoweringPlan {
    bool suppressesGraphOperators = false;
 };
 
-// Shared skeleton for a family's rejection plan: it sets only the fields that
-// are identical across every family (status/reason from the preserve flag, the
-// MetadataOnly-or-UNDEFINED storage triple, and the metadata/suppression
-// flags). Callers set the family-specific bias/accumulator storage, output
-// mode, compute profile, capability tag, consumed operators, and carriers so
-// this stays a byte-preserving factorization of the previous per-family code.
+// Shared skeleton for a family's rejection plan: sets only the fields identical across
+// every family; callers set the family-specific storage, epilogue, and carrier fields.
 inline QuantizedLoweringPlan MakeUnsupportedQuantizedPlan(EQuantizedBackend backend,
                                                           std::string reason,
                                                           bool preservesSemantics)

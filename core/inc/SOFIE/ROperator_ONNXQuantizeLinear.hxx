@@ -281,10 +281,8 @@ public:
    bool IsFP8Boundary() const { return fIsFP8; }
    double GetFP8Scale() const { return fFP8Scale; }
 
-   // The grid this boundary encodes onto, in the one representation that covers both
-   // encodings. Prefer this over GetQuantizationInfo/IsFP8Boundary/GetFP8Scale: those three
-   // only mean anything together, and every pass that took them apart got it wrong at least
-   // once. See QuantizationGrid in RQuantization.hxx.
+   // The grid this boundary encodes onto, covering both encodings (see QuantizationGrid in
+   // RQuantization.hxx); prefer it over the accessor trio above, which is only meaningful whole.
    QuantizationGrid GetGrid() const
    {
       QuantizationGrid grid;
@@ -349,14 +347,8 @@ public:
          fInputTensorNames[0] = fFusedClipInput;
    }
 
-   // S57i-a. Takes over the input of a Clip that cannot clamp anything, without recording
-   // the clamp -- distinct from FuseClipOnly, which keeps it. A Clip to +/-X in front of a
-   // Quantize whose own grid saturates at +/-X removes nothing, so dropping it is exact.
-   //
-   // The point is not the arithmetic, which FuseClipOnly already made free. It is that the
-   // Clip stops being an operator in the graph: every pass that walks value-preserving
-   // chains stops at a Clip, so leaving a no-op one in place silently blocks the analyses
-   // downstream. That is what it was doing to the idempotence walk.
+   // Takes over the input of a Clip whose bounds the grid's saturation already covers, without
+   // recording it (unlike FuseClipOnly): the no-op Clip leaves the graph and cannot block chain walks.
    void BypassNoOpClip(const std::string &clipInput)
    {
       fNX = clipInput;
@@ -449,8 +441,7 @@ public:
                DETAIL::ExactDoubleLiteral(fFP8Scale) + "));\n";
          if (IsFakeQuantRoundTripFused()) {
             // The absorbed DequantizeLinear: decoding here is what makes the pair a
-            // fake-quant. Writing the carrier instead would leave an E4M3 code sitting in a
-            // float tensor, which reads as plausible small integers rather than as an error.
+            // fake-quant, so the float output holds the decoded value, never the E4M3 code.
             op += SP + SP + SP + "y[idx] = static_cast<TOut>(SOFIE::DecodeFP8E4M3(q) * " +
                   DETAIL::ExactDoubleLiteral(fFP8Scale) + ");\n";
          } else {
@@ -542,7 +533,7 @@ private:
    std::string fNScale;
    std::string fNZeroPoint;
    std::string fNY;
-   std::string fDuplicateDecodeOf;   // S57h: output of the decode this one repeats
+   std::string fDuplicateDecodeOf;   // output of the decode this one repeats
    ETensorType fInputType = ETensorType::UNDEFINED;
    int fAxis = -1;
    std::vector<size_t> fShape;
@@ -587,23 +578,13 @@ public:
    const std::string &GetZeroPointTensor() const { return fNZeroPoint; }
    const QuantizationInfo &GetQuantizationInfo() const { return fInfo; }
 
-   // S57h. An exporter emits one DequantizeLinear per consumer, so a carrier read by three
-   // operators is decoded three times into three identical tensors. This one decodes what
-   // `survivor` already decoded -- same carrier, same grid -- so its output is that tensor
-   // under another name.
-   //
-   // Marked rather than deleted because SOFIE has no generic consumer rewiring: pointing
-   // this operator's readers at `survivor` would mean editing operators we do not own. A
-   // view costs nothing, changes no consumer, and keeps the name resolving -- the same
-   // trick ROperator_Reshape uses. See RModel::DeduplicateCarrierDecodes.
+   // Marks this decode as a duplicate of `survivor` (same carrier, same grid): its output becomes
+   // a view of the survivor's, as ROperator_Reshape does. See RModel::DeduplicateCarrierDecodes.
    void MarkAsDuplicateDecodeOf(const std::string &survivor)
    {
       fDuplicateDecodeOf = survivor;
-      // The dependency really has moved: this operator no longer touches the carrier, it
-      // views the survivor's already-decoded output. Saying so is not bookkeeping -- the
-      // round-trip fusion counts a carrier's consumers to decide whether it can collapse a
-      // pair, and a duplicate still claiming to read the carrier keeps that carrier looking
-      // ambiguous and blocks the fusion it was supposed to unblock.
+      // The input list must name the survivor's output, not the carrier: the round-trip
+      // fusion counts a carrier's consumers, and a stale carrier read blocks the collapse.
       fInputTensorNames = { fDuplicateDecodeOf };
    }
    bool IsDuplicateDecode() const { return !fDuplicateDecodeOf.empty(); }
@@ -612,10 +593,8 @@ public:
    bool IsFP8Boundary() const { return fIsFP8; }
    double GetFP8Scale() const { return fFP8Scale; }
 
-   // The grid this boundary encodes onto, in the one representation that covers both
-   // encodings. Prefer this over GetQuantizationInfo/IsFP8Boundary/GetFP8Scale: those three
-   // only mean anything together, and every pass that took them apart got it wrong at least
-   // once. See QuantizationGrid in RQuantization.hxx.
+   // The grid this boundary encodes onto, covering both encodings (see QuantizationGrid in
+   // RQuantization.hxx); prefer it over the accessor trio above, which is only meaningful whole.
    QuantizationGrid GetGrid() const
    {
       QuantizationGrid grid;
@@ -661,10 +640,8 @@ public:
       fShape = model.GetTensorShape(fNX);
       if (IsFP8TensorType(fInputType)) {
          fIsFP8 = true;
-         // The carrier is the input, whether a QuantizeLinear wrote it or it arrived as a
-         // DQ-only constant, so the contract is registered there rather than on the output.
-         // Registered unconditionally: the parser already derives a carrier from the ONNX
-         // type alone, and that one has no scale, so it has to be replaced rather than kept.
+         // The carrier is the input (QuantizeLinear-written or a DQ-only constant), so the
+         // contract lands there, unconditionally: the parser's type-derived contract has no scale.
          model.AddLowPrecisionTensorInfo(
             fNX, DETAIL::MakeONNXFP8TensorInfo(model, fNScale, fNZeroPoint, fInputType, fNX,
                                                "ONNX DequantizeLinear"));

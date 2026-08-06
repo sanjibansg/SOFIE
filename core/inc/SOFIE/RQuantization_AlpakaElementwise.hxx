@@ -2,8 +2,7 @@
 #define SOFIE_RQUANTIZATION_ALPAKA_ELEMENTWISE
 
 // Depends only on the shared utility layers: the requantize-clamp and status
-// primitives, and the row-major multidirectional broadcast primitive. It no
-// longer pulls in the dense-linear family header just for those helpers.
+// primitives, and the row-major multidirectional broadcast primitive.
 #include "SOFIE/RQuantization_AlpakaPrimitives.hxx"
 #include "SOFIE/RQuantization_AlpakaBroadcast.hxx"
 
@@ -68,9 +67,8 @@ QuantizedElementwiseAffineOf(const QuantizedElementwiseInvocation &params)
    return affine;
 }
 
-// Dequantize an operand element. A true integer carrier uses the affine
-// scale*(q - zero); a float carrier is an already-on-grid fake-quant value and
-// is used directly. Both cases feed the same op and output requantization.
+// Dequantize an operand element: an integer carrier uses the affine scale*(q - zero);
+// a float carrier is an already-on-grid fake-quant value and is used directly.
 template <typename CarrierT>
 __device__ inline double QuantizedElementwiseDequant(CarrierT value, double scale, std::int32_t zero)
 {
@@ -293,10 +291,8 @@ inline void LaunchQuantizedElementwiseAffine(QuantizedGemmCudaStream stream, voi
 
 } // namespace INTERNAL
 
-// Derives row-major strides and total element count from the operand extents,
-// then launches the affine INT8 or native FP8 elementwise kernel. Operand
-// extents are right-aligned against the output rank; a size-1 axis broadcasts
-// through a zero stride.
+// Derives row-major strides and element count from the right-aligned operand extents
+// (a size-1 axis broadcasts), then launches the affine INT8 or native FP8 kernel.
 inline void QuantizedElementwise_Call(QuantizedGemmCudaStream stream, void *output,
                                       const void *inputA, const void *inputB,
                                       QuantizedElementwiseInvocation params)
@@ -316,10 +312,8 @@ inline void QuantizedElementwise_Call(QuantizedGemmCudaStream stream, void *outp
    INTERNAL::QuantizedFillBroadcastStrides(params.inputExtent, params.inputStride, params.rank);
    INTERNAL::QuantizedFillBroadcastStrides(params.operandBExtent, params.operandBStride, params.rank);
    params.elements = elements;
-   // An operand that matches the output extent on every axis never broadcasts,
-   // so its element offset is the linear index; flag it to skip the per-element
-   // mixed-radix offset (a chain of 64-bit div/mod that otherwise dominates this
-   // memory-bound kernel). Broadcasting operands keep the general path.
+   // An operand matching the output extent on every axis never broadcasts, so its offset
+   // is the linear index; the flag skips the per-element mixed-radix div/mod chain.
    params.inputContiguous = true;
    params.operandBContiguous = true;
    for (int axis = 0; axis < params.rank; ++axis) {

@@ -575,9 +575,8 @@ __global__ void QuantizedConvCudaFP8Im2ColKernel(
    matrix[index] = value;
 }
 
-// Returns the current device's compute capability as major * 10 + minor.
-// Uses the attribute API: cudaGetDeviceProperties costs about one millisecond
-// per call and must not run on the per-inference FP8 Conv path.
+// Returns the current device's compute capability as major * 10 + minor, via the attribute
+// API; cudaGetDeviceProperties is too slow for the per-inference FP8 Conv path.
 inline int CurrentDeviceComputeCapability(const char *context)
 {
    int device = 0;
@@ -612,9 +611,8 @@ inline void QuantizedConvCudaLt_Call(
          matrixParams.outputScale;
    }
 
-   // Exact grouped shapes are represented as contiguous strided batches, so
-   // im2col, cuBLASLt, and the Conv-aware epilogue each execute once. Padded
-   // shapes retain the per-group path because each result must be unpadded.
+   // Exact grouped shapes are represented as contiguous strided batches, so im2col,
+   // cuBLASLt, and the epilogue each execute once; padded shapes keep the per-group path.
    const bool batchedExact = !matrixParams.paddedExecution;
    if (batchedExact) {
       matrixParams.batchCount = params.groups;
@@ -652,14 +650,8 @@ inline void QuantizedConvCudaLt_Call(
    QuantizedConvolutionInvocation effectiveParams = params;
    effectiveParams.matrix = matrixParams;
    if (batchedExact) {
-      // Unit-kernel Conv with unit strides/dilations and no padding is a plain
-      // GEMM whose A operand is the NCHW input itself, viewed column-major as
-      // [spatial, channelsPerGroup] per (batch, group) block. When the direct
-      // layout is provider-supported, the im2col staging launch and its
-      // read/write traffic are elided; the accumulator layout is unchanged for
-      // batch==1 or groups==1, so the epilogue below is shared. Provider
-      // support is shape-dependent, so an unsupported layout falls back to the
-      // staged path.
+      // Unit-kernel Conv with unit strides/dilations and no padding is a plain GEMM over
+      // the column-major NCHW input; an unsupported provider layout falls back to staging.
       bool executed = false;
       const std::size_t outputSpatial = params.outputHeight * params.outputWidth;
       const bool unitKernelGeometry =
@@ -690,11 +682,8 @@ inline void QuantizedConvCudaLt_Call(
          }
       }
       if (!executed && tiledExecution) {
-         // Budget-class shapes execute in row tiles: each tile is staged,
-         // multiplied, and finalized before its buffers are reused, so
-         // reusable scratch is bounded by the tile rather than the model
-         // shape. Two staging buffers and an internal staging stream let the
-         // next tile's im2col overlap the current tile's GEMM and epilogue.
+         // Row tiles bound reusable scratch by the tile rather than the model shape; two
+         // staging buffers overlap the next tile's im2col with the current GEMM and epilogue.
          const std::size_t tileRows = params.im2colTileRows;
          const std::size_t totalRows = matrixParams.logicalM;
          const std::size_t tileCount = (totalRows + tileRows - 1) / tileRows;

@@ -304,6 +304,13 @@ public:
       fOutputTensorNames = { fRegion.outputTensor };
    }
 
+   // The region reads its handoff tensor by this name everywhere -- the name list here and
+   // the invocation built at Generate time both derive from fRegion.inputSourceTensor.
+   bool RebindPlannedCarrierInput(const std::string &from, const std::string &to) override
+   {
+      return INTERNAL::RebindRegionCarrierInput(fRegion, fInputTensorNames, from, to);
+   }
+
    std::vector<std::string> GetStdLibs() override { return { "cmath", "cstdint", "vector" }; }
 
    void Initialize(RModel &) override {}

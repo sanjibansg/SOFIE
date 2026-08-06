@@ -284,6 +284,22 @@ inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMul
    return out.str();
 }
 
+// Shared body of RebindPlannedCarrierInput for the lowered dense regions: the invocation
+// built at Generate time and the name list both derive from region.inputSourceTensor.
+template <typename Region>
+bool RebindRegionCarrierInput(Region &region, std::vector<std::string> &inputNames,
+                              const std::string &from, const std::string &to)
+{
+   if (region.inputSourceTensor != from)
+      return false;
+   region.inputSourceTensor = to;
+   for (auto &name : inputNames) {
+      if (name == from)
+         name = to;
+   }
+   return true;
+}
+
 struct QuantizedCudaLtFP8DenseLinearCall {
    std::string boundaryName;
    std::string stateName;
@@ -301,9 +317,13 @@ struct QuantizedCudaLtFP8DenseLinearCall {
    QuantizedMatrixShapePolicy shapePolicy;
    double inputScale = 1.0;
    double weightScale = 1.0;
-   // FP8 only: grid step for an absorbed output requantize. 1 leaves the region emitting a
-   // float D, which is what every FP8 region does until the pass half of F2 lands.
+   // FP8 only: grid step of an adopted output quantize. 1 leaves the region emitting a
+   // float D.
    double outputScale = 1.0;
+   // Output clamp in output units, from a Clip absorbed with the quantize boundary.
+   bool hasOutputClamp = false;
+   double outputClampLow = 0.0;
+   double outputClampHigh = 0.0;
    EQuantizedComputeProfile computeProfile = EQuantizedComputeProfile::UNDEFINED;
    ELowPrecisionCarrier inputCarrier = ELowPrecisionCarrier::UNDEFINED;
    ELowPrecisionCarrier weightCarrier = ELowPrecisionCarrier::UNDEFINED;
@@ -341,6 +361,9 @@ inline QuantizedCudaLtFP8DenseLinearCall MakeQuantizedCudaLtFP8DenseLinearCall(
    call.inputScale = plan.lowPrecisionInputScale;
    call.weightScale = plan.lowPrecisionWeightScale;
    call.outputScale = plan.lowPrecisionOutputScale;
+   call.hasOutputClamp = plan.lowPrecisionOutputClampEnabled;
+   call.outputClampLow = plan.lowPrecisionOutputClampLow;
+   call.outputClampHigh = plan.lowPrecisionOutputClampHigh;
    call.computeProfile = plan.computeProfile;
    call.inputCarrier = plan.inputLowPrecisionCarrier;
    call.weightCarrier = plan.weightLowPrecisionCarrier;
@@ -461,6 +484,12 @@ inline std::string GenerateQuantizedCudaLtFP8DenseLinearCall(const QuantizedCuda
    if (call.outputScale != 1.0) {
       out << std::setprecision(std::numeric_limits<float>::max_digits10);
       out << "      " << call.paramsName << ".outputScale = static_cast<float>(" << call.outputScale << ");\n";
+   }
+   if (call.hasOutputClamp) {
+      out << std::setprecision(std::numeric_limits<float>::max_digits10);
+      out << "      " << call.paramsName << ".hasOutputClamp = true;\n";
+      out << "      " << call.paramsName << ".outputClampLow = static_cast<float>(" << call.outputClampLow << ");\n";
+      out << "      " << call.paramsName << ".outputClampHigh = static_cast<float>(" << call.outputClampHigh << ");\n";
    }
    out << "      " << call.paramsName << ".hasBias = " << (call.hasBias ? "true" : "false") << ";\n";
    out << "      " << call.paramsName << ".hasRelu = " << (call.hasRelu ? "true" : "false") << ";\n";

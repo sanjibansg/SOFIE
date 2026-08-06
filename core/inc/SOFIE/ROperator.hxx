@@ -13,9 +13,8 @@
 namespace SOFIE{
 
 class RModel;
-// Forward-declared rather than included: RQuantization.hxx is pulled in from inside a
-// namespace in places, and reaching for it here reintroduces an include cycle that already
-// had to be unpicked once. A const reference in a declaration needs no definition.
+// Forward-declared: including RQuantization.hxx here creates an include cycle, and a
+// const reference in a declaration needs no definition.
 struct QuantizationGrid;
 
 enum class OperatorKind {
@@ -75,21 +74,14 @@ inline const char* toString(OperatorKind kind) {
 
 inline std::set<OperatorKind> FusableKinds = { OperatorKind::RELU, OperatorKind::LAYERNORM, OperatorKind::BATCHNORM};
 
-// What an operator can do with a low-precision carrier on its input and output. This is the
-// question RModel::PropagateLowPrecisionThroughMovement asks, and the thing that decides
-// where a Quantize/Dequantize boundary is allowed to survive: a boundary is legitimate only
-// next to a RequiresFloat operator, and anywhere else it is an absorption we have not done.
-//
-// The default is RequiresFloat, so an operator that has not been audited keeps behaving
-// exactly as it does today. Opting in is a per-operator claim that has to be earned.
+// What an operator can do with a low-precision carrier on its input and output.
+// The default is RequiresFloat, so an unaudited operator keeps its float behavior.
 enum class ELowPrecisionCarrierSupport {
-   // Needs a real value: the arithmetic is not defined on codes, or is defined but changes
-   // the grid in a way no scale can express. LayerNorm and Softmax accumulate; Erf is a
-   // transcendental. These are the frontier, and their boundaries are the ones that stay.
+   // Needs a real value: the arithmetic is not defined on codes, or changes the grid in a
+   // way no scale can express (LayerNorm and Softmax accumulate; Erf is transcendental).
    RequiresFloat,
-   // Moves or relabels elements without reading them. A Transpose permutes, a Reshape
-   // reinterprets; neither looks at the value, so both are exact on codes and the grid is
-   // unchanged. Propagating through one deletes its bracketing boundary outright.
+   // Moves or relabels elements without reading them (a Transpose permutes, a Reshape
+   // reinterprets), so it is exact on codes and leaves the grid unchanged.
    ValuePreserving,
    // Computes on codes, but the result lands on a different grid than the operands, so it
    // needs a scale contract rather than a retyping. Elementwise and dense linear are here.
@@ -138,9 +130,7 @@ public:
    }
 
    // Repoints this operator at carrier tensors, replacing the float ones it was initialized
-   // with. Only meaningful for ValuePreserving: the replacements carry the same shapes, so
-   // nothing inferred at Initialize is invalidated, and no arithmetic depends on the element
-   // type. An operator that claims ValuePreserving must override this.
+   // with. An operator that claims ValuePreserving must override this.
    virtual void RewireLowPrecisionCarrier(const std::string & /*nameInput*/,
                                           const std::string & /*nameOutput*/)
    {
@@ -149,25 +139,12 @@ public:
          " reports it can carry low precision but does not implement RewireLowPrecisionCarrier");
    }
 
-   // Whether the device form writes its output into the input's storage rather than its own
-   // buffer -- true for a Reshape, which emits a non-owning view, and false for a Transpose,
-   // which runs a kernel. The pooled carrier arena has to be told, or it sizes the source's
-   // lifetime from the source's own last use, which the view outlives, and hands those bytes
-   // to a later carrier. Asked only of ValuePreserving operators, and only on the device
-   // path, where the aliasing is real.
+   // Whether the device form writes its output into the input's storage (a Reshape view)
+   // rather than its own buffer, so the pooled carrier arena can extend the source's lifetime.
    virtual bool CarrierOutputAliasesInput() const { return false; }
 
-   // Whether this operator can encode its own result onto a quantization grid, writing a
-   // low-precision carrier instead of a float. The counterpart to CarrierSupport: that one
-   // asks whether a code can pass *through*, this one whether the operator can *produce* one.
-   //
-   // The two questions are independent. LayerNorm and
-   // Softmax are RequiresFloat -- they accumulate, so no code can pass through them -- but
-   // both can perfectly well compute in float and encode on the way out. A boundary in front
-   // of such an operator has to stay; the one behind it does not.
-   //
-   // Answering true is what lets the pass delete the QuantizeLinear that would otherwise
-   // re-read this operator's output just to encode it.
+   // Whether this operator can encode its result onto a grid, writing a low-precision carrier
+   // instead of a float. Independent of CarrierSupport: RequiresFloat may still encode outbound.
    virtual bool CanFuseQuantizedOutput() const { return false; }
 
    // Redirects this operator to write `carrier`, encoded onto `grid`, in place of its usual
@@ -179,10 +156,27 @@ public:
          " reports it can fuse a quantized output but does not implement FuseQuantizedOutput");
    }
 
-   // A fused fake-quant boundary writes a FLOAT snapped onto the grid, not a code, so folding
-   // it needs no carrier, no type change, and no grid propagation: the consumer cannot tell.
-   // Separate from FuseQuantizedOutput because a carrier handoff must be agreed with the
-   // consumer and this cannot be disagreed with.
+   // Renames a planned carrier input from `from` to `to`; lowered regions that read a
+   // handoff tensor implement this. Returns whether a rename happened.
+   virtual bool RebindPlannedCarrierInput(const std::string & /*from*/, const std::string & /*to*/)
+   {
+      return false;
+   }
+
+   // The consumer-side twin of CanFuseQuantizedOutput: an operator that can decode a carrier
+   // operand at the load declares it, and the dequantize feeding it stops emitting.
+   virtual bool CanFuseDequantizedInput() const { return false; }
+
+   // Rebinds the input named `from` to read `carrier`, decoding on `grid` at the load.
+   // Returns whether an input matched; a false return leaves the dequantize in place.
+   virtual bool FuseDequantizedInput(const std::string & /*from*/, const std::string & /*carrier*/,
+                                     const QuantizationGrid & /*grid*/)
+   {
+      return false;
+   }
+
+   // A fused fake-quant boundary writes a FLOAT snapped onto the grid, not a code, so the
+   // fold needs no carrier, type change, or consumer agreement (unlike FuseQuantizedOutput).
    virtual bool CanFuseFakeQuantOutput() const { return false; }
 
    // Applies `grid`'s snap -- encode then decode -- to this operator's output on the way out,

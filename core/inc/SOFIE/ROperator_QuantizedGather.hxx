@@ -57,9 +57,8 @@ public:
    {
       fKind = OperatorKind::UNDEFINED;
       fName = "QuantizedGather";
-      // The table is read from the resolved weight-storage tensor (its real
-      // int8/uint8/fp8 carrier), not the ONNX source (which may be the float
-      // pre-quantization tensor).
+      // The table is read from the resolved weight-storage tensor (its real int8/uint8/fp8
+      // carrier), not the ONNX source, which may be the float pre-quantization tensor.
       fInputTensorNames = {fPlan.weightStorageTensor, fRegion.indicesTensor};
       fOutputTensorNames = {fRegion.outputTensor};
    }
@@ -109,9 +108,8 @@ public:
       out << "      " << params << ".inner = " << inner << ";\n";
       out << "      " << params << ".indexCount = " << indexCount << ";\n";
       out << std::setprecision(std::numeric_limits<double>::max_digits10);
-      // Per-channel affine tables resolve the scale by the quantization-axis
-      // stride in the table's data layout; a symmetric scale vector is read at
-      // runtime. Per-tensor tables and FP8 pass a null scale vector.
+      // Per-channel affine tables resolve the scale at runtime by the quantization-axis
+      // stride in the table's layout; per-tensor tables and FP8 pass a null scale vector.
       const bool perChannel = !fp8 && fRegion.tableQuant->granularity == EQuantizationGranularity::PerChannel;
       std::string scaleVector = "static_cast<const float *>(nullptr)";
       if (fp8) {

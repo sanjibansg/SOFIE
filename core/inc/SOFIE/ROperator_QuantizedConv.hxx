@@ -487,9 +487,8 @@ public:
           << ";\n";
       out << "      " << params << ".matrix.weightScaleMode = SOFIE::EQuantizedScaleMode::"
           << (fPlan.weightScaleMode == EQuantizedParameterMode::PerOutputChannel ? "PerOutputChannel" : "PerTensor") << ";\n";
-      // Unit-kernel Conv with an INT8 input carrier and exact matrix shapes can
-      // consume its NCHW input directly as the GEMM operand; the runtime falls
-      // back to staged im2col when the provider lacks the direct layout.
+      // Unit-kernel Conv with an INT8 input carrier and exact matrix shapes consumes its NCHW
+      // input directly as the GEMM operand; without provider layout support, staged im2col runs.
       const bool unitKernelDirectInput = !directAffine && !depthwise && !padded &&
          fContext.inputSourceType != ETensorType::FLOAT &&
          fContext.inputSourceType != ETensorType::UINT8 &&

@@ -2,9 +2,7 @@
 #define SOFIE_RQUANTIZATION_ALPAKA_PRIMITIVES
 
 // Backend-neutral quantized device/host primitives shared by every operator
-// family (dense linear, convolution, elementwise). Keeping them here lets a
-// family header depend on this small utility layer instead of pulling in an
-// unrelated family header just for status checks or the requantize-clamp.
+// family (dense linear, convolution, elementwise).
 
 #include <cmath>
 #include <cstdint>

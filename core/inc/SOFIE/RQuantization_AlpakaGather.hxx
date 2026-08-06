@@ -38,19 +38,8 @@ __device__ inline float QuantizedGatherDequant(CarrierT value, float scale, std:
       return scale * (static_cast<float>(static_cast<std::int32_t>(value)) - static_cast<float>(zero));
 }
 
-// General weight-only gather-dequantize. Every ONNX Gather collapses to the
-// (outer, indexCount, inner) iteration space; negative index values wrap and
-// out-of-range values clamp to the last row, matching base SOFIE Gather. When
-// perChannel is set, the affine scale is looked up per gathered element by the
-// table's quantization axis (symmetric, zero point 0); this resolves the axis
-// coordinate whether the quant axis is before, at, or after the gather axis.
-// One block per gathered slice (a fixed outer/index pair). The slice→(outer,
-// index) decomposition, the negative-index wrap/clamp, and the index load happen
-// once per block instead of once per element, eliminating the per-element 64-bit
-// div/mod that otherwise made this ALU-bound; threads then stride the contiguous
-// inner dimension with pure adds and coalesced loads/stores. A per-channel table
-// still resolves its scale per element (the quantization axis may vary along the
-// inner run), but per-tensor tables — the common case — do no division at all.
+// Weight-only gather-dequantize over (outer, indexCount, inner), one block per gathered
+// slice; negative indices wrap and out-of-range indices clamp, matching base SOFIE Gather.
 template <typename CarrierT, typename IndexT>
 __global__ void QuantizedGatherKernel(float *output, const CarrierT *table, const IndexT *indices,
                                       const float *scaleVector, QuantizedGatherInvocation params)
@@ -113,9 +102,8 @@ inline void LaunchQuantizedGather(QuantizedGemmCudaStream stream, float *output,
 
 } // namespace INTERNAL
 
-// Gathers rows/slices from a quantized constant table and dequantizes to float.
-// scaleVector is the per-channel scale device buffer, required when
-// params.perChannel is set and ignored otherwise.
+// Gathers rows/slices from a quantized constant table and dequantizes to float; scaleVector
+// is the per-channel scale device buffer, required only when params.perChannel is set.
 inline void QuantizedGather_Call(QuantizedGemmCudaStream stream, void *output, const void *table,
                                  const void *indices, const float *scaleVector,
                                  QuantizedGatherInvocation params)
