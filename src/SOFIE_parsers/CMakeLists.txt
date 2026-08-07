@@ -62,6 +62,7 @@ set(sources_cxx
     src/ParseExpand.cxx
     src/ParseGather.cxx
     src/ParseElu.cxx
+    src/ParseGelu.cxx
     src/ParseFuseConvAdd.cxx
     src/ParseFuseConvTransposeAdd.cxx
     src/ParseFuseGemmRelu.cxx
