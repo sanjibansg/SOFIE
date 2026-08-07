@@ -695,6 +695,14 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       fGC += RModelProfilerGPU::GenerateSessionMembers();
    }
 
+   bool hasBatchedGemm = false;
+   for (size_t id = 0; id < fOperators.size(); id++) {
+      if (fSkipOperators.count(id)) continue;
+      if (fOperators[id]->UsesBatchedGemm()) hasBatchedGemm = true;
+   }
+   if (hasBatchedGemm)
+      fGC += "\nbool fBatchedGemm = false;\n";
+
    // Session constructor
    if (fUseSession) {
       std::string sessionName = "\n\nSession";
@@ -719,8 +727,13 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
             fGC += "        size_t " + p.first + " = " + p.second;
          }
       }
+      if (hasBatchedGemm)
+         fGC += ",\n        bool batchedGemm = true";
       fGC += ") {\n";
-      
+
+      if (hasBatchedGemm)
+         fGC += SP + "fBatchedGemm = batchedGemm;\n";
+
       GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA();
       if (fUseWeightFile) {
          fGC += "\n//--- reading weights from file\n";

@@ -317,9 +317,7 @@ public:
       }
 
       std::vector<size_t> shape1 = {fShapeW[0], fShapeW[1], kernelSize};
-      // _xcol holds the im2col of every batch sample, so the non-grouped GPU path can
-      // run a single strided-batched GEMM over all samples (each gets its own slice).
-      std::vector<Dim> shape2 = {fShapeX[0], Dim{fShapeW[1]}, Dim{kernelSize}, channelDim };
+      std::vector<Dim> shape2 = {Dim{fShapeW[1]}, Dim{kernelSize}, channelDim };
       model.AddIntermediateTensor(fNX +"_f", ConvertStringToType(fType), shape1 );
       model.AddIntermediateTensor(fNX +"_xcol", ConvertStringToType(fType), shape2 );
       convK = fNX +"_f";
@@ -876,16 +874,17 @@ public:
       // Step 3 + 4: Im2Col then GEMM — structure differs for grouped vs non-grouped
       // -----------------------------------------------------------------------
       if (fAttrGroup == 1) {
-         // Non-grouped: im2col this sample into its own _xcol slice (slice n). The
-         // single strided-batched GEMM over all samples is issued after the loop.
+         // batched gives each sample its own _xcol slice, otherwise all reuse slice 0
+         out << SP << SP << "std::size_t const col_offset = fBatchedGemm ? n * " << colElements << "u : 0u;\n\n";
          out << SP << SP << "{\n";
          out << SP << SP << SP << "auto const elementsPerThread_im2col = Vec::all(static_cast<Idx>(1));\n";
          out << SP << SP << SP << "auto const elementsPerGrid_im2col   = Vec::all(Idx{" << colElements << "});\n";
          out << SP << SP << SP << "auto const workDiv_im2col = sofie_workdiv(elementsPerGrid_im2col);\n";
          out << SP << SP << SP << "alpaka::exec<Acc>(queue, workDiv_im2col, im2colKernel_" << opName
             << ", alpaka::getPtrNative(deviceBuf_" << fNX << ") + x_offset"
-            << ", alpaka::getPtrNative(deviceBuf_" << imcol << ") + n * " << colElements << "u"
+            << ", alpaka::getPtrNative(deviceBuf_" << imcol << ") + col_offset"
             << ", static_cast<Idx>(" << colElements << "));\n";
+         out << SP << SP << SP << "if (!fBatchedGemm) alpaka::wait(queue);\n";
          out << SP << SP << "}\n\n";
 
          if (!fNB.empty()) {
@@ -899,8 +898,19 @@ public:
                   << ", alpaka::getPtrNative(deviceBuf_" << fNB << ")"
                   << ", alpaka::getPtrNative(deviceBuf_" << fNY << ") + out_offset"
                   << ", static_cast<Idx>(" << biasElements << "));\n";
+               out << SP << SP << SP << "if (!fBatchedGemm) alpaka::wait(queue);\n";
                out << SP << SP << "}\n\n";
          }
+
+         out << SP << SP << "if (!fBatchedGemm) {\n";
+         out << SP << SP << SP << "blas.matmul('n', 'n', "
+            << gemm_m << ", " << gemm_n << ", " << gemm_k
+            << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+            << ", alpaka::getPtrNative(deviceBuf_" << convK << ")"
+            << ", " << (fNB.empty() ? "0.0f" : "1.0f")
+            << ", alpaka::getPtrNative(deviceBuf_" << fNY << ") + out_offset);\n";
+         out << SP << SP << SP << "alpaka::wait(queue);\n";
+         out << SP << SP << "}\n\n";
 
       } else {
          // Grouped convolution: im2col and GEMM per group with group-adjusted input pointer.
@@ -956,19 +966,18 @@ public:
 
       out << SP << "}\n"; // end batch loop
 
-      // Non-grouped: replace the per-sample matmul loop with one strided-batched GEMM.
-      // Each sample reads its own _xcol slice (strideA = colElements) and writes its own
-      // output block (strideC = gemm_n*gemm_m); the weight _f is shared, so strideB = 0.
       if (fAttrGroup == 1) {
          std::string convBeta = fNB.empty() ? "0.0f" : "1.0f";
-         out << SP << "alpaka::wait(queue);\n";
-         out << SP << "blas.gemmStridedBatched('n', 'n', "
+         out << SP << "if (fBatchedGemm) {\n";
+         out << SP << SP << "alpaka::wait(queue);\n";
+         out << SP << SP << "blas.gemmStridedBatched('n', 'n', "
             << gemm_m << ", " << gemm_n << ", " << gemm_k << ", 1.0f, "
             << "alpaka::getPtrNative(deviceBuf_" << imcol << "), " << gemm_m << ", " << colElements << ", "
             << "alpaka::getPtrNative(deviceBuf_" << convK << "), " << gemm_k << ", 0, "
             << convBeta << ", alpaka::getPtrNative(deviceBuf_" << fNY << "), "
             << gemm_m << ", " << gemm_n * gemm_m << ", " << bsize << ");\n";
-         out << SP << "alpaka::wait(queue);\n";
+         out << SP << SP << "alpaka::wait(queue);\n";
+         out << SP << "}\n";
       }
       return out.str();
    }
@@ -978,10 +987,39 @@ public:
    std::vector<std::string> GetBlasRoutines() override { return { std::string("Gemm"), std::string("Axpy") }; }
 
 
+   bool UsesBatchedGemm() override { return fAttrGroup == 1; }
+
+   std::string GenerateInitCode_GPU_ALPAKA() override {
+      if (fAttrGroup != 1) return "";
+      if (fShapeX.empty() || fShapeW.empty() || fShapeY.empty()) return "";
+
+      size_t bsize      = fShapeX[0].dim;
+      size_t oDepth     = (fDim > 2) ? fShapeY[2].dim    : 1;
+      size_t oHeight    = (fDim > 1) ? fShapeY[fDim].dim : 1;
+      size_t oWidth     = fShapeY[fDim + 1].dim;
+      size_t kernelSize = fAttrKernelShape[0] * fAttrKernelShape[1] * fAttrKernelShape[2];
+      size_t colElements = fShapeW[1] * kernelSize * oDepth * oHeight * oWidth;
+
+      // _xcol is declared for one sample, batching needs a slice per sample
+      std::stringstream out;
+      out << SP << "if (!fBatchedGemm) {\n";
+      out << SP << SP << "blas.addLayoutConfig(" << BlasLayoutConfig() << ");\n";
+      if (bsize > 1) {
+         out << SP << "} else {\n";
+         out << SP << SP << "deviceBuf_" << imcol << " = alpaka::allocBuf<" << fType
+             << ", size_t>(devAcc, Ext1D::all(Idx{" << bsize * colElements << "}));\n";
+      }
+      out << SP << "}\n";
+      return out.str();
+   }
+
    std::string GetBlasConfig(){
-      // Non-grouped Conv uses gemmStridedBatched (legacy cuBLAS, no cuBLASLt layout
-      // registration). Grouped Conv still uses the per-group matmul path below.
+      // batched path is legacy cuBLAS, the fallback registers its own layout
       if (fAttrGroup == 1) return "";
+      return BlasLayoutConfig();
+   }
+
+   std::string BlasLayoutConfig(){
       size_t oDepth_  = (fDim > 2) ? fShapeY[2].dim    : 1;
       size_t oHeight_ = (fDim > 1) ? fShapeY[fDim].dim : 1;
       size_t oWidth_  = fShapeY[fDim + 1].dim;
