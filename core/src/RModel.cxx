@@ -65,6 +65,7 @@ void RModel::BuildLoweredOperatorView(EQuantizedBackend backend)
 {
    fLoweredOperators.clear();
    fLoweredConsumedOperatorIndices.clear();
+   fQuantizationReport = QuantizationPipelineReport{};
    PrepareQuantizedTensorStorage(backend);
    AddLoweredQuantizedOperators(backend);
    // Canonicalization before any further absorption: duplicated decodes are what make a
@@ -79,10 +80,10 @@ void RModel::BuildLoweredOperatorView(EQuantizedBackend backend)
    // Both must only see the boundaries no region absorbed, and dead-code elimination
    // must see the final emit set, so it runs after the fusion rather than before.
    FuseUnabsorbedFakeQuantBoundaries();
-   // Runs on both sides of the Softmax/Clip fusion: before, because a dead reader blocks
+   // Runs on both sides of the handoff applier: before, because a dead reader blocks
    // that fusion's single-consumer guard; after, because it changes the emitted set.
    EliminateDeadOperators();
-   FuseSoftmaxClipBoundaries();
+   ApplyPlannedCarrierHandoffs();
    EliminateDeadOperators();
    // Last: the residual is only meaningful once every absorption has had its chance.
    CheckLowPrecisionCarrierFrontier();
@@ -118,7 +119,10 @@ void RModel::CanonicaliseBatchedMatMulOperands()
       // that lays it out. Every tensor on the way must be read only here.
       std::string cursor = gemm->GetWeightTensorName();
       ROperator_Transpose<float> *transpose = nullptr;
-      for (int hop = 0; hop < 3 && !cursor.empty(); ++hop) {
+      // Deliberately shorter than kQuantizationWalkMaxHops: staging puts at most two
+      // operators between the operand and its Transpose.
+      constexpr int kStagingWalkMaxHops = 3;
+      for (int hop = 0; hop < kStagingWalkMaxHops && !cursor.empty(); ++hop) {
          if (readers[cursor] != 1 || graphOutputs.count(cursor) != 0)
             break;
          auto found = producer.find(cursor);

@@ -1,5 +1,6 @@
 #include "SOFIE/RQuantization_DenseLinear.hxx"
 #include "SOFIE/RQuantization_Analysis.hxx"
+#include "SOFIE/RQuantization_Parameters.hxx"
 #include "SOFIE/RQuantization_Storage.hxx"
 #include "SOFIE/RModel.hxx"
 #include "SOFIE/ROperator_Gemm.hxx"
@@ -16,7 +17,6 @@
 #include <unordered_set>
 #include <iostream>
 #include <type_traits>
-#include <type_traits>
 #include <utility>
 
 namespace SOFIE {
@@ -29,57 +29,14 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
    const auto &graph = context.graph;
    const int verbose = context.verbose;
    auto readZeroPointTensor = [&model](const std::string &tensorName) {
-      std::vector<std::int64_t> values;
-      auto appendValues = [&values](const auto &typedValues) {
-         values.reserve(typedValues.size());
-         for (auto value : typedValues)
-            values.push_back(static_cast<std::int64_t>(value));
-      };
-
-      switch (model.GetTensorType(tensorName)) {
-      case ETensorType::FLOAT:
-         appendValues(model.GetTensorData<float>(tensorName));
-         break;
-      case ETensorType::DOUBLE:
-         appendValues(model.GetTensorData<double>(tensorName));
-         break;
-      case ETensorType::INT8:
-         appendValues(model.GetTensorData<std::int8_t>(tensorName));
-         break;
-      case ETensorType::UINT8:
-         appendValues(model.GetTensorData<std::uint8_t>(tensorName));
-         break;
-      case ETensorType::INT16:
-         appendValues(model.GetTensorData<std::int16_t>(tensorName));
-         break;
-      case ETensorType::UINT16:
-         appendValues(model.GetTensorData<std::uint16_t>(tensorName));
-         break;
-      case ETensorType::INT32:
-         appendValues(model.GetTensorData<std::int32_t>(tensorName));
-         break;
-      case ETensorType::UINT32:
-         appendValues(model.GetTensorData<std::uint32_t>(tensorName));
-         break;
-      case ETensorType::INT64:
-         appendValues(model.GetTensorData<std::int64_t>(tensorName));
-         break;
-      case ETensorType::UINT64:
-         appendValues(model.GetTensorData<std::uint64_t>(tensorName));
-         break;
-      default:
-         throw std::runtime_error("SOFIE quantized lowering expects numeric zero-point tensor [" + tensorName + "]");
-      }
-      return values;
+      return ReadTensorAsInt64Values(model, tensorName, /*throwOnUnknownType=*/true);
    };
 
    auto registerLowPrecisionSourceStorage = [&model](const std::string &logicalTensor,
                                                    const std::string &sourceTensor,
                                                    EQuantizedLayout layout) {
-      const auto shape = model.GetTensorShape(sourceTensor);
-      model.RegisterQuantizedTensorStorage(MakeLowPrecisionTensorStorage(logicalTensor, sourceTensor, sourceTensor,
-                                                                   model.GetLowPrecisionTensorInfo(sourceTensor),
-                                                                   layout, shape, EQuantizedBackend::ALPAKA));
+      RegisterInPlaceLowPrecisionCarrier(model, logicalTensor, sourceTensor, layout,
+                                         EQuantizedBackend::ALPAKA);
    };
 
    // An unsigned zero-point-0 carrier of width <= 7 is byte-identical to signed int8 over
@@ -115,38 +72,14 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
       return dynamic_cast<const ROperator_Reshape *>(op) != nullptr ||
              op->GetKind() == OperatorKind::CLIP;
    };
-   auto isBoundarySearchSeeThrough = [&operators, &isBoundaryChainAbsorbable](std::size_t index) {
+   auto isBoundarySearchSeeThrough = [&operators](std::size_t index) {
       if (index >= operators.size())
          return false;
-      return isBoundaryChainAbsorbable(index) ||
-             dynamic_cast<const ROperator_Transpose<float> *>(operators[index].get()) != nullptr;
+      return IsQuantizationBoundarySearchTransparent(*operators[index]);
    };
 
    auto readScalarInitializer = [&model](const std::string &name, double &value) {
-      if (name.empty() || !model.CheckIfTensorAlreadyExist(name) || !model.IsInitializedTensor(name))
-         return false;
-      // Genuinely one element: a broadcast vector would rescale per channel, which is a
-      // different transform from the single epilogue factor the callers fold it into.
-      std::size_t elements = 1;
-      for (auto extent : model.GetTensorShape(name))
-         elements *= extent;
-      if (elements != 1)
-         return false;
-      if (model.GetTensorType(name) == ETensorType::FLOAT) {
-         const auto data = model.GetTensorData<float>(name);
-         if (data.empty())
-            return false;
-         value = static_cast<double>(data[0]);
-         return true;
-      }
-      if (model.GetTensorType(name) == ETensorType::DOUBLE) {
-         const auto data = model.GetTensorData<double>(name);
-         if (data.empty())
-            return false;
-         value = data[0];
-         return true;
-      }
-      return false;
+      return ReadScalarInitializer(model, name, value);
    };
 
    struct AbsorbedOutputChain {
@@ -425,32 +358,32 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
       }
       if (producer == graph.producerByTensor.end() || producer->second >= operators.size())
          return;
-      // Walk back past the node this fusion absorbs -- a Clip on int8, a QuantizeLinear on
-      // FP8 -- to the Softmax; if that fusion declines, this handoff must not happen.
-      std::size_t softmaxIndex = producer->second;
+      // Walk back past the node this fusion absorbs (a Clip on int8, a QuantizeLinear on
+      // FP8) to the Softmax; if that fusion declines, this handoff must not happen.
+      std::size_t producerIndex = producer->second;
       const auto stepBack = [&](const std::string &sourceTensor) {
          auto behind = graph.producerByTensor.find(sourceTensor);
          if (behind == graph.producerByTensor.end() || behind->second >= operators.size())
             return false;
-         softmaxIndex = behind->second;
+         producerIndex = behind->second;
          return true;
       };
-      if (operators[softmaxIndex]->GetKind() == OperatorKind::CLIP) {
-         const auto clipInputs = operators[softmaxIndex]->GetOpInputTensors();
+      if (operators[producerIndex]->GetKind() == OperatorKind::CLIP) {
+         const auto clipInputs = operators[producerIndex]->GetOpInputTensors();
          if (clipInputs.empty() || !stepBack(std::string(clipInputs[0])))
             return;
-      } else if (operators[softmaxIndex]->IsQuantizationBoundary()) {
-         const std::string source = operators[softmaxIndex]->GetQuantizationSourceTensor();
+      } else if (operators[producerIndex]->IsQuantizationBoundary()) {
+         const std::string source = operators[producerIndex]->GetQuantizationSourceTensor();
          if (source.empty() || !stepBack(source))
             return;
       }
       // Asked of the operator rather than of its type: any producer that can encode its own
-      // output qualifies. The planner does not re-derive conditions; the applier is the authority.
+      // output qualifies. A plan the applier declines is a build error, so these must agree.
       if (QuantizationTraceEnabled())
          std::fprintf(stderr, "[handoff-behind] %s canFuse=%d\n",
-                      operators[softmaxIndex]->Name().c_str(),
-                      operators[softmaxIndex]->CanFuseQuantizedOutput() ? 1 : 0);
-      if (!operators[softmaxIndex]->CanFuseQuantizedOutput())
+                      operators[producerIndex]->Name().c_str(),
+                      operators[producerIndex]->CanFuseOutputOnGrid(EQuantizedOutputEmit::Carrier) ? 1 : 0);
+      if (!operators[producerIndex]->CanFuseOutputOnGrid(EQuantizedOutputEmit::Carrier))
          return;
       // A second reader of a float value would still need it; a carrier may keep its readers,
       // since the handoff changes who writes the codes, not who reads them.
@@ -463,12 +396,12 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
       if (model.IsInitializedTensor(tensor))
          return;
 
-      state.softmaxInt8Handoffs[tensor] = grid;
+      state.producerEncodeHandoffs[tensor] = grid;
       fusedInt8HandoffTensors.insert(tensor);
    };
 
    // The int8 entry point, unchanged in behaviour: a per-tensor signed-int8 region grid.
-   auto tryPlanSoftmaxInt8Handoff = [&tryPlanCarrierHandoff](const QuantizedMatMulRegion &region) {
+   auto planProducerEncodeHandoff = [&tryPlanCarrierHandoff](const QuantizedDenseLinearRegion &region) {
       const auto &info = region.inputQuant;
       if (info.granularity != EQuantizationGranularity::PerTensor || info.bitWidth != 8 ||
           !info.isSigned)
@@ -587,6 +520,34 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
       return best;
    };
 
+   // FP8 bias contract shared by the Gemm and MatMul spellings: an initialized
+   // FLOAT constant, applied by the cuBLASLt epilogue.
+   auto applyFP8BiasContract = [&model](QuantizedDenseLinearRegion &info, const char *spelling,
+                                        std::vector<std::string> &fp8Reasons) {
+      if (info.biasTensor.empty())
+         return;
+      if (!model.IsInitializedTensor(info.biasTensor))
+         fp8Reasons.push_back(std::string("native FP8 ") + spelling +
+                              " fused bias must be an initialized constant tensor");
+      else if (model.GetTensorType(info.biasTensor) != ETensorType::FLOAT)
+         fp8Reasons.push_back(std::string("native FP8 ") + spelling +
+                              " fused bias must be stored as FLOAT");
+      else
+         info.biasSourceTensor = info.biasTensor;
+   };
+
+   // A pre-Q float that is itself a same-grid dequantization means the upstream carrier
+   // already holds this region's input codes; adopt it and plan the producer handoff.
+   auto adoptUpstreamFP8InputCarrier = [&findUpstreamFP8Carrier, &tryPlanCarrierHandoff](
+                                          std::string &inputSourceTensor, double fp8InputScale) {
+      if (const std::string upstream = findUpstreamFP8Carrier(
+             inputSourceTensor, Float8GridFrom(fp8InputScale, EQuantizationGridKind::Float8E4M3));
+          !upstream.empty())
+         inputSourceTensor = upstream;
+      tryPlanCarrierHandoff(inputSourceTensor,
+                            Float8GridFrom(fp8InputScale, EQuantizationGridKind::Float8E4M3));
+   };
+
    for (std::size_t opIndex = 0; opIndex < operators.size(); ++opIndex) {
       if (operators[opIndex]->GetKind() != OperatorKind::GEMM)
          continue;
@@ -666,16 +627,7 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
             fp8Reasons.push_back("native FP8 dense-linear weight tensor must be initialized");
 
          if (isQuantizedMatMulSpelling) {
-            // Same bias contract as the FP8 Gemm spelling below: an initialized FLOAT
-            // constant, applied by the cuBLASLt epilogue.
-            if (!info.biasTensor.empty()) {
-               if (!model.IsInitializedTensor(info.biasTensor))
-                  fp8Reasons.push_back("native FP8 MatMul fused bias must be an initialized constant tensor");
-               else if (model.GetTensorType(info.biasTensor) != ETensorType::FLOAT)
-                  fp8Reasons.push_back("native FP8 MatMul fused bias must be stored as FLOAT");
-               else
-                  info.biasSourceTensor = info.biasTensor;
-            }
+            applyFP8BiasContract(info, "MatMul", fp8Reasons);
             // A fused MatMul+Add arrives as a Gemm with beta=1, which is the bias term
             // rather than a scaling of a pre-existing C.
             const bool fp8FusedBias = !info.biasSourceTensor.empty();
@@ -692,7 +644,8 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                                         "X[...,M,K] @ W[...,K,N] -> Y[...,M,N]"
                                       : matmulShape.reason);
 
-            auto matmul = MakeQuantizedMatMulRegionFromGemmLikeRegion(info);
+            QuantizedDenseLinearRegion matmul(info);
+            matmul.spelling = EQuantizedDenseLinearSpelling::MatMul;
             if (fp8FusedBias) {
                matmul.epilogue.kind = EQuantizedEpilogueKind::Bias;
                matmul.epilogue.biasSourceTensor = info.biasSourceTensor;
@@ -706,7 +659,7 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                matmul.status = EQuantizedLoweringStatus::SemanticRecognized;
                matmul.reason = "recognized native FP8 MatMul region; " + matmulShape.reason + "; output carrier is FLOAT";
                auto shapePolicy = MakeFP8DenseLinearShapePolicy(m, k, n, matmulShape.batchCount);
-               auto capability = MakeNativeFP8E4M3TNF32Capability(m, n, k);
+               auto capability = MakeNativeFP8E4M3TNF32Capability();
                capability.reason = "SOFIE cuBLASLt FP8 E4M3 TN FP32 path selected for native FP8 MatMul";
                // The region's own trailing encode: adopted into the cuBLASLt call as an FP8
                // D when the chain and grid allow, retiring the boundary kernel.
@@ -722,15 +675,7 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                                                : EQuantizedEpilogueKind::Relu;
                }
 
-               // A pre-Q float that is itself a same-grid dequantization means the upstream
-               // carrier already holds this region's input codes, one zero-copy Reshape away.
-               if (const std::string upstream = findUpstreamFP8Carrier(
-                      matmul.inputSourceTensor,
-                      Float8GridFrom(fp8InputScale, EQuantizationGridKind::Float8E4M3));
-                   !upstream.empty())
-                  matmul.inputSourceTensor = upstream;
-               tryPlanCarrierHandoff(matmul.inputSourceTensor,
-                                     Float8GridFrom(fp8InputScale, EQuantizationGridKind::Float8E4M3));
+               adoptUpstreamFP8InputCarrier(matmul.inputSourceTensor, fp8InputScale);
 
                // A canonicalised or runtime operand is already [N, K]; a plain MatMul weight
                // is [K, N] and is transposed into its own storage tensor.
@@ -770,20 +715,12 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
             StoreQuantizedRegion(state, std::move(matmul));
             if (verbose > 0) {
                std::cout << "SOFIE native FP8 MatMul candidate at operator " << opIndex << ": "
-                         << FindQuantizedRegion<QuantizedMatMulRegion>(state, opIndex)->reason << std::endl;
+                         << FindQuantizedRegion<QuantizedDenseLinearRegion>(state, opIndex)->reason << std::endl;
             }
             continue;
          }
 
-         if (!info.biasTensor.empty()) {
-            if (!model.IsInitializedTensor(info.biasTensor)) {
-               fp8Reasons.push_back("native FP8 Gemm fused bias must be an initialized constant tensor");
-            } else if (model.GetTensorType(info.biasTensor) != ETensorType::FLOAT) {
-               fp8Reasons.push_back("native FP8 Gemm fused bias must be stored as FLOAT");
-            } else {
-               info.biasSourceTensor = info.biasTensor;
-            }
-         }
+         applyFP8BiasContract(info, "Gemm", fp8Reasons);
          // Both spellings share one cuBLASLt call: TN is A[K,M]^T * B[K,N], NT is
          // X[M,K] * W[N,K]^T with the A/B operand roles swapped and m/n exchanged.
          const bool fp8LegacyTNSpelling = info.transA == 1 && info.transB == 0;
@@ -843,7 +780,7 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                              ? "recognized native FP8 Gemm region; alpha * X[M,K] * W[N,K]^T + beta * C -> [M,N]"
                              : "recognized native FP8 Gemm region; alpha * A[K,M]^T * B[K,N] + beta * C -> [M,N]";
             auto shapePolicy = MakeFP8DenseLinearShapePolicy(m, k, n, 1, fp8PaddedN);
-            auto capability = MakeNativeFP8E4M3TNF32Capability(m, n, k);
+            auto capability = MakeNativeFP8E4M3TNF32Capability();
             if (fp8PaddedN > n)
                info.reason += "; " + shapePolicy.reason;
 
@@ -854,15 +791,7 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
             if (outputAdopt.adopted())
                info.reason += "; output carrier is E4M3";
 
-            // A float producer feeding this region can encode straight onto the region's
-            // input grid instead of emitting a float for a boundary kernel to re-read.
-            if (const std::string upstream = findUpstreamFP8Carrier(
-                   info.inputSourceTensor,
-                   Float8GridFrom(fp8InputScale, EQuantizationGridKind::Float8E4M3));
-                !upstream.empty())
-               info.inputSourceTensor = upstream;
-            tryPlanCarrierHandoff(info.inputSourceTensor,
-                                  Float8GridFrom(fp8InputScale, EQuantizationGridKind::Float8E4M3));
+            adoptUpstreamFP8InputCarrier(info.inputSourceTensor, fp8InputScale);
 
             // A padded weight is a second constant, so it gets its own storage tensor; an
             // unpadded one is read in place.
@@ -887,7 +816,7 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
          StoreQuantizedRegion(state, std::move(info));
          if (verbose > 0) {
             std::cout << "SOFIE native FP8 Gemm candidate at operator " << opIndex << ": "
-                      << FindQuantizedRegion<QuantizedGemmRegion>(state, opIndex)->reason << std::endl;
+                      << FindQuantizedRegion<QuantizedDenseLinearRegion>(state, opIndex)->reason << std::endl;
          }
          continue;
       }
@@ -1220,7 +1149,8 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
 
       if (isQuantizedMatMulSpelling) {
          if (hasQuantizationEvidence) {
-            auto matmul = MakeQuantizedMatMulRegionFromGemmLikeRegion(info);
+            QuantizedDenseLinearRegion matmul(info);
+            matmul.spelling = EQuantizedDenseLinearSpelling::MatMul;
             matmul.epilogue = matmulEpilogue;
             matmul.shape = matmulShape;
             auto &plans = state.loweringPlans[opIndex];
@@ -1294,7 +1224,7 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                if (storageReasons.empty()) {
                   // Before the plan is built: it decides staging from whether the input
                   // source is still a float op, and this is what flips that.
-                  tryPlanSoftmaxInt8Handoff(matmul);
+                  planProducerEncodeHandoff(matmul);
                   const bool paddedStorage = selectedCapability.shapePolicy.policy == EQuantizedShapePolicy::Padded;
                   // A runtime operand is its own storage: canonicalisation already put it in
                   // [.., N, K], the layout the transposed constant path materialises.
@@ -1333,7 +1263,7 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
             StoreQuantizedRegion(state, std::move(matmul));
             if (verbose > 0) {
                std::cout << "SOFIE quantized MatMul candidate at operator " << opIndex << ": "
-                         << FindQuantizedRegion<QuantizedMatMulRegion>(state, opIndex)->reason << std::endl;
+                         << FindQuantizedRegion<QuantizedDenseLinearRegion>(state, opIndex)->reason << std::endl;
             }
          }
          continue;
@@ -1378,7 +1308,7 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
             StoreQuantizedRegion(state, std::move(info));
             if (verbose > 0) {
                std::cout << "SOFIE quantized Gemm candidate recognized but not lowered at operator " << opIndex << ": "
-                         << FindQuantizedRegion<QuantizedGemmRegion>(state, opIndex)->reason << std::endl;
+                         << FindQuantizedRegion<QuantizedDenseLinearRegion>(state, opIndex)->reason << std::endl;
             }
             continue;
          }
@@ -1472,18 +1402,42 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
 void MaterializeQuantizedDenseLinearWeights(QuantizedStoragePassContext &context)
 {
    auto &model = context.model;
-   auto &state = context.state;
    const auto backend = context.backend;
 
-   for (auto opIndex : SortedQuantizedRegionOperatorIndices(state.regions)) {
-      const auto *plan = FindQuantizedLoweringPlan(state, opIndex, backend);
-      if (plan == nullptr || !IsQuantizedLoweringAvailable(plan->status) ||
-          plan->weightStorageTensor.empty() || plan->weightStorageIsRuntimeTensor)
-         continue;
-
+   ForEachMaterializableQuantizedPlan(context, [&](const QuantizedRegion &regionVariant,
+                                                   const QuantizedLoweringPlan *plan) {
       std::visit([&](const auto &region) {
          using Region = std::decay_t<decltype(region)>;
-         if constexpr (std::is_same_v<Region, QuantizedGemmRegion>) {
+         if constexpr (std::is_same_v<Region, QuantizedDenseLinearRegion>) {
+            if (region.spelling == EQuantizedDenseLinearSpelling::MatMul) {
+               if (backend != EQuantizedBackend::ALPAKA)
+                  return;
+               const auto weightShape = model.GetTensorShape(region.weightSourceTensor);
+               if (weightShape.size() != 2 || !model.IsInitializedTensor(region.weightSourceTensor))
+                  throw std::runtime_error(
+                     "SOFIE quantized MatMul storage requires an initialized rank-2 weight tensor");
+               if (QuantizedPlanUsesFP8DenseLinear(*plan)) {
+                  if (plan->weightStorageTensor != region.weightSourceTensor) {
+                     context.install(MaterializeLowPrecisionDenseLinearWeightBytes(
+                        region.weightTensor, region.weightSourceTensor, plan->weightStorageTensor,
+                        model.GetLowPrecisionTensorInfo(region.weightSourceTensor), plan->weightLayout, backend,
+                        model.GetInitializedTensorData(region.weightSourceTensor).get(), weightShape, true));
+                     return;
+                  }
+                  context.registerLowPrecision(
+                     region.weightTensor, region.weightSourceTensor, plan->weightLayout);
+                  return;
+               }
+
+               const auto *weightData = static_cast<const float *>(
+                  model.GetInitializedTensorData(region.weightSourceTensor).get());
+               std::vector<float> perChannelScales;
+               if (IsPerChannelAxis(region.weightQuant, 1))
+                  perChannelScales = model.GetTensorData<float>(region.weightQuant.scaleTensor);
+               context.install(MaterializeQuantizedMatMulWeight(
+                  region, *plan, backend, weightData, weightShape, perChannelScales));
+               return;
+            }
             const auto weightShape = model.GetTensorShape(region.weightSourceTensor);
             if (weightShape.size() != 2 || !model.IsInitializedTensor(region.weightSourceTensor))
                throw std::runtime_error(
@@ -1511,76 +1465,40 @@ void MaterializeQuantizedDenseLinearWeights(QuantizedStoragePassContext &context
                perChannelScales = model.GetTensorData<float>(region.weightQuant.scaleTensor);
             context.install(MaterializeQuantizedGemmWeight(
                region, *plan, backend, weightData, weightShape, perChannelScales));
-         } else if constexpr (std::is_same_v<Region, QuantizedMatMulRegion>) {
-            if (backend != EQuantizedBackend::ALPAKA)
-               return;
-            const auto weightShape = model.GetTensorShape(region.weightSourceTensor);
-            if (weightShape.size() != 2 || !model.IsInitializedTensor(region.weightSourceTensor))
-               throw std::runtime_error(
-                  "SOFIE quantized MatMul storage requires an initialized rank-2 weight tensor");
-            if (QuantizedPlanUsesFP8DenseLinear(*plan)) {
-               if (plan->weightStorageTensor != region.weightSourceTensor) {
-                  context.install(MaterializeLowPrecisionDenseLinearWeightBytes(
-                     region.weightTensor, region.weightSourceTensor, plan->weightStorageTensor,
-                     model.GetLowPrecisionTensorInfo(region.weightSourceTensor), plan->weightLayout, backend,
-                     model.GetInitializedTensorData(region.weightSourceTensor).get(), weightShape, true));
-                  return;
-               }
-               context.registerLowPrecision(
-                  region.weightTensor, region.weightSourceTensor, plan->weightLayout);
-               return;
-            }
-
-            const auto *weightData = static_cast<const float *>(
-               model.GetInitializedTensorData(region.weightSourceTensor).get());
-            std::vector<float> perChannelScales;
-            if (IsPerChannelAxis(region.weightQuant, 1))
-               perChannelScales = model.GetTensorData<float>(region.weightQuant.scaleTensor);
-            context.install(MaterializeQuantizedMatMulWeight(
-               region, *plan, backend, weightData, weightShape, perChannelScales));
          }
-      }, state.regions.at(opIndex));
-   }
+      }, regionVariant);
+   });
 }
 
 std::unique_ptr<ROperator> MakeLoweredQuantizedOperator(
-   RModel &model, const ROperator &source, const QuantizedGemmRegion &region,
+   RModel &model, const ROperator &source, const QuantizedDenseLinearRegion &region,
    const QuantizedLoweringPlan &plan)
 {
    (void)model;
+   const bool isMatMul = region.spelling == EQuantizedDenseLinearSpelling::MatMul;
    const auto *gemm = dynamic_cast<const ROperator_Gemm<float> *>(&source);
    if (!gemm)
-      throw std::runtime_error("SOFIE quantized Gemm region is attached to a non-float Gemm operator");
+      throw std::runtime_error(isMatMul
+         ? "SOFIE quantized MatMul region is attached to a non-float Gemm-spelled MatMul operator"
+         : "SOFIE quantized Gemm region is attached to a non-float Gemm operator");
 
    QuantizedGemmCodegenContext codegen;
    codegen.inputShape = gemm->GetInputShape();
    codegen.weightShape = gemm->GetWeightShape();
    codegen.outputShape = gemm->GetOutputShape();
-   codegen.alpha = gemm->GetAlpha();
-   codegen.beta = gemm->GetBeta();
-   codegen.transA = gemm->GetTransA();
-   codegen.transB = gemm->GetTransB();
-   codegen.activation = gemm->GetActivationType();
-   // An absorbed Relu is applied by the epilogue's hasRelu.
-   if (region.outputReluOpIndex)
-      codegen.activation = EActivationType::RELU;
-   return std::make_unique<ROperator_QuantizedGemm>(region, plan, std::move(codegen));
-}
-
-std::unique_ptr<ROperator> MakeLoweredQuantizedOperator(
-   RModel &model, const ROperator &source, const QuantizedMatMulRegion &region,
-   const QuantizedLoweringPlan &plan)
-{
-   (void)model;
-   const auto *gemm = dynamic_cast<const ROperator_Gemm<float> *>(&source);
-   if (!gemm)
-      throw std::runtime_error("SOFIE quantized MatMul region is attached to a non-float Gemm-spelled MatMul operator");
-
-   QuantizedMatrixCodegenContext codegen;
-   codegen.inputShape = gemm->GetInputShape();
-   codegen.weightShape = gemm->GetWeightShape();
-   codegen.outputShape = gemm->GetOutputShape();
-   return std::make_unique<ROperator_QuantizedMatMul>(region, plan, std::move(codegen));
+   // Only the Gemm spelling forwards the operator attributes; the MatMul spelling reads
+   // the QuantizedMatrixCodegenContext base slice and its epilogue on the region.
+   if (!isMatMul) {
+      codegen.alpha = gemm->GetAlpha();
+      codegen.beta = gemm->GetBeta();
+      codegen.transA = gemm->GetTransA();
+      codegen.transB = gemm->GetTransB();
+      codegen.activation = gemm->GetActivationType();
+      // An absorbed Relu is applied by the epilogue's hasRelu.
+      if (region.outputReluOpIndex)
+         codegen.activation = EActivationType::RELU;
+   }
+   return std::make_unique<ROperator_QuantizedDenseLinear>(region, plan, std::move(codegen));
 }
 
 } // namespace SOFIE

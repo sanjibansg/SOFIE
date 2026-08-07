@@ -177,26 +177,23 @@ public:
       model.AddNeededStdLib("cmath");
    }
 
-   // Absorbs a downstream fake-quant boundary: the snap runs before the store and the
-   // boundary stops emitting. Output type and consumers are unchanged.
-   bool CanFuseFakeQuantOutput() const override { return true; }
+   // Absorbs a downstream boundary in either mode: the snap runs before the store, or the
+   // store encodes onto `grid` and writes the boundary's code tensor.
+   bool CanFuseOutputOnGrid(EQuantizedOutputEmit mode) const override
+   {
+      return mode == EQuantizedOutputEmit::Snap || (!fFakeQuantGrid && !fCarrierGrid);
+   }
 
    // Adopts the boundary's output tensor; the previous output is left for dead-code
    // elimination.
-   void FuseFakeQuantOutput(const std::string &output, const QuantizationGrid &grid) override
+   void FuseOutputOnGrid(const std::string &output, const QuantizationGrid &grid,
+                         EQuantizedOutputEmit mode) override
    {
       AdoptFusedOutputName(fNY, fOutputTensorNames, output, "LayerNormalization");
-      fFakeQuantGrid = grid;
-   }
-
-   // Absorbs a downstream carrier boundary: the store encodes onto `grid` and writes the
-   // boundary's code tensor, whose readers already expect a carrier.
-   bool CanFuseQuantizedOutput() const override { return !fFakeQuantGrid && !fCarrierGrid; }
-
-   void FuseQuantizedOutput(const std::string &carrier, const QuantizationGrid &grid) override
-   {
-      AdoptFusedOutputName(fNY, fOutputTensorNames, carrier, "LayerNormalization");
-      fCarrierGrid = grid;
+      if (mode == EQuantizedOutputEmit::Snap)
+         fFakeQuantGrid = grid;
+      else
+         fCarrierGrid = grid;
    }
 
    std::string GenerateInitCode() override

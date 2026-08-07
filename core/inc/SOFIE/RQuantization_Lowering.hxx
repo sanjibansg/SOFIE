@@ -3,7 +3,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <iomanip>
+#include <limits>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -21,12 +24,6 @@ enum class EQuantizedLoweringStatus {
 inline bool IsQuantizedLoweringAvailable(EQuantizedLoweringStatus status)
 {
    return status == EQuantizedLoweringStatus::Optimized || status == EQuantizedLoweringStatus::Baseline;
-}
-
-inline bool IsQuantizedLoweringUnsupported(EQuantizedLoweringStatus status)
-{
-   return status == EQuantizedLoweringStatus::BackendUnsupported ||
-          status == EQuantizedLoweringStatus::SemanticUnsupported;
 }
 
 inline bool IsQuantizedLoweringOptimized(EQuantizedLoweringStatus status)
@@ -62,16 +59,9 @@ enum class EQuantizedResourceRole {
    BackendWorkspace = 8
 };
 
-enum class EQuantizedResourceLifetime {
-   GraphValue = 0,
-   ModelPersistent = 1,
-   Invocation = 2
-};
-
 struct QuantizedResourceRequirement {
    EQuantizedResourceCategory category = EQuantizedResourceCategory::TensorStorage;
    EQuantizedResourceRole role = EQuantizedResourceRole::InputCarrier;
-   EQuantizedResourceLifetime lifetime = EQuantizedResourceLifetime::GraphValue;
    EQuantizedStorageType storageType = EQuantizedStorageType::UNDEFINED;
    std::size_t bytes = 0;
    std::size_t alignment = 1;
@@ -86,7 +76,6 @@ struct QuantizedResourceRequirements {
 inline void AddQuantizedResourceRequirement(QuantizedResourceRequirements &requirements,
                                             EQuantizedResourceCategory category,
                                             EQuantizedResourceRole role,
-                                            EQuantizedResourceLifetime lifetime,
                                             EQuantizedStorageType storageType,
                                             std::size_t bytes,
                                             std::size_t alignment,
@@ -95,7 +84,7 @@ inline void AddQuantizedResourceRequirement(QuantizedResourceRequirements &requi
 {
    if (bytes == 0)
       return;
-   requirements.entries.push_back({category, role, lifetime, storageType, bytes,
+   requirements.entries.push_back({category, role, storageType, bytes,
                                    std::max<std::size_t>(alignment, 1), reusable, std::move(reason)});
 }
 
@@ -266,12 +255,12 @@ enum class ELowPrecisionAccumulation {
    Float32 = 3
 };
 
+// The accumulation type is not stored: it is fully determined by the carrier
+// (affine-integer carriers accumulate in Int32, everything else in Float32).
 struct LowPrecisionTensorInfo {
    ELowPrecisionCarrier carrier = ELowPrecisionCarrier::UNDEFINED;
-   ELowPrecisionAccumulation accumulation = ELowPrecisionAccumulation::UNDEFINED;
    std::optional<QuantizationInfo> affineQuantization;
    std::string sourceTensor;
-   std::string reason;
 };
 
 inline bool IsAffineIntegerCarrier(ELowPrecisionCarrier carrier)
@@ -286,13 +275,11 @@ inline bool IsFP8Carrier(ELowPrecisionCarrier carrier)
 
 inline LowPrecisionTensorInfo LowPrecisionTensorInfoFromFP8Carrier(ELowPrecisionCarrier carrier,
                                                                    const std::string &sourceTensor,
-                                                                   const std::string &reason)
+                                                                   const std::string & /*reason*/)
 {
    LowPrecisionTensorInfo lowPrecision;
    lowPrecision.carrier = carrier;
-   lowPrecision.accumulation = ELowPrecisionAccumulation::Float32;
    lowPrecision.sourceTensor = sourceTensor;
-   lowPrecision.reason = reason;
    return lowPrecision;
 }
 
@@ -300,9 +287,20 @@ inline LowPrecisionTensorInfo LowPrecisionTensorInfoFromAffineQuantization(const
 {
    LowPrecisionTensorInfo lowPrecision;
    lowPrecision.carrier = info.isSigned ? ELowPrecisionCarrier::AffineInt8 : ELowPrecisionCarrier::AffineUInt8;
-   lowPrecision.accumulation = ELowPrecisionAccumulation::Int32;
    lowPrecision.affineQuantization = info;
    return lowPrecision;
+}
+
+// A merged per-operand slot holds either an affine contract (Affine* carrier, grid in
+// affineQuantization) or a native low-precision contract; the carrier discriminates.
+inline bool IsAffineOperand(const std::optional<LowPrecisionTensorInfo> &operand)
+{
+   return operand.has_value() && IsAffineIntegerCarrier(operand->carrier);
+}
+
+inline bool IsNativeLowPrecisionOperand(const std::optional<LowPrecisionTensorInfo> &operand)
+{
+   return operand.has_value() && !IsAffineIntegerCarrier(operand->carrier);
 }
 
 enum class EQuantizedOutputMode {
@@ -323,7 +321,6 @@ enum class EQuantizedComputeProfile {
    UnsupportedDenseLinearRank2 = 7,
    FP8E4M3DenseLinearRank2 = 8,
    FP8E5M2DenseLinearRank2 = 9,
-   FP8DenseLinearBackendUnsupported = 10,
    AffineInt8Conv = 11,
    AffineInt8AsymmetricConv = 12,
    FP8E4M3Conv = 13,
@@ -536,8 +533,6 @@ struct QuantizedLoweringPlan {
    double lowPrecisionOutputClampHigh = 0.0;
 
    std::vector<std::size_t> consumedOperatorIndices;
-   bool preservesQuantizationSemantics = false;
-   bool isMetadataOnly = false;
    bool suppressesGraphOperators = false;
 };
 
@@ -557,8 +552,6 @@ inline QuantizedLoweringPlan MakeUnsupportedQuantizedPlan(EQuantizedBackend back
    plan.inputStorage = storage;
    plan.weightStorage = storage;
    plan.outputStorage = storage;
-   plan.preservesQuantizationSemantics = preservesSemantics;
-   plan.isMetadataOnly = preservesSemantics;
    plan.suppressesGraphOperators = false;
    return plan;
 }
@@ -576,11 +569,6 @@ inline const QuantizedMatrixShapePolicy &RequireQuantizedMatrixShapePolicy(
    if (!plan.matrixShapePolicy)
       throw std::runtime_error("SOFIE " + context + " requires matrix execution geometry");
    return *plan.matrixShapePolicy;
-}
-
-inline bool QuantizedPlanUsesInt32Accumulator(const QuantizedLoweringPlan &plan)
-{
-   return plan.accumulatorStorage == EQuantizedStorageType::Int32Accumulator;
 }
 
 inline bool QuantizedPlanUsesPrequantizedWeights(const QuantizedLoweringPlan &plan)
@@ -617,5 +605,36 @@ inline bool IsOptimizedQuantizedAlpakaPlainDevicePlan(const QuantizedLoweringPla
    return plan.backend == EQuantizedBackend::ALPAKA &&
           IsOptimizedQuantizedPlainDevicePlan(plan);
 }
+
+// Shared codegen literal/enum-name helpers for the quantized operator emitters
+// (Conv/Elementwise/Gather). These produce generated text: the spelling is load-bearing.
+namespace INTERNAL {
+
+inline std::string QuantizedDoubleLiteral(double value)
+{
+   std::ostringstream out;
+   out << std::setprecision(std::numeric_limits<double>::max_digits10) << value;
+   return out.str();
+}
+
+inline std::string QuantizedInputCarrierEnumName(ETensorType type)
+{
+   switch (type) {
+   case ETensorType::INT8: return "SOFIE::EQuantizedInputCarrier::Int8";
+   case ETensorType::UINT8: return "SOFIE::EQuantizedInputCarrier::UInt8";
+   default: return "SOFIE::EQuantizedInputCarrier::Float";
+   }
+}
+
+inline std::string QuantizedOutputCarrierEnumName(ETensorType type)
+{
+   switch (type) {
+   case ETensorType::INT8: return "SOFIE::EQuantizedOutputCarrier::Int8";
+   case ETensorType::UINT8: return "SOFIE::EQuantizedOutputCarrier::UInt8";
+   default: return "SOFIE::EQuantizedOutputCarrier::Float";
+   }
+}
+
+} // namespace INTERNAL
 
 #endif // SOFIE_RQUANTIZATION_LOWERING

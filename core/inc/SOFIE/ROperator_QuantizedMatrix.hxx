@@ -96,16 +96,13 @@ struct QuantizedCudaLtMatMulCall {
    std::string m;
    std::string n;
    std::string k;
-   QuantizedMatrixShapePolicy shapePolicy;
+   // The lowering plan the call is built from; set by the Make* builder and read at
+   // emission, both within one Generate call, so the reference cannot dangle.
+   const QuantizedLoweringPlan *plan = nullptr;
    QuantizationInfo inputQuant;
    QuantizationInfo weightQuant;
    std::optional<QuantizationInfo> biasQuant;
    QuantizationInfo outputQuant;
-   EQuantizedOutputMode outputMode = EQuantizedOutputMode::UNDEFINED;
-   EQuantizedCarrierMode inputCarrierMode = EQuantizedCarrierMode::UNDEFINED;
-   EQuantizedParameterMode weightScaleMode = EQuantizedParameterMode::Scalar;
-   std::string capabilityTag;
-   std::string reason;
    bool hasBias = false;
    bool hasRelu = false;
    bool weightIsSigned = true;
@@ -141,17 +138,11 @@ inline QuantizedCudaLtMatMulCall MakeQuantizedCudaLtInt8DenseLinearCall(
    call.m = std::move(m);
    call.n = std::move(n);
    call.k = std::move(k);
-   call.shapePolicy =
-      RequireQuantizedMatrixShapePolicy(plan, "cuBLASLt dense-linear call");
+   call.plan = &plan;
    call.inputQuant = inputQuant;
    call.weightQuant = weightQuant;
    call.biasQuant = std::move(biasQuant);
    call.outputQuant = outputQuant;
-   call.outputMode = plan.outputMode;
-   call.inputCarrierMode = QuantizedCarrierModeForStorage(plan.inputStorage);
-   call.weightScaleMode = plan.weightScaleMode;
-   call.capabilityTag = plan.capabilityTag;
-   call.reason = plan.reason;
    call.hasBias = hasBias;
    call.hasRelu = hasRelu;
    call.weightIsSigned = weightIsSigned;
@@ -162,42 +153,45 @@ inline QuantizedCudaLtMatMulCall MakeQuantizedCudaLtInt8DenseLinearCall(
 
 inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMulCall &call)
 {
+   const QuantizedLoweringPlan &plan = *call.plan;
+   const auto &shapePolicy =
+      RequireQuantizedMatrixShapePolicy(plan, "cuBLASLt dense-linear call");
    if (call.outputTensor.empty() || call.inputTensor.empty() || call.weightStorageTensor.empty()) {
       throw std::runtime_error("SOFIE " + call.boundaryName + " is missing input/output/weight-storage tensors");
    }
    if (call.hasBias && (!call.biasQuant.has_value() || call.biasTensor.empty())) {
       throw std::runtime_error("SOFIE " + call.boundaryName + " is missing bias tensor or quantization metadata");
    }
-   if (call.weightScaleMode == EQuantizedParameterMode::PerOutputChannel && call.weightScaleTensor.empty()) {
+   if (plan.weightScaleMode == EQuantizedParameterMode::PerOutputChannel && call.weightScaleTensor.empty()) {
       throw std::runtime_error("SOFIE " + call.boundaryName + " per-channel launch is missing a weight scale tensor");
    }
 
    const auto inputRange = QuantizedIntegerRange(call.inputQuant);
    const auto biasRange = call.biasQuant ? QuantizedIntegerRange(*call.biasQuant) : std::pair<std::int64_t, std::int64_t>{0, 0};
    const auto outputRange = QuantizedIntegerRange(call.outputQuant);
-   const bool paddedExecution = call.shapePolicy.policy == EQuantizedShapePolicy::Padded;
+   const bool paddedExecution = shapePolicy.policy == EQuantizedShapePolicy::Padded;
 
    std::stringstream out;
    out << "\n//--------- " << call.boundaryName << "\n";
    out << "   // Optimized GPU boundary: stream-ordered cuBLASLt int8 matrix multiply selected by the lowering plan.\n";
    out << "   {\n";
-   out << "      // Quantized lowering capability: " << call.capabilityTag << "\n";
-   out << "      // Quantized lowering reason: " << call.reason << "\n";
+   out << "      // Quantized lowering capability: " << plan.capabilityTag << "\n";
+   out << "      // Quantized lowering reason: " << plan.reason << "\n";
    out << "      SOFIE::QuantizedDenseLinearInvocation " << call.paramsName << "{};\n";
    out << "      " << call.paramsName << ".logicalM = static_cast<std::size_t>(" << call.m << ");\n";
    out << "      " << call.paramsName << ".logicalN = static_cast<std::size_t>(" << call.n << ");\n";
    out << "      " << call.paramsName << ".logicalK = static_cast<std::size_t>(" << call.k << ");\n";
    if (paddedExecution) {
-      out << "      " << call.paramsName << ".m = " << call.shapePolicy.physicalM << ";\n";
-      out << "      " << call.paramsName << ".n = " << call.shapePolicy.physicalN << ";\n";
-      out << "      " << call.paramsName << ".k = " << call.shapePolicy.physicalK << ";\n";
+      out << "      " << call.paramsName << ".m = " << shapePolicy.physicalM << ";\n";
+      out << "      " << call.paramsName << ".n = " << shapePolicy.physicalN << ";\n";
+      out << "      " << call.paramsName << ".k = " << shapePolicy.physicalK << ";\n";
       out << "      " << call.paramsName << ".paddedExecution = true;\n";
    } else {
       out << "      " << call.paramsName << ".m = " << call.paramsName << ".logicalM;\n";
       out << "      " << call.paramsName << ".n = " << call.paramsName << ".logicalN;\n";
       out << "      " << call.paramsName << ".k = " << call.paramsName << ".logicalK;\n";
    }
-   if (call.shapePolicy.batchCount > 1) {
+   if (shapePolicy.batchCount > 1) {
       if (paddedExecution) {
          throw std::runtime_error("SOFIE " + call.boundaryName +
                                   " cannot combine padded execution with strided batching: the strides below"
@@ -205,7 +199,7 @@ inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMul
       }
       // Each slice is contiguous, so the stride is just the slice's element count. This
       // is layout-independent: B holds K*N elements whether it is stored [K,N] or [N,K].
-      const auto &shape = call.shapePolicy;
+      const auto &shape = shapePolicy;
       out << "      " << call.paramsName << ".batchCount = " << shape.batchCount << ";\n";
       out << "      " << call.paramsName << ".batchStrideA = " << (shape.logicalM * shape.logicalK) << ";\n";
       out << "      " << call.paramsName << ".batchStrideB = " << (shape.logicalK * shape.logicalN) << ";\n";
@@ -236,15 +230,15 @@ inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMul
    out << "      " << call.paramsName << ".hasRelu = " << (call.hasRelu ? "true" : "false") << ";\n";
    out << "      " << call.paramsName << ".maxWorkspaceBytes = SOFIE::kQuantizedCudaLtMaxWorkspaceBytes;\n";
    out << "      " << call.paramsName << ".epilogueMode = SOFIE::EQuantizedEpilogueMode::"
-       << QuantizedCudaEpilogueModeName(call.outputMode, call.boundaryName) << ";\n";
+       << QuantizedCudaEpilogueModeName(plan.outputMode, call.boundaryName) << ";\n";
    out << "      " << call.paramsName << ".inputCarrier = SOFIE::EQuantizedInputCarrier::"
-       << QuantizedCudaInputCarrierName(call.inputCarrierMode, call.boundaryName) << ";\n";
+       << QuantizedCudaInputCarrierName(QuantizedCarrierModeForStorage(plan.inputStorage), call.boundaryName) << ";\n";
    // A fake-quant-float epilogue dequantizes to a float D, so the carrier must be Float;
    // a quantized epilogue keeps the int8/uint8 carrier.
    const bool fusedRequantize =
-      call.outputMode != EQuantizedOutputMode::Quantized && call.outputRequantize.has_value();
+      plan.outputMode != EQuantizedOutputMode::Quantized && call.outputRequantize.has_value();
    out << "      " << call.paramsName << ".outputCarrier = SOFIE::EQuantizedOutputCarrier::"
-       << (call.outputMode == EQuantizedOutputMode::Quantized
+       << (plan.outputMode == EQuantizedOutputMode::Quantized
               ? QuantizedCudaOutputCarrierName(call.outputQuant, call.boundaryName)
               : (fusedRequantize ? std::string("Int8") : std::string("Float"))) << ";\n";
    if (fusedRequantize) {
@@ -261,7 +255,7 @@ inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMul
    out << "      " << call.paramsName << ".weightType = SOFIE::EQuantizedWeightCarrier::"
        << (call.weightIsSigned ? "Int8" : "UInt8") << ";\n";
    out << "      " << call.paramsName << ".weightScaleMode = SOFIE::EQuantizedScaleMode::"
-       << (call.weightScaleMode == EQuantizedParameterMode::PerOutputChannel ? "PerOutputChannel" : "PerTensor") << ";\n";
+       << (plan.weightScaleMode == EQuantizedParameterMode::PerOutputChannel ? "PerOutputChannel" : "PerTensor") << ";\n";
 
    out << "      " << call.stateName << ".BindScratch(quantizedCudaScratchArena.View());\n";
    out << "      SOFIE::QuantizedGemmCudaLt_Call(" << call.stateName
@@ -274,7 +268,7 @@ inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMul
    } else {
       out << ", static_cast<const float *>(nullptr)";
    }
-   if (call.weightScaleMode == EQuantizedParameterMode::PerOutputChannel) {
+   if (plan.weightScaleMode == EQuantizedParameterMode::PerOutputChannel) {
       out << ", alpaka::getPtrNative(deviceBuf_" << call.weightScaleTensor << ")";
    } else {
       out << ", static_cast<const float *>(nullptr)";
@@ -282,22 +276,6 @@ inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMul
    out << ", " << call.paramsName << ");\n";
    out << "   }\n";
    return out.str();
-}
-
-// Shared body of RebindPlannedCarrierInput for the lowered dense regions: the invocation
-// built at Generate time and the name list both derive from region.inputSourceTensor.
-template <typename Region>
-bool RebindRegionCarrierInput(Region &region, std::vector<std::string> &inputNames,
-                              const std::string &from, const std::string &to)
-{
-   if (region.inputSourceTensor != from)
-      return false;
-   region.inputSourceTensor = to;
-   for (auto &name : inputNames) {
-      if (name == from)
-         name = to;
-   }
-   return true;
 }
 
 struct QuantizedCudaLtFP8DenseLinearCall {
@@ -314,27 +292,13 @@ struct QuantizedCudaLtFP8DenseLinearCall {
    std::string m;
    std::string n;
    std::string k;
-   QuantizedMatrixShapePolicy shapePolicy;
-   double inputScale = 1.0;
-   double weightScale = 1.0;
-   // FP8 only: grid step of an adopted output quantize. 1 leaves the region emitting a
-   // float D.
-   double outputScale = 1.0;
-   // Output clamp in output units, from a Clip absorbed with the quantize boundary.
-   bool hasOutputClamp = false;
-   double outputClampLow = 0.0;
-   double outputClampHigh = 0.0;
-   EQuantizedComputeProfile computeProfile = EQuantizedComputeProfile::UNDEFINED;
-   ELowPrecisionCarrier inputCarrier = ELowPrecisionCarrier::UNDEFINED;
-   ELowPrecisionCarrier weightCarrier = ELowPrecisionCarrier::UNDEFINED;
-   ELowPrecisionCarrier outputCarrier = ELowPrecisionCarrier::UNDEFINED;
-   ELowPrecisionAccumulation accumulation = ELowPrecisionAccumulation::UNDEFINED;
-   std::string capabilityTag;
-   std::string reason;   // NT spelling: cuBLASLt's A operand is the weight and B the activation, with m=N and
+   // The lowering plan the call is built from; set by the Make* builder and read at
+   // emission, both within one Generate call, so the reference cannot dangle.
+   const QuantizedLoweringPlan *plan = nullptr;
+   // NT spelling: cuBLASLt's A operand is the weight and B the activation, with m=N and
    // n=M, so the output is row-major [M, N]. TN passes them the other way.
    bool weightIsMatrixA = false;
    bool hasRelu = false;
-
 };
 
 inline QuantizedCudaLtFP8DenseLinearCall MakeQuantizedCudaLtFP8DenseLinearCall(
@@ -357,20 +321,7 @@ inline QuantizedCudaLtFP8DenseLinearCall MakeQuantizedCudaLtFP8DenseLinearCall(
    call.m = std::move(m);
    call.n = std::move(n);
    call.k = std::move(k);
-   call.shapePolicy = RequireQuantizedMatrixShapePolicy(plan, "cuBLASLt FP8 dense-linear call");
-   call.inputScale = plan.lowPrecisionInputScale;
-   call.weightScale = plan.lowPrecisionWeightScale;
-   call.outputScale = plan.lowPrecisionOutputScale;
-   call.hasOutputClamp = plan.lowPrecisionOutputClampEnabled;
-   call.outputClampLow = plan.lowPrecisionOutputClampLow;
-   call.outputClampHigh = plan.lowPrecisionOutputClampHigh;
-   call.computeProfile = plan.computeProfile;
-   call.inputCarrier = plan.inputLowPrecisionCarrier;
-   call.weightCarrier = plan.weightLowPrecisionCarrier;
-   call.outputCarrier = plan.outputLowPrecisionCarrier;
-   call.accumulation = plan.lowPrecisionAccumulation;
-   call.capabilityTag = plan.capabilityTag;
-   call.reason = plan.reason;
+   call.plan = &plan;
    return call;
 }
 
@@ -417,11 +368,14 @@ inline const char *QuantizedCudaFP8AccumulationName(ELowPrecisionAccumulation ac
 
 inline std::string GenerateQuantizedCudaLtFP8DenseLinearCall(const QuantizedCudaLtFP8DenseLinearCall &call)
 {
+   const QuantizedLoweringPlan &plan = *call.plan;
+   const auto &shapePolicy =
+      RequireQuantizedMatrixShapePolicy(plan, "cuBLASLt FP8 dense-linear call");
    if (call.outputTensor.empty() || call.inputTensor.empty() || call.weightStorageTensor.empty()) {
       throw std::runtime_error("SOFIE " + call.boundaryName + " is missing input/output/weight-storage tensors");
    }
-   if (call.computeProfile != EQuantizedComputeProfile::FP8E4M3DenseLinearRank2 &&
-       call.computeProfile != EQuantizedComputeProfile::FP8E5M2DenseLinearRank2) {
+   if (plan.computeProfile != EQuantizedComputeProfile::FP8E4M3DenseLinearRank2 &&
+       plan.computeProfile != EQuantizedComputeProfile::FP8E5M2DenseLinearRank2) {
       throw std::runtime_error("SOFIE " + call.boundaryName + " requires an FP8 dense-linear lowering plan");
    }
 
@@ -429,10 +383,10 @@ inline std::string GenerateQuantizedCudaLtFP8DenseLinearCall(const QuantizedCuda
    out << "\n//--------- " << call.boundaryName << "\n";
    out << "   // Low-precision GPU boundary: stream-ordered cuBLASLt FP8 dense-linear call selected by the lowering plan.\n";
    out << "   {\n";
-   out << "      // Low-precision lowering capability: " << call.capabilityTag << "\n";
-   out << "      // Low-precision lowering reason: " << call.reason << "\n";
+   out << "      // Low-precision lowering capability: " << plan.capabilityTag << "\n";
+   out << "      // Low-precision lowering reason: " << plan.reason << "\n";
    out << "      SOFIE::QuantizedFP8DenseLinearInvocation " << call.paramsName << "{};\n";
-   const bool paddedExecution = QuantizedShapePolicyUsesPadding(call.shapePolicy.policy);
+   const bool paddedExecution = QuantizedShapePolicyUsesPadding(shapePolicy.policy);
    if (paddedExecution && !call.weightIsMatrixA) {
       throw std::runtime_error("SOFIE " + call.boundaryName +
                                " pads the output leading dimension, which only the NT operand order supports");
@@ -440,7 +394,7 @@ inline std::string GenerateQuantizedCudaLtFP8DenseLinearCall(const QuantizedCuda
    // NT swaps the cuBLASLt operand roles: m/n are exchanged along with the A/B pointers, and
    // a padded call runs at the physical N while keeping the logical N to slice back with.
    out << "      " << call.paramsName << ".m = static_cast<std::size_t>("
-       << (paddedExecution ? std::to_string(call.shapePolicy.physicalN)
+       << (paddedExecution ? std::to_string(shapePolicy.physicalN)
                            : (call.weightIsMatrixA ? call.n : call.m))
        << ");\n";
    out << "      " << call.paramsName << ".n = static_cast<std::size_t>("
@@ -450,10 +404,10 @@ inline std::string GenerateQuantizedCudaLtFP8DenseLinearCall(const QuantizedCuda
       out << "      " << call.paramsName << ".paddedExecution = true;\n";
    }
    out << "      " << call.paramsName << ".k = static_cast<std::size_t>(" << call.k << ");\n";
-   if (call.shapePolicy.batchCount > 1) {
+   if (shapePolicy.batchCount > 1) {
       // Each slice is contiguous, so the stride is its element count. The A/B strides
       // follow the same operand swap the m/n above do.
-      const auto &shape = call.shapePolicy;
+      const auto &shape = shapePolicy;
       const auto inputStride = shape.logicalM * shape.logicalK;
       const auto weightStride = shape.logicalK * shape.logicalN;
       out << "      " << call.paramsName << ".batchCount = " << shape.batchCount << ";\n";
@@ -464,32 +418,32 @@ inline std::string GenerateQuantizedCudaLtFP8DenseLinearCall(const QuantizedCuda
       out << "      " << call.paramsName << ".batchStrideC = " << (shape.logicalM * shape.logicalN) << ";\n";
    }
    out << "      " << call.paramsName << ".inputFormat = SOFIE::EQuantizedFP8Format::"
-       << QuantizedCudaFP8FormatName(call.inputCarrier, call.boundaryName) << ";\n";
+       << QuantizedCudaFP8FormatName(plan.inputLowPrecisionCarrier, call.boundaryName) << ";\n";
    out << "      " << call.paramsName << ".weightFormat = SOFIE::EQuantizedFP8Format::"
-       << QuantizedCudaFP8FormatName(call.weightCarrier, call.boundaryName) << ";\n";
+       << QuantizedCudaFP8FormatName(plan.weightLowPrecisionCarrier, call.boundaryName) << ";\n";
    out << "      " << call.paramsName << ".outputCarrier = SOFIE::EQuantizedFP8OutputCarrier::"
-       << QuantizedCudaFP8OutputCarrierName(call.outputCarrier, call.boundaryName) << ";\n";
+       << QuantizedCudaFP8OutputCarrierName(plan.outputLowPrecisionCarrier, call.boundaryName) << ";\n";
    out << "      " << call.paramsName << ".accumulation = SOFIE::EQuantizedFP8Accumulation::"
-       << QuantizedCudaFP8AccumulationName(call.accumulation, call.boundaryName) << ";\n";
+       << QuantizedCudaFP8AccumulationName(plan.lowPrecisionAccumulation, call.boundaryName) << ";\n";
    out << "      " << call.paramsName << ".alpha = static_cast<float>("
        << std::setprecision(std::numeric_limits<float>::max_digits10) << call.alpha << ");\n";
    out << "      " << call.paramsName << ".beta = static_cast<float>("
        << std::setprecision(std::numeric_limits<float>::max_digits10) << call.beta << ");\n";
    // Left at their defaults when unit, so an uncalibrated call emits no scale at all.
-   if (call.inputScale != 1.0 || call.weightScale != 1.0) {
+   if (plan.lowPrecisionInputScale != 1.0 || plan.lowPrecisionWeightScale != 1.0) {
       out << std::setprecision(std::numeric_limits<float>::max_digits10);
-      out << "      " << call.paramsName << ".inputScale = static_cast<float>(" << call.inputScale << ");\n";
-      out << "      " << call.paramsName << ".weightScale = static_cast<float>(" << call.weightScale << ");\n";
+      out << "      " << call.paramsName << ".inputScale = static_cast<float>(" << plan.lowPrecisionInputScale << ");\n";
+      out << "      " << call.paramsName << ".weightScale = static_cast<float>(" << plan.lowPrecisionWeightScale << ");\n";
    }
-   if (call.outputScale != 1.0) {
+   if (plan.lowPrecisionOutputScale != 1.0) {
       out << std::setprecision(std::numeric_limits<float>::max_digits10);
-      out << "      " << call.paramsName << ".outputScale = static_cast<float>(" << call.outputScale << ");\n";
+      out << "      " << call.paramsName << ".outputScale = static_cast<float>(" << plan.lowPrecisionOutputScale << ");\n";
    }
-   if (call.hasOutputClamp) {
+   if (plan.lowPrecisionOutputClampEnabled) {
       out << std::setprecision(std::numeric_limits<float>::max_digits10);
       out << "      " << call.paramsName << ".hasOutputClamp = true;\n";
-      out << "      " << call.paramsName << ".outputClampLow = static_cast<float>(" << call.outputClampLow << ");\n";
-      out << "      " << call.paramsName << ".outputClampHigh = static_cast<float>(" << call.outputClampHigh << ");\n";
+      out << "      " << call.paramsName << ".outputClampLow = static_cast<float>(" << plan.lowPrecisionOutputClampLow << ");\n";
+      out << "      " << call.paramsName << ".outputClampHigh = static_cast<float>(" << plan.lowPrecisionOutputClampHigh << ");\n";
    }
    out << "      " << call.paramsName << ".hasBias = " << (call.hasBias ? "true" : "false") << ";\n";
    out << "      " << call.paramsName << ".hasRelu = " << (call.hasRelu ? "true" : "false") << ";\n";

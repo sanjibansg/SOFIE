@@ -1,4 +1,5 @@
 #include "SOFIE/RQuantization_Parameters.hxx"
+#include "SOFIE/RModel.hxx"
 
 #include <cmath>
 #include <stdexcept>
@@ -74,6 +75,46 @@ QuantizationInfo MakeValidatedQuantizationInfo(const QuantizationParameterSpec &
    info.axis = InferQuantizationParameterAxis(spec.tensorShape, parameterCount,
                                               spec.explicitAxis, spec.context);
    return info;
+}
+
+std::vector<std::int64_t> ReadTensorAsInt64Values(RModel &model, const std::string &tensorName,
+                                                  bool throwOnUnknownType)
+{
+   std::vector<std::int64_t> values;
+   auto appendValues = [&values](const auto &typedValues) {
+      values.reserve(typedValues.size());
+      for (auto value : typedValues)
+         values.push_back(static_cast<std::int64_t>(value));
+   };
+
+   switch (model.GetTensorType(tensorName)) {
+   case ETensorType::FLOAT: appendValues(model.GetTensorData<float>(tensorName)); break;
+   case ETensorType::DOUBLE: appendValues(model.GetTensorData<double>(tensorName)); break;
+   case ETensorType::INT8: appendValues(model.GetTensorData<std::int8_t>(tensorName)); break;
+   case ETensorType::UINT8: appendValues(model.GetTensorData<std::uint8_t>(tensorName)); break;
+   case ETensorType::INT16: appendValues(model.GetTensorData<std::int16_t>(tensorName)); break;
+   case ETensorType::UINT16: appendValues(model.GetTensorData<std::uint16_t>(tensorName)); break;
+   case ETensorType::INT32: appendValues(model.GetTensorData<std::int32_t>(tensorName)); break;
+   case ETensorType::UINT32: appendValues(model.GetTensorData<std::uint32_t>(tensorName)); break;
+   case ETensorType::INT64: appendValues(model.GetTensorData<std::int64_t>(tensorName)); break;
+   case ETensorType::UINT64: appendValues(model.GetTensorData<std::uint64_t>(tensorName)); break;
+   default:
+      if (throwOnUnknownType)
+         throw std::runtime_error("SOFIE quantized lowering expects numeric zero-point tensor [" + tensorName + "]");
+      break;
+   }
+   return values;
+}
+
+std::vector<double> ReadFloatOrDoubleValues(RModel &model, const std::string &tensorName)
+{
+   if (model.GetTensorType(tensorName) == ETensorType::FLOAT) {
+      const auto values = model.GetTensorData<float>(tensorName);
+      return {values.begin(), values.end()};
+   }
+   if (model.GetTensorType(tensorName) == ETensorType::DOUBLE)
+      return model.GetTensorData<double>(tensorName);
+   return {};
 }
 
 } // namespace SOFIE

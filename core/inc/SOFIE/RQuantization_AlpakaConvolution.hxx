@@ -53,8 +53,66 @@ inline void QuantizedConvCudaAffine_Call(
 #else
 
 namespace INTERNAL {
+
+// Maps one (output pixel, kernel tap) pair to its flat NCHW input element index; false when
+// the tap falls in the padding border. Shared by every Conv kernel's (kh, kw) walk.
+__device__ inline bool QuantizedConvCudaInputIndex(const QuantizedConvolutionInvocation &params,
+                                                   std::size_t batch, std::size_t inputChannel,
+                                                   std::size_t outputHeight, std::size_t outputWidth,
+                                                   std::size_t kh, std::size_t kw,
+                                                   std::size_t &inputIndex)
+{
+   const auto inputHeight = static_cast<std::int64_t>(
+      outputHeight * params.strideHeight + kh * params.dilationHeight) -
+      static_cast<std::int64_t>(params.padTop);
+   const auto inputWidth = static_cast<std::int64_t>(
+      outputWidth * params.strideWidth + kw * params.dilationWidth) -
+      static_cast<std::int64_t>(params.padLeft);
+   if (inputHeight < 0 || inputWidth < 0 ||
+       inputHeight >= static_cast<std::int64_t>(params.inputHeight) ||
+       inputWidth >= static_cast<std::int64_t>(params.inputWidth))
+      return false;
+   inputIndex = ((batch * params.inputChannels + inputChannel) * params.inputHeight +
+                 static_cast<std::size_t>(inputHeight)) * params.inputWidth +
+                static_cast<std::size_t>(inputWidth);
+   return true;
+}
+
+// Fetch policies for the shared im2col kernel. Int8 quantizes a float input carrier on the
+// fly and zero-fills partial-tile padding rows; FP8 copies E4M3 codes verbatim, never tiled.
+struct QuantizedConvCudaIm2ColInt8Fetch {
+   using Element = std::int8_t;
+   static constexpr bool kZeroFillPaddedRows = true;
+   const float *inputFloat = nullptr;
+   const std::int8_t *inputInt8 = nullptr;
+
+   __device__ Element Load(std::size_t source, const QuantizedConvolutionInvocation &params) const
+   {
+      const std::int32_t value = inputInt8 != nullptr
+                                    ? static_cast<std::int32_t>(inputInt8[source])
+                                    : QuantizedCudaQuantizeClamp(static_cast<double>(inputFloat[source]),
+                                                                 params.matrix.inputScale,
+                                                                 params.matrix.inputZeroPoint,
+                                                                 params.matrix.inputQMin,
+                                                                 params.matrix.inputQMax);
+      return static_cast<std::int8_t>(value);
+   }
+};
+
+struct QuantizedConvCudaIm2ColFP8Fetch {
+   using Element = std::uint8_t;
+   static constexpr bool kZeroFillPaddedRows = false;
+   const std::uint8_t *input = nullptr;
+
+   __device__ Element Load(std::size_t source, const QuantizedConvolutionInvocation &) const
+   {
+      return input[source];
+   }
+};
+
+template <typename FetchPolicy>
 __global__ void QuantizedConvCudaIm2ColKernel(
-   const float *inputFloat, const std::int8_t *inputInt8, std::int8_t *matrix,
+   FetchPolicy fetch, typename FetchPolicy::Element *matrix,
    std::size_t groupBegin, std::size_t groupCount, std::size_t rowBegin,
    std::size_t rowCount, QuantizedConvolutionInvocation params)
 {
@@ -68,11 +126,13 @@ __global__ void QuantizedConvCudaIm2ColKernel(
    const std::size_t groupIndex = index % groupElements;
    const std::size_t row = rowBegin + groupIndex / params.matrix.logicalK;
    const std::size_t patch = groupIndex % params.matrix.logicalK;
-   if (row >= params.matrix.logicalM) {
-      // Zero-fill the padding rows of a final partial tile so the GEMM never
-      // reads uninitialized staging; their results are not consumed.
-      matrix[index] = 0;
-      return;
+   if constexpr (FetchPolicy::kZeroFillPaddedRows) {
+      if (row >= params.matrix.logicalM) {
+         // Zero-fill the padding rows of a final partial tile so the GEMM never
+         // reads uninitialized staging; their results are not consumed.
+         matrix[index] = 0;
+         return;
+      }
    }
    const std::size_t kernelIndex = patch % (params.kernelHeight * params.kernelWidth);
    const std::size_t inputChannelLocal = patch / (params.kernelHeight * params.kernelWidth);
@@ -83,29 +143,15 @@ __global__ void QuantizedConvCudaIm2ColKernel(
    const std::size_t outputIndex = row % outputSpatial;
    const std::size_t outputHeight = outputIndex / params.outputWidth;
    const std::size_t outputWidth = outputIndex % params.outputWidth;
-   const auto inputHeight = static_cast<std::int64_t>(outputHeight * params.strideHeight +
-      kernelHeight * params.dilationHeight) - static_cast<std::int64_t>(params.padTop);
-   const auto inputWidth = static_cast<std::int64_t>(outputWidth * params.strideWidth +
-      kernelWidth * params.dilationWidth) - static_cast<std::int64_t>(params.padLeft);
+   const std::size_t channelsPerGroup = params.inputChannels / params.groups;
+   const std::size_t inputChannel = group * channelsPerGroup + inputChannelLocal;
 
-   std::int32_t value = 0;
-   if (inputHeight >= 0 && inputWidth >= 0 &&
-       inputHeight < static_cast<std::int64_t>(params.inputHeight) &&
-       inputWidth < static_cast<std::int64_t>(params.inputWidth)) {
-      const std::size_t channelsPerGroup = params.inputChannels / params.groups;
-      const std::size_t inputChannel = group * channelsPerGroup + inputChannelLocal;
-      const std::size_t source = ((batch * params.inputChannels + inputChannel) * params.inputHeight +
-                                  static_cast<std::size_t>(inputHeight)) * params.inputWidth +
-                                 static_cast<std::size_t>(inputWidth);
-      value = inputInt8 != nullptr
-                 ? static_cast<std::int32_t>(inputInt8[source])
-                 : QuantizedCudaQuantizeClamp(static_cast<double>(inputFloat[source]),
-                                              params.matrix.inputScale,
-                                              params.matrix.inputZeroPoint,
-                                              params.matrix.inputQMin,
-                                              params.matrix.inputQMax);
-   }
-   matrix[index] = static_cast<std::int8_t>(value);
+   typename FetchPolicy::Element value{};
+   std::size_t source = 0;
+   if (QuantizedConvCudaInputIndex(params, batch, inputChannel, outputHeight, outputWidth,
+                                   kernelHeight, kernelWidth, source))
+      value = fetch.Load(source, params);
+   matrix[index] = value;
 }
 
 template <typename OutputT>
@@ -168,14 +214,9 @@ __global__ void QuantizedConvCudaQuantizedEpilogueKernel(
          params.matrix.beta * static_cast<double>(biasQuantized - params.matrix.biasZeroPoint) *
          biasScale / params.matrix.outputScale);
    }
-   int quantized = __float2int_rn(
-      __fmaf_rn(static_cast<float>(accumulator[accumulatorIndex]), scale, offset));
-   if constexpr (HasRelu) {
-      if (quantized < params.matrix.outputZeroPoint)
-         quantized = params.matrix.outputZeroPoint;
-   }
-   quantized = QuantizedCudaClamp(quantized, params.matrix.outputQMin,
-                                  params.matrix.outputQMax);
+   const std::int32_t quantized = QuantizedCudaFmaReluClampCode<HasRelu>(
+      static_cast<float>(accumulator[accumulatorIndex]), scale, offset,
+      params.matrix.outputZeroPoint, params.matrix.outputQMin, params.matrix.outputQMax);
 
    const std::size_t outputSpatial = params.outputHeight * params.outputWidth;
    const std::size_t batch = row / outputSpatial;
@@ -244,25 +285,8 @@ __global__ void QuantizedConvCudaFloatEpilogueKernel(
    const double weightScale = params.matrix.weightScaleMode == EQuantizedScaleMode::PerOutputChannel
       ? static_cast<double>(weightScaleVector[channel])
       : params.matrix.weightScale;
-   double real = params.matrix.alpha * static_cast<double>(accumulator[accumulatorIndex]) *
-                 params.matrix.inputScale * weightScale;
-   if (params.matrix.hasBias && bias != nullptr) {
-      const double biasScale = params.matrix.weightScaleMode == EQuantizedScaleMode::PerOutputChannel
-         ? params.matrix.inputScale * weightScale
-         : params.matrix.biasScale;
-      const auto biasQuantized = QuantizedCudaQuantizeClamp(
-         static_cast<double>(bias[channel]), biasScale,
-         params.matrix.biasZeroPoint, params.matrix.biasQMin,
-         params.matrix.biasQMax);
-      real += params.matrix.beta *
-              static_cast<double>(biasQuantized - params.matrix.biasZeroPoint) * biasScale;
-   }
-
-   auto outputQuantized = QuantizedCudaQuantizeClamp(
-      real, params.matrix.outputScale, params.matrix.outputZeroPoint,
-      params.matrix.outputQMin, params.matrix.outputQMax);
-   if (params.matrix.hasRelu && outputQuantized < params.matrix.outputZeroPoint)
-      outputQuantized = params.matrix.outputZeroPoint;
+   const auto outputQuantized = QuantizedCudaFakeQuantOutputCode(
+      accumulator[accumulatorIndex], bias, channel, weightScale, params.matrix);
    const float value = static_cast<float>(
       static_cast<double>(outputQuantized - params.matrix.outputZeroPoint) *
       params.matrix.outputScale);
@@ -322,21 +346,11 @@ __global__ void QuantizedConvCudaDepthwiseKernel(
    std::int64_t accumulator = 0;
    for (std::size_t kh = 0; kh < params.kernelHeight; ++kh) {
       for (std::size_t kw = 0; kw < params.kernelWidth; ++kw) {
-         const auto inputHeight = static_cast<std::int64_t>(
-            outputHeight * params.strideHeight + kh * params.dilationHeight) -
-            static_cast<std::int64_t>(params.padTop);
-         const auto inputWidth = static_cast<std::int64_t>(
-            outputWidth * params.strideWidth + kw * params.dilationWidth) -
-            static_cast<std::int64_t>(params.padLeft);
-         if (inputHeight < 0 || inputWidth < 0 ||
-             inputHeight >= static_cast<std::int64_t>(params.inputHeight) ||
-             inputWidth >= static_cast<std::int64_t>(params.inputWidth))
+         std::size_t inputIndex = 0;
+         if (!QuantizedConvCudaInputIndex(params, batch, inputChannel, outputHeight,
+                                          outputWidth, kh, kw, inputIndex))
             continue;
 
-         const std::size_t inputIndex =
-            ((batch * params.inputChannels + inputChannel) * params.inputHeight +
-             static_cast<std::size_t>(inputHeight)) * params.inputWidth +
-            static_cast<std::size_t>(inputWidth);
          const std::int32_t inputValue = inputInt8 != nullptr
             ? static_cast<std::int32_t>(inputInt8[inputIndex])
             : QuantizedCudaQuantizeClamp(static_cast<double>(inputFloat[inputIndex]),
@@ -402,21 +416,11 @@ __global__ void QuantizedConvCudaDepthwiseFP8Kernel(
    float accumulator = params.matrix.hasBias && bias != nullptr ? bias[outputChannel] : 0.0f;
    for (std::size_t kh = 0; kh < geometry.kernelHeight; ++kh) {
       for (std::size_t kw = 0; kw < geometry.kernelWidth; ++kw) {
-         const auto inputHeight = static_cast<std::int64_t>(
-            outputHeight * geometry.strideHeight + kh * geometry.dilationHeight) -
-            static_cast<std::int64_t>(geometry.padTop);
-         const auto inputWidth = static_cast<std::int64_t>(
-            outputWidth * geometry.strideWidth + kw * geometry.dilationWidth) -
-            static_cast<std::int64_t>(geometry.padLeft);
-         if (inputHeight < 0 || inputWidth < 0 ||
-             inputHeight >= static_cast<std::int64_t>(geometry.inputHeight) ||
-             inputWidth >= static_cast<std::int64_t>(geometry.inputWidth))
+         std::size_t inputIndex = 0;
+         if (!QuantizedConvCudaInputIndex(geometry, batch, inputChannel, outputHeight,
+                                          outputWidth, kh, kw, inputIndex))
             continue;
 
-         const std::size_t inputIndex =
-            ((batch * geometry.inputChannels + inputChannel) * geometry.inputHeight +
-             static_cast<std::size_t>(inputHeight)) * geometry.inputWidth +
-            static_cast<std::size_t>(inputWidth);
          const std::size_t kernelIndex = kh * geometry.kernelWidth + kw;
          const std::size_t weightIndex =
             (inputChannel * kernelSpatial + kernelIndex) * channelMultiplier + multiplier;
@@ -457,21 +461,11 @@ __global__ void QuantizedConvCudaAffineKernel(
       const std::size_t inputChannel = group * inputChannelsPerGroup + inputChannelLocal;
       for (std::size_t kh = 0; kh < params.kernelHeight; ++kh) {
          for (std::size_t kw = 0; kw < params.kernelWidth; ++kw) {
-            const auto inputHeight = static_cast<std::int64_t>(
-               outputHeight * params.strideHeight + kh * params.dilationHeight) -
-               static_cast<std::int64_t>(params.padTop);
-            const auto inputWidth = static_cast<std::int64_t>(
-               outputWidth * params.strideWidth + kw * params.dilationWidth) -
-               static_cast<std::int64_t>(params.padLeft);
-            if (inputHeight < 0 || inputWidth < 0 ||
-                inputHeight >= static_cast<std::int64_t>(params.inputHeight) ||
-                inputWidth >= static_cast<std::int64_t>(params.inputWidth))
+            std::size_t inputIndex = 0;
+            if (!QuantizedConvCudaInputIndex(params, batch, inputChannel, outputHeight,
+                                             outputWidth, kh, kw, inputIndex))
                continue;
 
-            const std::size_t inputIndex =
-               ((batch * params.inputChannels + inputChannel) * params.inputHeight +
-                static_cast<std::size_t>(inputHeight)) * params.inputWidth +
-               static_cast<std::size_t>(inputWidth);
             const std::int32_t inputValue = inputInt8 != nullptr
                ? static_cast<std::int32_t>(inputInt8[inputIndex])
                : inputUInt8 != nullptr
@@ -524,57 +518,6 @@ __global__ void QuantizedConvCudaAffineKernel(
       output[index] = static_cast<OutputT>(outputValue);
    }
 }
-__global__ void QuantizedConvCudaFP8Im2ColKernel(
-   const std::uint8_t *input, std::uint8_t *matrix,
-   std::size_t groupBegin, std::size_t groupCount,
-   QuantizedConvolutionInvocation params)
-{
-   const std::size_t groupElements = params.matrix.logicalM * params.matrix.logicalK;
-   const std::size_t elements = groupCount * groupElements;
-   const std::size_t index =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-   if (index >= elements)
-      return;
-   const std::size_t group = groupBegin + index / groupElements;
-   const std::size_t groupIndex = index % groupElements;
-   const std::size_t row = groupIndex / params.matrix.logicalK;
-   const std::size_t patch = groupIndex % params.matrix.logicalK;
-   const std::size_t kernelIndex =
-      patch % (params.kernelHeight * params.kernelWidth);
-   const std::size_t inputChannelLocal =
-      patch / (params.kernelHeight * params.kernelWidth);
-   const std::size_t kernelHeight = kernelIndex / params.kernelWidth;
-   const std::size_t kernelWidth = kernelIndex % params.kernelWidth;
-   const std::size_t outputSpatial = params.outputHeight * params.outputWidth;
-   const std::size_t batch = row / outputSpatial;
-   const std::size_t outputIndex = row % outputSpatial;
-   const std::size_t outputHeight = outputIndex / params.outputWidth;
-   const std::size_t outputWidth = outputIndex % params.outputWidth;
-   const auto inputHeight =
-      static_cast<std::int64_t>(outputHeight * params.strideHeight +
-                                kernelHeight * params.dilationHeight) -
-      static_cast<std::int64_t>(params.padTop);
-   const auto inputWidth =
-      static_cast<std::int64_t>(outputWidth * params.strideWidth +
-                                kernelWidth * params.dilationWidth) -
-      static_cast<std::int64_t>(params.padLeft);
-
-   std::uint8_t value = 0;
-   if (inputHeight >= 0 && inputWidth >= 0 &&
-       inputHeight < static_cast<std::int64_t>(params.inputHeight) &&
-       inputWidth < static_cast<std::int64_t>(params.inputWidth)) {
-      const std::size_t channelsPerGroup = params.inputChannels / params.groups;
-      const std::size_t inputChannel =
-         group * channelsPerGroup + inputChannelLocal;
-      const std::size_t source =
-         ((batch * params.inputChannels + inputChannel) * params.inputHeight +
-          static_cast<std::size_t>(inputHeight)) * params.inputWidth +
-         static_cast<std::size_t>(inputWidth);
-      value = input[source];
-   }
-   matrix[index] = value;
-}
-
 // Returns the current device's compute capability as major * 10 + minor, via the attribute
 // API; cudaGetDeviceProperties is too slow for the per-inference FP8 Conv path.
 inline int CurrentDeviceComputeCapability(const char *context)
@@ -722,8 +665,8 @@ inline void QuantizedConvCudaLt_Call(
                static_cast<int>((stagingElements + threads - 1) / threads);
             INTERNAL::QuantizedConvCudaIm2ColKernel
                <<<stagingBlocks, threads, 0, state.fTileStagingStream>>>(
-                  inputFloat, inputInt8, staging, 0, params.groups, rowBegin,
-                  tileRows, effectiveParams);
+                  INTERNAL::QuantizedConvCudaIm2ColInt8Fetch{inputFloat, inputInt8},
+                  staging, 0, params.groups, rowBegin, tileRows, effectiveParams);
             INTERNAL::CheckCudaStatus(cudaGetLastError(),
                                       "tiled QuantizedConvCudaIm2ColKernel launch");
             INTERNAL::CheckCudaStatus(
@@ -773,8 +716,8 @@ inline void QuantizedConvCudaLt_Call(
             matrixParams.logicalM * matrixParams.logicalK;
          const int inputBlocks = static_cast<int>((inputElements + threads - 1) / threads);
          INTERNAL::QuantizedConvCudaIm2ColKernel<<<inputBlocks, threads, 0, stream>>>(
-            inputFloat, inputInt8, matrixInput, 0, params.groups, 0,
-            matrixParams.logicalM, effectiveParams);
+            INTERNAL::QuantizedConvCudaIm2ColInt8Fetch{inputFloat, inputInt8}, matrixInput,
+            0, params.groups, 0, matrixParams.logicalM, effectiveParams);
          INTERNAL::CheckCudaStatus(cudaGetLastError(),
                                    "batched QuantizedConvCudaIm2ColKernel launch");
          state.Execute(state.AccumulatorBuffer(), matrixInput,
@@ -815,8 +758,8 @@ inline void QuantizedConvCudaLt_Call(
    const std::size_t weightGroupStride = matrixParams.n * matrixParams.k;
    for (std::size_t group = 0; group < params.groups; ++group) {
       INTERNAL::QuantizedConvCudaIm2ColKernel<<<inputBlocks, threads, 0, stream>>>(
-         inputFloat, inputInt8, matrixInput, group, 1, 0, matrixParams.logicalM,
-         effectiveParams);
+         INTERNAL::QuantizedConvCudaIm2ColInt8Fetch{inputFloat, inputInt8}, matrixInput,
+         group, 1, 0, matrixParams.logicalM, effectiveParams);
       INTERNAL::CheckCudaStatus(cudaGetLastError(), "QuantizedConvCudaIm2ColKernel launch");
 
       const auto *groupWeight =
@@ -1027,11 +970,11 @@ inline void QuantizedConvCudaLtFP8_Call(
    const std::size_t inputElements = matrixParams.batchCount *
       matrixParams.m * matrixParams.k;
    const int inputBlocks = static_cast<int>((inputElements + threads - 1) / threads);
-   INTERNAL::QuantizedConvCudaFP8Im2ColKernel<<<inputBlocks, threads, 0, stream>>>(
-      static_cast<const std::uint8_t *>(input), matrixInput, 0,
-      matrixParams.batchCount, geometry);
+   INTERNAL::QuantizedConvCudaIm2ColKernel<<<inputBlocks, threads, 0, stream>>>(
+      INTERNAL::QuantizedConvCudaIm2ColFP8Fetch{static_cast<const std::uint8_t *>(input)},
+      matrixInput, 0, matrixParams.batchCount, 0, geometry.matrix.logicalM, geometry);
    INTERNAL::CheckCudaStatus(cudaGetLastError(),
-                             "batched QuantizedConvCudaFP8Im2ColKernel launch");
+                             "batched FP8 QuantizedConvCudaIm2ColKernel launch");
 
    state.Execute(matrixOutput, matrixInput, weight, matrixParams, stream);
    const std::size_t outputElements = matrixParams.batchCount *

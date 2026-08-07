@@ -961,9 +961,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       if (fLoweredConsumedOperatorIndices.count(id) != 0) continue;
       auto loweredIt = fLoweredOperators.find(id);
       ROperator *op = (loweredIt != fLoweredOperators.end()) ? loweredIt->second.get() : fOperators[id].get();
-      // Same as the kernel-struct loop above: fused activation ops must still
-      // declare their member variable (e.g. `leakyReluKernel`) even though
-      // their Generate_GPU_ALPAKA call is skipped in the infer-body loop.
+      // As in the kernel-struct loop above: fused activation ops must still declare their
+      // member variable even though their Generate_GPU_ALPAKA call is skipped.
 
       auto gIt = fOpToFusionGroupIdx.find(id);
       size_t gIdx = (gIt != fOpToFusionGroupIdx.end()) ? gIt->second : SIZE_MAX;
@@ -1010,14 +1009,17 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       if (planIt == backendPlans.end() || !IsOptimizedQuantizedAlpakaPlainDevicePlan(planIt->second))
          continue;
       std::string stateName;
-      if (FindQuantizedRegion<QuantizedGemmRegion>(fQuantizationState, opIndex)) {
-         stateName = QuantizedPlanUsesFP8DenseLinear(planIt->second)
-                       ? "quantizedGemmCudaLtFP8State_"
-                       : "quantizedGemmCudaLtState_";
-      } else if (FindQuantizedRegion<QuantizedMatMulRegion>(fQuantizationState, opIndex)) {
-         stateName = QuantizedPlanUsesFP8DenseLinear(planIt->second)
-                       ? "quantizedMatMulCudaLtFP8State_"
-                       : "quantizedMatMulCudaLtState_";
+      if (const auto *dense =
+             FindQuantizedRegion<QuantizedDenseLinearRegion>(fQuantizationState, opIndex)) {
+         if (dense->spelling == EQuantizedDenseLinearSpelling::Gemm) {
+            stateName = QuantizedPlanUsesFP8DenseLinear(planIt->second)
+                          ? "quantizedGemmCudaLtFP8State_"
+                          : "quantizedGemmCudaLtState_";
+         } else {
+            stateName = QuantizedPlanUsesFP8DenseLinear(planIt->second)
+                          ? "quantizedMatMulCudaLtFP8State_"
+                          : "quantizedMatMulCudaLtState_";
+         }
       }
       if (!stateName.empty()) {
          fGC += "      result.selectedWorkspaceBytes = std::max(result.selectedWorkspaceBytes, " +
@@ -1103,10 +1105,8 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
    if (!fIsSubGraph) {
       fGC.clear();
       GenerateHeaderInfo_GPU_ALPAKA(hgname);
-      // S57c. The absorption backlog, in the artifact rather than only in a trace flag, so
-      // it is visible to whoever reads the generated code and can be asserted on. Counts
-      // boundaries next to an operator that could have taken a carrier and did not; it does
-      // not count a Quantize on a LayerNorm's output, which is a separate lever.
+      // Counts boundaries next to an operator that could have taken a carrier and did not;
+      // emitted into the artifact so it can be read and asserted on.
       fGC += "// SOFIE carrier frontier: " + std::to_string(fCarrierFrontierViolations.size()) +
              " unabsorbed Quantize/Dequantize boundaries\n";
       for (const auto &violation : fCarrierFrontierViolations)

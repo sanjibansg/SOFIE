@@ -34,31 +34,6 @@ private:
    QuantizedLoweringPlan fPlan;
    QuantizedElementwiseCodegenContext fContext;
 
-   static std::string DoubleLiteral(double value)
-   {
-      std::ostringstream out;
-      out << std::setprecision(std::numeric_limits<double>::max_digits10) << value;
-      return out.str();
-   }
-
-   static std::string InputCarrierEnum(ETensorType type)
-   {
-      switch (type) {
-      case ETensorType::INT8: return "SOFIE::EQuantizedInputCarrier::Int8";
-      case ETensorType::UINT8: return "SOFIE::EQuantizedInputCarrier::UInt8";
-      default: return "SOFIE::EQuantizedInputCarrier::Float";
-      }
-   }
-
-   static std::string OutputCarrierEnum(ETensorType type)
-   {
-      switch (type) {
-      case ETensorType::INT8: return "SOFIE::EQuantizedOutputCarrier::Int8";
-      case ETensorType::UINT8: return "SOFIE::EQuantizedOutputCarrier::UInt8";
-      default: return "SOFIE::EQuantizedOutputCarrier::Float";
-      }
-   }
-
    // Right-aligns an operand shape against the output rank, padding leading axes
    // with 1 so the broadcast kernel indexes every operand with the output rank.
    std::vector<std::size_t> AlignedExtent(const std::vector<std::size_t> &shape,
@@ -125,23 +100,23 @@ public:
          out << "      " << params << ".lowPrecisionFP8 = true;\n";
          out << "      " << params << ".outputCarrier = SOFIE::EQuantizedOutputCarrier::Float;\n";
       } else {
-         const auto &inputQuant = *fRegion.inputQuant;
-         const auto &operandBQuant = *fRegion.operandBQuant;
+         const auto &inputQuant = *fRegion.inputLowPrecision->affineQuantization;
+         const auto &operandBQuant = *fRegion.operandBLowPrecision->affineQuantization;
          const auto &outputQuant = *fRegion.outputQuant;
          const auto outputRange = QuantizedIntegerRange(outputQuant);
-         out << "      " << params << ".inputScale = " << DoubleLiteral(inputQuant.scale) << ";\n";
-         out << "      " << params << ".operandBScale = " << DoubleLiteral(operandBQuant.scale) << ";\n";
-         out << "      " << params << ".outputScale = " << DoubleLiteral(outputQuant.scale) << ";\n";
+         out << "      " << params << ".inputScale = " << INTERNAL::QuantizedDoubleLiteral(inputQuant.scale) << ";\n";
+         out << "      " << params << ".operandBScale = " << INTERNAL::QuantizedDoubleLiteral(operandBQuant.scale) << ";\n";
+         out << "      " << params << ".outputScale = " << INTERNAL::QuantizedDoubleLiteral(outputQuant.scale) << ";\n";
          out << "      " << params << ".inputZeroPoint = " << inputQuant.zeroPoint << ";\n";
          out << "      " << params << ".operandBZeroPoint = " << operandBQuant.zeroPoint << ";\n";
          out << "      " << params << ".outputZeroPoint = " << outputQuant.zeroPoint << ";\n";
          out << "      " << params << ".outputQMin = " << outputRange.first << ";\n";
          out << "      " << params << ".outputQMax = " << outputRange.second << ";\n";
-         out << "      " << params << ".inputCarrier = " << InputCarrierEnum(fContext.inputSourceType) << ";\n";
-         out << "      " << params << ".operandBCarrier = " << InputCarrierEnum(fContext.operandBSourceType) << ";\n";
-         out << "      " << params << ".outputCarrier = " << OutputCarrierEnum(fContext.outputType) << ";\n";
+         out << "      " << params << ".inputCarrier = " << INTERNAL::QuantizedInputCarrierEnumName(fContext.inputSourceType) << ";\n";
+         out << "      " << params << ".operandBCarrier = " << INTERNAL::QuantizedInputCarrierEnumName(fContext.operandBSourceType) << ";\n";
+         out << "      " << params << ".outputCarrier = " << INTERNAL::QuantizedOutputCarrierEnumName(fContext.outputType) << ";\n";
       }
-      out << "      " << params << ".hasRelu = " << (fRegion.hasRelu ? "true" : "false") << ";\n";
+      out << "      " << params << ".hasRelu = false;\n";
       out << "      SOFIE::QuantizedElementwise_Call(alpaka::getNativeHandle(queue), "
           << "alpaka::getPtrNative(deviceBuf_" << fRegion.outputTensor << "), "
           << "alpaka::getPtrNative(deviceBuf_" << fRegion.inputSourceTensor << "), "

@@ -10,6 +10,8 @@
 
 namespace SOFIE {
 
+class RModel;
+
 struct QuantizationParameterSpec {
    std::vector<double> scales;
    std::vector<std::int64_t> zeroPoints;
@@ -34,6 +36,15 @@ int InferQuantizationParameterAxis(const std::vector<std::size_t> &tensorShape,
                                    const std::string &context);
 
 QuantizationInfo MakeValidatedQuantizationInfo(const QuantizationParameterSpec &spec);
+
+// Reads an initialized numeric tensor's values widened to int64 (zero-point
+// tensors). An unknown element type either throws or yields an empty vector.
+std::vector<std::int64_t> ReadTensorAsInt64Values(RModel &model, const std::string &tensorName,
+                                                  bool throwOnUnknownType);
+
+// Reads an initialized float/double tensor's values as doubles (scale
+// tensors); any other element type yields an empty vector.
+std::vector<double> ReadFloatOrDoubleValues(RModel &model, const std::string &tensorName);
 
 } // namespace SOFIE
 

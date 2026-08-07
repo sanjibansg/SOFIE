@@ -70,13 +70,13 @@ std::vector<std::uint8_t> PackQuantizedGemmWeightsUInt8(const float *data,
                                                          const QuantizationInfo &info);
 
 MaterializedQuantizedTensor MaterializeQuantizedGemmWeight(
-   const QuantizedGemmRegion &region, const QuantizedLoweringPlan &plan,
+   const QuantizedDenseLinearRegion &region, const QuantizedLoweringPlan &plan,
    EQuantizedBackend backend, const float *sourceData,
    const std::vector<std::size_t> &sourceShape,
    const std::vector<float> &perChannelScales);
 
 MaterializedQuantizedTensor MaterializeQuantizedMatMulWeight(
-   const QuantizedMatMulRegion &region, const QuantizedLoweringPlan &plan,
+   const QuantizedDenseLinearRegion &region, const QuantizedLoweringPlan &plan,
    EQuantizedBackend backend, const float *sourceData,
    const std::vector<std::size_t> &sourceShape,
    const std::vector<float> &perChannelScales);
@@ -90,6 +90,20 @@ MaterializedQuantizedTensor MaterializeQuantizedConvWeight(
 
 class RModel;
 
+// Registers storage metadata for a carrier whose ONNX source initializer already
+// holds the carrier bytes in place (storage tensor == source tensor, plain layout).
+void RegisterInPlaceQuantizedCarrier(RModel &model, const std::string &logicalTensor,
+                                     const std::string &sourceTensor,
+                                     const QuantizationInfo &quantization,
+                                     const std::vector<std::size_t> &shape,
+                                     EQuantizedBackend backend);
+
+// Low-precision flavor: the shape and carrier info come from the model's
+// low-precision tensor registry.
+void RegisterInPlaceLowPrecisionCarrier(RModel &model, const std::string &logicalTensor,
+                                        const std::string &sourceTensor, EQuantizedLayout layout,
+                                        EQuantizedBackend backend);
+
 struct QuantizedStoragePassContext {
    RModel &model;
    QuantizationModelState &state;
@@ -98,6 +112,41 @@ struct QuantizedStoragePassContext {
    std::function<void(const std::string &, const std::string &, EQuantizedLayout)>
       registerLowPrecision;
 };
+
+// Shared scaffold for the per-family weight-materialization drivers: invokes the callback
+// once per typed region, in sorted operator order, whose plan owns a weight-storage tensor.
+template <class RegionT, class CallbackT>
+void ForEachMaterializableQuantizedPlan(QuantizedStoragePassContext &context, CallbackT &&callback)
+{
+   const auto &state = context.state;
+   const auto backend = context.backend;
+   for (auto opIndex : SortedQuantizedRegionOperatorIndices(state.regions)) {
+      const auto *region = FindQuantizedRegion<RegionT>(state, opIndex);
+      if (region == nullptr)
+         continue;
+      const auto *plan = FindQuantizedLoweringPlan(state, opIndex, backend);
+      if (plan == nullptr || !IsQuantizedLoweringAvailable(plan->status) ||
+          plan->weightStorageTensor.empty())
+         continue;
+      callback(region, plan);
+   }
+}
+
+// Variant-dispatching form used by the dense-linear driver, which handles the whole
+// region variant itself and additionally skips runtime-tensor weight storage.
+template <class CallbackT>
+void ForEachMaterializableQuantizedPlan(QuantizedStoragePassContext &context, CallbackT &&callback)
+{
+   const auto &state = context.state;
+   const auto backend = context.backend;
+   for (auto opIndex : SortedQuantizedRegionOperatorIndices(state.regions)) {
+      const auto *plan = FindQuantizedLoweringPlan(state, opIndex, backend);
+      if (plan == nullptr || !IsQuantizedLoweringAvailable(plan->status) ||
+          plan->weightStorageTensor.empty() || plan->weightStorageIsRuntimeTensor)
+         continue;
+      callback(state.regions.at(opIndex), plan);
+   }
+}
 
 } // namespace SOFIE
 

@@ -30,8 +30,7 @@ private:
    // pass 3. The absorbed operator's output tensor is written in place of fNY.
    std::string fFusedOutputTensor; // empty means write fNY as usual
    // Set means write a low-precision carrier rather than a float. Held as a QuantizationGrid
-   // rather than a QuantizationInfo so one encode serves int8 and FP8: the grid is the affine
-   // map plus which codes exist, which is the whole of what an encode needs.
+   // so one encode serves int8 and FP8: the affine map plus which codes exist.
    std::optional<QuantizationGrid> fOutputGrid;
    bool fQuantHasClip = false;
    double fQuantClipLow = 0.0;
@@ -52,13 +51,19 @@ public:
    // for the exponentials, so Y must keep the input's width.
    bool CanFuseClip() const { return SoftmaxUsesRegisterResidentRows(); }
    // A log-softmax output is not on the grid the boundary describes, so it cannot encode.
-   bool CanFuseQuantizedOutput() const override { return CanFuseClip() && !fLogSoftmax; }
-
-   // The general hook: encode onto `grid` with no clamp of our own. The five-argument
-   // overload below is the Softmax-and-Clip case, which additionally folds the Clip's bounds.
-   void FuseQuantizedOutput(const std::string &carrier, const QuantizationGrid &grid) override
+   bool CanFuseOutputOnGrid(EQuantizedOutputEmit mode) const override
    {
-      FuseQuantizedOutput(carrier, grid, false, 0.0, 0.0);
+      return mode == EQuantizedOutputEmit::Carrier && CanFuseClip() && !fLogSoftmax;
+   }
+
+   // The general hook: encode onto `grid` with no additional clamp. The five-argument
+   // FuseQuantizedOutput below is the Softmax-and-Clip case, which also folds the Clip's bounds.
+   void FuseOutputOnGrid(const std::string &output, const QuantizationGrid &grid,
+                         EQuantizedOutputEmit mode) override
+   {
+      if (mode != EQuantizedOutputEmit::Carrier)
+         return ROperator::FuseOutputOnGrid(output, grid, mode);
+      FuseQuantizedOutput(output, grid, false, 0.0, 0.0);
    }
 
    // Absorb a following Clip, writing its output tensor instead of fNY.
@@ -234,9 +239,8 @@ public:
       return out.str();
    }
 
-   // ---- GPU / Alpaka codegen -------------------------------------------------
-   // Two kernels selected by `inner`: one thread per row when inner > 1, one block per
-   // row when inner == 1. The block path reduces pairwise, so its sum order differs.
+   // GPU/Alpaka codegen: two kernels selected by `inner`, one thread per row when
+   // inner > 1 and one block per row when inner == 1; the block path reduces pairwise.
 private:
    // Threads per block for the contiguous path; a power of two for the tree reductions.
    static constexpr std::size_t kSoftmaxBlockThreads = 256;
@@ -384,9 +388,8 @@ public:
                      ExactDoubleLiteral(fQuantClipHigh) + ") : v);\n";
             }
             if (fOutputGrid && fOutputGrid->IsFloatingPoint()) {
-               // An FP8 grid has no zero point and its own saturation, so the encode is the
-               // scale division followed by the hardware convert -- exactly what
-               // ROperator_ONNXQuantizeLinear emits for a float8 boundary.
+               // An FP8 grid has no zero point and its own saturation: the encode is the scale
+               // division followed by the hardware convert, matching ROperator_ONNXQuantizeLinear.
                op += I4 + "auto q = SOFIE::EncodeFP8E4M3(static_cast<float>(static_cast<double>(v) / " +
                      ExactDoubleLiteral(fOutputGrid->scale) + "));\n";
                op += I4 + "Y[base + k] = static_cast<TOut>(q);\n";
@@ -492,8 +495,8 @@ public:
          out << SP << "auto const elementsPerGrid_" << fNY << " = Vec::all(Idx{" << numRows << "});\n";
          out << SP << "auto const workDiv_" << fNY << " = sofie_workdiv(elementsPerGrid_" << fNY << ");\n";
       }
-      // The fused form writes the Quantize's carrier; the float intermediate it used to
-      // write then has no reader and is never allocated.
+      // The fused form writes the Quantize's carrier; the bypassed float intermediate
+      // has no reader and is never allocated.
       const std::string outBuf = fFusedOutputTensor.empty() ? fNY : fFusedOutputTensor;
       out << SP << "auto task_" << opName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNY
           << ", softmaxKernel_" << opName << ", alpaka::getPtrNative(deviceBuf_" << fNX

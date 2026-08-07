@@ -88,6 +88,16 @@ enum class ELowPrecisionCarrierSupport {
    Arithmetic
 };
 
+// How a producer absorbs a downstream quantization boundary into its own store.
+enum class EQuantizedOutputEmit {
+   // Encode onto the grid and write the boundary's low-precision code tensor: changes the
+   // tensor's type, so it needs the reader's agreement via the handoff plumbing.
+   Carrier,
+   // Apply the grid's snap, an encode followed by a decode, and write a float the
+   // consumer cannot tell apart: no carrier, no type change, no consumer agreement.
+   Snap
+};
+
 class ROperator{
 
 
@@ -143,27 +153,21 @@ public:
    // rather than its own buffer, so the pooled carrier arena can extend the source's lifetime.
    virtual bool CarrierOutputAliasesInput() const { return false; }
 
-   // Whether this operator can encode its result onto a grid, writing a low-precision carrier
-   // instead of a float. Independent of CarrierSupport: RequiresFloat may still encode outbound.
-   virtual bool CanFuseQuantizedOutput() const { return false; }
+   // Whether this operator can absorb a boundary on its output in the given mode. Independent
+   // of CarrierSupport: RequiresFloat may still encode outbound.
+   virtual bool CanFuseOutputOnGrid(EQuantizedOutputEmit /*mode*/) const { return false; }
 
-   // Redirects this operator to write `carrier`, encoded onto `grid`, in place of its usual
-   // float output. Only called when CanFuseQuantizedOutput() is true.
-   virtual void FuseQuantizedOutput(const std::string & /*carrier*/, const QuantizationGrid & /*grid*/)
+   // Redirects this operator to write `output` on `grid`, as a carrier code or a snapped
+   // float per `mode`, in place of its usual result. Only called when CanFuseOutputOnGrid.
+   virtual void FuseOutputOnGrid(const std::string & /*output*/, const QuantizationGrid & /*grid*/,
+                                 EQuantizedOutputEmit /*mode*/)
    {
       throw std::runtime_error(
          "SOFIE operator " + Name() +
-         " reports it can fuse a quantized output but does not implement FuseQuantizedOutput");
+         " reports it can fuse its output onto a grid but does not implement FuseOutputOnGrid");
    }
 
-   // Renames a planned carrier input from `from` to `to`; lowered regions that read a
-   // handoff tensor implement this. Returns whether a rename happened.
-   virtual bool RebindPlannedCarrierInput(const std::string & /*from*/, const std::string & /*to*/)
-   {
-      return false;
-   }
-
-   // The consumer-side twin of CanFuseQuantizedOutput: an operator that can decode a carrier
+   // The consumer-side twin of CanFuseOutputOnGrid: an operator that can decode a carrier
    // operand at the load declares it, and the dequantize feeding it stops emitting.
    virtual bool CanFuseDequantizedInput() const { return false; }
 
@@ -173,19 +177,6 @@ public:
                                      const QuantizationGrid & /*grid*/)
    {
       return false;
-   }
-
-   // A fused fake-quant boundary writes a FLOAT snapped onto the grid, not a code, so the
-   // fold needs no carrier, type change, or consumer agreement (unlike FuseQuantizedOutput).
-   virtual bool CanFuseFakeQuantOutput() const { return false; }
-
-   // Applies `grid`'s snap -- encode then decode -- to this operator's output on the way out,
-   // writing `output` in place of its usual result. Only called when CanFuseFakeQuantOutput().
-   virtual void FuseFakeQuantOutput(const std::string & /*output*/, const QuantizationGrid & /*grid*/)
-   {
-      throw std::runtime_error(
-         "SOFIE operator " + Name() +
-         " reports it can fuse a fake-quant output but does not implement FuseFakeQuantOutput");
    }
 
    // Value-preserving graph-analysis hook used by first-class quantization metadata.

@@ -118,7 +118,6 @@ void BuildElementwisePlans(QuantizationModelState &state, QuantizedElementwiseRe
    alpaka.computeProfile = EQuantizedComputeProfile::GenericRecognized;
    alpaka.consumedOperatorIndices = QuantizedRegionConsumedOperatorIndices(region);
    alpaka.suppressesGraphOperators = true;
-   alpaka.isMetadataOnly = false;
    alpaka.outputMode = outputIsInteger ? EQuantizedOutputMode::Quantized
                                        : EQuantizedOutputMode::ExactFakeQuantFloat;
 
@@ -151,13 +150,8 @@ void BuildElementwisePlans(QuantizationModelState &state, QuantizedElementwiseRe
       alpaka.weightLayout = EQuantizedLayout::Plain;
    }
 
-   QuantizedLoweringPlan cpu;
-   cpu.backend = EQuantizedBackend::CPU;
-   cpu.status = EQuantizedLoweringStatus::BackendUnsupported;
-   cpu.consumedOperatorIndices = alpaka.consumedOperatorIndices;
-   cpu.reason = region.reason + "; CPU elementwise " + opName + " lowering is not implemented";
-
-   plans[EQuantizedBackend::CPU] = std::move(cpu);
+   plans[EQuantizedBackend::CPU] = MakeCpuUnsupportedMirrorPlan(
+      alpaka, region.reason + "; CPU elementwise " + opName + " lowering is not implemented");
    plans[EQuantizedBackend::ALPAKA] = std::move(alpaka);
 }
 
@@ -168,30 +162,24 @@ void BuildElementwisePlans(QuantizationModelState &state, QuantizedElementwiseRe
 void MaterializeQuantizedElementwiseWeights(QuantizedStoragePassContext &context)
 {
    auto &model = context.model;
-   auto &state = context.state;
    const auto backend = context.backend;
 
-   for (auto opIndex : SortedQuantizedRegionOperatorIndices(state.regions)) {
-      const auto *region = FindQuantizedRegion<QuantizedElementwiseRegion>(state, opIndex);
-      if (region == nullptr || !region->operandBIsConstant)
-         continue;
-      const auto *plan = FindQuantizedLoweringPlan(state, opIndex, backend);
-      if (plan == nullptr || !IsQuantizedLoweringAvailable(plan->status) ||
-          plan->weightStorageTensor.empty())
-         continue;
+   ForEachMaterializableQuantizedPlan<QuantizedElementwiseRegion>(context, [&](
+      const QuantizedElementwiseRegion *region, const QuantizedLoweringPlan *plan) {
+      if (!region->operandBIsConstant)
+         return;
       if (!model.IsInitializedTensor(region->operandBSourceTensor))
          throw std::runtime_error("SOFIE quantized elementwise constant operand must be initialized");
 
       const auto shape = model.GetTensorShape(region->operandBSourceTensor);
-      if (region->operandBLowPrecision) {
+      if (IsNativeLowPrecisionOperand(region->operandBLowPrecision)) {
          context.registerLowPrecision(region->operandBTensor, region->operandBSourceTensor,
                                       plan->weightLayout);
-      } else if (region->operandBQuant) {
-         model.RegisterQuantizedTensorStorage(MakeQuantizedTensorStorage(
-            region->operandBTensor, region->operandBSourceTensor, region->operandBSourceTensor,
-            *region->operandBQuant, EQuantizedLayout::Plain, shape, backend));
+      } else if (IsAffineOperand(region->operandBLowPrecision)) {
+         RegisterInPlaceQuantizedCarrier(model, region->operandBTensor, region->operandBSourceTensor,
+                                         *region->operandBLowPrecision->affineQuantization, shape, backend);
       }
-   }
+   });
 }
 
 void DiscoverQuantizedElementwiseRegions(QuantizationPassContext &context)
@@ -248,10 +236,16 @@ void DiscoverQuantizedElementwiseRegions(QuantizationPassContext &context)
       region.operandBSourceTensor = operandB.sourceTensor;
       region.inputShape = operandA.shape;
       region.operandBShape = operandB.shape;
-      region.inputQuant = operandA.affine;
-      region.operandBQuant = operandB.affine;
-      region.inputLowPrecision = operandA.lowPrecision;
-      region.operandBLowPrecision = operandB.lowPrecision;
+      // Each operand resolved to exactly one contract; an affine grid maps into the merged
+      // slot through the factory, keeping the carrier the storage pass would derive.
+      region.inputLowPrecision =
+         operandA.affine
+            ? std::optional<LowPrecisionTensorInfo>(LowPrecisionTensorInfoFromAffineQuantization(*operandA.affine))
+            : operandA.lowPrecision;
+      region.operandBLowPrecision =
+         operandB.affine
+            ? std::optional<LowPrecisionTensorInfo>(LowPrecisionTensorInfoFromAffineQuantization(*operandB.affine))
+            : operandB.lowPrecision;
       if (operandA.quantOpIndex)
          region.inputQuantOpIndex = *operandA.quantOpIndex;
       if (operandB.quantOpIndex)
@@ -271,9 +265,6 @@ void DiscoverQuantizedElementwiseRegions(QuantizationPassContext &context)
          if (operandA.lowPrecision->carrier != ELowPrecisionCarrier::FP8E4M3 ||
              operandB.lowPrecision->carrier != ELowPrecisionCarrier::FP8E4M3)
             reasons.push_back("native FP8 elementwise requires E4M3 operand carriers");
-         region.outputLowPrecision =
-            LowPrecisionTensorInfoFromFP8Carrier(ELowPrecisionCarrier::Float32, elementwiseOutput,
-                                                 "FP8 elementwise FP32 semantic output");
          region.outputTensor = elementwiseOutput; // float semantic output, consumed downstream
       } else if (bothAffine) {
          if (region.kind == EQuantizedElementwiseKind::Mul &&
@@ -319,19 +310,11 @@ void DiscoverQuantizedElementwiseRegions(QuantizationPassContext &context)
       }
 
       if (!operandA.resolved || !operandB.resolved || !reasons.empty()) {
-         region.status = EQuantizedLoweringStatus::SemanticUnsupported;
-         region.reason = reasons.empty() ? "elementwise region is metadata-recognized but unsupported"
-                                         : JoinQuantizationReasons(reasons);
-         auto &plans = state.loweringPlans[opIndex];
-         plans[EQuantizedBackend::CPU] =
-            MakeUnsupportedQuantizedPlan(EQuantizedBackend::CPU, region.reason, false);
-         plans[EQuantizedBackend::ALPAKA] =
-            MakeUnsupportedQuantizedPlan(EQuantizedBackend::ALPAKA, region.reason, false);
-         StoreQuantizedRegion(state, std::move(region));
-         if (verbose > 0)
-            std::cout << "SOFIE quantized elementwise candidate at operator " << opIndex
-                      << " unsupported: " << FindQuantizedRegion<QuantizedElementwiseRegion>(state, opIndex)->reason
-                      << std::endl;
+         RejectUnsupportedQuantizedRegion(
+            state, opIndex, std::move(region),
+            reasons.empty() ? std::string("elementwise region is metadata-recognized but unsupported")
+                            : JoinQuantizationReasons(reasons),
+            "elementwise", verbose);
          continue;
       }
 

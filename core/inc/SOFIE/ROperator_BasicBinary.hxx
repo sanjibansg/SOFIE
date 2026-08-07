@@ -117,12 +117,18 @@ public:
 
    // Absorbs a downstream fake-quant boundary: the snap runs at this kernel's single store
    // and the boundary stops emitting. A constant-folded output emits no kernel, so it cannot.
-   bool CanFuseFakeQuantOutput() const override { return !fIsOutputConstant; }
+   bool CanFuseOutputOnGrid(EQuantizedOutputEmit mode) const override
+   {
+      return mode == EQuantizedOutputEmit::Snap && !fIsOutputConstant;
+   }
 
    // Adopts the boundary's output tensor; the previous output is left for dead-code
    // elimination.
-   void FuseFakeQuantOutput(const std::string &output, const QuantizationGrid &grid) override
+   void FuseOutputOnGrid(const std::string &output, const QuantizationGrid &grid,
+                         EQuantizedOutputEmit mode) override
    {
+      if (mode != EQuantizedOutputEmit::Snap)
+         return ROperator::FuseOutputOnGrid(output, grid, mode);
       AdoptFusedOutputName(fNY, fOutputTensorNames, output, "BasicBinary");
       fFakeQuantGrid = grid;
    }

@@ -17,13 +17,6 @@
 namespace SOFIE {
 namespace INTERNAL {
 
-inline std::string QuantizedConvDoubleLiteral(double value)
-{
-   std::ostringstream out;
-   out << std::setprecision(std::numeric_limits<double>::max_digits10) << value;
-   return out.str();
-}
-
 inline std::string QuantizedConvDoubleVectorLiteral(const std::vector<double> &values)
 {
    std::ostringstream out;
@@ -31,7 +24,7 @@ inline std::string QuantizedConvDoubleVectorLiteral(const std::vector<double> &v
    for (std::size_t index = 0; index < values.size(); ++index) {
       if (index != 0)
          out << ", ";
-      out << QuantizedConvDoubleLiteral(values[index]);
+      out << QuantizedDoubleLiteral(values[index]);
    }
    out << "}";
    return out.str();
@@ -95,7 +88,7 @@ public:
           !IsQuantizedLoweringAvailable(fPlan.status) ||
           fPlan.capabilityTag != "portable_affine_conv_cpu")
          throw std::runtime_error("SOFIE ROperator_QuantizedConv requires an available portable CPU plan");
-      if (!fRegion.inputQuant || !fRegion.weightQuant)
+      if (!IsAffineOperand(fRegion.inputLowPrecision) || !IsAffineOperand(fRegion.weightLowPrecision))
          throw std::runtime_error("SOFIE ROperator_QuantizedConv requires affine input and weight contracts");
       if (fContext.inputShape.size() < 3 || fContext.inputShape.size() > 4 ||
           fContext.weightShape.size() != fContext.inputShape.size() ||
@@ -119,9 +112,9 @@ public:
       const auto kernelHeight = rank == 2 ? fContext.weightShape[2] : 1;
       const auto kernelWidth = fContext.weightShape[rank + 1];
       const auto patchElements = channelsPerGroup * kernelHeight * kernelWidth;
-      const auto inputRange = QuantizedIntegerRange(*fRegion.inputQuant);
-      const auto outputRange = fRegion.outputQuant
-                                  ? QuantizedIntegerRange(*fRegion.outputQuant)
+      const auto inputRange = QuantizedIntegerRange(*fRegion.inputLowPrecision->affineQuantization);
+      const auto outputRange = fRegion.outputLowPrecision
+                                  ? QuantizedIntegerRange(*fRegion.outputLowPrecision->affineQuantization)
                                   : std::pair<std::int64_t, std::int64_t>{0, 0};
 
       if (inputChannels != channelsPerGroup * fRegion.attributes.group)
@@ -176,8 +169,8 @@ public:
          out << SP << SP << SP << SP << SP << SP << SP << SP << SP
              << "std::int64_t qx = static_cast<std::int64_t>(std::nearbyint("
              << "static_cast<double>(tensor_" << fRegion.inputSourceTensor
-             << "[inputIndex]) / " << INTERNAL::QuantizedConvDoubleLiteral(fRegion.inputQuant->scale)
-             << " + " << fRegion.inputQuant->zeroPoint << "));\n";
+             << "[inputIndex]) / " << INTERNAL::QuantizedDoubleLiteral(fRegion.inputLowPrecision->affineQuantization->scale)
+             << " + " << fRegion.inputLowPrecision->affineQuantization->zeroPoint << "));\n";
          out << SP << SP << SP << SP << SP << SP << SP << SP << SP
              << "qx = std::clamp<std::int64_t>(qx, " << inputRange.first
              << ", " << inputRange.second << ");\n";
@@ -188,7 +181,7 @@ public:
       }
       out << SP << SP << SP << SP << SP << SP << SP << SP << SP
           << "quantizedConvPatch_" << opName << "[patchIndex] = static_cast<std::int32_t>(qx - "
-          << fRegion.inputQuant->zeroPoint << ");\n";
+          << fRegion.inputLowPrecision->affineQuantization->zeroPoint << ");\n";
       out << SP << SP << SP << SP << SP << SP << SP << SP << "}\n";
       out << SP << SP << SP << SP << SP << SP << SP << "}\n";
       out << SP << SP << SP << SP << SP << SP << "}\n";
@@ -216,7 +209,7 @@ public:
             out << SP << SP << SP << SP << SP << SP
                 << "accumulator = static_cast<std::int64_t>(std::nearbyint("
                 << "static_cast<double>(tensor_" << fRegion.biasSourceTensor
-                << "[oc]) / (" << INTERNAL::QuantizedConvDoubleLiteral(fRegion.inputQuant->scale)
+                << "[oc]) / (" << INTERNAL::QuantizedDoubleLiteral(fRegion.inputLowPrecision->affineQuantization->scale)
                 << " * weightScale)));\n";
          }
       }
@@ -233,18 +226,18 @@ public:
       out << SP << SP << SP << SP << SP << SP << "}\n";
       out << SP << SP << SP << SP << SP << SP << "double realValue = "
           << "static_cast<double>(accumulator) * "
-          << INTERNAL::QuantizedConvDoubleLiteral(fRegion.inputQuant->scale)
+          << INTERNAL::QuantizedDoubleLiteral(fRegion.inputLowPrecision->affineQuantization->scale)
           << " * weightScale;\n";
       if (QuantizedEpilogueHasRelu(fRegion.epilogueKind))
          out << SP << SP << SP << SP << SP << SP << "realValue = std::max(realValue, 0.0);\n";
       out << SP << SP << SP << SP << SP << SP << "const std::size_t outputIndex = "
           << "((batch * " << outputChannels << " + oc) * " << outputHeight
           << " + oh) * " << outputWidth << " + ow;\n";
-      if (fRegion.outputQuant) {
+      if (fRegion.outputLowPrecision) {
          out << SP << SP << SP << SP << SP << SP << "std::int64_t qy = "
              << "static_cast<std::int64_t>(std::nearbyint(realValue / "
-             << INTERNAL::QuantizedConvDoubleLiteral(fRegion.outputQuant->scale)
-             << " + " << fRegion.outputQuant->zeroPoint << "));\n";
+             << INTERNAL::QuantizedDoubleLiteral(fRegion.outputLowPrecision->affineQuantization->scale)
+             << " + " << fRegion.outputLowPrecision->affineQuantization->zeroPoint << "));\n";
          out << SP << SP << SP << SP << SP << SP << "qy = std::clamp<std::int64_t>(qy, "
              << outputRange.first << ", " << outputRange.second << ");\n";
          if (fPlan.outputMode == EQuantizedOutputMode::Quantized) {
@@ -254,8 +247,8 @@ public:
          } else {
             out << SP << SP << SP << SP << SP << SP << "tensor_" << fRegion.outputTensor
                 << "[outputIndex] = static_cast<float>((qy - "
-                << fRegion.outputQuant->zeroPoint << ") * "
-                << INTERNAL::QuantizedConvDoubleLiteral(fRegion.outputQuant->scale) << ");\n";
+                << fRegion.outputLowPrecision->affineQuantization->zeroPoint << ") * "
+                << INTERNAL::QuantizedDoubleLiteral(fRegion.outputLowPrecision->affineQuantization->scale) << ");\n";
          }
       } else {
          out << SP << SP << SP << SP << SP << SP << "tensor_" << fRegion.outputTensor
@@ -385,15 +378,15 @@ public:
          return out.str();
       }
 
-      if (!fRegion.inputQuant || !fRegion.weightQuant || !fRegion.outputQuant)
+      if (!IsAffineOperand(fRegion.inputLowPrecision) || !IsAffineOperand(fRegion.weightLowPrecision) || !IsAffineOperand(fRegion.outputLowPrecision))
          throw std::runtime_error("SOFIE INT8 Conv Alpaka launch requires affine input, weight, and output contracts");
 
       const bool depthwise =
          fRegion.attributes.kind == EQuantizedConvolutionKind::Depthwise;
       const bool directAffine = fPlan.capabilityTag == "alpaka_affine_conv_direct";
       const auto rank = fRegion.attributes.spatialRank;
-      const auto inputRange = QuantizedIntegerRange(*fRegion.inputQuant);
-      const auto outputRange = QuantizedIntegerRange(*fRegion.outputQuant);
+      const auto inputRange = QuantizedIntegerRange(*fRegion.inputLowPrecision->affineQuantization);
+      const auto outputRange = QuantizedIntegerRange(*fRegion.outputLowPrecision->affineQuantization);
       const auto biasRange = fRegion.biasQuant
                                 ? QuantizedIntegerRange(*fRegion.biasQuant)
                                 : std::pair<std::int64_t, std::int64_t>{0, 0};
@@ -453,16 +446,16 @@ public:
       out << "      " << params << ".matrix.k = " << matrixShape.physicalK << ";\n";
       out << "      " << params << ".matrix.paddedExecution = " << (padded ? "true" : "false") << ";\n";
       out << std::setprecision(std::numeric_limits<double>::max_digits10);
-      out << "      " << params << ".matrix.inputScale = " << fRegion.inputQuant->scale << ";\n";
-      out << "      " << params << ".matrix.weightScale = " << fRegion.weightQuant->scale << ";\n";
+      out << "      " << params << ".matrix.inputScale = " << fRegion.inputLowPrecision->affineQuantization->scale << ";\n";
+      out << "      " << params << ".matrix.weightScale = " << fRegion.weightLowPrecision->affineQuantization->scale << ";\n";
       out << "      " << params << ".matrix.biasScale = "
           << (fRegion.biasQuant ? fRegion.biasQuant->scale : 1.0) << ";\n";
-      out << "      " << params << ".matrix.outputScale = " << fRegion.outputQuant->scale << ";\n";
-      out << "      " << params << ".matrix.inputZeroPoint = " << fRegion.inputQuant->zeroPoint << ";\n";
-      out << "      " << params << ".matrix.weightZeroPoint = " << fRegion.weightQuant->zeroPoint << ";\n";
+      out << "      " << params << ".matrix.outputScale = " << fRegion.outputLowPrecision->affineQuantization->scale << ";\n";
+      out << "      " << params << ".matrix.inputZeroPoint = " << fRegion.inputLowPrecision->affineQuantization->zeroPoint << ";\n";
+      out << "      " << params << ".matrix.weightZeroPoint = " << fRegion.weightLowPrecision->affineQuantization->zeroPoint << ";\n";
       out << "      " << params << ".matrix.biasZeroPoint = "
           << (fRegion.biasQuant ? fRegion.biasQuant->zeroPoint : 0) << ";\n";
-      out << "      " << params << ".matrix.outputZeroPoint = " << fRegion.outputQuant->zeroPoint << ";\n";
+      out << "      " << params << ".matrix.outputZeroPoint = " << fRegion.outputLowPrecision->affineQuantization->zeroPoint << ";\n";
       out << "      " << params << ".matrix.inputQMin = " << inputRange.first << ";\n";
       out << "      " << params << ".matrix.inputQMax = " << inputRange.second << ";\n";
       out << "      " << params << ".matrix.biasQMin = " << biasRange.first << ";\n";

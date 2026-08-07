@@ -9,13 +9,8 @@
 
 namespace SOFIE {
 
-// S57c. One surviving Quantize/Dequantize kernel that no adjacent operator asked for.
-//
-// A boundary is *justified* when a neighbour on its float side reports RequiresFloat: the
-// value has to become real there, so encoding or decoding it is the model, not our overhead.
-// Every other surviving boundary is absorption we have not done, and this names the operator
-// that should have done it. The list is meant to be a burn-down, not an error log -- it
-// starts long, and the point is that it cannot silently grow.
+// One surviving Quantize/Dequantize kernel that no adjacent operator asked for. A boundary
+// is justified only when a float-side neighbour reports RequiresFloat; this names the rest.
 struct CarrierFrontierViolation {
    std::string boundaryOperator;   // "QuantizeLinear" / "DequantizeLinear"
    std::string boundaryTensor;     // the carrier it produces or consumes
@@ -48,6 +43,7 @@ private:
    std::unordered_map<std::string, TensorInfo> fIntermediateTensorInfos;
    std::unordered_map<std::string, DynamicTensorInfo> fDynamicTensorInfos;
    QuantizationModelState fQuantizationState; // quantization metadata, regions, storage, and backend lowering plans
+   QuantizationPipelineReport fQuantizationReport; // report of the last lowered-view build (transient)
    QuantizedMemoryDiagnostics fQuantizedMemoryDiagnostics; // transient generated-memory contract
    std::size_t fAlpakaIntermediateDeviceBytes = 0; // transient live intermediate allocation total
    std::unordered_map<std::string, std::pair<std::vector<Dim>, bool>> fShapeTensors; // constant tensors describing a shape
@@ -99,26 +95,31 @@ private:
    /// handled by the ONNX parser) into a single in-place kernel sequence.
    void FuseGemmActivations_GPU();
    void BuildLoweredOperatorView(EQuantizedBackend backend = EQuantizedBackend::CPU);
+   // True while an original operator is still emitted: neither consumed by a lowered
+   // region nor replaced by one. The lowered-view passes' shared aliveness test.
+   bool OriginalOperatorEmitted(std::size_t index) const;
+   // Consumers of every emitted reader: alive original operators plus lowered regions,
+   // which are emitted and read tensors even though they are not alive.
+   std::unordered_map<std::string, std::vector<std::size_t>> EmittedConsumersByTensor() const;
    void PrepareQuantizedTensorStorage(EQuantizedBackend backend);
    void AddQuantizedGeneratedHeaders(EQuantizedBackend backend = EQuantizedBackend::CPU);
    void AddLoweredQuantizedOperators(EQuantizedBackend backend = EQuantizedBackend::CPU);
    void SetKnownTensorType(const std::string &tensorName, ETensorType type);
-   // S57h canonicalization: collapses DequantizeLinear nodes that decode the same carrier on
-   // the same grid, which an exporter duplicates once per consumer.
+   // Collapses DequantizeLinear nodes that decode the same carrier on the same grid,
+   // which an exporter duplicates once per consumer.
    void DeduplicateCarrierDecodes(EQuantizedBackend backend = EQuantizedBackend::CPU);
-   // S57i-a canonicalization: drops a Clip that cannot clamp anything because the
-   // QuantizeLinear it feeds already saturates at the same bound.
+   // Drops a Clip that cannot clamp anything because the QuantizeLinear it feeds
+   // already saturates at the same bound.
    void DropNoOpClipsBeforeQuantize(EQuantizedBackend backend = EQuantizedBackend::CPU);
-   // S57c: records every surviving Q/DQ boundary that no adjacent operator asked for.
+   // Records every surviving Q/DQ boundary that no adjacent operator asked for.
    void CheckLowPrecisionCarrierFrontier();
-   // Moves a Reshape/Transpose run onto the quantized carrier and deletes the Dequantize/
-   // Quantize pair that bracketed it. Runs before the fusion below, which would otherwise
-   // collapse the carrier's producer into a float round trip.
+   // Moves a Reshape/Transpose run onto the quantized carrier, deleting the bracketing
+   // Dequantize/Quantize pair; runs before the fusion below, which would otherwise absorb it.
    void PropagateLowPrecisionThroughMovement(EQuantizedBackend backend = EQuantizedBackend::CPU);
    // Collapses each surviving Clip? -> Quantize -> Dequantize into one kernel. Runs last,
    // so it only sees boundaries no region absorbed.
    void FuseUnabsorbedFakeQuantBoundaries();
-   void FuseSoftmaxClipBoundaries();
+   void ApplyPlannedCarrierHandoffs();
    // Stops emitting operators whose outputs nobody reads. Not quantization specific.
    void EliminateDeadOperators();
    // Puts a batched MatMul's B operand in [.., N, K] by re-permuting the Transpose that
@@ -145,8 +146,8 @@ public:
 
    int Verbose() const { return fVerbose;}
 
-   // S57c. Surviving Q/DQ boundaries that no adjacent operator asked for -- the absorption
-   // backlog, populated by the last stage of BuildLoweredOperatorView.
+   // Surviving Q/DQ boundaries that no adjacent operator asked for; populated by the
+   // last stage of BuildLoweredOperatorView.
    const std::vector<CarrierFrontierViolation> &GetCarrierFrontierViolations() const
    {
       return fCarrierFrontierViolations;
@@ -171,6 +172,9 @@ public:
 
    void AnalyzeQuantizedRegions();
    const QuantizationModelState & GetQuantizationState() const { return fQuantizationState; }
+   // Report of the last BuildLoweredOperatorView run: per-pass event counts, the frontier
+   // classification, and one entry per planned region.
+   const QuantizationPipelineReport &GetQuantizationPipelineReport() const { return fQuantizationReport; }
 
    // Read-only view of the lowering decision, for diagnostics.
    void BuildLoweredOperatorViewForDiagnostics(EQuantizedBackend backend)

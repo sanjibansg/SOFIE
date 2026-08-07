@@ -199,45 +199,49 @@ QuantizedConvPatternMatch MatchQuantizedConvPattern(
 void CheckQuantizedConvQuantization(const QuantizedConvRegion &region,
                                     std::vector<std::string> &reasons)
 {
-   const bool affine = region.inputQuant.has_value() || region.weightQuant.has_value();
-   const bool nativeLowPrecision = region.inputLowPrecision.has_value() ||
-                                   region.weightLowPrecision.has_value();
+   const bool affine = IsAffineOperand(region.inputLowPrecision) ||
+                       IsAffineOperand(region.weightLowPrecision);
+   const bool nativeLowPrecision = IsNativeLowPrecisionOperand(region.inputLowPrecision) ||
+                                   IsNativeLowPrecisionOperand(region.weightLowPrecision);
    if (affine && nativeLowPrecision) {
       reasons.push_back("Conv mixes affine-integer and native low-precision operand contracts");
       return;
    }
 
    if (affine) {
-      if (!region.inputQuant)
+      if (!IsAffineOperand(region.inputLowPrecision))
          reasons.push_back("Conv input tensor has no affine quantization contract");
-      if (!region.weightQuant)
+      if (!IsAffineOperand(region.weightLowPrecision))
          reasons.push_back("Conv weight tensor has no affine quantization contract");
-      if (!region.inputQuant || !region.weightQuant)
+      if (!IsAffineOperand(region.inputLowPrecision) || !IsAffineOperand(region.weightLowPrecision))
          return;
 
-      CheckIntegerContract(*region.inputQuant, "Conv input", reasons);
-      CheckIntegerContract(*region.weightQuant, "Conv weight", reasons);
-      if (region.inputQuant->granularity != EQuantizationGranularity::PerTensor)
+      const auto &inputQuant = *region.inputLowPrecision->affineQuantization;
+      const auto &weightQuant = *region.weightLowPrecision->affineQuantization;
+      CheckIntegerContract(inputQuant, "Conv input", reasons);
+      CheckIntegerContract(weightQuant, "Conv weight", reasons);
+      if (inputQuant.granularity != EQuantizationGranularity::PerTensor)
          reasons.push_back("Conv activation quantization is not per-tensor");
-      if (region.weightQuant->granularity == EQuantizationGranularity::PerChannel) {
-         if (region.weightQuant->axis != 0)
+      if (weightQuant.granularity == EQuantizationGranularity::PerChannel) {
+         if (weightQuant.axis != 0)
             reasons.push_back("Conv per-channel weight quantization axis is not output-channel axis 0");
-      } else if (region.weightQuant->granularity != EQuantizationGranularity::PerTensor) {
+      } else if (weightQuant.granularity != EQuantizationGranularity::PerTensor) {
          reasons.push_back("Conv weight quantization is neither per-tensor nor per-output-channel");
       }
-      if (region.outputQuant) {
-         CheckIntegerContract(*region.outputQuant, "Conv output", reasons);
-         if (region.outputQuant->granularity != EQuantizationGranularity::PerTensor)
+      if (IsAffineOperand(region.outputLowPrecision)) {
+         const auto &outputQuant = *region.outputLowPrecision->affineQuantization;
+         CheckIntegerContract(outputQuant, "Conv output", reasons);
+         if (outputQuant.granularity != EQuantizationGranularity::PerTensor)
             reasons.push_back("Conv output quantization is not per-tensor");
       }
       if (region.biasQuant) {
          const auto &bias = *region.biasQuant;
          if (!bias.isSigned || bias.zeroPoint != 0)
             reasons.push_back("Conv bias quantization is not signed with zero point 0");
-         if (region.weightQuant->granularity == EQuantizationGranularity::PerTensor) {
+         if (weightQuant.granularity == EQuantizationGranularity::PerTensor) {
             if (bias.granularity != EQuantizationGranularity::PerTensor)
                reasons.push_back("Conv bias granularity does not match per-tensor weights");
-            const double expectedScale = region.inputQuant->scale * region.weightQuant->scale;
+            const double expectedScale = inputQuant.scale * weightQuant.scale;
             const double tolerance = std::max(std::abs(expectedScale) * 1e-6, 1e-12);
             if (std::abs(bias.scale - expectedScale) > tolerance)
                reasons.push_back("Conv bias scale does not equal input scale times weight scale");
@@ -256,8 +260,10 @@ void CheckQuantizedConvQuantization(const QuantizedConvRegion &region,
       if (!IsFP8Carrier(region.inputLowPrecision->carrier) ||
           !IsFP8Carrier(region.weightLowPrecision->carrier))
          reasons.push_back("native low-precision Conv operands are not FP8 carriers");
-      if (region.inputLowPrecision->accumulation != ELowPrecisionAccumulation::Float32 ||
-          region.weightLowPrecision->accumulation != ELowPrecisionAccumulation::Float32)
+      // Accumulation is derived from the carrier: affine-integer carriers accumulate in
+      // Int32, everything else in Float32.
+      if (IsAffineIntegerCarrier(region.inputLowPrecision->carrier) ||
+          IsAffineIntegerCarrier(region.weightLowPrecision->carrier))
          reasons.push_back("native FP8 Conv does not request FP32 accumulation");
       if (region.outputLowPrecision &&
           region.outputLowPrecision->carrier != ELowPrecisionCarrier::Float32)
@@ -367,10 +373,16 @@ void DiscoverQuantizedConvRegions(QuantizationPassContext &context)
                quantization = model.GetQuantizationInfo(tensor);
          };
 
+         std::optional<QuantizationInfo> inputQuant;
+         std::optional<QuantizationInfo> weightQuant;
          connectInputBoundary(region.inputTensor, "Conv input", region.inputQuantOpIndex,
-                              region.inputSourceTensor, region.inputQuant);
+                              region.inputSourceTensor, inputQuant);
          connectInputBoundary(region.weightTensor, "Conv weight", region.weightQuantOpIndex,
-                              region.weightSourceTensor, region.weightQuant);
+                              region.weightSourceTensor, weightQuant);
+         if (inputQuant)
+            region.inputLowPrecision = LowPrecisionTensorInfoFromAffineQuantization(*inputQuant);
+         if (weightQuant)
+            region.weightLowPrecision = LowPrecisionTensorInfoFromAffineQuantization(*weightQuant);
 
          if (!region.biasTensor.empty()) {
             if (model.HasQuantizationInfo(region.biasTensor)) {
@@ -381,8 +393,8 @@ void DiscoverQuantizedConvRegions(QuantizationPassContext &context)
                   region.biasQuantOpIndex = boundaryIndex;
             } else if (model.IsInitializedTensor(region.biasTensor)) {
                region.biasSourceTensor = region.biasTensor;
-               if (region.inputQuant && region.weightQuant)
-                  region.biasQuant = MakeAccumulatorBiasQuantization(*region.inputQuant, *region.weightQuant);
+               if (inputQuant && weightQuant)
+                  region.biasQuant = MakeAccumulatorBiasQuantization(*inputQuant, *weightQuant);
             } else {
                reasons.push_back("Conv bias is neither quantized nor an initialized float constant");
             }
@@ -397,7 +409,8 @@ void DiscoverQuantizedConvRegions(QuantizationPassContext &context)
                   region.outputQuantOpIndex = consumerIndex;
                   region.outputTensor = std::string(outputs.front());
                   if (model.HasQuantizationInfo(region.outputTensor))
-                     region.outputQuant = model.GetQuantizationInfo(region.outputTensor);
+                     region.outputLowPrecision = LowPrecisionTensorInfoFromAffineQuantization(
+                        model.GetQuantizationInfo(region.outputTensor));
                   else
                      reasons.push_back("Conv output quantization boundary produced no affine contract");
                } else {

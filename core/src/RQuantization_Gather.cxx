@@ -1,5 +1,6 @@
 #include "SOFIE/RQuantization_Gather.hxx"
 #include "SOFIE/RQuantization_Analysis.hxx"
+#include "SOFIE/RQuantization_Parameters.hxx"
 #include "SOFIE/RQuantization_Storage.hxx"
 #include "SOFIE/RModel.hxx"
 #include "SOFIE/ROperator_Gather.hxx"
@@ -37,20 +38,13 @@ bool PerChannelIsSymmetric(RModel &model, const QuantizationInfo &info)
    const auto &tensor = info.zeroPointTensor;
    if (tensor.empty() || !model.IsInitializedTensor(tensor))
       return info.zeroPoint == 0;
-   auto allZero = [](const auto &values) {
-      for (auto value : values)
-         if (value != 0)
-            return false;
-      return true;
-   };
-   switch (model.GetTensorType(tensor)) {
-   case ETensorType::INT8: return allZero(model.GetTensorData<std::int8_t>(tensor));
-   case ETensorType::UINT8: return allZero(model.GetTensorData<std::uint8_t>(tensor));
-   case ETensorType::INT32: return allZero(model.GetTensorData<std::int32_t>(tensor));
-   case ETensorType::INT64: return allZero(model.GetTensorData<std::int64_t>(tensor));
-   case ETensorType::FLOAT: return allZero(model.GetTensorData<float>(tensor));
-   default: return false;
-   }
+   const auto values = ReadTensorAsInt64Values(model, tensor, /*throwOnUnknownType=*/false);
+   if (values.empty())
+      return false;
+   for (auto value : values)
+      if (value != 0)
+         return false;
+   return true;
 }
 
 // Reads a per-channel symmetric scale vector as doubles (the initializer is
@@ -59,12 +53,7 @@ std::vector<double> ReadGatherChannelScales(RModel &model, const QuantizationInf
 {
    if (info.scaleTensor.empty() || !model.IsInitializedTensor(info.scaleTensor))
       return {};
-   if (model.GetTensorType(info.scaleTensor) == ETensorType::DOUBLE) {
-      const auto values = model.GetTensorData<double>(info.scaleTensor);
-      return std::vector<double>(values.begin(), values.end());
-   }
-   const auto values = model.GetTensorData<float>(info.scaleTensor);
-   return std::vector<double>(values.begin(), values.end());
+   return ReadFloatOrDoubleValues(model, info.scaleTensor);
 }
 
 // Quantizes a float gather table into its int8/uint8 carrier, plain row-major. Per-tensor
@@ -74,7 +63,7 @@ MaterializedQuantizedTensor MaterializeQuantizedGatherTable(
    EQuantizedBackend backend, const float *sourceData,
    const std::vector<std::size_t> &shape, const std::vector<double> &channelScales)
 {
-   const auto &tableQuant = *region.tableQuant;
+   const auto &tableQuant = *region.tableLowPrecision->affineQuantization;
    const auto count = QuantizedStorageElementCount(shape);
    const bool perChannel = tableQuant.granularity == EQuantizationGranularity::PerChannel;
    std::size_t inner = 1;
@@ -151,23 +140,24 @@ void DiscoverQuantizedGatherRegions(QuantizationPassContext &context)
       region.axis = gather->GetAxis();
       region.tableShape = model.GetTensorShape(tableTensor);
       region.indicesShape = model.GetTensorShape(indicesTensor);
-      region.outputShape = model.GetTensorShape(gatherOutput);
 
       // Resolve the quantized table carrier and its physical constant source.
       if (model.HasQuantizationInfo(tableTensor)) {
-         region.tableQuant = model.GetQuantizationInfo(tableTensor);
-         CheckQuantizationInfo(*region.tableQuant, "gather table", reasons);
-         if (region.tableQuant->granularity == EQuantizationGranularity::PerChannel) {
+         region.tableLowPrecision =
+            LowPrecisionTensorInfoFromAffineQuantization(model.GetQuantizationInfo(tableTensor));
+         const auto &tableQuant = *region.tableLowPrecision->affineQuantization;
+         CheckQuantizationInfo(tableQuant, "gather table", reasons);
+         if (tableQuant.granularity == EQuantizationGranularity::PerChannel) {
             // Per-channel supports any quantization axis as long as it is symmetric; the
             // runtime resolves the channel from the table's quantization-axis stride.
-            const auto quantAxis = region.tableQuant->axis;
+            const auto quantAxis = tableQuant.axis;
             if (quantAxis < 0 || static_cast<std::size_t>(quantAxis) >= region.tableShape.size())
                reasons.push_back("per-channel gather table quantization axis is out of range");
-            else if (!PerChannelIsSymmetric(model, *region.tableQuant))
+            else if (!PerChannelIsSymmetric(model, tableQuant))
                reasons.push_back("per-channel gather table must be symmetric (zero point 0)");
-            else if (region.tableQuant->scaleTensor.empty())
+            else if (tableQuant.scaleTensor.empty())
                reasons.push_back("per-channel gather table requires an initialized scale vector");
-         } else if (region.tableQuant->granularity != EQuantizationGranularity::PerTensor) {
+         } else if (tableQuant.granularity != EQuantizationGranularity::PerTensor) {
             reasons.push_back("gather table uses an unsupported quantization granularity");
          }
          std::vector<std::string> local;
@@ -206,24 +196,15 @@ void DiscoverQuantizedGatherRegions(QuantizationPassContext &context)
 
       auto &plans = state.loweringPlans[opIndex];
       if (!reasons.empty()) {
-         region.status = EQuantizedLoweringStatus::SemanticUnsupported;
-         region.reason = JoinQuantizationReasons(reasons);
-         plans[EQuantizedBackend::CPU] =
-            MakeUnsupportedQuantizedPlan(EQuantizedBackend::CPU, region.reason, false);
-         plans[EQuantizedBackend::ALPAKA] =
-            MakeUnsupportedQuantizedPlan(EQuantizedBackend::ALPAKA, region.reason, false);
-         StoreQuantizedRegion(state, std::move(region));
-         if (verbose > 0)
-            std::cout << "SOFIE quantized gather candidate at operator " << opIndex
-                      << " unsupported: "
-                      << FindQuantizedRegion<QuantizedGatherRegion>(state, opIndex)->reason << std::endl;
+         RejectUnsupportedQuantizedRegion(state, opIndex, std::move(region),
+                                          JoinQuantizationReasons(reasons), "gather", verbose);
          continue;
       }
 
       region.status = EQuantizedLoweringStatus::SemanticRecognized;
       region.reason = "recognized weight-only quantized Gather (embedding/head)";
 
-      const bool fp8 = region.tableLowPrecision.has_value();
+      const bool fp8 = IsNativeLowPrecisionOperand(region.tableLowPrecision);
       QuantizedLoweringPlan alpaka;
       alpaka.backend = EQuantizedBackend::ALPAKA;
       alpaka.status = EQuantizedLoweringStatus::Optimized;
@@ -231,7 +212,6 @@ void DiscoverQuantizedGatherRegions(QuantizationPassContext &context)
       alpaka.outputMode = EQuantizedOutputMode::ExactFakeQuantFloat;
       alpaka.consumedOperatorIndices = QuantizedRegionConsumedOperatorIndices(region);
       alpaka.suppressesGraphOperators = true;
-      alpaka.isMetadataOnly = false;
       alpaka.outputStorage = EQuantizedStorageType::FloatCarrier;
       alpaka.weightLayout = EQuantizedLayout::Plain;
       // The table is materialized into a dedicated weight-storage tensor read in its real
@@ -247,8 +227,9 @@ void DiscoverQuantizedGatherRegions(QuantizationPassContext &context)
          alpaka.lowPrecisionAccumulation = ELowPrecisionAccumulation::Float32;
          alpaka.capabilityTag = "cuda_fp8_gather_e4m3_f32";
       } else {
-         const auto storage = region.tableQuant->isSigned ? EQuantizedStorageType::Int8
-                                                          : EQuantizedStorageType::UInt8;
+         const auto &tableQuant = *region.tableLowPrecision->affineQuantization;
+         const auto storage = tableQuant.isSigned ? EQuantizedStorageType::Int8
+                                                  : EQuantizedStorageType::UInt8;
          // A float source (QONNX fake-quant) is quantized into the carrier; a
          // source already stored as int8/uint8 is used in place.
          const auto tableType = model.GetTensorType(region.tableSourceTensor);
@@ -260,20 +241,15 @@ void DiscoverQuantizedGatherRegions(QuantizationPassContext &context)
          alpaka.capabilityTag = "alpaka_int8_gather";
          // Per-channel tables read a symmetric scale vector at runtime; protect
          // it from pruning via the shared weight-scale contract.
-         if (region.tableQuant->granularity == EQuantizationGranularity::PerChannel) {
+         if (tableQuant.granularity == EQuantizationGranularity::PerChannel) {
             alpaka.weightScaleMode = EQuantizedParameterMode::PerOutputChannel;
-            alpaka.weightScaleTensor = region.tableQuant->scaleTensor;
+            alpaka.weightScaleTensor = tableQuant.scaleTensor;
          }
       }
       alpaka.reason = region.reason + "; " + alpaka.capabilityTag;
 
-      QuantizedLoweringPlan cpu;
-      cpu.backend = EQuantizedBackend::CPU;
-      cpu.status = EQuantizedLoweringStatus::BackendUnsupported;
-      cpu.consumedOperatorIndices = alpaka.consumedOperatorIndices;
-      cpu.reason = region.reason + "; CPU gather lowering is not implemented";
-
-      plans[EQuantizedBackend::CPU] = std::move(cpu);
+      plans[EQuantizedBackend::CPU] = MakeCpuUnsupportedMirrorPlan(
+         alpaka, region.reason + "; CPU gather lowering is not implemented");
       plans[EQuantizedBackend::ALPAKA] = std::move(alpaka);
       StoreQuantizedRegion(state, std::move(region));
       if (verbose > 0)
@@ -285,39 +261,32 @@ void DiscoverQuantizedGatherRegions(QuantizationPassContext &context)
 void MaterializeQuantizedGatherWeights(QuantizedStoragePassContext &context)
 {
    auto &model = context.model;
-   auto &state = context.state;
    const auto backend = context.backend;
 
-   for (auto opIndex : SortedQuantizedRegionOperatorIndices(state.regions)) {
-      const auto *region = FindQuantizedRegion<QuantizedGatherRegion>(state, opIndex);
-      if (region == nullptr)
-         continue;
-      const auto *plan = FindQuantizedLoweringPlan(state, opIndex, backend);
-      if (plan == nullptr || !IsQuantizedLoweringAvailable(plan->status) ||
-          plan->weightStorageTensor.empty())
-         continue;
+   ForEachMaterializableQuantizedPlan<QuantizedGatherRegion>(context, [&](
+      const QuantizedGatherRegion *region, const QuantizedLoweringPlan *plan) {
       if (!model.IsInitializedTensor(region->tableSourceTensor))
          throw std::runtime_error("SOFIE quantized gather table must be initialized");
 
       const auto shape = model.GetTensorShape(region->tableSourceTensor);
-      if (region->tableLowPrecision) {
+      if (IsNativeLowPrecisionOperand(region->tableLowPrecision)) {
          // Copy the fp8 table bytes into the dedicated weight-storage tensor so it
          // is externalized to the binary weight file instead of inlined in source.
          context.install(MaterializeLowPrecisionWeightBytes(
             region->tableTensor, region->tableSourceTensor, plan->weightStorageTensor,
             *region->tableLowPrecision, EQuantizedLayout::Plain, backend,
             model.GetInitializedTensorData(region->tableSourceTensor).get(), shape));
-      } else if (region->tableQuant) {
+      } else if (IsAffineOperand(region->tableLowPrecision)) {
+         const auto &tableQuant = *region->tableLowPrecision->affineQuantization;
          if (plan->weightStorageTensor == region->tableSourceTensor) {
             // Source already in the affine carrier: register storage metadata only.
-            model.RegisterQuantizedTensorStorage(MakeQuantizedTensorStorage(
-               region->tableTensor, region->tableSourceTensor, region->tableSourceTensor,
-               *region->tableQuant, EQuantizedLayout::Plain, shape, backend));
+            RegisterInPlaceQuantizedCarrier(model, region->tableTensor, region->tableSourceTensor,
+                                            tableQuant, shape, backend);
          } else {
             // Float source (QONNX fake-quant): quantize the table into its carrier.
             std::vector<double> channelScales;
-            if (region->tableQuant->granularity == EQuantizationGranularity::PerChannel)
-               channelScales = ReadGatherChannelScales(model, *region->tableQuant);
+            if (tableQuant.granularity == EQuantizationGranularity::PerChannel)
+               channelScales = ReadGatherChannelScales(model, tableQuant);
             context.install(MaterializeQuantizedGatherTable(
                *region, *plan, backend,
                static_cast<const float *>(
@@ -325,7 +294,7 @@ void MaterializeQuantizedGatherWeights(QuantizedStoragePassContext &context)
                shape, channelScales));
          }
       }
-   }
+   });
 }
 
 QuantizedGatherCodegenContext MakeQuantizedGatherCodegenContext(

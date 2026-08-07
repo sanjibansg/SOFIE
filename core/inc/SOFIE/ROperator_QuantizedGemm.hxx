@@ -59,7 +59,7 @@ inline void ValidateFP8GemmContext(const QuantizedGemmCodegenContext &context,
    }
 }
 
-inline bool HasQuantizedGemmBias(const QuantizedGemmRegion &region)
+inline bool HasQuantizedGemmBias(const QuantizedDenseLinearRegion &region)
 {
    return !region.biasSourceTensor.empty();
 }
@@ -67,7 +67,7 @@ inline bool HasQuantizedGemmBias(const QuantizedGemmRegion &region)
 } // namespace INTERNAL
 
 inline std::string GenerateFusedQuantizedGemmCallCPUCode(std::string opName, const QuantizedGemmCodegenContext &context,
-                                                          const QuantizedGemmRegion &region,
+                                                          const QuantizedDenseLinearRegion &region,
                                                           const QuantizedLoweringPlan &plan)
 {
    opName = "op_" + opName;
@@ -209,7 +209,7 @@ inline std::string GenerateFusedQuantizedGemmCallCPUCode(std::string opName, con
 
 inline std::string GenerateFusedQuantizedGemmCublasLtCoreLaunch(std::string opName,
                                                                const QuantizedGemmCodegenContext &context,
-                                                               const QuantizedGemmRegion &region,
+                                                               const QuantizedDenseLinearRegion &region,
                                                                const QuantizedLoweringPlan &plan)
 {
    INTERNAL::ValidateQuantizedGemmContext(context, "fused Quantized Gemm cuBLASLt core launch");
@@ -243,7 +243,7 @@ inline std::string GenerateFusedQuantizedGemmCublasLtCoreLaunch(std::string opNa
 
 inline std::string GenerateFusedQuantizedGemmCublasLtFP8Launch(std::string opName,
                                                                const QuantizedGemmCodegenContext &context,
-                                                               const QuantizedGemmRegion &region,
+                                                               const QuantizedDenseLinearRegion &region,
                                                                const QuantizedLoweringPlan &plan)
 {
    INTERNAL::ValidateFP8GemmContext(context, "fused Quantized Gemm cuBLASLt FP8 launch");
@@ -283,69 +283,6 @@ inline std::string GenerateFusedQuantizedGemmCublasLtFP8Launch(std::string opNam
    call.hasRelu = context.activation == EActivationType::RELU;
    return INTERNAL::GenerateQuantizedCudaLtFP8DenseLinearCall(call);
 }
-
-class ROperator_QuantizedGemm final : public ROperator {
-private:
-   QuantizedGemmRegion fRegion;
-   QuantizedLoweringPlan fPlan;
-   QuantizedGemmCodegenContext fContext;
-
-public:
-   ROperator_QuantizedGemm(QuantizedGemmRegion region, QuantizedLoweringPlan plan,
-                           QuantizedGemmCodegenContext context)
-      : fRegion(std::move(region)), fPlan(std::move(plan)), fContext(std::move(context))
-   {
-      fKind = OperatorKind::QUANTIZED_GEMM;
-      fName = "QuantizedGemm";
-      fInputTensorNames = { fRegion.inputSourceTensor, fRegion.weightSourceTensor };
-      if (!fRegion.biasSourceTensor.empty()) {
-         fInputTensorNames.emplace_back(fRegion.biasSourceTensor);
-      }
-      fOutputTensorNames = { fRegion.outputTensor };
-   }
-
-   // The region reads its handoff tensor by this name everywhere -- the name list here and
-   // the invocation built at Generate time both derive from fRegion.inputSourceTensor.
-   bool RebindPlannedCarrierInput(const std::string &from, const std::string &to) override
-   {
-      return INTERNAL::RebindRegionCarrierInput(fRegion, fInputTensorNames, from, to);
-   }
-
-   std::vector<std::string> GetStdLibs() override { return { "cmath", "cstdint", "vector" }; }
-
-   void Initialize(RModel &) override {}
-
-   std::string Generate(std::string opName) override
-   {
-      if (fPlan.backend != EQuantizedBackend::CPU || !IsQuantizedLoweringAvailable(fPlan.status) ||
-          !fPlan.suppressesGraphOperators || !QuantizedPlanUsesPrequantizedWeights(fPlan) ||
-          fPlan.weightLayout != EQuantizedLayout::PackedCPU) {
-         throw std::runtime_error("SOFIE ROperator_QuantizedGemm CPU code generation requires an available packed-weight CPU lowering plan");
-      }
-      std::string code = "\n//--------- ROperator_QuantizedGemm synthetic fused CPU operator " + opName + "\n";
-      return code + GenerateFusedQuantizedGemmCallCPUCode(std::move(opName), fContext, fRegion, fPlan);
-   }
-
-   std::string Generate_GPU_Kernel_ALPAKA(std::string) override { return ""; }
-
-   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override
-   {
-      if (!IsOptimizedQuantizedAlpakaPlainDevicePlan(fPlan))
-         throw std::runtime_error("SOFIE ROperator_QuantizedGemm Alpaka code generation requires an optimized PlainDevice plan");
-      if (QuantizedPlanUsesFP8DenseLinear(fPlan))
-         return "   SOFIE::QuantizedGemmCudaLtFP8State quantizedGemmCudaLtFP8State_" + opName + "; // persistent cuBLASLt FP8 handle and algorithm state\n";
-      return "   SOFIE::QuantizedGemmCudaLtState quantizedGemmCudaLtState_" + opName + "; // persistent cuBLASLt handle and algorithm state\n";
-   }
-
-   std::string Generate_GPU_ALPAKA(std::string opName) override
-   {
-      if (!IsOptimizedQuantizedAlpakaPlainDevicePlan(fPlan))
-         throw std::runtime_error("SOFIE ROperator_QuantizedGemm Alpaka code generation requires an optimized PlainDevice plan");
-      if (QuantizedPlanUsesFP8DenseLinear(fPlan))
-         return GenerateFusedQuantizedGemmCublasLtFP8Launch(std::move(opName), fContext, fRegion, fPlan);
-      return GenerateFusedQuantizedGemmCublasLtCoreLaunch(std::move(opName), fContext, fRegion, fPlan);
-   }
-};
 
 } // namespace SOFIE
 

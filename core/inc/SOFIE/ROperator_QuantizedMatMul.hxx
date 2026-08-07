@@ -5,6 +5,7 @@
 #include "SOFIE/SOFIE_common.hxx"
 #include "SOFIE/RQuantization.hxx"
 #include "SOFIE/ROperator_QuantizedMatrix.hxx"
+#include "SOFIE/ROperator_QuantizedGemm.hxx"
 
 #include <cstdint>
 #include <stdexcept>
@@ -16,15 +17,21 @@ namespace SOFIE {
 
 namespace INTERNAL {
 
-inline void ValidateQuantizedMatMulContext(const QuantizedMatrixCodegenContext &context,
-                                           const QuantizedMatMulRegion &region,
-                                           const QuantizedLoweringPlan &plan,
-                                           const std::string &pathName)
+inline void ValidateQuantizedMatMulLaunchContext(const QuantizedMatrixCodegenContext &context,
+                                                 const std::string &pathName)
 {
    if (context.inputShape.empty() || context.weightShape.empty() || context.outputShape.empty()) {
       throw std::runtime_error("SOFIE " + pathName + " called before MatMul initialization");
    }
-   // TrueBatched is admitted here as well: the int8 call emits batchCount and the three
+}
+
+// Shared shape/batch/tensor checks of the int8 and FP8 MatMul launches; the
+// two paths differ only in their plan check and path string.
+inline void ValidateQuantizedMatMulShapeContract(const QuantizedDenseLinearRegion &region,
+                                                 const QuantizedLoweringPlan &plan,
+                                                 const std::string &pathName)
+{
+   // TrueBatched is admitted here as well: the call emits batchCount and the three
    // strides, and the runtime already programs strided-batched layouts.
    if (!QuantizedMatMulShapeIsRecognized(region.shape)) {
       throw std::runtime_error("SOFIE " + pathName + " requires a recognized MatMul shape");
@@ -42,6 +49,15 @@ inline void ValidateQuantizedMatMulContext(const QuantizedMatrixCodegenContext &
    if (region.inputSourceTensor.empty() || region.outputTensor.empty()) {
       throw std::runtime_error("SOFIE " + pathName + " is missing input/output tensors");
    }
+}
+
+inline void ValidateQuantizedMatMulContext(const QuantizedMatrixCodegenContext &context,
+                                           const QuantizedDenseLinearRegion &region,
+                                           const QuantizedLoweringPlan &plan,
+                                           const std::string &pathName)
+{
+   ValidateQuantizedMatMulLaunchContext(context, pathName);
+   ValidateQuantizedMatMulShapeContract(region, plan, pathName);
    ValidateQuantizedCudaLtMatrixPlan(plan, pathName);
 }
 
@@ -49,7 +65,7 @@ inline void ValidateQuantizedMatMulContext(const QuantizedMatrixCodegenContext &
 
 inline std::string GenerateFusedQuantizedMatMulCublasLtLaunch(std::string opName,
                                                               const QuantizedMatrixCodegenContext &context,
-                                                              const QuantizedMatMulRegion &region,
+                                                              const QuantizedDenseLinearRegion &region,
                                                               const QuantizedLoweringPlan &plan)
 {
    INTERNAL::ValidateQuantizedMatMulContext(context, region, plan, "fused Quantized MatMul cuBLASLt launch");
@@ -73,35 +89,19 @@ inline std::string GenerateFusedQuantizedMatMulCublasLtLaunch(std::string opName
 
 inline std::string GenerateFusedQuantizedMatMulCublasLtFP8Launch(std::string opName,
                                                                  const QuantizedMatrixCodegenContext &context,
-                                                                 const QuantizedMatMulRegion &region,
+                                                                 const QuantizedDenseLinearRegion &region,
                                                                  const QuantizedLoweringPlan &plan)
 {
-   if (context.inputShape.empty() || context.weightShape.empty() || context.outputShape.empty()) {
-      throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch called before MatMul initialization");
-   }
+   INTERNAL::ValidateQuantizedMatMulLaunchContext(context, "fused Quantized MatMul cuBLASLt FP8 launch");
    if (!IsOptimizedQuantizedAlpakaPlainDevicePlan(plan) || !QuantizedPlanUsesFP8DenseLinear(plan) ||
        plan.weightStorageTensor.empty()) {
       throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch requires an optimized Alpaka PlainDevice FP8 plan");
    }
-   // TrueBatched is admitted here as well: the call emits batchCount and the three strides,
-   // and the FP8 runtime already programs strided-batched layouts.
-   if (!QuantizedMatMulShapeIsRecognized(region.shape)) {
-      throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch requires a recognized MatMul shape");
-   }
+   INTERNAL::ValidateQuantizedMatMulShapeContract(region, plan,
+                                                  "fused Quantized MatMul cuBLASLt FP8 launch");
    const auto &matrixShape =
       RequireQuantizedMatrixShapePolicy(
          plan, "fused Quantized MatMul cuBLASLt FP8 launch");
-   if (matrixShape.logicalM != region.shape.logicalM ||
-       matrixShape.logicalK != region.shape.logicalK ||
-       matrixShape.logicalN != region.shape.logicalN) {
-      throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch lowering plan shape does not match the MatMul region shape");
-   }
-   if (matrixShape.batchCount != region.shape.batchCount) {
-      throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch lowering plan batch count does not match the MatMul region");
-   }
-   if (region.inputSourceTensor.empty() || region.outputTensor.empty()) {
-      throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch is missing input/output tensors");
-   }
    const bool fp8HasBias = QuantizedEpilogueHasBias(region.epilogue.kind);
    if (fp8HasBias && region.epilogue.biasSourceTensor.empty()) {
       throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch has a bias epilogue with no bias tensor");
@@ -124,40 +124,58 @@ inline std::string GenerateFusedQuantizedMatMulCublasLtFP8Launch(std::string opN
    return INTERNAL::GenerateQuantizedCudaLtFP8DenseLinearCall(call);
 }
 
-class ROperator_QuantizedMatMul final : public ROperator {
+// One lowered operator for both dense-linear spellings. Every per-spelling difference
+// (kind, display name, bias, stdlibs, CPU path, symbol prefixes) keys on fRegion.spelling.
+class ROperator_QuantizedDenseLinear final : public ROperator {
 private:
-   QuantizedMatMulRegion fRegion;
+   QuantizedDenseLinearRegion fRegion;
    QuantizedLoweringPlan fPlan;
-   QuantizedMatrixCodegenContext fContext;
+   // Superset context: the MatMul spelling reads only the QuantizedMatrixCodegenContext
+   // base slice and leaves the Gemm attributes at their defaults.
+   QuantizedGemmCodegenContext fContext;
+
+   bool IsMatMulSpelling() const { return fRegion.spelling == EQuantizedDenseLinearSpelling::MatMul; }
 
 public:
-   ROperator_QuantizedMatMul(QuantizedMatMulRegion region, QuantizedLoweringPlan plan,
-                             QuantizedMatrixCodegenContext context)
+   ROperator_QuantizedDenseLinear(QuantizedDenseLinearRegion region, QuantizedLoweringPlan plan,
+                                  QuantizedGemmCodegenContext context)
       : fRegion(std::move(region)), fPlan(std::move(plan)), fContext(std::move(context))
    {
-      fKind = OperatorKind::QUANTIZED_MATMUL;
-      fName = "QuantizedMatMul";
+      const bool isMatMul = IsMatMulSpelling();
+      fKind = isMatMul ? OperatorKind::QUANTIZED_MATMUL : OperatorKind::QUANTIZED_GEMM;
+      fName = isMatMul ? "QuantizedMatMul" : "QuantizedGemm";
       fInputTensorNames = { fRegion.inputSourceTensor, fRegion.weightSourceTensor };
-      if (QuantizedEpilogueHasBias(fRegion.epilogue.kind)) {
-         fInputTensorNames.emplace_back(fRegion.epilogue.biasSourceTensor);
+      if (isMatMul) {
+         if (QuantizedEpilogueHasBias(fRegion.epilogue.kind)) {
+            fInputTensorNames.emplace_back(fRegion.epilogue.biasSourceTensor);
+         }
+      } else if (!fRegion.biasSourceTensor.empty()) {
+         fInputTensorNames.emplace_back(fRegion.biasSourceTensor);
       }
       fOutputTensorNames = { fRegion.outputTensor };
    }
 
-   // The region reads its handoff tensor by this name everywhere -- the name list here and
-   // the invocation built at Generate time both derive from fRegion.inputSourceTensor.
-   bool RebindPlannedCarrierInput(const std::string &from, const std::string &to) override
+   std::vector<std::string> GetStdLibs() override
    {
-      return INTERNAL::RebindRegionCarrierInput(fRegion, fInputTensorNames, from, to);
+      if (IsMatMulSpelling())
+         return { "cstdint", "vector" };
+      return { "cmath", "cstdint", "vector" };
    }
-
-   std::vector<std::string> GetStdLibs() override { return { "cstdint", "vector" }; }
 
    void Initialize(RModel &) override {}
 
-   std::string Generate(std::string) override
+   std::string Generate(std::string opName) override
    {
-      throw std::runtime_error("SOFIE ROperator_QuantizedMatMul CPU code generation is not implemented");
+      if (IsMatMulSpelling()) {
+         throw std::runtime_error("SOFIE ROperator_QuantizedMatMul CPU code generation is not implemented");
+      }
+      if (fPlan.backend != EQuantizedBackend::CPU || !IsQuantizedLoweringAvailable(fPlan.status) ||
+          !fPlan.suppressesGraphOperators || !QuantizedPlanUsesPrequantizedWeights(fPlan) ||
+          fPlan.weightLayout != EQuantizedLayout::PackedCPU) {
+         throw std::runtime_error("SOFIE ROperator_QuantizedGemm CPU code generation requires an available packed-weight CPU lowering plan");
+      }
+      std::string code = "\n//--------- ROperator_QuantizedGemm synthetic fused CPU operator " + opName + "\n";
+      return code + GenerateFusedQuantizedGemmCallCPUCode(std::move(opName), fContext, fRegion, fPlan);
    }
 
    std::string Generate_GPU_Kernel_ALPAKA(std::string) override { return ""; }
@@ -165,18 +183,34 @@ public:
    std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override
    {
       if (!IsOptimizedQuantizedAlpakaPlainDevicePlan(fPlan)) {
-         throw std::runtime_error("SOFIE ROperator_QuantizedMatMul Alpaka code generation requires an optimized PlainDevice plan");
+         throw std::runtime_error(IsMatMulSpelling()
+            ? "SOFIE ROperator_QuantizedMatMul Alpaka code generation requires an optimized PlainDevice plan"
+            : "SOFIE ROperator_QuantizedGemm Alpaka code generation requires an optimized PlainDevice plan");
       }
-      if (QuantizedPlanUsesFP8DenseLinear(fPlan))
-         return "   SOFIE::QuantizedGemmCudaLtFP8State quantizedMatMulCudaLtFP8State_" + opName + "; // persistent cuBLASLt FP8 handle and algorithm state\n";
-      return "   SOFIE::QuantizedGemmCudaLtState quantizedMatMulCudaLtState_" + opName + "; // persistent cuBLASLt handle and algorithm state\n";
+      // The emitted state symbol prefix is per spelling and must survive verbatim.
+      const bool fp8 = QuantizedPlanUsesFP8DenseLinear(fPlan);
+      if (IsMatMulSpelling()) {
+         if (fp8)
+            return "   SOFIE::QuantizedGemmCudaLtFP8State quantizedMatMulCudaLtFP8State_" + opName + "; // persistent cuBLASLt FP8 handle and algorithm state\n";
+         return "   SOFIE::QuantizedGemmCudaLtState quantizedMatMulCudaLtState_" + opName + "; // persistent cuBLASLt handle and algorithm state\n";
+      }
+      if (fp8)
+         return "   SOFIE::QuantizedGemmCudaLtFP8State quantizedGemmCudaLtFP8State_" + opName + "; // persistent cuBLASLt FP8 handle and algorithm state\n";
+      return "   SOFIE::QuantizedGemmCudaLtState quantizedGemmCudaLtState_" + opName + "; // persistent cuBLASLt handle and algorithm state\n";
    }
 
    std::string Generate_GPU_ALPAKA(std::string opName) override
    {
+      if (IsMatMulSpelling()) {
+         if (QuantizedPlanUsesFP8DenseLinear(fPlan))
+            return GenerateFusedQuantizedMatMulCublasLtFP8Launch(std::move(opName), fContext, fRegion, fPlan);
+         return GenerateFusedQuantizedMatMulCublasLtLaunch(std::move(opName), fContext, fRegion, fPlan);
+      }
+      if (!IsOptimizedQuantizedAlpakaPlainDevicePlan(fPlan))
+         throw std::runtime_error("SOFIE ROperator_QuantizedGemm Alpaka code generation requires an optimized PlainDevice plan");
       if (QuantizedPlanUsesFP8DenseLinear(fPlan))
-         return GenerateFusedQuantizedMatMulCublasLtFP8Launch(std::move(opName), fContext, fRegion, fPlan);
-      return GenerateFusedQuantizedMatMulCublasLtLaunch(std::move(opName), fContext, fRegion, fPlan);
+         return GenerateFusedQuantizedGemmCublasLtFP8Launch(std::move(opName), fContext, fRegion, fPlan);
+      return GenerateFusedQuantizedGemmCublasLtCoreLaunch(std::move(opName), fContext, fRegion, fPlan);
    }
 };
 

@@ -1,5 +1,6 @@
 #include "SOFIE/RQuantization_Storage.hxx"
 #include "SOFIE/RQuantization_DenseLinear.hxx"
+#include "SOFIE/RModel.hxx"
 
 #include <cstring>
 #include <stdexcept>
@@ -256,7 +257,7 @@ std::vector<std::uint8_t> PackQuantizedGemmWeightsUInt8(const float *data, std::
 }
 
 MaterializedQuantizedTensor MaterializeQuantizedGemmWeight(
-   const QuantizedGemmRegion &region, const QuantizedLoweringPlan &plan,
+   const QuantizedDenseLinearRegion &region, const QuantizedLoweringPlan &plan,
    EQuantizedBackend backend, const float *sourceData,
    const std::vector<std::size_t> &sourceShape,
    const std::vector<float> &perChannelScales)
@@ -312,7 +313,7 @@ MaterializedQuantizedTensor MaterializeQuantizedGemmWeight(
 }
 
 MaterializedQuantizedTensor MaterializeQuantizedMatMulWeight(
-   const QuantizedMatMulRegion &region, const QuantizedLoweringPlan &plan,
+   const QuantizedDenseLinearRegion &region, const QuantizedLoweringPlan &plan,
    EQuantizedBackend backend, const float *sourceData,
    const std::vector<std::size_t> &sourceShape,
    const std::vector<float> &perChannelScales)
@@ -352,8 +353,9 @@ MaterializedQuantizedTensor MaterializeQuantizedConvWeight(
 {
    if (backend != EQuantizedBackend::CPU && backend != EQuantizedBackend::ALPAKA)
       throw std::runtime_error("SOFIE quantized Conv storage requires the CPU or Alpaka backend");
-   if (!region.weightQuant)
+   if (!IsAffineOperand(region.weightLowPrecision))
       throw std::runtime_error("SOFIE quantized Conv storage requires affine weight metadata");
+   const auto &weightQuant = *region.weightLowPrecision->affineQuantization;
    if (sourceShape.size() < 3 || sourceShape.size() > 4)
       throw std::runtime_error("SOFIE quantized Conv storage requires rank-3 or rank-4 weights");
    if (sourceData == nullptr)
@@ -362,14 +364,14 @@ MaterializedQuantizedTensor MaterializeQuantizedConvWeight(
    const auto count = QuantizedStorageElementCount(sourceShape);
    const auto outputChannels = sourceShape.front();
    const auto elementsPerOutputChannel = count / outputChannels;
-   const bool perChannel = region.weightQuant->granularity == EQuantizationGranularity::PerChannel;
+   const bool perChannel = weightQuant.granularity == EQuantizationGranularity::PerChannel;
    if (perChannel && perChannelScales.size() != outputChannels)
       throw std::runtime_error("SOFIE quantized Conv weight-scale count does not match output channels");
    if (perChannel && !perChannelZeroPoints.empty() && perChannelZeroPoints.size() != outputChannels)
       throw std::runtime_error("SOFIE quantized Conv weight zero-point count does not match output channels");
 
    auto channelInfo = [&](std::size_t outputChannel) {
-      auto info = *region.weightQuant;
+      auto info = weightQuant;
       if (perChannel) {
          info.scale = perChannelScales[outputChannel];
          if (!perChannelZeroPoints.empty())
@@ -387,7 +389,7 @@ MaterializedQuantizedTensor MaterializeQuantizedConvWeight(
          ? &RequireQuantizedMatrixShapePolicy(
               plan, "quantized Conv matrix weight materialization")
          : nullptr;
-   if (matrixStorage && (!region.weightQuant->isSigned ||
+   if (matrixStorage && (!weightQuant.isSigned ||
                          plan.weightLayout != EQuantizedLayout::PlainDevice ||
                          !QuantizedShapePolicyIsExecutable(matrixShape->policy)))
       throw std::runtime_error("SOFIE Alpaka Conv matrix storage requires an executable signed-INT8 PlainDevice plan");
@@ -402,7 +404,7 @@ MaterializedQuantizedTensor MaterializeQuantizedConvWeight(
       : sourceShape;
    result.storage = MakeQuantizedTensorStorage(
       region.weightTensor, region.weightSourceTensor, plan.weightStorageTensor,
-      *region.weightQuant,
+      weightQuant,
       backend == EQuantizedBackend::ALPAKA ? EQuantizedLayout::PlainDevice
                                            : EQuantizedLayout::Plain,
       storageShape, backend);
@@ -445,11 +447,32 @@ MaterializedQuantizedTensor MaterializeQuantizedConvWeight(
       return values;
    };
 
-   if (region.weightQuant->isSigned)
+   if (weightQuant.isSigned)
       SetMaterializedPayload(result, materialize(std::int8_t{}));
    else
       SetMaterializedPayload(result, materialize(std::uint8_t{}));
    return result;
+}
+
+void RegisterInPlaceQuantizedCarrier(RModel &model, const std::string &logicalTensor,
+                                     const std::string &sourceTensor,
+                                     const QuantizationInfo &quantization,
+                                     const std::vector<std::size_t> &shape,
+                                     EQuantizedBackend backend)
+{
+   model.RegisterQuantizedTensorStorage(MakeQuantizedTensorStorage(
+      logicalTensor, sourceTensor, sourceTensor, quantization, EQuantizedLayout::Plain,
+      shape, backend));
+}
+
+void RegisterInPlaceLowPrecisionCarrier(RModel &model, const std::string &logicalTensor,
+                                        const std::string &sourceTensor, EQuantizedLayout layout,
+                                        EQuantizedBackend backend)
+{
+   const auto shape = model.GetTensorShape(sourceTensor);
+   model.RegisterQuantizedTensorStorage(MakeLowPrecisionTensorStorage(
+      logicalTensor, sourceTensor, sourceTensor, model.GetLowPrecisionTensorInfo(sourceTensor),
+      layout, shape, backend));
 }
 
 } // namespace SOFIE

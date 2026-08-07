@@ -15,7 +15,6 @@ namespace SOFIE {
 
 struct QuantizedDenseLinearProfileAssessment {
    EQuantizedComputeProfile profile = EQuantizedComputeProfile::UNDEFINED;
-   bool cublasLtOptimizedCandidate = false;
    std::vector<std::string> reasons;
 };
 
@@ -91,7 +90,7 @@ constexpr std::size_t kCublasLtFP8LeadingDimensionBytes = 16;
 std::size_t PaddedFP8DenseLinearOutputN(std::size_t n, std::size_t outputElementBytes);
 QuantizedMatrixShapePolicy MakeFP8DenseLinearShapePolicy(std::size_t m, std::size_t k, std::size_t n,
                                                          std::size_t batchCount = 1, std::size_t physicalN = 0);
-QuantizedDenseLinearBackendCapability MakeNativeFP8E4M3TNF32Capability(std::size_t m, std::size_t n, std::size_t k);
+QuantizedDenseLinearBackendCapability MakeNativeFP8E4M3TNF32Capability();
 
 bool IsProfitableCublasLtPaddedDenseLinearPolicy(const QuantizedMatrixShapePolicy &policy);
 std::string ExplainCublasLtPaddedDenseLinearProfitability(const QuantizedMatrixShapePolicy &policy);
@@ -107,16 +106,12 @@ QuantizedDenseLinearBackendCapability AssessCublasLtDenseLinearCapability(
 QuantizedDenseLinearBackendCapability
 SelectExecutableDenseLinearCapability(QuantizedDenseLinearBackendCapability capability);
 
-QuantizedDenseLinearOperands MakeDenseLinearOperands(const QuantizedGemmRegion &region,
-                                                      const std::vector<std::size_t> &inputShape,
-                                                      const std::vector<std::size_t> &weightShape,
-                                                      const std::vector<std::size_t> &outputShape);
-QuantizedDenseLinearOperands MakeDenseLinearOperands(const QuantizedMatMulRegion &region,
+QuantizedDenseLinearOperands MakeDenseLinearOperands(const QuantizedDenseLinearRegion &region,
                                                       const std::vector<std::size_t> &inputShape,
                                                       const std::vector<std::size_t> &weightShape,
                                                       const std::vector<std::size_t> &outputShape);
 
-QuantizedLoweringPlan MakeUnsupportedQuantizedMatMulPlan(const QuantizedMatMulRegion &region,
+QuantizedLoweringPlan MakeUnsupportedQuantizedMatMulPlan(const QuantizedDenseLinearRegion &region,
                                                          EQuantizedBackend backend,
                                                          std::string reason,
                                                          bool preservesSemantics);
@@ -126,25 +121,23 @@ QuantizedLoweringPlan MakeUnsupportedLowPrecisionDenseLinearPlan(
    ELowPrecisionCarrier outputCarrier, ELowPrecisionAccumulation accumulation,
    EQuantizedComputeProfile profile, std::string capabilityTag);
 QuantizedLoweringPlan MakeMatMulAlpakaTransposedWeightStoragePlan(
-   const QuantizedMatMulRegion &region, const std::string &weightStorageTensor,
+   const QuantizedDenseLinearRegion &region, const std::string &weightStorageTensor,
    const QuantizedMatrixShapePolicy &shapePolicy, bool dequantizeFloatOutput = false,
    bool floatInputCarrier = false);
-QuantizedLoweringPlan MakeCPUPackedWeightBaselinePlan(const QuantizedGemmRegion &region,
+QuantizedLoweringPlan MakeCPUPackedWeightBaselinePlan(const QuantizedDenseLinearRegion &region,
                                                        const std::string &weightStorageTensor);
 QuantizedLoweringPlan MakeUnsupportedQuantizedGemmPlan(EQuantizedBackend backend,
                                                        std::string reason,
                                                        bool preservesSemantics);
 QuantizedLoweringPlan MakeAlpakaCublasLtCorePlan(
-   const QuantizedGemmRegion &region, const std::string &weightStorageTensor,
+   const QuantizedDenseLinearRegion &region, const std::string &weightStorageTensor,
    const QuantizedDenseLinearBackendCapability &capability, bool dequantizeFloatOutput = false,
    bool floatInputCarrier = false);
 
+// One FP8 plan builder for both spellings; the bias presence is the only
+// per-spelling read, keyed on region.spelling.
 QuantizedLoweringPlan MakeAlpakaCublasLtFP8Plan(
-   const QuantizedGemmRegion &region, const std::string &weightStorageTensor,
-   const QuantizedDenseLinearBackendCapability &capability,
-   const QuantizedMatrixShapePolicy &shapePolicy);
-QuantizedLoweringPlan MakeAlpakaCublasLtFP8Plan(
-   const QuantizedMatMulRegion &region, const std::string &weightStorageTensor,
+   const QuantizedDenseLinearRegion &region, const std::string &weightStorageTensor,
    const QuantizedDenseLinearBackendCapability &capability,
    const QuantizedMatrixShapePolicy &shapePolicy);
 
@@ -152,10 +145,7 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context);
 void MaterializeQuantizedDenseLinearWeights(QuantizedStoragePassContext &context);
 
 std::unique_ptr<ROperator> MakeLoweredQuantizedOperator(
-   RModel &model, const ROperator &source, const QuantizedGemmRegion &region,
-   const QuantizedLoweringPlan &plan);
-std::unique_ptr<ROperator> MakeLoweredQuantizedOperator(
-   RModel &model, const ROperator &source, const QuantizedMatMulRegion &region,
+   RModel &model, const ROperator &source, const QuantizedDenseLinearRegion &region,
    const QuantizedLoweringPlan &plan);
 
 void PopulateDenseLinearResourceRequirements(QuantizedLoweringPlan &plan, bool hasBias);

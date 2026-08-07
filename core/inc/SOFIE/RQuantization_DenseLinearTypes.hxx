@@ -28,9 +28,7 @@ inline QuantizedDenseLinearBackendCapability MakeFP8DenseLinearBackendUnsupporte
    QuantizedDenseLinearBackendCapability capability;
    capability.backend = backend;
    capability.executable = false;
-   capability.profile = weightCarrier == ELowPrecisionCarrier::FP8E5M2
-                           ? EQuantizedComputeProfile::FP8E5M2DenseLinearRank2
-                           : EQuantizedComputeProfile::FP8E4M3DenseLinearRank2;
+   capability.profile = EQuantizedComputeProfile::FP8E4M3DenseLinearRank2;
    capability.inputCarrier = inputCarrier;
    capability.weightCarrier = weightCarrier;
    capability.outputCarrier = outputCarrier;
@@ -55,8 +53,6 @@ struct QuantizedMatMulShapeAssessment {
    std::size_t logicalN = 0;
    std::size_t batchCount = 1;
    std::vector<std::size_t> batchShape;
-   std::vector<std::size_t> flattenedInputShape;
-   std::vector<std::size_t> flattenedOutputShape;
    std::string reason;
    std::vector<std::string> unsupportedReasons;
 };
@@ -66,17 +62,6 @@ inline bool QuantizedMatMulShapeIsRecognized(const QuantizedMatMulShapeAssessmen
    return assessment.kind == EQuantizedMatMulShapeKind::Rank2 ||
           assessment.kind == EQuantizedMatMulShapeKind::FlattenableProjection ||
           assessment.kind == EQuantizedMatMulShapeKind::TrueBatched;
-}
-
-inline bool QuantizedMatMulShapeIsRank2Executable(const QuantizedMatMulShapeAssessment &assessment)
-{
-   return assessment.kind == EQuantizedMatMulShapeKind::Rank2;
-}
-
-inline bool QuantizedMatMulShapeIsSingleGemmExecutable(const QuantizedMatMulShapeAssessment &assessment)
-{
-   return assessment.kind == EQuantizedMatMulShapeKind::Rank2 ||
-          assessment.kind == EQuantizedMatMulShapeKind::FlattenableProjection;
 }
 
 inline bool QuantizedPlanUsesFP8DenseLinear(const QuantizedLoweringPlan &plan)

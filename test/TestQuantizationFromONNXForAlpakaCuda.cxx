@@ -1,680 +1,45 @@
+// Per-operator-family tests: the convolution metadata/shape/validator matrix, the raw
+// Conv/Elementwise/Gather device kernels, frontend equivalence, and the elementwise and
+// gather metadata families. Also the umbrella translation unit: it #includes the section
+// files at the bottom, because the SOFIE Alpaka headers define external-linkage
+// __global__ kernels, so exactly one translation unit per binary may reach them.
+
 #include <algorithm>
 #include <cmath>
-#include <limits>
 #include <cstddef>
 #include <cstdint>
-#include <fstream>
-#include <iterator>
+#include <limits>
 #include <memory>
-#include <numeric>
-#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "SOFIE/RModel.hxx"
-#include "SOFIE/ROperator_Reshape.hxx"
-#include "SOFIE/ROperator_Softmax.hxx"
-#include "SOFIE/ROperator_Transpose.hxx"
 #include "SOFIE/ROperator_BasicBinary.hxx"
 #include "SOFIE/ROperator_Conv.hxx"
 #include "SOFIE/ROperator_Gather.hxx"
 #include "SOFIE/ROperator_ONNXQuantizeLinear.hxx"
 #include "SOFIE/ROperator_QONNXQuant.hxx"
 #include "SOFIE/ROperator_QuantizedConv.hxx"
-#include "SOFIE/ROperator_Gemm.hxx"
 #include "SOFIE/ROperator_Relu.hxx"
 #include "SOFIE/RQuantization_Convolution.hxx"
 #include "SOFIE/RQuantization_DenseLinear.hxx"
 #include "SOFIE/RQuantization_Storage.hxx"
-#include "SOFIE/RWeightFile.hxx"
 #include "SOFIE/SOFIE_QuantizedAlpaka.hxx"
 
-#include "QONNX_QuantGemm_Binary_FromONNX_GPU_ALPAKA.hxx"
-#include "QONNX_QuantGemm_NoBias_FromONNX_GPU_ALPAKA.hxx"
-#include "QONNX_QuantMatMul_FromONNX_GPU_ALPAKA.hxx"
-#include "QONNX_QuantMatMul_Padded_FromONNX_GPU_ALPAKA.hxx"
-#include "QONNX_QuantMatMul_Add_FromONNX_GPU_ALPAKA.hxx"
-#include "ONNX_QDQ_QuantGemm_FromONNX_GPU_ALPAKA.hxx"
-#include "ONNX_QDQ_QuantMatMul_FromONNX_GPU_ALPAKA.hxx"
-#include "ONNX_QDQ_QuantMatMul_Chain_FromONNX_GPU_ALPAKA.hxx"
-#include "ONNX_QDQ_QuantGemm_PerChannelWeight_FromONNX_GPU_ALPAKA.hxx"
-#include "ONNX_QDQ_QuantMatMul_PerChannelWeight_FromONNX_GPU_ALPAKA.hxx"
-#include "ONNX_QDQ_QuantMatMul_RankNProjection_FromONNX_GPU_ALPAKA.hxx"
-#include "FP8_MatMul_Add_FromONNX_GPU_ALPAKA.hxx"
-#include "FP8_QDQ_Scaled_FromONNX_GPU_ALPAKA.hxx"
-#include "FP8_QDQ_OddScale_FromONNX_GPU_ALPAKA.hxx"
-#include "FP8_BatchedMatMul_FromONNX_GPU_ALPAKA.hxx"
-#include "ONNX_QDQ_QuantMatMul_RankNProjection_Add_FromONNX_GPU_ALPAKA.hxx"
+#include "QuantizationAlpakaTestFixture.hxx"
+#include "QuantizationTestHelpers.hxx"
+
 #include "QONNX_QuantConv_FromONNX_GPU_ALPAKA.hxx"
 #include "ONNX_QDQ_QuantConv_FromONNX_GPU_ALPAKA.hxx"
-#include "QONNX_QuantMLP_FromONNX_GPU_ALPAKA.hxx"
-#include "ONNX_QDQ_QuantMLP_FromONNX_GPU_ALPAKA.hxx"
-#include "ONNX_QDQ_ReshapeGemm_FromONNX_GPU_ALPAKA.hxx"
-#include "ONNX_QDQ_ResidualAdd_FromONNX_GPU_ALPAKA.hxx"
-#include "ONNX_QDQ_BatchedMatMul_FromONNX_GPU_ALPAKA.hxx"
-#include "ONNX_QDQ_BatchedMatMul_NarrowClip_FromONNX_GPU_ALPAKA.hxx"
-#include "ONNX_QDQ_BatchedMatMul_TransposedOutput_FromONNX_GPU_ALPAKA.hxx"
-#include "ONNX_QDQ_CarrierHandoff_FromONNX_GPU_ALPAKA.hxx"
-#include "QDQ_MovementCarrier_FromONNX_GPU_ALPAKA.hxx"
-#include "QDQ_DuplicateDecode_FromONNX_GPU_ALPAKA.hxx"
 
 #include <alpaka/alpaka.hpp>
 #include <cuda_runtime.h>
-#ifdef SOFIE_USE_CUBLASLT
+
 #include <cuda_fp8.h>
-#endif
+
 #include "gtest/gtest.h"
 
-using Idx = std::size_t;
-using Dim = alpaka::DimInt<1>;
-using Ext1D = alpaka::Vec<Dim, Idx>;
-
-struct QuantizedLinearTest {
-   Idx m;
-   Idx k;
-   Idx n;
-   bool matMul;
-   bool hasBias;
-   bool perChannelWeight;
-};
-
-std::int8_t QuantizedLinearTestInputValue(Idx index)
-{
-   return static_cast<std::int8_t>(((index * 5 + index / 7) % 31) - 15);
-}
-
-std::int8_t QuantizedLinearTestWeightValue(Idx index, Idx n)
-{
-   return static_cast<std::int8_t>(((index * 3 + index / 11 + n) % 29) - 14);
-}
-
-std::vector<std::int8_t> MakeQuantizedLinearTestInput(const QuantizedLinearTest &test)
-{
-   std::vector<std::int8_t> input(test.m * test.k);
-   for (Idx i = 0; i < input.size(); ++i)
-      input[i] = QuantizedLinearTestInputValue(i);
-   return input;
-}
-
-std::vector<std::int8_t> MakeQuantizedLinearTestExpected(const QuantizedLinearTest &test,
-                                                         const std::vector<std::int8_t> &input)
-{
-   std::vector<std::int8_t> output(test.m * test.n);
-   constexpr int scaleNumerators[] = {3, 4, 5, 6};
-   for (Idx row = 0; row < test.m; ++row) {
-      for (Idx column = 0; column < test.n; ++column) {
-         std::int32_t accumulator = 0;
-         for (Idx inner = 0; inner < test.k; ++inner) {
-            const Idx weightIndex = test.matMul ? inner * test.n + column : column * test.k + inner;
-            accumulator += static_cast<std::int32_t>(input[row * test.k + inner]) *
-                           static_cast<std::int32_t>(QuantizedLinearTestWeightValue(weightIndex, test.n));
-         }
-         if (test.hasBias)
-            accumulator += static_cast<std::int32_t>((column * 3) % 17) - 8;
-         const int scaleNumerator = test.perChannelWeight ? scaleNumerators[column % 4] : 4;
-         const auto quantized = static_cast<long>(std::nearbyint(
-            static_cast<double>(accumulator) * static_cast<double>(scaleNumerator) / 128.0));
-         output[row * test.n + column] = static_cast<std::int8_t>(std::clamp(quantized, -128L, 127L));
-      }
-   }
-   return output;
-}
-
-class QuantizationAlpakaTest : public ::testing::Test {
-protected:
-    // Shared devices and platforms
-    alpaka::PlatformCpu hostPlatform;
-    alpaka::DevCpu host;
-    alpaka::PlatformCudaRt platform;
-    alpaka::DevCudaRt device;
-    alpaka::Queue<alpaka::DevCudaRt, alpaka::NonBlocking> queue;
-
-    template <typename TModel>
-    void ExpectQuantizedLinearInt8Output(TModel &model, const std::vector<std::int8_t> &expectedOutput,
-                                         auto &&...inputs)
-    {
-        const Idx outputSize = expectedOutput.size();
-        auto result_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(outputSize));
-        auto result = model.infer(std::forward<decltype(inputs)>(inputs)...);
-        alpaka::wait(queue);
-        cudaDeviceSynchronize();
-
-        alpaka::memcpy(queue, result_h, result);
-        alpaka::wait(queue);
-
-        const auto *res_ptr = reinterpret_cast<const std::int8_t *>(alpaka::getPtrNative(result_h));
-        for (Idx i = 0; i < outputSize; ++i) {
-            EXPECT_EQ(static_cast<int>(res_ptr[i]), static_cast<int>(expectedOutput[i])) << "i=" << i;
-        }
-    }
-
-    auto CopyQuantizedInputToDevice(const std::vector<std::int8_t> &input)
-    {
-        const Idx inputSize = input.size();
-        auto input_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(inputSize));
-        std::int8_t *input_ptr = reinterpret_cast<std::int8_t *>(alpaka::getPtrNative(input_h));
-        for (Idx i = 0; i < inputSize; ++i)
-            input_ptr[i] = input[i];
-
-        auto input_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(inputSize));
-        alpaka::memcpy(queue, input_d, input_h);
-        alpaka::wait(queue);
-        return input_d;
-    }
-
-    template <typename TModel>
-    void RunQuantizedLinearInt8(const char *weightFile, const QuantizedLinearTest &test)
-    {
-        const auto input = MakeQuantizedLinearTestInput(test);
-        const auto expectedOutput = MakeQuantizedLinearTestExpected(test, input);
-        auto input_d = CopyQuantizedInputToDevice(input);
-        TModel model(weightFile);
-        ExpectQuantizedLinearInt8Output(model, expectedOutput, input_d);
-    }
-
-
-    QuantizationAlpakaTest() 
-        : hostPlatform{}
-        , host(alpaka::getDevByIdx(hostPlatform, 0u))
-        , platform{}
-        , device(alpaka::getDevByIdx(platform, 0u))
-        , queue(device)
-    {
-    }
-
-    void SetUp() override {
-        cudaDeviceSynchronize();
-    }
-
-    void TearDown() override {
-        alpaka::wait(queue);
-        cudaDeviceSynchronize();
-    }
-
-    ~QuantizationAlpakaTest() override {
-        cudaDeviceSynchronize();
-    }
-};
-
-
-TEST_F(QuantizationAlpakaTest, DenseLinear)
-{
-   {
-      SCOPED_TRACE("QONNX biased Gemm");
-         // Biased Gemm: Yq = QY(SX * SW_j * sum_k Xq_ik * Wq_jk + SX * SW_j * Bq_j).
-         RunQuantizedLinearInt8<SOFIE_QONNX_QuantGemm::Session<alpaka::TagGpuCudaRt>>(
-            "QONNX_QuantGemm_Binary_FromONNX_GPU_ALPAKA.bin",
-            QuantizedLinearTest{512, 64, 32, false, true, true});
-   }
-   {
-      SCOPED_TRACE("QONNX and Q/DQ Gemm equivalence");
-         // QONNX Quant and standard Q/DQ encode the same no-bias Gemm semantics.
-         RunQuantizedLinearInt8<SOFIE_QONNX_QuantGemm_NoBias::Session<alpaka::TagGpuCudaRt>>(
-            "QONNX_QuantGemm_NoBias_FromONNX_GPU_ALPAKA.dat",
-            QuantizedLinearTest{256, 64, 64, false, false, false});
-         RunQuantizedLinearInt8<SOFIE_ONNX_QDQ_QuantGemm::Session<alpaka::TagGpuCudaRt>>(
-            "ONNX_QDQ_QuantGemm_FromONNX_GPU_ALPAKA.dat",
-            QuantizedLinearTest{256, 64, 64, false, false, false});
-   }
-   {
-      SCOPED_TRACE("Gemm and MatMul per-channel weights");
-         // Gemm uses output-channel axis 0; MatMul uses output-channel axis 1.
-         RunQuantizedLinearInt8<SOFIE_ONNX_QDQ_QuantGemm_PerChannelWeight::Session<alpaka::TagGpuCudaRt>>(
-            "ONNX_QDQ_QuantGemm_PerChannelWeight_FromONNX_GPU_ALPAKA.dat",
-            QuantizedLinearTest{256, 64, 64, false, false, true});
-         RunQuantizedLinearInt8<SOFIE_ONNX_QDQ_QuantMatMul_PerChannelWeight::Session<alpaka::TagGpuCudaRt>>(
-            "ONNX_QDQ_QuantMatMul_PerChannelWeight_FromONNX_GPU_ALPAKA.dat",
-            QuantizedLinearTest{256, 64, 64, true, false, true});
-   }
-   {
-      SCOPED_TRACE("QONNX, Q/DQ and rank-N MatMul");
-         // MatMul uses W as [K,N]: Yq = QY(SX * SW_j * sum_k Xq_ik * Wq_kj).
-         RunQuantizedLinearInt8<SOFIE_QONNX_QuantMatMul::Session<alpaka::TagGpuCudaRt>>(
-            "QONNX_QuantMatMul_FromONNX_GPU_ALPAKA.dat",
-            QuantizedLinearTest{512, 64, 32, true, false, true});
-
-         // Standard Q/DQ example currently uses the smaller shared 256x64 input.
-         RunQuantizedLinearInt8<SOFIE_ONNX_QDQ_QuantMatMul::Session<alpaka::TagGpuCudaRt>>(
-            "ONNX_QDQ_QuantMatMul_FromONNX_GPU_ALPAKA.dat",
-            QuantizedLinearTest{256, 64, 64, true, false, false});
-         RunQuantizedLinearInt8<SOFIE_ONNX_QDQ_QuantMatMul_RankNProjection::Session<alpaka::TagGpuCudaRt>>(
-            "ONNX_QDQ_QuantMatMul_RankNProjection_FromONNX_GPU_ALPAKA.dat",
-            QuantizedLinearTest{256, 64, 64, true, false, false});
-   }
-   {
-      SCOPED_TRACE("padded MatMul");
-         // Padded MatMul has logical M=511; the backend may pad physical storage but returns logical Y.
-         RunQuantizedLinearInt8<SOFIE_QONNX_QuantMatMul_Padded::Session<alpaka::TagGpuCudaRt>>(
-            "QONNX_QuantMatMul_Padded_FromONNX_GPU_ALPAKA.dat",
-            QuantizedLinearTest{511, 64, 80, true, false, true});
-   }
-   {
-      SCOPED_TRACE("MatMul with fused Add");
-         // Projection bias: Yq = QY(SX * SW_j * sum_k Xq_ik * Wq_kj + bias_j).
-         RunQuantizedLinearInt8<SOFIE_QONNX_QuantMatMul_Add::Session<alpaka::TagGpuCudaRt>>(
-            "QONNX_QuantMatMul_Add_FromONNX_GPU_ALPAKA.dat",
-            QuantizedLinearTest{256, 64, 64, true, true, false});
-         RunQuantizedLinearInt8<SOFIE_ONNX_QDQ_QuantMatMul_RankNProjection_Add::Session<alpaka::TagGpuCudaRt>>(
-            "ONNX_QDQ_QuantMatMul_RankNProjection_Add_FromONNX_GPU_ALPAKA.dat",
-            QuantizedLinearTest{256, 64, 64, true, true, false});
-   }
-}
-
-// Runs a generated multi-layer quantized Session on the GPU. The DenseLinear cases above
-// check one GEMM's numerics; this covers the multi-layer carrier plumbing.
-TEST_F(QuantizationAlpakaTest, MultiLayerMlpRuns)
-{
-   // QONNX_QuantMLP.onnx: input[32,256] -> Quant -> Gemm(256) -> Relu -> Gemm(256) -> Quant, signed int8.
-   constexpr Idx kM = 32, kK = 256, kN = 256;
-   std::vector<std::int8_t> input(static_cast<std::size_t>(kM) * kK);
-   for (std::size_t i = 0; i < input.size(); ++i)
-      input[i] = static_cast<std::int8_t>((static_cast<int>(i * 7 + 3) % 15) - 7);
-
-   auto input_d = CopyQuantizedInputToDevice(input);
-   SOFIE_QONNX_QuantMLP::Session<alpaka::TagGpuCudaRt> model("QONNX_QuantMLP_FromONNX_GPU_ALPAKA.dat");
-
-   const Idx outputSize = static_cast<Idx>(kM) * kN;
-   auto result = model.infer(input_d);
-   alpaka::wait(queue);
-   cudaDeviceSynchronize();
-
-   auto result_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(outputSize));
-   alpaka::memcpy(queue, result_h, result);
-   alpaka::wait(queue);
-   const auto *res_ptr = reinterpret_cast<const std::int8_t *>(alpaka::getPtrNative(result_h));
-
-   // Non-degenerate output: both GEMMs ran, and the result is not a constant fill.
-   int nonZero = 0;
-   std::int8_t minv = 127, maxv = -128;
-   for (Idx i = 0; i < outputSize; ++i) {
-      nonZero += (res_ptr[i] != 0);
-      minv = std::min(minv, res_ptr[i]);
-      maxv = std::max(maxv, res_ptr[i]);
-   }
-   EXPECT_GT(nonZero, 0) << "multi-layer quantized MLP produced an all-zero output";
-   EXPECT_NE(static_cast<int>(minv), static_cast<int>(maxv)) << "output is a constant fill";
-}
-
-// The same network in standard ONNX Q/DQ, which lowers to the same kernels. Its terminal
-// DequantizeLinear makes the graph output float rather than int8.
-TEST_F(QuantizationAlpakaTest, MultiLayerQdqMlpRuns)
-{
-   constexpr Idx kM = 32, kK = 256, kN = 256;
-   std::vector<std::int8_t> input(static_cast<std::size_t>(kM) * kK);
-   for (std::size_t i = 0; i < input.size(); ++i)
-      input[i] = static_cast<std::int8_t>((static_cast<int>(i * 7 + 3) % 15) - 7);
-
-   auto input_d = CopyQuantizedInputToDevice(input);
-   SOFIE_ONNX_QDQ_QuantMLP::Session<alpaka::TagGpuCudaRt> model("ONNX_QDQ_QuantMLP_FromONNX_GPU_ALPAKA.dat");
-
-   const Idx outputSize = static_cast<Idx>(kM) * kN;
-   auto result = model.infer(input_d);
-   alpaka::wait(queue);
-   cudaDeviceSynchronize();
-
-   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(outputSize));
-   alpaka::memcpy(queue, result_h, result);
-   alpaka::wait(queue);
-   const auto *res_ptr = reinterpret_cast<const float *>(alpaka::getPtrNative(result_h));
-
-   int nonZero = 0;
-   float minv = std::numeric_limits<float>::infinity();
-   float maxv = -std::numeric_limits<float>::infinity();
-   for (Idx i = 0; i < outputSize; ++i) {
-      nonZero += (res_ptr[i] != 0.0f);
-      minv = std::min(minv, res_ptr[i]);
-      maxv = std::max(maxv, res_ptr[i]);
-      ASSERT_TRUE(std::isfinite(res_ptr[i])) << "non-finite output at i=" << i;
-   }
-   EXPECT_GT(nonZero, 0) << "Q/DQ multi-layer MLP produced an all-zero output";
-   EXPECT_NE(minv, maxv) << "output is a constant fill";
-}
-
-// A rank-3 dense layer folded to rank-2, whose input source is a float tensor behind an
-// absorbed Q/DQ pair. Values must match exactly.
-TEST_F(QuantizationAlpakaTest, QdqReshapeGemmMatchesExactReference)
-{
-   constexpr Idx kB = 8, kT = 32, kK = 128, kN = 128;
-   constexpr double kInScale = 0.0078125, kWeightScale = 0.00390625, kOutScale = 0.015625;
-   constexpr Idx kM = kB * kT;
-
-   // Mirrors make_qdq_reshape_gemm_fixture.py; keep the two in sync.
-   auto weightValue = [](std::size_t k, std::size_t n) {
-      return static_cast<int>((k * 31 + n * 17) % 15) - 7;
-   };
-   auto biasValue = [](std::size_t n) {
-      return (static_cast<double>(n % 5) - 2.0) * kInScale * kWeightScale * 4.0;
-   };
-
-   std::vector<float> input(static_cast<std::size_t>(kM) * kK);
-   for (std::size_t i = 0; i < input.size(); ++i)
-      input[i] = static_cast<float>((static_cast<int>(i * 13 + 5) % 97) - 48) * 0.03125f;
-
-   // Host reference: quantize the input, accumulate in int32, rescale, clip on the output
-   // grid, re-quantize, dequantize -- exactly what the graph spells out.
-   auto clampTo = [](double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); };
-   std::vector<std::int8_t> inputQ(input.size());
-   for (std::size_t i = 0; i < input.size(); ++i)
-      inputQ[i] = static_cast<std::int8_t>(clampTo(std::nearbyint(input[i] / kInScale), -128.0, 127.0));
-
-   std::vector<float> expected(static_cast<std::size_t>(kM) * kN);
-   for (std::size_t m = 0; m < kM; ++m) {
-      for (std::size_t n = 0; n < kN; ++n) {
-         std::int32_t acc = 0;
-         for (std::size_t k = 0; k < kK; ++k)
-            acc += static_cast<std::int32_t>(inputQ[m * kK + k]) * weightValue(k, n);
-         double real = acc * kInScale * kWeightScale + biasValue(n);
-         real = clampTo(real, -128.0 * kOutScale, 127.0 * kOutScale);
-         const double q = clampTo(std::nearbyint(real / kOutScale), -128.0, 127.0);
-         expected[m * kN + n] = static_cast<float>(q * kOutScale);
-      }
-   }
-
-   const Idx inputSize = static_cast<Idx>(input.size());
-   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(inputSize));
-   std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
-   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(inputSize));
-   alpaka::memcpy(queue, input_d, input_h);
-   alpaka::wait(queue);
-
-   SOFIE_ONNX_QDQ_ReshapeGemm::Session<alpaka::TagGpuCudaRt> model(
-      "ONNX_QDQ_ReshapeGemm_FromONNX_GPU_ALPAKA.dat");
-   auto result = model.infer(input_d);
-   alpaka::wait(queue);
-   cudaDeviceSynchronize();
-
-   const Idx outputSize = static_cast<Idx>(expected.size());
-   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(outputSize));
-   alpaka::memcpy(queue, result_h, result);
-   alpaka::wait(queue);
-   const auto *res_ptr = reinterpret_cast<const float *>(alpaka::getPtrNative(result_h));
-
-   int mismatches = 0;
-   for (Idx i = 0; i < outputSize && mismatches < 5; ++i) {
-      if (res_ptr[i] != expected[i]) {
-         ++mismatches;
-         EXPECT_EQ(res_ptr[i], expected[i]) << "at i=" << i;
-      }
-   }
-   EXPECT_EQ(mismatches, 0) << "quantized Reshape->Gemm region diverged from the exact reference";
-}
-
-// A quantized dense region feeding a quantized residual Add, where both families must
-// agree on which carrier materialises on the tensor they share.
-TEST_F(QuantizationAlpakaTest, QdqResidualAddMatchesExactReference)
-{
-   constexpr Idx kB = 8, kT = 32, kK = 128, kN = 128;
-   constexpr double kInScale = 0.0078125, kWeightScale = 0.00390625;
-   constexpr double kOutScale = 0.015625, kResScale = 0.03125;
-   constexpr Idx kM = kB * kT;
-
-   // Mirrors make_qdq_reshape_gemm_fixture.py; keep the two in sync.
-   auto weightValue = [](std::size_t k, std::size_t n) {
-      return static_cast<int>((k * 31 + n * 17) % 15) - 7;
-   };
-   auto biasValue = [](std::size_t n) {
-      return (static_cast<double>(n % 5) - 2.0) * kInScale * kWeightScale * 4.0;
-   };
-   auto clampTo = [](double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); };
-
-   std::vector<float> input(static_cast<std::size_t>(kM) * kK);
-   for (std::size_t i = 0; i < input.size(); ++i)
-      input[i] = static_cast<float>((static_cast<int>(i * 13 + 5) % 97) - 48) * 0.03125f;
-
-   std::vector<std::int8_t> inputQ(input.size());
-   for (std::size_t i = 0; i < input.size(); ++i)
-      inputQ[i] = static_cast<std::int8_t>(clampTo(std::nearbyint(input[i] / kInScale), -128.0, 127.0));
-
-   std::vector<float> expected(static_cast<std::size_t>(kM) * kN);
-   for (std::size_t m = 0; m < kM; ++m) {
-      for (std::size_t n = 0; n < kN; ++n) {
-         std::int32_t acc = 0;
-         for (std::size_t k = 0; k < kK; ++k)
-            acc += static_cast<std::int32_t>(inputQ[m * kK + k]) * weightValue(k, n);
-         double real = acc * kInScale * kWeightScale + biasValue(n);
-         real = clampTo(real, -128.0 * kOutScale, 127.0 * kOutScale);
-         const double dense = clampTo(std::nearbyint(real / kOutScale), -128.0, 127.0) * kOutScale;
-         // Residual operand is the dequantized input, on its own grid.
-         const double skip = static_cast<double>(inputQ[m * kK + n]) * kInScale;
-         double sum = clampTo(dense + skip, -128.0 * kResScale, 127.0 * kResScale);
-         const double q = clampTo(std::nearbyint(sum / kResScale), -128.0, 127.0);
-         expected[m * kN + n] = static_cast<float>(q * kResScale);
-      }
-   }
-
-   const Idx inputSize = static_cast<Idx>(input.size());
-   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(inputSize));
-   std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
-   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(inputSize));
-   alpaka::memcpy(queue, input_d, input_h);
-   alpaka::wait(queue);
-
-   SOFIE_ONNX_QDQ_ResidualAdd::Session<alpaka::TagGpuCudaRt> model(
-      "ONNX_QDQ_ResidualAdd_FromONNX_GPU_ALPAKA.dat");
-   auto result = model.infer(input_d);
-   alpaka::wait(queue);
-   cudaDeviceSynchronize();
-
-   const Idx outputSize = static_cast<Idx>(expected.size());
-   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(outputSize));
-   alpaka::memcpy(queue, result_h, result);
-   alpaka::wait(queue);
-   const auto *res_ptr = reinterpret_cast<const float *>(alpaka::getPtrNative(result_h));
-
-   int mismatches = 0;
-   for (Idx i = 0; i < outputSize && mismatches < 5; ++i) {
-      if (res_ptr[i] != expected[i]) {
-         ++mismatches;
-         EXPECT_EQ(res_ptr[i], expected[i]) << "at i=" << i;
-      }
-   }
-   EXPECT_EQ(mismatches, 0) << "quantized dense -> residual Add diverged from the exact reference";
-}
-
-TEST(QuantizationContracts, Core)
-{
-   {
-      SCOPED_TRACE("binary weight header");
-         std::string bytes(24, 0);
-         std::stringstream stream(bytes, std::ios::in | std::ios::binary);
-         EXPECT_THROW(SOFIE::ReadBinaryWeightFileHeader(stream, 0), std::runtime_error);
-   }
-   {
-      SCOPED_TRACE("optional matrix geometry");
-         SOFIE::QuantizedLoweringPlan plan;
-         EXPECT_FALSE(plan.matrixShapePolicy.has_value());
-         EXPECT_THROW(
-            SOFIE::RequireQuantizedMatrixShapePolicy(plan, "test matrix operator"),
-            std::runtime_error);
-
-         auto &shape = SOFIE::EnsureQuantizedMatrixShapePolicy(plan);
-         shape.policy = SOFIE::EQuantizedShapePolicy::Exact;
-         shape.logicalM = 4;
-         EXPECT_EQ(
-            SOFIE::RequireQuantizedMatrixShapePolicy(plan, "test matrix operator").logicalM,
-            4U);
-   }
-   {
-      SCOPED_TRACE("typed region collection");
-         SOFIE::QuantizationModelState state;
-
-         SOFIE::QuantizedGemmRegion gemm;
-         gemm.gemmOpIndex = 11;
-         gemm.inputSourceTensor = "gemm_input";
-         gemm.weightSourceTensor = "gemm_weight";
-         gemm.outputTensor = "gemm_output";
-         gemm.inputQuantOpIndex = 9;
-         gemm.weightQuantOpIndex = 10;
-         gemm.outputQuantOpIndex = 12;
-         gemm.status = SOFIE::EQuantizedLoweringStatus::SemanticRecognized;
-         gemm.reason = "recognized Gemm";
-
-         SOFIE::QuantizedMatMulRegion matmul;
-         matmul.matmulOpIndex = 21;
-         matmul.inputSourceTensor = "matmul_input";
-         matmul.weightSourceTensor = "matmul_weight";
-         matmul.outputTensor = "matmul_output";
-         matmul.status = SOFIE::EQuantizedLoweringStatus::Optimized;
-         matmul.reason = "lowered MatMul";
-
-         SOFIE::QuantizedConvRegion conv;
-         conv.convOpIndex = 31;
-         conv.inputSourceTensor = "conv_input";
-         conv.weightSourceTensor = "conv_weight";
-         conv.outputTensor = "conv_output";
-         conv.status = SOFIE::EQuantizedLoweringStatus::BackendUnsupported;
-         conv.reason = "unsupported Conv profile";
-
-         SOFIE::StoreQuantizedRegion(state, std::move(gemm));
-         SOFIE::StoreQuantizedRegion(state, std::move(matmul));
-         SOFIE::StoreQuantizedRegion(state, std::move(conv));
-
-         EXPECT_EQ(state.regions.size(), 3U);
-         EXPECT_EQ(SOFIE::CountQuantizedRegions<SOFIE::QuantizedGemmRegion>(state), 1U);
-         EXPECT_EQ(SOFIE::CountQuantizedRegions<SOFIE::QuantizedMatMulRegion>(state), 1U);
-         EXPECT_EQ(SOFIE::CountQuantizedRegions<SOFIE::QuantizedConvRegion>(state), 1U);
-         EXPECT_NE(SOFIE::FindQuantizedRegion<SOFIE::QuantizedGemmRegion>(state, 11), nullptr);
-         EXPECT_EQ(SOFIE::FindQuantizedRegion<SOFIE::QuantizedConvRegion>(state, 11), nullptr);
-
-         const auto &storedGemm = state.regions.at(11);
-         EXPECT_EQ(SOFIE::QuantizedRegionAnchorIndex(storedGemm), 11U);
-         EXPECT_EQ(SOFIE::QuantizedRegionInputSourceTensor(storedGemm), "gemm_input");
-         EXPECT_EQ(SOFIE::QuantizedRegionSecondaryStorageTensor(storedGemm), "gemm_weight");
-         EXPECT_EQ(SOFIE::QuantizedRegionOutputTensor(storedGemm), "gemm_output");
-         EXPECT_EQ(SOFIE::QuantizedRegionStatus(storedGemm),
-                   SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
-         EXPECT_EQ(SOFIE::QuantizedRegionReason(storedGemm), "recognized Gemm");
-         EXPECT_EQ(SOFIE::QuantizedRegionConsumedOperatorIndices(storedGemm),
-                   std::vector<std::size_t>({9, 10, 11, 12}));
-
-         SOFIE::QuantizedConvRegion duplicate;
-         duplicate.convOpIndex = 11;
-         EXPECT_THROW(SOFIE::StoreQuantizedRegion(state, std::move(duplicate)),
-                      std::runtime_error);
-   }
-   {
-      SCOPED_TRACE("physical tensor validation");
-         SOFIE::QuantizationInfo quantization;
-         quantization.bitWidth = 8;
-         quantization.isSigned = true;
-
-         SOFIE::MaterializedQuantizedTensor tensor;
-         tensor.storage = SOFIE::MakeQuantizedTensorStorage(
-            "logical_weight", "source_weight", "physical_weight", quantization,
-            SOFIE::EQuantizedLayout::PlainDevice, {4}, SOFIE::EQuantizedBackend::ALPAKA);
-         tensor.tensorType = SOFIE::ETensorType::INT8;
-         tensor.bytes.resize(4);
-         EXPECT_NO_THROW(SOFIE::ValidateMaterializedQuantizedTensor(tensor));
-
-         tensor.bytes.pop_back();
-         EXPECT_THROW(SOFIE::ValidateMaterializedQuantizedTensor(tensor), std::runtime_error);
-         tensor.bytes.resize(4);
-         tensor.tensorType = SOFIE::ETensorType::UINT8;
-         EXPECT_THROW(SOFIE::ValidateMaterializedQuantizedTensor(tensor), std::runtime_error);
-   }
-   {
-      SCOPED_TRACE("resources and carrier lifetimes");
-         SOFIE::QuantizedMatMulRegion region;
-         region.inputQuant.bitWidth = 8;
-         region.inputQuant.isSigned = true;
-         region.weightQuant.bitWidth = 8;
-         region.weightQuant.isSigned = true;
-         region.outputQuant.bitWidth = 8;
-         region.outputQuant.isSigned = true;
-         region.epilogue.kind = SOFIE::EQuantizedEpilogueKind::Bias;
-
-         SOFIE::QuantizedMatrixShapePolicy shape;
-         shape.policy = SOFIE::EQuantizedShapePolicy::Padded;
-         shape.logicalM = 511;
-         shape.logicalK = 64;
-         shape.logicalN = 80;
-         shape.physicalM = 512;
-         shape.physicalK = 64;
-         shape.physicalN = 80;
-
-         const auto plan = SOFIE::MakeMatMulAlpakaTransposedWeightStoragePlan(
-            region, "weight_quantized_transposed_device_storage", shape);
-
-         constexpr std::size_t tensorBytes =
-            (511ULL * 64ULL) + (80ULL * 64ULL) + (80ULL * sizeof(float)) + (511ULL * 80ULL);
-         constexpr std::size_t scratchBytes =
-            SOFIE::kQuantizedCudaLtMaxWorkspaceBytes + (512ULL * 64ULL) +
-            (512ULL * 80ULL * sizeof(std::int32_t)) + (512ULL * 80ULL) + (80ULL * sizeof(float));
-         EXPECT_EQ(SOFIE::QuantizedResourceBytes(
-                      plan.resources, SOFIE::EQuantizedResourceCategory::TensorStorage),
-                   tensorBytes);
-         EXPECT_EQ(SOFIE::QuantizedReusableScratchBytes(plan.resources), scratchBytes);
-         EXPECT_EQ(SOFIE::QuantizedPackedReusableScratchBytes(plan.resources), scratchBytes);
-         EXPECT_EQ(plan.resources.entries.size(), 9U);
-
-         SOFIE::QuantizedResourceRequirements first;
-         SOFIE::AddQuantizedResourceRequirement(
-            first, SOFIE::EQuantizedResourceCategory::BackendScratch,
-            SOFIE::EQuantizedResourceRole::InputStaging,
-            SOFIE::EQuantizedResourceLifetime::Invocation, SOFIE::EQuantizedStorageType::Int8,
-            3, 1, true, "first scratch slice");
-         SOFIE::AddQuantizedResourceRequirement(
-            first, SOFIE::EQuantizedResourceCategory::BackendScratch,
-            SOFIE::EQuantizedResourceRole::Accumulator,
-            SOFIE::EQuantizedResourceLifetime::Invocation, SOFIE::EQuantizedStorageType::Int32Accumulator,
-            5, 8, true, "aligned scratch slice");
-         SOFIE::QuantizedResourceRequirements second;
-         SOFIE::AddQuantizedResourceRequirement(
-            second, SOFIE::EQuantizedResourceCategory::BackendScratch,
-            SOFIE::EQuantizedResourceRole::BackendWorkspace,
-            SOFIE::EQuantizedResourceLifetime::Invocation, SOFIE::EQuantizedStorageType::UNDEFINED,
-            7, 1, true, "second operator scratch");
-         const auto firstPacked = SOFIE::QuantizedPackedReusableScratchBytes(first);
-         const auto secondPacked = SOFIE::QuantizedPackedReusableScratchBytes(second);
-         EXPECT_EQ(firstPacked, 13U);
-         EXPECT_EQ(std::max(firstPacked, secondPacked), 13U);
-         EXPECT_LT(std::max(firstPacked, secondPacked), firstPacked + secondPacked);
-
-         const auto carrierPlan = SOFIE::PlanQuantizedCarrierMemory({
-            {"input_carrier", SOFIE::EQuantizedStorageType::Int8, 64, 16, 0, 1},
-            {"output_same_step", SOFIE::EQuantizedStorageType::UInt8, 64, 16, 1, 2},
-            {"later_fp8_carrier", SOFIE::EQuantizedStorageType::FP8E4M3, 32, 16, 2, 3},
-         });
-         ASSERT_EQ(carrierPlan.allocations.size(), 3U);
-         auto offsetFor = [&](const std::string &name) {
-            const auto allocation = std::find_if(
-               carrierPlan.allocations.begin(), carrierPlan.allocations.end(),
-               [&](const auto &entry) { return entry.lifetime.tensorName == name; });
-            EXPECT_NE(allocation, carrierPlan.allocations.end());
-            return allocation == carrierPlan.allocations.end() ? std::size_t{0} : allocation->offset;
-         };
-         EXPECT_NE(offsetFor("input_carrier"), offsetFor("output_same_step"));
-         EXPECT_EQ(offsetFor("input_carrier"), offsetFor("later_fp8_carrier"));
-         EXPECT_EQ(carrierPlan.peakBytes, 128U);
-         EXPECT_EQ(carrierPlan.unpooledBytes, 160U);
-   }
-}
-
-namespace {
-SOFIE::QuantizationInfo TestQuantization(int axis, double scale = 0.125)
-{
-   SOFIE::QuantizationInfo info;
-   info.bitWidth = 8;
-   info.isSigned = true;
-   info.scale = scale;
-   info.zeroPoint = 0;
-   info.rounding = SOFIE::EQuantizationRoundingMode::ROUND;
-   info.overflow = SOFIE::EQuantizationOverflowMode::SAT;
-   info.granularity = axis < 0 ? SOFIE::EQuantizationGranularity::PerTensor
-                               : SOFIE::EQuantizationGranularity::PerChannel;
-   info.axis = axis;
-   return info;
-}
-
-template <class Operator, class... Args>
-void AddNamedOperator(SOFIE::RModel &model, const std::string &name, Args &&...args)
-{
-   auto op = std::make_unique<Operator>(std::forward<Args>(args)...);
-   op->fName = name;
-   model.AddOperator(std::move(op));
-}
-} // namespace
 
 TEST(QuantizationMetadata, Convolution)
 {
@@ -740,8 +105,18 @@ TEST(QuantizationMetadata, Convolution)
             "output_carrier", SOFIE::ETensorType::INT8, -1);
          qdq.Initialize();
 
-         ASSERT_EQ(SOFIE::CountQuantizedRegions<SOFIE::QuantizedConvRegion>(qonnx.GetQuantizationState()), 1U);
-         ASSERT_EQ(SOFIE::CountQuantizedRegions<SOFIE::QuantizedConvRegion>(qdq.GetQuantizationState()), 1U);
+         // Both frontends must canonicalize to exactly one conv region; the pipeline report of
+         // the ALPAKA lowered view is the counting surface.
+         const auto &qonnxReport = SOFIE_TEST::AlpakaPipelineReport(qonnx);
+         const auto &qdqReport = SOFIE_TEST::AlpakaPipelineReport(qdq);
+         ASSERT_EQ(SOFIE_TEST::CountRegions(qonnxReport, "conv"), 1U);
+         ASSERT_EQ(SOFIE_TEST::CountRegions(qdqReport, "conv"), 1U);
+         const auto *qonnxEntry = SOFIE_TEST::FindRegion(qonnxReport, "output_quantized");
+         const auto *qdqEntry = SOFIE_TEST::FindRegion(qdqReport, "output_carrier");
+         ASSERT_NE(qonnxEntry, nullptr);
+         ASSERT_NE(qdqEntry, nullptr);
+         EXPECT_EQ(qonnxEntry->family, "conv");
+         EXPECT_EQ(qdqEntry->family, "conv");
          const auto &qonnxRegion = *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(qonnx.GetQuantizationState());
          const auto &qdqRegion = *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(qdq.GetQuantizationState());
          EXPECT_EQ(qonnxRegion.status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
@@ -751,20 +126,23 @@ TEST(QuantizationMetadata, Convolution)
          EXPECT_EQ(qonnxRegion.attributes.spatialRank, 1U);
          EXPECT_EQ(qonnxRegion.attributes.kernelShape, std::vector<std::size_t>({3}));
          EXPECT_EQ(qonnxRegion.attributes.pads, std::vector<std::size_t>({1, 1}));
-         ASSERT_TRUE(qonnxRegion.inputQuant.has_value());
-         ASSERT_TRUE(qdqRegion.inputQuant.has_value());
-         ASSERT_TRUE(qonnxRegion.weightQuant.has_value());
-         ASSERT_TRUE(qdqRegion.weightQuant.has_value());
-         ASSERT_TRUE(qonnxRegion.outputQuant.has_value());
-         ASSERT_TRUE(qdqRegion.outputQuant.has_value());
-         EXPECT_EQ(qonnxRegion.inputQuant->bitWidth, qdqRegion.inputQuant->bitWidth);
-         EXPECT_EQ(qonnxRegion.inputQuant->isSigned, qdqRegion.inputQuant->isSigned);
-         EXPECT_DOUBLE_EQ(qonnxRegion.inputQuant->scale, qdqRegion.inputQuant->scale);
-         EXPECT_EQ(qonnxRegion.weightQuant->axis, qdqRegion.weightQuant->axis);
-         ASSERT_TRUE(qonnxRegion.biasQuant.has_value());
-         ASSERT_TRUE(qdqRegion.biasQuant.has_value());
-         EXPECT_DOUBLE_EQ(qonnxRegion.biasQuant->scale, 0.125 * 0.125);
-         EXPECT_DOUBLE_EQ(qdqRegion.biasQuant->scale, 0.125 * 0.125);
+         // The operand contracts are parse products: both frontends must mint the same
+         // grids in the model's tensor-info map.
+         ASSERT_TRUE(qonnx.HasQuantizationInfo("input_quantized"));
+         ASSERT_TRUE(qdq.HasQuantizationInfo("input_dequantized"));
+         ASSERT_TRUE(qonnx.HasQuantizationInfo("weight_quantized"));
+         ASSERT_TRUE(qdq.HasQuantizationInfo("weight_dequantized"));
+         ASSERT_TRUE(qonnx.HasQuantizationInfo("output_quantized"));
+         ASSERT_TRUE(qdq.HasQuantizationInfo("output_carrier"));
+         const auto &qonnxInput = qonnx.GetQuantizationInfo("input_quantized");
+         const auto &qdqInput = qdq.GetQuantizationInfo("input_dequantized");
+         EXPECT_EQ(qonnxInput.bitWidth, qdqInput.bitWidth);
+         EXPECT_EQ(qonnxInput.isSigned, qdqInput.isSigned);
+         EXPECT_DOUBLE_EQ(qonnxInput.scale, qdqInput.scale);
+         EXPECT_EQ(qonnx.GetQuantizationInfo("weight_quantized").axis,
+                   qdq.GetQuantizationInfo("weight_dequantized").axis);
+         EXPECT_DOUBLE_EQ(qonnx.GetQuantizationInfo("output_quantized").scale,
+                          qdq.GetQuantizationInfo("output_carrier").scale);
 
          const auto *qonnxCpuPlan = SOFIE::FindQuantizedLoweringPlan(
             qonnx.GetQuantizationState(), qonnxRegion.convOpIndex, SOFIE::EQuantizedBackend::CPU);
@@ -785,7 +163,10 @@ TEST(QuantizationMetadata, Convolution)
          EXPECT_EQ(qonnxAlpakaPlan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
          EXPECT_EQ(qonnxAlpakaPlan->computeProfile, SOFIE::EQuantizedComputeProfile::AffineInt8Conv);
          EXPECT_EQ(qonnxAlpakaPlan->capabilityTag, "alpaka_int8_depthwise_conv_direct");
-         EXPECT_FALSE(qonnxAlpakaPlan->isMetadataOnly);
+         // "This region actually lowered": the pipeline report row carries the lowered-view
+         // verdict, and the depthwise call check below proves the emission.
+         EXPECT_EQ(qonnxEntry->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         EXPECT_EQ(qonnxEntry->capabilityTag, "alpaka_int8_depthwise_conv_direct");
          EXPECT_TRUE(qonnxAlpakaPlan->suppressesGraphOperators);
          EXPECT_FALSE(qonnxAlpakaPlan->matrixShapePolicy.has_value());
          EXPECT_EQ(SOFIE::QuantizedPackedReusableScratchBytes(qonnxAlpakaPlan->resources), 0U);
@@ -821,10 +202,22 @@ TEST(QuantizationMetadata, Convolution)
             SOFIE::MakeQuantizedConvCodegenContext(qonnx, qonnxRegion));
          const auto alpakaCode = qonnxAlpakaLowered.Generate_GPU_ALPAKA("depthwise_conv");
          EXPECT_NE(alpakaCode.find("direct depthwise CUDA INT8 operator"), std::string::npos);
-         EXPECT_NE(alpakaCode.find("QuantizedConvCudaDepthwise_Call"), std::string::npos);
-         EXPECT_EQ(alpakaCode.find("QuantizedConvCudaLt_Call"), std::string::npos);
+         SOFIE_TEST::ExpectCallPresent(alpakaCode, "QuantizedConvCudaDepthwise_Call");
+         SOFIE_TEST::ExpectCallAbsent(alpakaCode, "QuantizedConvCudaLt_Call");
          EXPECT_TRUE(qonnxAlpakaLowered.Generate_GPU_Kernel_Definitions_ALPAKA(
             "depthwise_conv").empty());
+
+         // Both frontends derive the same bias contract, scale = inputScale * weightScale;
+         // the derived value is a generated-text carrier, not a region internal.
+         const auto *qdqAlpakaPlan = SOFIE::FindQuantizedLoweringPlan(
+            qdq.GetQuantizationState(), qdqRegion.convOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+         ASSERT_NE(qdqAlpakaPlan, nullptr);
+         SOFIE::ROperator_QuantizedConv qdqAlpakaLowered(
+            qdqRegion, *qdqAlpakaPlan,
+            SOFIE::MakeQuantizedConvCodegenContext(qdq, qdqRegion));
+         const auto qdqAlpakaCode = qdqAlpakaLowered.Generate_GPU_ALPAKA("qdq_depthwise_conv");
+         SOFIE_TEST::ExpectCallPresent(alpakaCode, ".matrix.biasScale = 0.015625;");
+         SOFIE_TEST::ExpectCallPresent(qdqAlpakaCode, ".matrix.biasScale = 0.015625;");
    }
    {
       SCOPED_TRACE("bias and ReLU epilogue");
@@ -861,7 +254,8 @@ TEST(QuantizationMetadata, Convolution)
          addBoundary("relu_output", "output_quantized", "quantize_output");
          model.Initialize();
 
-         ASSERT_EQ(SOFIE::CountQuantizedRegions<SOFIE::QuantizedConvRegion>(model.GetQuantizationState()), 1U);
+         // One conv region absorbing the bias and ReLU, counted through the pipeline report.
+         ASSERT_EQ(SOFIE_TEST::CountRegions(SOFIE_TEST::AlpakaPipelineReport(model), "conv"), 1U);
          const auto &region = *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(model.GetQuantizationState());
          EXPECT_EQ(region.status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
          EXPECT_EQ(region.epilogueKind, SOFIE::EQuantizedEpilogueKind::BiasRelu);
@@ -980,9 +374,11 @@ TEST(QuantizationMetadata, Convolution)
          auto fp8 = makeFP8Conv(false);
          auto fp8Depthwise = makeFP8Conv(true);
 
-         auto alpakaPlan = [](const SOFIE::RModel &model) {
+         // Builds the ALPAKA lowered view so the pipeline report carries each model's verdict,
+         // then hands back the single conv region's ALPAKA plan.
+         auto alpakaPlan = [](SOFIE::RModel &model) {
+            EXPECT_EQ(SOFIE_TEST::CountRegions(SOFIE_TEST::AlpakaPipelineReport(model), "conv"), 1U);
             const auto &state = model.GetQuantizationState();
-            EXPECT_EQ(SOFIE::CountQuantizedRegions<SOFIE::QuantizedConvRegion>(state), 1U);
             const auto opIndex = SOFIE::QuantizedRegionAnchorIndex(*SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(state));
             return SOFIE::FindQuantizedLoweringPlan(
                state, opIndex, SOFIE::EQuantizedBackend::ALPAKA);
@@ -1005,7 +401,14 @@ TEST(QuantizationMetadata, Convolution)
          EXPECT_EQ(standardPlan->capabilityTag, "alpaka_int8_conv_matrix_exact");
          EXPECT_EQ(standardPlan->computeProfile, SOFIE::EQuantizedComputeProfile::AffineInt8Conv);
          EXPECT_TRUE(standardPlan->suppressesGraphOperators);
-         EXPECT_FALSE(standardPlan->isMetadataOnly);
+         // "Actually lowered": the pipeline report row for this region reports Optimized, and the
+         // QuantizedConvCudaLt_Call check below proves the call was emitted.
+         {
+            const auto *standardEntry = SOFIE_TEST::FindRegion(
+               standard.GetQuantizationPipelineReport(), "output_quantized");
+            ASSERT_NE(standardEntry, nullptr);
+            EXPECT_EQ(standardEntry->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         }
          EXPECT_EQ(standardPlan->weightLayout, SOFIE::EQuantizedLayout::PlainDevice);
          ASSERT_TRUE(standardPlan->matrixShapePolicy.has_value());
          EXPECT_EQ(standardPlan->matrixShapePolicy->logicalM, 256U);
@@ -1102,7 +505,14 @@ TEST(QuantizationMetadata, Convolution)
          EXPECT_EQ(fp8Plan->capabilityTag, "cuda_fp8_conv_matrix_e4m3_f32");
          EXPECT_EQ(fp8Plan->computeProfile, SOFIE::EQuantizedComputeProfile::FP8E4M3Conv);
          EXPECT_TRUE(fp8Plan->suppressesGraphOperators);
-         EXPECT_FALSE(fp8Plan->isMetadataOnly);
+         // "Actually lowered": pipeline report verdict plus the QuantizedConvCudaLtFP8_Call
+         // presence check below on the generated text.
+         {
+            const auto *fp8Entry = SOFIE_TEST::FindRegion(
+               fp8.GetQuantizationPipelineReport(), "output");
+            ASSERT_NE(fp8Entry, nullptr);
+            EXPECT_EQ(fp8Entry->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         }
          ASSERT_TRUE(fp8Plan->matrixShapePolicy.has_value());
          EXPECT_EQ(fp8Plan->matrixShapePolicy->logicalM, 8U);
          EXPECT_EQ(fp8Plan->matrixShapePolicy->logicalN, 8U);
@@ -1258,57 +668,140 @@ TEST(QuantizationMetadata, Convolution)
          checkAutoPad("SAME_UPPER", {1, 8, 8}, {0, 1});
          checkAutoPad("SAME_LOWER", {1, 8, 8}, {1, 0});
 
-         auto valid = SOFIE::QuantizedConvRegion{};
-         valid.inputQuant = TestQuantization(-1, 0.125);
-         valid.weightQuant = TestQuantization(-1, 0.25);
-         valid.outputQuant = TestQuantization(-1, 0.5);
-         valid.biasQuant = TestQuantization(-1, 0.125 * 0.25);
-         valid.biasQuant->bitWidth = 32;
-         std::vector<std::string> reasons;
-         SOFIE::CheckQuantizedConvQuantization(valid, reasons);
-         EXPECT_TRUE(reasons.empty());
+         // Broken operand contracts must surface as parse-time semantic rejects carrying
+         // the validator's factual reason; each case dials exactly one contract knob.
+         struct ContractCase {
+            const char *name;
+            bool perChannelWeightAxis1;
+            bool perChannelOutput;
+            bool quantizedBias;
+            float biasScale;
+            std::int8_t biasZeroPoint;
+            const char *expectedReason; // empty: the contract is valid and recognized
+         };
+         const std::vector<ContractCase> contractCases = {
+            {"valid_contract", false, false, true, 0.03125f, 0, ""},
+            {"invalid_weight_axis", true, false, false, 0.0f, 0,
+             "axis is not output-channel axis 0"},
+            {"invalid_output_granularity", false, true, false, 0.0f, 0,
+             "output quantization is not per-tensor"},
+            {"invalid_bias_scale", false, false, true, 0.5f, 0,
+             "bias scale does not equal input scale times weight scale"},
+            {"invalid_bias_zero_point", false, false, true, 0.03125f, 1,
+             "bias quantization is not signed with zero point 0"},
+         };
 
-         auto invalidWeightAxis = valid;
-         invalidWeightAxis.weightQuant->granularity =
-            SOFIE::EQuantizationGranularity::PerChannel;
-         invalidWeightAxis.weightQuant->axis = 1;
-         reasons.clear();
-         SOFIE::CheckQuantizedConvQuantization(invalidWeightAxis, reasons);
-         EXPECT_TRUE(containsReason(reasons, "axis is not output-channel axis 0"));
+         for (const auto &testCase : contractCases) {
+            SCOPED_TRACE(testCase.name);
+            SOFIE::RModel model(testCase.name);
+            model.AddInputTensorInfo("input", SOFIE::ETensorType::FLOAT,
+                                     std::vector<std::size_t>{1, 4, 16});
+            model.AddInitializedTensor("weight_carrier", std::vector<std::size_t>{8, 4, 3},
+                                       std::vector<std::int8_t>(96, 1));
+            model.AddInitializedTensor("input_scale", std::vector<std::size_t>{},
+                                       std::vector<float>{0.125f});
+            model.AddInitializedTensor("zero_point_int8", std::vector<std::size_t>{},
+                                       std::vector<std::int8_t>{0});
+            if (testCase.perChannelWeightAxis1) {
+               model.AddInitializedTensor("weight_scale", std::vector<std::size_t>{4},
+                                          std::vector<float>(4, 0.25f));
+               model.AddInitializedTensor("weight_zero_point", std::vector<std::size_t>{4},
+                                          std::vector<std::int8_t>(4, 0));
+            } else {
+               model.AddInitializedTensor("weight_scale", std::vector<std::size_t>{},
+                                          std::vector<float>{0.25f});
+               model.AddInitializedTensor("weight_zero_point", std::vector<std::size_t>{},
+                                          std::vector<std::int8_t>{0});
+            }
+            if (testCase.perChannelOutput) {
+               model.AddInitializedTensor("output_scale", std::vector<std::size_t>{8},
+                                          std::vector<float>(8, 0.5f));
+               model.AddInitializedTensor("output_zero_point", std::vector<std::size_t>{8},
+                                          std::vector<std::int8_t>(8, 0));
+            } else {
+               model.AddInitializedTensor("output_scale", std::vector<std::size_t>{},
+                                          std::vector<float>{0.5f});
+               model.AddInitializedTensor("output_zero_point", std::vector<std::size_t>{},
+                                          std::vector<std::int8_t>{0});
+            }
+            AddNamedOperator<SOFIE::ROperator_ONNXQuantizeLinear>(
+               model, "q_in", "input", "input_scale", "zero_point_int8", "input_carrier",
+               SOFIE::ETensorType::INT8, -1);
+            AddNamedOperator<SOFIE::ROperator_ONNXDequantizeLinear>(
+               model, "dq_in", "input_carrier", "input_scale", "zero_point_int8",
+               "input_dequantized", SOFIE::ETensorType::INT8, -1);
+            AddNamedOperator<SOFIE::ROperator_ONNXDequantizeLinear>(
+               model, "dq_w", "weight_carrier", "weight_scale", "weight_zero_point",
+               "weight_dequantized", SOFIE::ETensorType::INT8,
+               testCase.perChannelWeightAxis1 ? 1 : -1);
+            if (testCase.quantizedBias) {
+               model.AddInitializedTensor("bias_carrier", std::vector<std::size_t>{8},
+                                          std::vector<std::int8_t>(8, 0));
+               model.AddInitializedTensor("bias_scale", std::vector<std::size_t>{},
+                                          std::vector<float>{testCase.biasScale});
+               model.AddInitializedTensor("bias_zero_point", std::vector<std::size_t>{},
+                                          std::vector<std::int8_t>{testCase.biasZeroPoint});
+               AddNamedOperator<SOFIE::ROperator_ONNXDequantizeLinear>(
+                  model, "dq_b", "bias_carrier", "bias_scale", "bias_zero_point",
+                  "bias_dequantized", SOFIE::ETensorType::INT8, -1);
+            }
+            AddNamedOperator<SOFIE::ROperator_Conv<float>>(
+               model, "conv", "NOTSET", std::vector<std::size_t>{1}, 1,
+               std::vector<std::size_t>{3}, std::vector<std::size_t>{1, 1},
+               std::vector<std::size_t>{1}, "input_dequantized", "weight_dequantized",
+               testCase.quantizedBias ? "bias_dequantized" : "", "conv_output");
+            AddNamedOperator<SOFIE::ROperator_ONNXQuantizeLinear>(
+               model, "q_out", "conv_output", "output_scale", "output_zero_point",
+               "output_quantized", SOFIE::ETensorType::INT8,
+               testCase.perChannelOutput ? 1 : -1);
+            model.Initialize();
 
-         auto invalidOutputGranularity = valid;
-         invalidOutputGranularity.outputQuant->granularity =
-            SOFIE::EQuantizationGranularity::PerChannel;
-         invalidOutputGranularity.outputQuant->axis = 1;
-         reasons.clear();
-         SOFIE::CheckQuantizedConvQuantization(invalidOutputGranularity, reasons);
-         EXPECT_TRUE(containsReason(reasons, "output quantization is not per-tensor"));
+            const auto *region = SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(
+               model.GetQuantizationState());
+            ASSERT_NE(region, nullptr);
+            if (std::string(testCase.expectedReason).empty()) {
+               EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized)
+                  << region->reason;
+            } else {
+               EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticUnsupported)
+                  << region->reason;
+               EXPECT_NE(region->reason.find(testCase.expectedReason), std::string::npos)
+                  << region->reason;
+            }
+         }
 
-         auto invalidBiasScale = valid;
-         invalidBiasScale.biasQuant->scale = 0.5;
-         reasons.clear();
-         SOFIE::CheckQuantizedConvQuantization(invalidBiasScale, reasons);
-         EXPECT_TRUE(containsReason(reasons, "bias scale does not equal input scale times weight scale"));
-
-         auto invalidBiasZeroPoint = valid;
-         invalidBiasZeroPoint.biasQuant->zeroPoint = 1;
-         reasons.clear();
-         SOFIE::CheckQuantizedConvQuantization(invalidBiasZeroPoint, reasons);
-         EXPECT_TRUE(containsReason(reasons, "bias quantization is not signed with zero point 0"));
-
-         SOFIE::QuantizedConvRegion invalidFP8Output;
-         invalidFP8Output.inputLowPrecision =
-            SOFIE::LowPrecisionTensorInfoFromFP8Carrier(
-               SOFIE::ELowPrecisionCarrier::FP8E4M3, "input", "test input");
-         invalidFP8Output.weightLowPrecision =
-            SOFIE::LowPrecisionTensorInfoFromFP8Carrier(
-               SOFIE::ELowPrecisionCarrier::FP8E4M3, "weight", "test weight");
-         invalidFP8Output.outputLowPrecision =
-            SOFIE::LowPrecisionTensorInfoFromFP8Carrier(
-               SOFIE::ELowPrecisionCarrier::FP8E4M3, "output", "test output");
-         reasons.clear();
-         SOFIE::CheckQuantizedConvQuantization(invalidFP8Output, reasons);
-         EXPECT_TRUE(containsReason(reasons, "currently requires FP32 output"));
+         // A native FP8 Conv declaring an FP8 output contract must reject at parse:
+         // the backend contract is FP32 output only.
+         {
+            SCOPED_TRACE("invalid_fp8_output_contract");
+            SOFIE::RModel model("fp8_conv_fp8_output_contract");
+            model.AddInputTensorInfo("input", SOFIE::ETensorType::FLOAT8E4M3FN,
+                                     std::vector<std::size_t>{1, 4, 8});
+            model.AddInitializedTensor(
+               "weight", SOFIE::ETensorType::FLOAT8E4M3FN, std::vector<std::size_t>{8, 4, 3},
+               std::shared_ptr<void>(new std::uint8_t[96]{},
+                                     std::default_delete<std::uint8_t[]>()));
+            AddNamedOperator<SOFIE::ROperator_Conv<float>>(
+               model, "conv", "NOTSET", std::vector<std::size_t>{1}, 1,
+               std::vector<std::size_t>{3}, std::vector<std::size_t>{1, 1},
+               std::vector<std::size_t>{1}, "input", "weight", "", "output");
+            model.AddLowPrecisionTensorInfo(
+               "input", SOFIE::LowPrecisionTensorInfoFromFP8Carrier(
+                           SOFIE::ELowPrecisionCarrier::FP8E4M3, "input", "test input"));
+            model.AddLowPrecisionTensorInfo(
+               "weight", SOFIE::LowPrecisionTensorInfoFromFP8Carrier(
+                            SOFIE::ELowPrecisionCarrier::FP8E4M3, "weight", "test weight"));
+            model.AddLowPrecisionTensorInfo(
+               "output", SOFIE::LowPrecisionTensorInfoFromFP8Carrier(
+                            SOFIE::ELowPrecisionCarrier::FP8E4M3, "output", "test output"));
+            model.Initialize();
+            const auto *region = SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(
+               model.GetQuantizationState());
+            ASSERT_NE(region, nullptr);
+            EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticUnsupported);
+            EXPECT_NE(region->reason.find("currently requires FP32 output"), std::string::npos)
+               << region->reason;
+         }
    }
    {
       SCOPED_TRACE("shape and resource matrix");
@@ -1416,8 +909,9 @@ TEST(QuantizationMetadata, Convolution)
          for (const auto &testCase : cases) {
             SCOPED_TRACE(testCase.name);
             auto model = makeModel(testCase);
+            // One conv region per case, counted through the pipeline pipeline report.
+            ASSERT_EQ(SOFIE_TEST::CountRegions(SOFIE_TEST::AlpakaPipelineReport(model), "conv"), 1U);
             const auto &state = model.GetQuantizationState();
-            ASSERT_EQ(SOFIE::CountQuantizedRegions<SOFIE::QuantizedConvRegion>(state), 1U);
             const auto &region = *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(state);
             EXPECT_EQ(region.attributes.kind, testCase.kind);
             const auto *plan = SOFIE::FindQuantizedLoweringPlan(
@@ -1449,10 +943,12 @@ TEST(QuantizationMetadata, Convolution)
                   return entry.role == SOFIE::EQuantizedResourceRole::WeightCarrier;
                });
             ASSERT_NE(weightResource, plan->resources.entries.end());
+            // Persistent-weight accounting without the lifetime tag: the carrier is
+            // non-reusable tensor storage at least as large as the logical weight payload.
             EXPECT_EQ(weightResource->category,
                       SOFIE::EQuantizedResourceCategory::TensorStorage);
-            EXPECT_EQ(weightResource->lifetime,
-                      SOFIE::EQuantizedResourceLifetime::ModelPersistent);
+            EXPECT_GE(weightResource->bytes,
+                      SOFIE::ConvertShapeToLength(testCase.weightShape));
             EXPECT_FALSE(weightResource->reusable);
             EXPECT_FALSE(plan->weightStorageTensor.empty());
             if (testCase.status == SOFIE::EQuantizedLoweringStatus::BackendUnsupported)
@@ -1505,12 +1001,15 @@ TEST(QuantizationMetadata, Convolution)
             SOFIE::EQuantizationOverflowMode::SAT);
          model.Initialize();
 
-         ASSERT_EQ(SOFIE::CountQuantizedRegions<SOFIE::QuantizedConvRegion>(model.GetQuantizationState()), 1U);
+         // One conv region; per-channel recognition is a parse product in the
+         // tensor-info map.
+         ASSERT_EQ(SOFIE_TEST::CountRegions(SOFIE_TEST::AlpakaPipelineReport(model), "conv"), 1U);
          const auto &region = *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(model.GetQuantizationState());
-         ASSERT_TRUE(region.weightQuant.has_value());
-         EXPECT_EQ(region.weightQuant->granularity,
+         ASSERT_TRUE(model.HasQuantizationInfo("weight_quantized"));
+         const auto &weightInfo = model.GetQuantizationInfo("weight_quantized");
+         EXPECT_EQ(weightInfo.granularity,
                    SOFIE::EQuantizationGranularity::PerChannel);
-         EXPECT_EQ(region.weightQuant->axis, 0);
+         EXPECT_EQ(weightInfo.axis, 0);
          EXPECT_EQ(region.biasSourceTensor, "bias");
          ASSERT_TRUE(region.biasQuant.has_value());
          EXPECT_EQ(region.biasQuant->bitWidth, 32U);
@@ -2405,56 +1904,6 @@ TEST_F(QuantizationAlpakaTest, ConvolutionFrontendsEquivalent)
    }
 }
 
-TEST_F(QuantizationAlpakaTest, MemoryPlanning)
-{
-   constexpr Idx m = 64;
-   constexpr Idx k = 128;
-   constexpr Idx n = 128;
-   constexpr Idx layers = 4;
-
-   std::vector<std::int8_t> values(m * k);
-   for (Idx i = 0; i < values.size(); ++i)
-      values[i] = static_cast<std::int8_t>(((i * 5) % 31) - 15);
-   const auto input = values;
-
-   for (Idx layer = 0; layer < layers; ++layer) {
-      std::vector<std::int8_t> next(m * n);
-      for (Idx row = 0; row < m; ++row) {
-         for (Idx column = 0; column < n; ++column) {
-            std::int32_t accumulator = 0;
-            for (Idx inner = 0; inner < k; ++inner) {
-               const auto weight = static_cast<std::int8_t>(
-                  ((inner * n + column + layer * 3) % 9) - 4);
-               accumulator += static_cast<std::int32_t>(values[row * k + inner]) *
-                              static_cast<std::int32_t>(weight);
-            }
-            const auto quantized = static_cast<long>(
-               std::nearbyint(static_cast<double>(accumulator) / 8.0));
-            next[row * n + column] =
-               static_cast<std::int8_t>(std::clamp(quantized, -128L, 127L));
-         }
-      }
-      values = std::move(next);
-   }
-
-   auto input_d = CopyQuantizedInputToDevice(input);
-   SOFIE_ONNX_QDQ_QuantMatMul_Chain::Session<alpaka::TagGpuCudaRt> model(
-      "ONNX_QDQ_QuantMatMul_Chain_FromONNX_GPU_ALPAKA.dat");
-   ExpectQuantizedLinearInt8Output(model, values, input_d);
-
-   const auto diagnostics = model.GetQuantizedMemoryDiagnostics();
-   EXPECT_EQ(diagnostics.persistentCarrierBytes, 4U * k * n);
-   EXPECT_EQ(diagnostics.graphValuePeakBytes, 2U * m * n);
-   EXPECT_EQ(diagnostics.graphValueUnpooledBytes, 3U * m * n);
-   EXPECT_EQ(diagnostics.GraphValueBytesAvoided(), m * n);
-   EXPECT_EQ(diagnostics.workspaceCapacityBytes, SOFIE::kQuantizedCudaLtMaxWorkspaceBytes);
-   EXPECT_GT(diagnostics.reusableScratchPeakBytes, diagnostics.workspaceCapacityBytes);
-   EXPECT_LE(diagnostics.selectedWorkspaceBytes, diagnostics.workspaceCapacityBytes);
-   EXPECT_EQ(diagnostics.PlannedQuantizedDevicePeakBytes(),
-             diagnostics.persistentCarrierBytes + diagnostics.graphValuePeakBytes +
-                diagnostics.reusableScratchPeakBytes);
-}
-
 TEST_F(QuantizationAlpakaTest, ElementwiseKernels)
 {
    // SOFIE quantization uses round-half-to-even (nearbyint); the references
@@ -2726,10 +2175,12 @@ TEST(QuantizationMetadata, Elementwise)
       return model;
    };
 
-   auto singleRegion = [](const SOFIE::RModel &model) -> const SOFIE::QuantizedElementwiseRegion * {
-      const auto &state = model.GetQuantizationState();
-      EXPECT_EQ(SOFIE::CountQuantizedRegions<SOFIE::QuantizedElementwiseRegion>(state), 1U);
-      return SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedElementwiseRegion>(state);
+   // One elementwise region per model, counted through the pipeline pipeline report; the
+   // region handle itself is still needed to reach its plans.
+   auto singleRegion = [](SOFIE::RModel &model) -> const SOFIE::QuantizedElementwiseRegion * {
+      EXPECT_EQ(SOFIE_TEST::CountRegions(SOFIE_TEST::AlpakaPipelineReport(model), "elementwise"), 1U);
+      return SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedElementwiseRegion>(
+         model.GetQuantizationState());
    };
 
    {
@@ -2744,10 +2195,16 @@ TEST(QuantizationMetadata, Elementwise)
          EXPECT_EQ(qdqRegion->kind, SOFIE::EQuantizedElementwiseKind::Add);
          EXPECT_EQ(qonnxRegion->status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
          EXPECT_EQ(qdqRegion->status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
-         ASSERT_TRUE(qonnxRegion->inputQuant.has_value());
-         ASSERT_TRUE(qdqRegion->inputQuant.has_value());
-         EXPECT_EQ(qonnxRegion->inputQuant->scale, qdqRegion->inputQuant->scale);
-         EXPECT_EQ(qonnxRegion->outputQuant->scale, qdqRegion->outputQuant->scale);
+         // The operand grids are parse products: both frontends must mint the same
+         // input and output scales, read from the tensor-info map.
+         ASSERT_TRUE(qonnx.HasQuantizationInfo("xa_q"));
+         ASSERT_TRUE(qdq.HasQuantizationInfo("xa_i8"));
+         EXPECT_EQ(qonnx.GetQuantizationInfo("xa_q").scale,
+                   qdq.GetQuantizationInfo("xa_i8").scale);
+         ASSERT_TRUE(qonnx.HasQuantizationInfo("output"));
+         ASSERT_TRUE(qdq.HasQuantizationInfo("output"));
+         EXPECT_EQ(qonnx.GetQuantizationInfo("output").scale,
+                   qdq.GetQuantizationInfo("output").scale);
 
          for (const auto *model : {&qonnx, &qdq}) {
             const auto &state = model->GetQuantizationState();
@@ -3116,8 +2573,9 @@ TEST(QuantizationMetadata, Gather)
    {
       SCOPED_TRACE("per-tensor weight-only Gather is recognized and externalizes the table");
          auto model = buildQDQGather("qdq_gather", Quant::PerTensor);
+         // One gather region, counted through the pipeline pipeline report.
+         ASSERT_EQ(SOFIE_TEST::CountRegions(SOFIE_TEST::AlpakaPipelineReport(model), "gather"), 1U);
          const auto &state = model.GetQuantizationState();
-         ASSERT_EQ(SOFIE::CountQuantizedRegions<SOFIE::QuantizedGatherRegion>(state), 1U);
          const auto *region = SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedGatherRegion>(state);
          ASSERT_NE(region, nullptr);
          EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
@@ -3156,830 +2614,8 @@ TEST(QuantizationMetadata, Gather)
    }
 }
 
-// Multi-layer QONNX MLP in the shape a PQuant export produces. Every Gemm must reach the
-// optimized cuBLASLt int8 path, and codegen must not abort on an orphaned Quant.
-TEST(QuantizationMLP, MultiLayerQONNXWeaverStyle)
-{
-#ifndef SOFIE_USE_CUBLASLT
-   GTEST_SKIP() << "SOFIE_USE_CUBLASLT is not enabled";
-#else
-   // >1M MACs per Gemm, so each is a cuBLASLt exact-shape optimized candidate.
-   const std::size_t M = 64, K = 256, H = 256, N = 256;
-   SOFIE::RModel model("quant_mlp_weaver_style");
-   model.AddInputTensorInfo("input", SOFIE::ETensorType::FLOAT, std::vector<std::size_t>{M, K});
-
-   auto addFloat = [&](const std::string &name, const std::vector<std::size_t> &shp,
-                       std::size_t count, float v) {
-      model.AddInitializedTensor(name, SOFIE::ETensorType::FLOAT, shp,
-                                 std::shared_ptr<void>(new float[count], std::default_delete<float[]>()));
-      std::fill_n(static_cast<float *>(model.GetInitializedTensorData(name).get()), count, v);
-   };
-   addFloat("scale", {}, 1, 0.03125f);
-   addFloat("zp", {}, 1, 0.0f);
-   addFloat("bits", {}, 1, 8.0f);
-   addFloat("W0", {H, K}, H * K, 0.02f); // [out, in] for transB=1
-   addFloat("b0", {H}, H, 0.0f);
-   addFloat("W1", {N, H}, N * H, 0.02f);
-   addFloat("b1", {N}, N, 0.0f);
-
-   auto quant = [&](const std::string &pfx, const std::string &src, const std::string &dst) {
-      AddNamedOperator<SOFIE::ROperator_QONNXQuant>(
-         model, pfx, src, "scale", "zp", "bits", dst, true, false,
-         SOFIE::EQuantizationRoundingMode::ROUND, SOFIE::EQuantizationOverflowMode::SAT);
-   };
-   quant("q_in", "input", "in_q");
-   quant("q_w0", "W0", "W0_q");
-   quant("q_b0", "b0", "b0_q");
-   AddNamedOperator<SOFIE::ROperator_Gemm<float>>(model, "gemm0", 1.0f, 1.0f, 0, 1,
-                                                  "in_q", "W0_q", "b0_q", "g0");
-   quant("q_g0", "g0", "g0_q");
-   AddNamedOperator<SOFIE::ROperator_Relu<float>>(model, "relu0", "g0_q", "a0");
-   quant("q_a0", "a0", "a0_q");
-   quant("q_w1", "W1", "W1_q");
-   quant("q_b1", "b1", "b1_q");
-   AddNamedOperator<SOFIE::ROperator_Gemm<float>>(model, "gemm1", 1.0f, 1.0f, 0, 1,
-                                                  "a0_q", "W1_q", "b1_q", "g1");
-   quant("q_out", "g1", "output");
-   model.AddOutputTensorNameList({"output"});
-
-   ASSERT_NO_THROW(model.Initialize());
-   const auto &state = model.GetQuantizationState();
-
-   // Two quantized Gemm regions, each with an optimized cuBLASLt int8 ALPAKA plan.
-   ASSERT_EQ(SOFIE::CountQuantizedRegions<SOFIE::QuantizedGemmRegion>(state), 2U);
-   std::size_t optimizedGemms = 0;
-   for (const auto &[opIndex, region] : state.regions) {
-      if (SOFIE::FindQuantizedRegion<SOFIE::QuantizedGemmRegion>(state, opIndex) == nullptr)
-         continue;
-      const auto *plan =
-         SOFIE::FindQuantizedLoweringPlan(state, opIndex, SOFIE::EQuantizedBackend::ALPAKA);
-      ASSERT_NE(plan, nullptr);
-      EXPECT_EQ(plan->status, SOFIE::EQuantizedLoweringStatus::Optimized) << plan->reason;
-      if (plan->status == SOFIE::EQuantizedLoweringStatus::Optimized)
-         ++optimizedGemms;
-   }
-   EXPECT_EQ(optimizedGemms, 2U);
-
-   // The chain must generate without aborting on an orphaned QONNX Quant.
-   EXPECT_NO_THROW(model.GenerateGPU_ALPAKA(SOFIE::Options::kBinaryWeightFile));
-#endif
-}
-
-// A strided-batched Gemm with a transposed B operand, which requires the transposed-case
-// leading dimensions. The operator is built directly, as no parser path emits this.
-TEST(QuantizationCodegen, BatchedGemmTransposedBLeadingDimensions)
-{
-   // (batch 2 x 3) x [M=4, K=5] @ [N=6, K=5]^T -> [M=4, N=6]. K != N so a wrong lda is
-   // a different number rather than an accidental match.
-   const std::size_t B = 2, H = 3, M = 4, K = 5, N = 6;
-   SOFIE::RModel model("batched_gemm_transposed_b");
-   model.AddInputTensorInfo("x", SOFIE::ETensorType::FLOAT, std::vector<std::size_t>{B, H, M, K});
-
-   const std::size_t weightCount = B * H * N * K;
-   model.AddInitializedTensor("bw", SOFIE::ETensorType::FLOAT, std::vector<std::size_t>{B, H, N, K},
-                              std::shared_ptr<void>(new float[weightCount],
-                                                    std::default_delete<float[]>()));
-   std::fill_n(static_cast<float *>(model.GetInitializedTensorData("bw").get()), weightCount, 0.5f);
-
-   // alpha=1, beta=0, transA=0, transB=1, and no bias -- the combination that selects the
-   // gemmStridedBatched branch.
-   AddNamedOperator<SOFIE::ROperator_Gemm<float>>(model, "bgemm", 1.0f, 0.0f, 0, 1, "x", "bw", "y");
-   model.AddOutputTensorNameList({"y"});
-
-   ASSERT_NO_THROW(model.Initialize());
-   ASSERT_NO_THROW(model.GenerateGPU_ALPAKA(SOFIE::Options::kBinaryWeightFile));
-   const std::string code = model.ReturnGenerated();
-
-   const auto call = code.find("gemmStridedBatched");
-   ASSERT_NE(call, std::string::npos) << "expected the strided-batched branch for a rank-4 "
-                                         "no-bias Gemm with a per-batch B operand";
-
-   // The leading dimension is the argument immediately after the A_sofie pointer, which is
-   // the ONNX B tensor. transa_sofie is 't' here, so it must be K, not m_sofie (= N).
-   const std::string afterPointer = "deviceBuf_bw), ";
-   const auto at = code.find(afterPointer, call);
-   ASSERT_NE(at, std::string::npos);
-   const std::string tail = code.substr(at + afterPointer.size(), 32);
-   EXPECT_EQ(tail.substr(0, tail.find(',')), std::to_string(K))
-      << "lda must be K for a transposed A_sofie operand; emitted: " << tail;
-}
-
-// Batched activation x activation, both operands runtime tensors, B through a Transpose,
-// a scalar Mul folding into epilogue alpha. Mirrors make_qdq_batched_matmul_fixture.py.
-namespace {
-
-constexpr Idx kBmmB = 32, kBmmH = 8, kBmmT = 32, kBmmD = 16;
-constexpr double kBmmScaleA = 0.0078125, kBmmScaleB = 0.00390625, kBmmScaleOut = 0.00048828125;
-constexpr double kBmmAlpha = 0.25;
-
-// Operand values in grid units, small enough that quantization never clamps -- the
-// accumulator is then exactly the integer dot product of these.
-int BatchedMatMulAValue(std::size_t i)
-{
-   return static_cast<int>((i * 13 + 5) % 97) - 48;
-}
-int BatchedMatMulBValue(std::size_t i)
-{
-   return static_cast<int>((i * 29 + 11) % 83) - 41;
-}
-
-std::size_t BatchedMatMulIndex(std::size_t b, std::size_t h, std::size_t t, std::size_t d)
-{
-   return ((b * kBmmH + h) * kBmmT + t) * kBmmD + d;
-}
-
-} // namespace
-
-class QuantizedBatchedMatMulTest : public QuantizationAlpakaTest {
-protected:
-   // QuantizeLinear is elementwise, so quantizing before or after the transpose agrees;
-   // the accumulator indexes B by [.., n, d] off the untransposed values.
-   std::vector<float> Reference(int clipLoQ, int clipHiQ) const
-   {
-      auto clampTo = [](double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); };
-      const double clipLo = clipLoQ * kBmmScaleOut;
-      const double clipHi = clipHiQ * kBmmScaleOut;
-
-      std::vector<float> expected(kBmmB * kBmmH * kBmmT * kBmmT);
-      for (std::size_t b = 0; b < kBmmB; ++b) {
-         for (std::size_t h = 0; h < kBmmH; ++h) {
-            for (std::size_t m = 0; m < kBmmT; ++m) {
-               for (std::size_t n = 0; n < kBmmT; ++n) {
-                  std::int32_t acc = 0;
-                  for (std::size_t d = 0; d < kBmmD; ++d)
-                     acc += BatchedMatMulAValue(BatchedMatMulIndex(b, h, m, d)) *
-                            BatchedMatMulBValue(BatchedMatMulIndex(b, h, n, d));
-                  double real = acc * kBmmScaleA * kBmmScaleB * kBmmAlpha;
-                  real = clampTo(real, clipLo, clipHi);
-                  const double q = clampTo(std::nearbyint(real / kBmmScaleOut), -128.0, 127.0);
-                  expected[((b * kBmmH + h) * kBmmT + m) * kBmmT + n] =
-                     static_cast<float>(q * kBmmScaleOut);
-               }
-            }
-         }
-      }
-      return expected;
-   }
-
-   auto MakeOperand(int (*value)(std::size_t), double scale)
-   {
-      const Idx count = kBmmB * kBmmH * kBmmT * kBmmD;
-      auto host_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(count));
-      auto *ptr = alpaka::getPtrNative(host_h);
-      for (Idx i = 0; i < count; ++i)
-         ptr[i] = static_cast<float>(value(i) * scale);
-      auto device_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(count));
-      alpaka::memcpy(queue, device_d, host_h);
-      alpaka::wait(queue);
-      return device_d;
-   }
-
-   template <typename TResult>
-   void ExpectExact(TResult &result, const std::vector<float> &expected, const char *what)
-   {
-      const Idx outputSize = static_cast<Idx>(expected.size());
-      auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(outputSize));
-      alpaka::memcpy(queue, result_h, result);
-      alpaka::wait(queue);
-      const auto *res_ptr = reinterpret_cast<const float *>(alpaka::getPtrNative(result_h));
-
-      int mismatches = 0;
-      for (Idx i = 0; i < outputSize; ++i) {
-         if (res_ptr[i] != expected[i]) {
-            ++mismatches;
-            if (mismatches <= 5)
-               EXPECT_EQ(res_ptr[i], expected[i]) << "at i=" << i;
-         }
-      }
-      EXPECT_EQ(mismatches, 0) << what << " diverged from the exact reference (" << mismatches
-                               << " of " << outputSize << " elements)";
-   }
-};
-
-TEST_F(QuantizedBatchedMatMulTest, MatchesExactReference)
-{
-   auto q_d = MakeOperand(&BatchedMatMulAValue, kBmmScaleA);
-   auto k_d = MakeOperand(&BatchedMatMulBValue, kBmmScaleB);
-
-   SOFIE_ONNX_QDQ_BatchedMatMul::Session<alpaka::TagGpuCudaRt> model(
-      "ONNX_QDQ_BatchedMatMul_FromONNX_GPU_ALPAKA.dat");
-   auto result = model.infer(q_d, k_d);
-   alpaka::wait(queue);
-   cudaDeviceSynchronize();
-
-   ExpectExact(result, Reference(-128, 127), "batched activation x activation MatMul");
-}
-
-// An output Clip narrower than the int8 grid, which the region folds into outputClamp.
-TEST_F(QuantizedBatchedMatMulTest, NarrowOutputClipMatchesExactReference)
-{
-   auto q_d = MakeOperand(&BatchedMatMulAValue, kBmmScaleA);
-   auto k_d = MakeOperand(&BatchedMatMulBValue, kBmmScaleB);
-
-   SOFIE_ONNX_QDQ_BatchedMatMul_NarrowClip::Session<alpaka::TagGpuCudaRt> model(
-      "ONNX_QDQ_BatchedMatMul_NarrowClip_FromONNX_GPU_ALPAKA.dat");
-   auto result = model.infer(q_d, k_d);
-   alpaka::wait(queue);
-   cudaDeviceSynchronize();
-
-   ExpectExact(result, Reference(-64, 63), "batched MatMul with a narrow output clip");
-}
-
-// A Transpose on the output chain: the boundary behind it defines the grid, but the
-// Transpose must not be absorbed, since that would drop the permutation.
-TEST_F(QuantizedBatchedMatMulTest, TransposedOutputChainMatchesExactReference)
-{
-   constexpr double kOutScaleT = 0.001953125;  // 2^-9; no alpha here, so the product is 4x larger
-   auto clampTo = [](double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); };
-
-   // The graph permutes [B, H, T, T] -> [B, T, H, T] and flattens the tail, so the value
-   // computed at (b, h, m, n) must land at [(b*T + m)*H*T + h*T + n].
-   std::vector<float> expected(kBmmB * kBmmH * kBmmT * kBmmT);
-   for (std::size_t b = 0; b < kBmmB; ++b) {
-      for (std::size_t h = 0; h < kBmmH; ++h) {
-         for (std::size_t m = 0; m < kBmmT; ++m) {
-            for (std::size_t n = 0; n < kBmmT; ++n) {
-               std::int32_t acc = 0;
-               for (std::size_t d = 0; d < kBmmD; ++d)
-                  acc += BatchedMatMulAValue(BatchedMatMulIndex(b, h, m, d)) *
-                         BatchedMatMulBValue(BatchedMatMulIndex(b, h, n, d));
-               double real = acc * kBmmScaleA * kBmmScaleB;
-               real = clampTo(real, -128.0 * kOutScaleT, 127.0 * kOutScaleT);
-               const double q = clampTo(std::nearbyint(real / kOutScaleT), -128.0, 127.0);
-               expected[(b * kBmmT + m) * kBmmH * kBmmT + h * kBmmT + n] =
-                  static_cast<float>(q * kOutScaleT);
-            }
-         }
-      }
-   }
-
-   auto q_d = MakeOperand(&BatchedMatMulAValue, kBmmScaleA);
-   auto k_d = MakeOperand(&BatchedMatMulBValue, kBmmScaleB);
-
-   SOFIE_ONNX_QDQ_BatchedMatMul_TransposedOutput::Session<alpaka::TagGpuCudaRt> model(
-      "ONNX_QDQ_BatchedMatMul_TransposedOutput_FromONNX_GPU_ALPAKA.dat");
-   auto result = model.infer(q_d, k_d);
-   alpaka::wait(queue);
-   cudaDeviceSynchronize();
-
-   ExpectExact(result, expected, "batched MatMul with a Transpose on its output chain");
-}
-
-// Two fake-quant boundaries on one grid split by a Reshape, where the region reads the
-// existing int8 carrier. Mirrors make_qdq_carrier_handoff_fixture.py.
-TEST_F(QuantizationAlpakaTest, QdqCarrierHandoffMatchesExactReference)
-{
-   constexpr Idx kB = 32, kT = 32, kK = 128, kN = 128;
-   constexpr double kInScale = 0.0078125, kWeightScale = 0.0078125, kOutScale = 0.015625;
-   constexpr Idx kM = kB * kT;
-
-   auto weightValue = [](std::size_t k, std::size_t n) {
-      return static_cast<int>((k * 23 + n * 11) % 13) - 6;
-   };
-   auto biasValue = [](std::size_t n) {
-      return (static_cast<double>(n % 7) - 3.0) * kInScale * kWeightScale * 8.0;
-   };
-   auto inputValue = [](std::size_t i) {
-      return static_cast<int>((i * 17 + 3) % 61) - 30;
-   };
-   auto clampTo = [](double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); };
-
-   std::vector<float> input(static_cast<std::size_t>(kM) * kK);
-   for (std::size_t i = 0; i < input.size(); ++i)
-      input[i] = static_cast<float>(inputValue(i) * kInScale);
-
-   // Both boundaries are on kInScale and the values are exactly representable, so the second
-   // quantization is the identity and the accumulator is the integer dot product.
-   std::vector<float> expected(static_cast<std::size_t>(kM) * kN);
-   for (std::size_t m = 0; m < kM; ++m) {
-      for (std::size_t n = 0; n < kN; ++n) {
-         std::int32_t acc = 0;
-         for (std::size_t k = 0; k < kK; ++k)
-            acc += inputValue(m * kK + k) * weightValue(k, n);
-         double real = acc * kInScale * kWeightScale + biasValue(n);
-         real = clampTo(real, -128.0 * kOutScale, 127.0 * kOutScale);
-         const double q = clampTo(std::nearbyint(real / kOutScale), -128.0, 127.0);
-         expected[m * kN + n] = static_cast<float>(q * kOutScale);
-      }
-   }
-
-   const Idx inputSize = static_cast<Idx>(input.size());
-   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(inputSize));
-   std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
-   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(inputSize));
-   alpaka::memcpy(queue, input_d, input_h);
-   alpaka::wait(queue);
-
-   SOFIE_ONNX_QDQ_CarrierHandoff::Session<alpaka::TagGpuCudaRt> model(
-      "ONNX_QDQ_CarrierHandoff_FromONNX_GPU_ALPAKA.dat");
-   auto result = model.infer(input_d);
-   alpaka::wait(queue);
-   cudaDeviceSynchronize();
-
-   const Idx outputSize = static_cast<Idx>(expected.size());
-   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(outputSize));
-   alpaka::memcpy(queue, result_h, result);
-   alpaka::wait(queue);
-   const auto *res_ptr = reinterpret_cast<const float *>(alpaka::getPtrNative(result_h));
-
-   int mismatches = 0;
-   for (Idx i = 0; i < outputSize && mismatches < 5; ++i) {
-      if (res_ptr[i] != expected[i]) {
-         ++mismatches;
-         EXPECT_EQ(res_ptr[i], expected[i]) << "at i=" << i;
-      }
-   }
-   EXPECT_EQ(mismatches, 0) << "int8 carrier handoff diverged from the exact reference";
-}
-
-// A Q/DQ exporter emits one DequantizeLinear per consumer; canonicalization keeps one
-// and turns the rest into views. Same carrier, same grid, so this compares bit-for-bit.
-TEST_F(QuantizationAlpakaTest, DuplicateDecodesCollapseWithoutChangingValues)
-{
-   constexpr Idx kN = 16;
-   constexpr double kInScale = 0.25, kWeightScale = 0.125;
-   auto xValue = [](std::size_t i) {
-      return (static_cast<double>((i * 7 + 3) % 13) - 6.0) * kInScale;
-   };
-   auto wValue = [](std::size_t i) {
-      return (static_cast<double>((i * 5 + 2) % 11) - 5.0) * kWeightScale;
-   };
-   auto biasValue = [](std::size_t i) { return static_cast<double>((i * 3 + 1) % 7) - 3.0; };
-
-   std::vector<float> input(kN);
-   std::vector<float> expected(kN);
-   for (std::size_t i = 0; i < kN; ++i) {
-      input[i] = static_cast<float>(xValue(i));
-      const double x = xValue(i);
-      expected[i] = static_cast<float>(x * wValue(i) + x * wValue(i + 3) + (x + biasValue(i)));
-   }
-
-   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(kN));
-   std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
-   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(kN));
-   alpaka::memcpy(queue, input_d, input_h);
-   alpaka::wait(queue);
-
-   SOFIE_QDQ_DuplicateDecode::Session<alpaka::TagGpuCudaRt> model(
-      "QDQ_DuplicateDecode_FromONNX_GPU_ALPAKA.dat");
-   auto result = model.infer(input_d);
-   alpaka::wait(queue);
-   cudaDeviceSynchronize();
-
-   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(kN));
-   alpaka::memcpy(queue, result_h, result);
-   alpaka::wait(queue);
-   const auto *res = reinterpret_cast<const float *>(alpaka::getPtrNative(result_h));
-
-   int mismatches = 0;
-   for (Idx i = 0; i < kN && mismatches < 5; ++i) {
-      if (res[i] != expected[i]) {
-         ++mismatches;
-         EXPECT_EQ(res[i], expected[i]) << "at i=" << i;
-      }
-   }
-   EXPECT_EQ(mismatches, 0) << "collapsing duplicate decodes changed the values";
-}
-
-// The numeric test above passes whether or not the duplicates collapsed; this asserts
-// the collapse happened and that a duplicate stops claiming to read the carrier.
-TEST(DuplicateDecodeCodegen, DuplicatesBecomeViewsOverTheSurvivor)
-{
-   std::ifstream in("QDQ_DuplicateDecode_FromONNX_GPU_ALPAKA.hxx");
-   ASSERT_TRUE(in.good());
-   const std::string code((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-
-   auto occurrences = [&code](const std::string &needle) {
-      int n = 0;
-      for (std::size_t at = code.find(needle); at != std::string::npos;
-           at = code.find(needle, at + needle.size()))
-         ++n;
-      return n;
-   };
-
-   EXPECT_EQ(occurrences("(duplicate decode: view over "), 2)
-      << "expected exactly two duplicates collapsed to views";
-
-   // Three DequantizeLinear nodes in, no decode kernel out: two became views and the
-   // survivor fused with its producing Quantize once the carrier had exactly one consumer.
-   EXPECT_EQ(occurrences("struct DequantizeLinearKernel_op_"), 0)
-      << "the survivor did not fuse with its Quantize; the duplicates are still blocking it";
-   EXPECT_EQ(occurrences("struct QuantizeLinearKernel_op_"), 1)
-      << "expected one fused round trip to remain";
-}
-
-// The frontier invariant: a surviving boundary is legitimate only where float genuinely
-// enters or leaves. Scores carrier propagation only; foldable producer encodes are separate.
-TEST(CarrierFrontier, SurvivingBoundariesAreTheFrontierAndNotABacklog)
-{
-   // Every fixture reports its residual, so a regression shows up as a diff in the artifact
-   // rather than as a silent slowdown.
-   for (const char *header : {"QDQ_MovementCarrier_FromONNX_GPU_ALPAKA.hxx",
-                              "ONNX_QDQ_ReshapeGemm_FromONNX_GPU_ALPAKA.hxx",
-                              "ONNX_QDQ_QuantMLP_FromONNX_GPU_ALPAKA.hxx"}) {
-      std::ifstream in(header);
-      ASSERT_TRUE(in.good()) << header;
-      const std::string code((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-      EXPECT_NE(code.find("// SOFIE carrier frontier:"), std::string::npos)
-         << header << " does not report its carrier frontier";
-   }
-
-   // MovementCarrier retains one owed boundary: the trailing Dequantize feeds an Arithmetic
-   // MatMul no region claimed. Pinning it at one makes a regression to two visible.
-   std::ifstream in("QDQ_MovementCarrier_FromONNX_GPU_ALPAKA.hxx");
-   ASSERT_TRUE(in.good());
-   const std::string code((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-   EXPECT_NE(code.find("// SOFIE carrier frontier: 1 unabsorbed"), std::string::npos)
-      << "MovementCarrier's residual moved; if that was intended, update this number and say "
-         "which absorption changed";
-}
-
-// Of the carrier capability protocol's answers only CarrierOutputAliasesInput fails
-// silently (the pooled arena hands a live view's bytes away), so it is the one pinned.
-TEST(CarrierCapabilityProtocol, OperatorsDeclareWhatTheyCanCarry)
-{
-   // The default has to be RequiresFloat, or every operator nobody has audited starts
-   // claiming it can carry codes.
-   SOFIE::ROperator_Softmax softmax(1, "x", "y");
-   EXPECT_EQ(softmax.CarrierSupport(), SOFIE::ELowPrecisionCarrierSupport::RequiresFloat);
-   EXPECT_FALSE(softmax.CarrierOutputAliasesInput());
-   EXPECT_THROW(softmax.RewireLowPrecisionCarrier("a", "b"), std::runtime_error);
-
-   // A Reshape emits a non-owning view on the device: its output *is* its input's storage.
-   SOFIE::ROperator_Reshape reshape(SOFIE::ReshapeOpMode::Reshape, 0, "x", "shape", "y");
-   EXPECT_EQ(reshape.CarrierSupport(), SOFIE::ELowPrecisionCarrierSupport::ValuePreserving);
-   EXPECT_TRUE(reshape.CarrierOutputAliasesInput())
-      << "a Reshape that does not declare aliasing lets the carrier arena reuse its source";
-
-   // A Transpose runs a real kernel into its own buffer, so it does not alias. Declaring
-   // otherwise would keep tensors out of the arena that belong in it -- wasteful, not wrong.
-   SOFIE::ROperator_Transpose<float> transpose(std::vector<SOFIE::int_t>{1, 0}, "x", "y");
-   EXPECT_EQ(transpose.CarrierSupport(), SOFIE::ELowPrecisionCarrierSupport::ValuePreserving);
-   EXPECT_FALSE(transpose.CarrierOutputAliasesInput());
-}
-
-// Movement runs rewire onto the carrier and the bracketing pairs are deleted; the fixture's
-// grid makes quantizing the identity, so this compares bit-for-bit.
-TEST_F(QuantizationAlpakaTest, MovementCarrierPropagationMatchesExactReference)
-{
-   // Mirrors MovementCarrierModelGenerator.py; keep the two in sync.
-   constexpr Idx kM = 8, kK = 32, kRows = 4, kCols = 64, kN = 4;
-   constexpr double kInScale = 0.25, kWeightScale = 0.125;
-
-   auto xValue = [](std::size_t i) {
-      return (static_cast<double>((i * 7 + 3) % 13) - 6.0) * kInScale;
-   };
-   auto wValue = [](std::size_t i) {
-      return (static_cast<double>((i * 5 + 2) % 11) - 5.0) * kWeightScale;
-   };
-   auto biasValue = [](std::size_t i) { return static_cast<double>((i * 3 + 1) % 7) - 3.0; };
-
-   std::vector<float> input(static_cast<std::size_t>(kM) * kK);
-   for (std::size_t i = 0; i < input.size(); ++i)
-      input[i] = static_cast<float>(xValue(i));
-
-   // The reshape and transpose are pure data movement, so the reference indexes the input
-   // directly rather than re-deriving what the graph does.
-   std::vector<float> expected(static_cast<std::size_t>(kCols) * kN);
-   for (std::size_t c = 0; c < kCols; ++c) {
-      for (std::size_t n = 0; n < kN; ++n) {
-         double acc = biasValue(n);
-         for (std::size_t r = 0; r < kRows; ++r)
-            acc += xValue(r * kCols + c) * wValue(r * kN + n);
-         expected[c * kN + n] = static_cast<float>(acc);
-      }
-   }
-
-   const Idx inputSize = static_cast<Idx>(input.size());
-   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(inputSize));
-   std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
-   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(inputSize));
-   alpaka::memcpy(queue, input_d, input_h);
-   alpaka::wait(queue);
-
-   SOFIE_QDQ_MovementCarrier::Session<alpaka::TagGpuCudaRt> model(
-      "QDQ_MovementCarrier_FromONNX_GPU_ALPAKA.dat");
-   auto result = model.infer(input_d);
-   alpaka::wait(queue);
-   cudaDeviceSynchronize();
-
-   const Idx outputSize = static_cast<Idx>(expected.size());
-   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(outputSize));
-   alpaka::memcpy(queue, result_h, result);
-   alpaka::wait(queue);
-   const auto *res_ptr = reinterpret_cast<const float *>(alpaka::getPtrNative(result_h));
-
-   int mismatches = 0;
-   for (Idx i = 0; i < outputSize && mismatches < 5; ++i) {
-      if (res_ptr[i] != expected[i]) {
-         ++mismatches;
-         EXPECT_EQ(res_ptr[i], expected[i]) << "at i=" << i;
-      }
-   }
-   EXPECT_EQ(mismatches, 0) << "carrier propagated through Reshape/Transpose changed the values";
-}
-
-// The numeric test cannot tell propagation from a correct float round trip on this grid;
-// this asserts the rewrite happened and the movement operators read the carriers.
-TEST(MovementCarrierCodegen, BracketingBoundariesAreDeleted)
-{
-   std::ifstream in("QDQ_MovementCarrier_FromONNX_GPU_ALPAKA.hxx");
-   ASSERT_TRUE(in.good());
-   const std::string code((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-
-   auto occurrences = [&code](const std::string &needle) {
-      int n = 0;
-      for (std::size_t at = code.find(needle); at != std::string::npos;
-           at = code.find(needle, at + needle.size()))
-         ++n;
-      return n;
-   };
-
-   // Of three Quantize and three Dequantize nodes the two bracketing pairs must be gone;
-   // the leading Quantize and the trailing Dequantize survive.
-   EXPECT_EQ(occurrences("struct QuantizeLinearKernel_op_"), 1)
-      << "a Quantize bracketing a movement operator was not deleted";
-   EXPECT_EQ(occurrences("struct DequantizeLinearKernel_op_"), 1)
-      << "a Dequantize bracketing a movement operator was not deleted";
-
-   // The Reshape aliases the incoming carrier rather than a float tensor, and the
-   // Transpose permutes bytes out of the carrier the Reshape produced.
-   EXPECT_NE(code.find("deviceBuf_rq = alpaka::createView(devAcc, alpaka::getPtrNative(deviceBuf_xq)"),
-             std::string::npos)
-      << "the Reshape is not viewing the int8 carrier";
-   EXPECT_NE(code.find("transposeKernel_5, alpaka::getPtrNative(deviceBuf_rq)"), std::string::npos)
-      << "the Transpose is not reading the carrier the Reshape produced";
-
-   // A Reshape view makes two names one allocation, so neither may enter the pooled arena.
-   // Asserted on the generated text: the corruption is a warp race, not deterministic numbers.
-   EXPECT_NE(code.find("BufI81D deviceBuf_xq = alpaka::allocBuf"), std::string::npos)
-      << "the aliased source was pooled; a later carrier can overwrite it mid-flight";
-}
-
-// Asserts the carrier handoff engaged, which the numeric test cannot observe because
-// staging the float back to int8 computes the same values.
-TEST(QuantizedCarrierHandoffCodegen, RegionReadsTheUpstreamInt8Carrier)
-{
-   std::ifstream in("ONNX_QDQ_CarrierHandoff_FromONNX_GPU_ALPAKA.hxx");
-   ASSERT_TRUE(in.good());
-   const std::string code((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-
-   const auto call = code.find("QuantizedGemmCudaLt_Call");
-   ASSERT_NE(call, std::string::npos) << "region did not lower";
-   EXPECT_NE(code.find("inputCarrier = SOFIE::EQuantizedInputCarrier::Int8"), std::string::npos)
-      << "region still stages float->int8 internally; the upstream carrier handoff did not engage";
-   // deviceBuf_aq is the QuantizeLinear output, i.e. the carrier one boundary upstream.
-   EXPECT_NE(code.find("deviceBuf_aq"), std::string::npos)
-      << "region is not reading the upstream int8 carrier tensor";
-}
-
-// Asserts the region lowers to cuBLASLt, which the numeric tests cannot observe: both
-// operands are exactly representable, so an FP32 fallback computes the same numbers.
-TEST(QuantizedBatchedMatMulCodegen, RegionLowersToCublasLt)
-{
-   for (const char *header : {"ONNX_QDQ_BatchedMatMul_FromONNX_GPU_ALPAKA.hxx",
-                              "ONNX_QDQ_BatchedMatMul_NarrowClip_FromONNX_GPU_ALPAKA.hxx",
-                              "ONNX_QDQ_BatchedMatMul_TransposedOutput_FromONNX_GPU_ALPAKA.hxx"}) {
-      std::ifstream in(header);
-      ASSERT_TRUE(in.good()) << "cannot open " << header;
-      const std::string code((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-      EXPECT_NE(code.find("QuantizedGemmCudaLt_Call"), std::string::npos)
-         << header << " emits no fused int8 GEMM call: the batched activation x activation "
-                      "region fell back to FP32, so its numeric test proves nothing";
-   }
-}
-
-// Native-FP8 MatMul executed on the GPU. Values are small integers, exact in E4M3 and in
-// the float32 accumulation, so the comparison is exact. Mirrors make_fp8_matmul_fixture.py.
-namespace {
-
-float FP8MatMulXValue(std::size_t i) { return static_cast<float>((i * 7 + 3) % 13) - 6.0f; }
-float FP8MatMulWValue(std::size_t i) { return static_cast<float>((i * 7 + 5) % 11) - 5.0f; }
-float FP8MatMulBiasValue(std::size_t i) { return static_cast<float>((i * 5 + 1) % 9) - 4.0f; }
-float FP8BatchedQValue(std::size_t i) { return static_cast<float>((i * 13 + 5) % 15) - 7.0f; }
-
-} // namespace
-
-// Exporter-shaped FP8 (activations Q/DQ, weight DQ-only) with non-unit scales, which are
-// what program cuBLASLt's scales. Values are exact multiples, so the comparison is bit-exact.
-constexpr float kFP8QdqInputScale = 0.25f;
-constexpr float kFP8QdqWeightScale = 0.125f;
-float FP8QdqXValue(std::size_t i) { return (static_cast<float>((i * 7 + 3) % 13) - 6.0f) * kFP8QdqInputScale; }
-float FP8QdqWValue(std::size_t i) { return (static_cast<float>((i * 7 + 5) % 11) - 5.0f) * kFP8QdqWeightScale; }
-float FP8QdqBiasValue(std::size_t i) { return static_cast<float>((i * 5 + 1) % 9) - 4.0f; }
-
-TEST_F(QuantizationAlpakaTest, ScaledFP8QdqMatMulAddMatchesExactReference)
-{
-   constexpr Idx kM = 8, kK = 16, kN = 8;
-   std::vector<float> input(static_cast<std::size_t>(kM) * kK);
-   for (std::size_t i = 0; i < input.size(); ++i)
-      input[i] = FP8QdqXValue(i);
-
-   std::vector<float> expected(static_cast<std::size_t>(kM) * kN);
-   for (Idx m = 0; m < kM; ++m) {
-      for (Idx n = 0; n < kN; ++n) {
-         float accumulator = 0.0f;
-         for (Idx k = 0; k < kK; ++k)
-            accumulator += input[m * kK + k] * FP8QdqWValue(static_cast<std::size_t>(k) * kN + n);
-         expected[m * kN + n] = accumulator + FP8QdqBiasValue(n);
-      }
-   }
-
-   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(static_cast<Idx>(input.size())));
-   std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
-   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(static_cast<Idx>(input.size())));
-   alpaka::memcpy(queue, input_d, input_h);
-   alpaka::wait(queue);
-
-   SOFIE_FP8_QDQ_Scaled::Session<alpaka::TagGpuCudaRt> model("FP8_QDQ_Scaled_FromONNX_GPU_ALPAKA.dat");
-   auto result = model.infer(input_d);
-   alpaka::wait(queue);
-   cudaDeviceSynchronize();
-
-   const Idx outputSize = static_cast<Idx>(expected.size());
-   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(outputSize));
-   alpaka::memcpy(queue, result_h, result);
-   alpaka::wait(queue);
-   const auto *res_ptr = reinterpret_cast<const float *>(alpaka::getPtrNative(result_h));
-   for (Idx i = 0; i < outputSize; ++i)
-      EXPECT_EQ(res_ptr[i], expected[i]) << "i=" << i;
-}
-
-// The same graph on non-power-of-two scales, where scale handling cannot hide behind
-// exact shifts; values are integer multiples, so the comparison stays bit-exact.
-TEST_F(QuantizationAlpakaTest, OddScaleFP8QdqMatMulAddMatchesExactReference)
-{
-   constexpr Idx kM = 8, kK = 16, kN = 8;
-   constexpr float kInputScale = 7.0f / 64.0f;
-   constexpr float kWeightScale = 5.0f / 128.0f;
-   auto xValue = [](std::size_t i) {
-      return (static_cast<float>((i * 7 + 3) % 13) - 6.0f) * kInputScale;
-   };
-   auto wValue = [](std::size_t i) {
-      return (static_cast<float>((i * 7 + 5) % 11) - 5.0f) * kWeightScale;
-   };
-
-   std::vector<float> input(static_cast<std::size_t>(kM) * kK);
-   for (std::size_t i = 0; i < input.size(); ++i)
-      input[i] = xValue(i);
-
-   std::vector<float> expected(static_cast<std::size_t>(kM) * kN);
-   for (Idx m = 0; m < kM; ++m) {
-      for (Idx n = 0; n < kN; ++n) {
-         float accumulator = 0.0f;
-         for (Idx k = 0; k < kK; ++k)
-            accumulator += input[m * kK + k] * wValue(static_cast<std::size_t>(k) * kN + n);
-         expected[m * kN + n] = accumulator + FP8QdqBiasValue(n);
-      }
-   }
-
-   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(static_cast<Idx>(input.size())));
-   std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
-   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(static_cast<Idx>(input.size())));
-   alpaka::memcpy(queue, input_d, input_h);
-   alpaka::wait(queue);
-
-   SOFIE_FP8_QDQ_OddScale::Session<alpaka::TagGpuCudaRt> model(
-      "FP8_QDQ_OddScale_FromONNX_GPU_ALPAKA.dat");
-   auto result = model.infer(input_d);
-   alpaka::wait(queue);
-   cudaDeviceSynchronize();
-
-   const Idx outputSize = static_cast<Idx>(expected.size());
-   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(outputSize));
-   alpaka::memcpy(queue, result_h, result);
-   alpaka::wait(queue);
-   const auto *res_ptr = reinterpret_cast<const float *>(alpaka::getPtrNative(result_h));
-   for (Idx i = 0; i < outputSize; ++i)
-      EXPECT_EQ(res_ptr[i], expected[i]) << "i=" << i;
-}
-
-// The region adopts the trailing FP8 Q/DQ: cuBLASLt narrows D onto the Q's grid and a
-// standalone dequantize decodes; a decoding quantize kernel would mean the round trip returned.
-TEST(ScaledFP8QdqCodegen, AdoptedOutputQuantNarrowsDAndDecodesSeparately)
-{
-   std::ifstream file("FP8_QDQ_FakeQuantOut_FromONNX_GPU_ALPAKA.hxx");
-   ASSERT_TRUE(file.good()) << "generated header missing";
-   const std::string code((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-
-   // The one FP8 quantize kernel is the input encode, which writes the carrier and must
-   // not decode; the adopted trailing pair emits no quantize kernel at all.
-   std::string bodies;
-   int decoding = 0, total = 0;
-   for (std::size_t at = code.find("ONNX_QUANTIZELINEAR_FP8_KERNEL_ALPAKA"); at != std::string::npos;
-        at = code.find("ONNX_QUANTIZELINEAR_FP8_KERNEL_ALPAKA", at + 1)) {
-      const auto body = code.substr(at, code.find("};", at) - at);
-      bodies += body;
-      ++total;
-      if (body.find("DecodeFP8E4M3") != std::string::npos)
-         ++decoding;
-   }
-   ASSERT_GT(total, 0) << "no FP8 quantize kernel: the fixture stopped exercising the FP8 front end";
-   EXPECT_EQ(decoding, 0)
-      << "expected no FP8 quantize kernel to decode: the trailing pair is adopted by the "
-         "region, so a decoding kernel means the fused round trip came back:\n"
-      << bodies;
-   EXPECT_NE(code.find("outputCarrier = SOFIE::EQuantizedFP8OutputCarrier::FP8E4M3"), std::string::npos)
-      << "the region did not adopt the trailing quantize as its FP8 output carrier";
-   EXPECT_NE(code.find("DequantizeLinearKernel"), std::string::npos)
-      << "no standalone dequantize decodes the adopted carrier back to float";
-}
-
-TEST_F(QuantizationAlpakaTest, NativeFP8MatMulAddMatchesExactReference)
-{
-   constexpr Idx kM = 8, kK = 16, kN = 16;
-   std::vector<float> input(static_cast<std::size_t>(kM) * kK);
-   for (std::size_t i = 0; i < input.size(); ++i)
-      input[i] = FP8MatMulXValue(i);
-
-   std::vector<float> expected(static_cast<std::size_t>(kM) * kN);
-   for (Idx m = 0; m < kM; ++m) {
-      for (Idx n = 0; n < kN; ++n) {
-         float accumulator = 0.0f;
-         for (Idx k = 0; k < kK; ++k)
-            accumulator += input[m * kK + k] * FP8MatMulWValue(static_cast<std::size_t>(k) * kN + n);
-         expected[m * kN + n] = accumulator + FP8MatMulBiasValue(n);
-      }
-   }
-
-   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(static_cast<Idx>(input.size())));
-   std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
-   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(static_cast<Idx>(input.size())));
-   alpaka::memcpy(queue, input_d, input_h);
-   alpaka::wait(queue);
-
-   SOFIE_FP8_MatMul_Add::Session<alpaka::TagGpuCudaRt> model("FP8_MatMul_Add_FromONNX_GPU_ALPAKA.dat");
-   auto result = model.infer(input_d);
-   alpaka::wait(queue);
-   cudaDeviceSynchronize();
-
-   const Idx outputSize = static_cast<Idx>(expected.size());
-   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(outputSize));
-   alpaka::memcpy(queue, result_h, result);
-   alpaka::wait(queue);
-   const auto *res_ptr = reinterpret_cast<const float *>(alpaka::getPtrNative(result_h));
-   for (Idx i = 0; i < outputSize; ++i)
-      EXPECT_EQ(res_ptr[i], expected[i]) << "i=" << i;
-}
-
-TEST_F(QuantizationAlpakaTest, NativeFP8BatchedMatMulMatchesExactReference)
-{
-   constexpr Idx kB = 2, kH = 4, kT = 8, kD = 16;
-   const std::size_t elements = static_cast<std::size_t>(kB) * kH * kT * kD;
-   std::vector<float> input(elements);
-   for (std::size_t i = 0; i < input.size(); ++i)
-      input[i] = FP8BatchedQValue(i);
-
-   // scores[b,h,i,j] = sum_d q[b,h,i,d] * q[b,h,j,d], the q @ k^T the fixture spells with
-   // a Transpose the batched-operand canonicalisation folds away.
-   std::vector<float> expected(static_cast<std::size_t>(kB) * kH * kT * kT);
-   for (Idx b = 0; b < kB; ++b) {
-      for (Idx h = 0; h < kH; ++h) {
-         const std::size_t base = ((static_cast<std::size_t>(b) * kH) + h) * kT * kD;
-         for (Idx i = 0; i < kT; ++i) {
-            for (Idx j = 0; j < kT; ++j) {
-               float accumulator = 0.0f;
-               for (Idx d = 0; d < kD; ++d)
-                  accumulator += input[base + i * kD + d] * input[base + j * kD + d];
-               expected[(((static_cast<std::size_t>(b) * kH) + h) * kT + i) * kT + j] = accumulator;
-            }
-         }
-      }
-   }
-
-   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(static_cast<Idx>(input.size())));
-   std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
-   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(static_cast<Idx>(input.size())));
-   alpaka::memcpy(queue, input_d, input_h);
-   alpaka::wait(queue);
-
-   SOFIE_FP8_BatchedMatMul::Session<alpaka::TagGpuCudaRt> model("FP8_BatchedMatMul_FromONNX_GPU_ALPAKA.dat");
-   auto result = model.infer(input_d);
-   alpaka::wait(queue);
-   cudaDeviceSynchronize();
-
-   const Idx outputSize = static_cast<Idx>(expected.size());
-   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(outputSize));
-   alpaka::memcpy(queue, result_h, result);
-   alpaka::wait(queue);
-   const auto *res_ptr = reinterpret_cast<const float *>(alpaka::getPtrNative(result_h));
-   for (Idx i = 0; i < outputSize; ++i)
-      EXPECT_EQ(res_ptr[i], expected[i]) << "i=" << i;
-}
-
-// Asserts the regions reach the FP8 call, which the numeric tests cannot observe: the
-// operands are exactly representable, so an FP32 fallback computes the same numbers.
-TEST(NativeFP8MatMulCodegen, RegionsLowerToCublasLtFP8)
-{
-   for (const char *header : {"FP8_MatMul_Add_FromONNX_GPU_ALPAKA.hxx",
-                              "FP8_BatchedMatMul_FromONNX_GPU_ALPAKA.hxx"}) {
-      std::ifstream in(header);
-      ASSERT_TRUE(in.good()) << "cannot open " << header;
-      const std::string code((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-      EXPECT_NE(code.find("QuantizedGemmCudaLtFP8_Call"), std::string::npos)
-         << header << " emits no FP8 dense-linear call: the region fell back to FP32, so its "
-                      "numeric test proves nothing";
-      EXPECT_EQ(code.find("blas.gemm"), std::string::npos)
-         << header << " still emits an FP32 BLAS call";
-   }
-}
+// Umbrella includes; see the header comment. Section files keep their own
+// include lists; the guards make the union well-formed in this single TU.
+#include "TestQuantizationNumerics.cxx"
+#include "TestQuantizationEliminationLadder.cxx"
+#include "TestQuantizationReport.cxx"

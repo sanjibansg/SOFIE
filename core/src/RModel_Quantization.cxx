@@ -21,10 +21,35 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace SOFIE {
+
+bool RModel::OriginalOperatorEmitted(std::size_t index) const
+{
+   return fLoweredConsumedOperatorIndices.count(index) == 0 &&
+          fLoweredOperators.find(index) == fLoweredOperators.end();
+}
+
+std::unordered_map<std::string, std::vector<std::size_t>> RModel::EmittedConsumersByTensor() const
+{
+   std::unordered_map<std::string, std::vector<std::size_t>> consumers;
+   for (std::size_t index = 0; index < fOperators.size(); ++index) {
+      if (!OriginalOperatorEmitted(index))
+         continue;
+      for (const auto &input : fOperators[index]->GetOpInputTensors())
+         consumers[std::string(input)].push_back(index);
+   }
+   for (const auto &lowered : fLoweredOperators) {
+      if (!lowered.second)
+         continue;
+      for (const auto &input : lowered.second->GetOpInputTensors())
+         consumers[std::string(input)].push_back(lowered.first);
+   }
+   return consumers;
+}
 
 void RModel::AddQuantizationInfo(const std::string & tensor_name, QuantizationInfo info)
 {
@@ -122,7 +147,7 @@ void RModel::AnalyzeQuantizedRegions()
 
    auto sameLowPrecisionTensorInfo = [&sameQuantizationInfo](const LowPrecisionTensorInfo &lhs,
                                                              const LowPrecisionTensorInfo &rhs) {
-      if (lhs.carrier != rhs.carrier || lhs.accumulation != rhs.accumulation ||
+      if (lhs.carrier != rhs.carrier ||
           lhs.affineQuantization.has_value() != rhs.affineQuantization.has_value())
          return false;
       if (lhs.affineQuantization)
@@ -162,49 +187,38 @@ void RModel::AnalyzeQuantizedRegions()
       return true;
    };
 
-   auto addMetadataDiagnostic = [this](const ROperator &op, const std::string &reason) {
-      fQuantizationState.metadataDiagnostics.push_back(
-         "quantization metadata stopped at " + op.Name() + ": " + reason);
-   };
-
-   auto propagateSingleSourceMetadata = [&](const ROperator &op, const std::string &source,
+   auto propagateSingleSourceMetadata = [&](const std::string &source,
                                             const std::string &target, const std::vector<int_t> &axisMap) {
       if (!HasQuantizationInfo(target) && HasQuantizationInfo(source)) {
          if (auto info = remapQuantization(GetQuantizationInfo(source), axisMap))
             AddQuantizationInfo(target, *info);
-         else
-            addMetadataDiagnostic(op, "the source per-axis contract cannot be represented by the output axis map");
       }
 
       if (!HasLowPrecisionTensorInfo(target) && HasLowPrecisionTensorInfo(source)) {
          auto info = GetLowPrecisionTensorInfo(source);
          if (info.affineQuantization) {
             auto remapped = remapQuantization(*info.affineQuantization, axisMap);
-            if (!remapped) {
-               addMetadataDiagnostic(op, "the source low-precision per-axis contract cannot be represented by the output axis map");
+            if (!remapped)
                return;
-            }
             info.affineQuantization = *remapped;
          }
          AddLowPrecisionTensorInfo(target, std::move(info));
       }
    };
 
-   auto propagateCompatibleSourceMetadata = [&](const ROperator &op, const std::vector<std::string> &sources,
+   auto propagateCompatibleSourceMetadata = [&](const std::vector<std::string> &sources,
                                                 const std::string &target, const std::vector<int_t> &axisMap) {
       if (sources.empty())
          return;
 
       if (!HasQuantizationInfo(target)) {
          bool compatible = true;
-         bool anyMetadata = false;
          std::optional<QuantizationInfo> candidate;
          for (const auto &source : sources) {
             if (!HasQuantizationInfo(source)) {
                compatible = false;
                continue;
             }
-            anyMetadata = true;
             const auto &info = GetQuantizationInfo(source);
             if (!candidate)
                candidate = info;
@@ -214,23 +228,17 @@ void RModel::AnalyzeQuantizedRegions()
          if (compatible && candidate) {
             if (auto remapped = remapQuantization(*candidate, axisMap))
                AddQuantizationInfo(target, *remapped);
-            else
-               addMetadataDiagnostic(op, "the compatible affine inputs use an axis changed by the operation");
-         } else if (anyMetadata) {
-            addMetadataDiagnostic(op, "data inputs do not all carry the same affine quantization contract");
          }
       }
 
       if (!HasLowPrecisionTensorInfo(target)) {
          bool compatible = true;
-         bool anyMetadata = false;
          std::optional<LowPrecisionTensorInfo> candidate;
          for (const auto &source : sources) {
             if (!HasLowPrecisionTensorInfo(source)) {
                compatible = false;
                continue;
             }
-            anyMetadata = true;
             const auto &info = GetLowPrecisionTensorInfo(source);
             if (!candidate)
                candidate = info;
@@ -240,15 +248,11 @@ void RModel::AnalyzeQuantizedRegions()
          if (compatible && candidate) {
             if (candidate->affineQuantization) {
                auto remapped = remapQuantization(*candidate->affineQuantization, axisMap);
-               if (!remapped) {
-                  addMetadataDiagnostic(op, "the compatible low-precision inputs use an axis changed by the operation");
+               if (!remapped)
                   return;
-               }
                candidate->affineQuantization = *remapped;
             }
             AddLowPrecisionTensorInfo(target, std::move(*candidate));
-         } else if (anyMetadata) {
-            addMetadataDiagnostic(op, "data inputs do not all carry the same low-precision contract");
          }
       }
    };
@@ -276,21 +280,19 @@ void RModel::AnalyzeQuantizedRegions()
             continue;
          auto targetShape = GetTensorShape(target);
          auto axisMap = op->GetQuantizationMetadataAxisMap(sourceShape, targetShape);
-         if (!isValidAxisMap(axisMap, sourceShape.size(), targetShape.size())) {
-            addMetadataDiagnostic(*op, "operator supplied an invalid output-to-input axis map");
+         if (!isValidAxisMap(axisMap, sourceShape.size(), targetShape.size()))
             continue;
-         }
          if (op->RequiresCompatibleQuantizationMetadataInputs())
-            propagateCompatibleSourceMetadata(*op, sources, target, axisMap);
+            propagateCompatibleSourceMetadata(sources, target, axisMap);
          else
-            propagateSingleSourceMetadata(*op, source, target, axisMap);
+            propagateSingleSourceMetadata(source, target, axisMap);
       }
    }
 
    const auto graph = BuildQuantizationGraphIndex(fOperators);
    QuantizationPassContext context{*this, fOperators, fQuantizationState, graph, fVerbose};
    // Each family exposes one Discover* entry that yields both regions and their
-   // lowering plans; the model pass no longer calls a family-specific plan step.
+   // lowering plans; the model pass has no family-specific plan step.
    DiscoverQuantizedDenseLinearRegions(context);
    DiscoverQuantizedConvRegions(context);
    DiscoverQuantizedElementwiseRegions(context);
@@ -333,9 +335,7 @@ void RModel::PrepareQuantizedTensorStorage(EQuantizedBackend backend)
       const auto shape = GetTensorShape(sourceTensor);
       if (shape.size() != 2 || !IsInitializedTensor(sourceTensor))
          throw std::runtime_error("SOFIE low-precision dense-linear storage requires an initialized rank-2 weight tensor");
-      RegisterQuantizedTensorStorage(MakeLowPrecisionTensorStorage(logicalTensor, sourceTensor, sourceTensor,
-                                                                   GetLowPrecisionTensorInfo(sourceTensor),
-                                                                   layout, shape, backend));
+      RegisterInPlaceLowPrecisionCarrier(*this, logicalTensor, sourceTensor, layout, backend);
    };
 
    QuantizedStoragePassContext storageContext{
@@ -465,10 +465,40 @@ void RModel::AddLoweredQuantizedOperators(EQuantizedBackend backend)
 
    for (auto opIndex : SortedQuantizedRegionOperatorIndices(fQuantizationState.regions)) {
       const auto *plan = FindQuantizedLoweringPlan(fQuantizationState, opIndex, backend);
-      if (plan == nullptr || !IsQuantizedLoweringAvailable(plan->status))
+      if (plan == nullptr)
          continue;
 
       const auto &region = fQuantizationState.regions.at(opIndex);
+
+      // Report row for every region the active backend planned, lowered or not; the
+      // status field says which.
+      QuantizedRegionReportEntry entry;
+      entry.outputTensor = QuantizedRegionOutputTensor(region);
+      entry.status = plan->status;
+      entry.capabilityTag = plan->capabilityTag;
+      std::visit(
+         [&entry](const auto &typed) {
+            using T = std::decay_t<decltype(typed)>;
+            if constexpr (std::is_base_of_v<QuantizedDenseLinearRegion, T>) {
+               entry.family =
+                  typed.spelling == EQuantizedDenseLinearSpelling::MatMul ? "matmul" : "gemm";
+               entry.adoptedOutput = typed.outputQuantOpIndex != static_cast<std::size_t>(-1);
+            } else if constexpr (std::is_same_v<T, QuantizedConvRegion>) {
+               entry.family = "conv";
+            } else if constexpr (std::is_same_v<T, QuantizedElementwiseRegion>) {
+               entry.family = "elementwise";
+            } else {
+               entry.family = "gather";
+            }
+         },
+         region);
+      if (entry.adoptedOutput)
+         ++fQuantizationReport.adoptedOutputs;
+      fQuantizationReport.regions.push_back(std::move(entry));
+
+      if (!IsQuantizedLoweringAvailable(plan->status))
+         continue;
+
       auto lowered = std::visit(
          [this, opIndex, plan](const auto &typedRegion) {
             return MakeLoweredQuantizedOperator(
@@ -483,32 +513,18 @@ void RModel::AddLoweredQuantizedOperators(EQuantizedBackend backend)
 
 // Absorbs a saturation Clip into the preceding Softmax, which clamps in its third pass.
 // The Softmax takes over the Clip's output tensor, leaving downstream readers unchanged.
-void RModel::FuseSoftmaxClipBoundaries()
+void RModel::ApplyPlannedCarrierHandoffs()
 {
    // A subgraph body can read a tensor that does not appear in the containing operator's
    // input list, so single-consumer reasoning is not sound there.
    if (!fSubGraphs.empty())
       return;
 
-   auto alive = [this](std::size_t index) {
-      return fLoweredConsumedOperatorIndices.count(index) == 0 &&
-             fLoweredOperators.find(index) == fLoweredOperators.end();
-   };
+   auto alive = [this](std::size_t index) { return OriginalOperatorEmitted(index); };
 
    // Counts consumers over everything emitted, lowered regions included, so a region
    // reading the Softmax output makes the Clip a second consumer.
-   std::unordered_map<std::string, std::vector<std::size_t>> consumers;
-   for (std::size_t index = 0; index < fOperators.size(); ++index) {
-      if (alive(index))
-         for (const auto &input : fOperators[index]->GetOpInputTensors())
-            consumers[std::string(input)].push_back(index);
-   }
-   for (const auto &lowered : fLoweredOperators) {
-      if (!lowered.second)
-         continue;
-      for (const auto &input : lowered.second->GetOpInputTensors())
-         consumers[std::string(input)].push_back(lowered.first);
-   }
+   const auto consumers = EmittedConsumersByTensor();
 
    std::unordered_set<std::string> applied;
    // Names the condition declining each candidate. Trace-only; decisions are unchanged.
@@ -524,7 +540,7 @@ void RModel::FuseSoftmaxClipBoundaries()
       // encoding the output is general, and alone still absorbs the boundary.
       auto *softmax = dynamic_cast<ROperator_Softmax *>(fOperators[index].get());
       const bool canFoldClip = softmax != nullptr && softmax->CanFuseClip();
-      const bool canEncodeOutput = fOperators[index]->CanFuseQuantizedOutput();
+      const bool canEncodeOutput = fOperators[index]->CanFuseOutputOnGrid(EQuantizedOutputEmit::Carrier);
       if (!canFoldClip && !canEncodeOutput)
          continue;
 
@@ -542,7 +558,7 @@ void RModel::FuseSoftmaxClipBoundaries()
          { declineApply(fOperators[index]->Name(),
                         consumer == consumers.end() ? "no_consumer" : "multiple_consumers"); continue; }
       // The absorbed node is a Clip on the int8 path and a QuantizeLinear on the FP8 one;
-      // only the clamp differs -- a Clip contributes one, a boundary encodes without.
+      // only the clamp differs: a Clip contributes one, a boundary encodes without.
       const std::size_t absorbedIndex = consumer->second.front();
       if (!alive(absorbedIndex))
          { declineApply(fOperators[index]->Name(), "absorbed_node_not_alive"); continue; }
@@ -559,8 +575,8 @@ void RModel::FuseSoftmaxClipBoundaries()
       const std::string fusedOutput(absorbedOutputs[0]);
       // A tensor already planned as a carrier handoff has a consumer committed to reading a
       // carrier, so the Softmax must encode rather than only clamp.
-      auto handoff = fQuantizationState.softmaxInt8Handoffs.find(fusedOutput);
-      const bool hasHandoff = handoff != fQuantizationState.softmaxInt8Handoffs.end();
+      auto handoff = fQuantizationState.producerEncodeHandoffs.find(fusedOutput);
+      const bool hasHandoff = handoff != fQuantizationState.producerEncodeHandoffs.end();
       // Absorbing a boundary is only ever worth doing to write its carrier. Without a
       // handoff there is nothing to write, and swallowing it would delete the encode.
       if (!absorbsClip && !hasHandoff)
@@ -572,59 +588,26 @@ void RModel::FuseSoftmaxClipBoundaries()
                                       static_cast<double>(clip->ClipMax()));
       } else if (hasHandoff) {
          // The general path, through the virtual: no cast, no operator-specific knowledge.
-         fOperators[index]->FuseQuantizedOutput(fusedOutput, handoff->second);
+         fOperators[index]->FuseOutputOnGrid(fusedOutput, handoff->second, EQuantizedOutputEmit::Carrier);
       } else {
          softmax->FuseClip(fusedOutput, static_cast<double>(clip->ClipMin()),
                            static_cast<double>(clip->ClipMax()));
       }
+      if (hasHandoff)
+         ++fQuantizationReport.producerEncodeHandoffs;
       fLoweredConsumedOperatorIndices.insert(absorbedIndex);
       applied.insert(fusedOutput);
    }
 
-   // The safety half of the one-authority design: when the applier declined a handoff the
-   // planner recorded, the pair's Quantize is revived and the region reads its carrier.
-   for (const auto &handoff : fQuantizationState.softmaxInt8Handoffs) {
+   // The planner's guards mirror the applier's, so a recorded handoff the applier did not
+   // absorb is a pipeline bug: fail loudly rather than emit a region reading unwritten codes.
+   for (const auto &handoff : fQuantizationState.producerEncodeHandoffs) {
       if (applied.count(handoff.first) != 0)
          continue;
-
-      bool recovered = false;
-      for (std::size_t dqIndex = 0; dqIndex < fOperators.size() && !recovered; ++dqIndex) {
-         auto *dequantize = dynamic_cast<ROperator_ONNXDequantizeLinear *>(fOperators[dqIndex].get());
-         if (dequantize == nullptr || dequantize->GetOutputTensor() != handoff.first)
-            continue;
-         const std::string carrier = dequantize->GetInputTensor();
-         if (carrier.empty())
-            break;
-         for (std::size_t qIndex = 0; qIndex < fOperators.size(); ++qIndex) {
-            auto *quantize = dynamic_cast<ROperator_ONNXQuantizeLinear *>(fOperators[qIndex].get());
-            if (quantize == nullptr || quantize->GetOutputTensor() != carrier)
-               continue;
-            // The region wants codes on the planned grid; the carrier holds codes on the
-            // Quantize's grid. Anything but exact agreement is not a recovery.
-            if (!SameGrid(quantize->GetGrid(), handoff.second))
-               break;
-            std::size_t rebound = 0;
-            for (auto &lowered : fLoweredOperators) {
-               if (lowered.second &&
-                   lowered.second->RebindPlannedCarrierInput(handoff.first, carrier))
-                  ++rebound;
-            }
-            if (rebound == 0)
-               break;
-            fLoweredConsumedOperatorIndices.erase(qIndex);
-            recovered = true;
-            if (QuantizationTraceEnabled())
-               std::fprintf(stderr, "[handoff-recover] %s -> %s (%zu region(s), Quantize revived)\n",
-                            handoff.first.c_str(), carrier.c_str(), rebound);
-            break;
-         }
-      }
-
-      if (!recovered)
-         throw std::runtime_error(
-            "SOFIE quantization planned a Softmax int8 handoff for tensor '" + handoff.first +
-            "' but the Softmax/Clip fusion did not apply it and no same-grid carrier was "
-            "recoverable; the consuming region would read a carrier nothing writes");
+      throw std::runtime_error(
+         "SOFIE quantization planned a producer-encode handoff for tensor '" + handoff.first +
+         "' but the applier did not absorb it; the consuming region would read a carrier "
+         "nothing writes");
    }
 
    // The consumer-side twin of the absorption above: a dequantize whose float is read by
@@ -636,8 +619,6 @@ void RModel::FuseSoftmaxClipBoundaries()
       if (dequantize == nullptr)
          continue;
       const auto &grid = dequantize->GetGrid();
-      if (!IsPerTensorE4M3(grid))
-         continue;
       const std::string floatOut = dequantize->GetOutputTensor();
       const std::string carrier = dequantize->GetInputTensor();
       if (floatOut.empty() || carrier.empty())
@@ -658,6 +639,7 @@ void RModel::FuseSoftmaxClipBoundaries()
          continue;
       if (consumer->FuseDequantizedInput(floatOut, carrier, grid)) {
          fLoweredConsumedOperatorIndices.insert(dqIndex);
+         ++fQuantizationReport.decodeFusions;
          if (QuantizationTraceEnabled())
             std::fprintf(stderr, "[decode-fuse] %s reads %s at the load\n",
                          consumer->Name().c_str(), carrier.c_str());
@@ -674,48 +656,12 @@ void RModel::DropNoOpClipsBeforeQuantize(EQuantizedBackend backend)
    if (!fSubGraphs.empty())
       return;
 
-   auto alive = [this](std::size_t index) {
-      return fLoweredConsumedOperatorIndices.count(index) == 0 &&
-             fLoweredOperators.find(index) == fLoweredOperators.end();
-   };
+   auto alive = [this](std::size_t index) { return OriginalOperatorEmitted(index); };
    auto readScalar = [this](const std::string &name, double &value) {
-      if (name.empty() || !CheckIfTensorAlreadyExist(name) || !IsInitializedTensor(name))
-         return false;
-      std::size_t elements = 1;
-      for (auto extent : GetTensorShape(name))
-         elements *= extent;
-      if (elements != 1)
-         return false;
-      if (GetTensorType(name) == ETensorType::FLOAT) {
-         const auto data = GetTensorData<float>(name);
-         if (data.empty())
-            return false;
-         value = static_cast<double>(data[0]);
-         return true;
-      }
-      if (GetTensorType(name) == ETensorType::DOUBLE) {
-         const auto data = GetTensorData<double>(name);
-         if (data.empty())
-            return false;
-         value = data[0];
-         return true;
-      }
-      return false;
+      return ReadScalarInitializer(*this, name, value);
    };
 
-   std::unordered_map<std::string, std::vector<std::size_t>> consumers;
-   for (std::size_t index = 0; index < fOperators.size(); ++index) {
-      if (!alive(index))
-         continue;
-      for (const auto &input : fOperators[index]->GetOpInputTensors())
-         consumers[std::string(input)].push_back(index);
-   }
-   for (const auto &lowered : fLoweredOperators) {
-      if (!lowered.second)
-         continue;
-      for (const auto &input : lowered.second->GetOpInputTensors())
-         consumers[std::string(input)].push_back(lowered.first);
-   }
+   auto consumers = EmittedConsumersByTensor();
    const std::set<std::string> graphOutputs(fOutputTensorNames.begin(), fOutputTensorNames.end());
 
    int dropped = 0;
@@ -765,6 +711,7 @@ void RModel::DropNoOpClipsBeforeQuantize(EQuantizedBackend backend)
       quantize->BypassNoOpClip(std::string(clipInputs[0]));
       fLoweredConsumedOperatorIndices.insert(index);
       ++dropped;
+      ++fQuantizationReport.noOpClipsDropped;
    }
 
    if (std::getenv("SOFIE_NOOP_CLIP_TRACE") != nullptr)
@@ -785,10 +732,7 @@ void RModel::DeduplicateCarrierDecodes(EQuantizedBackend backend)
    if (!fSubGraphs.empty())
       return;
 
-   auto alive = [this](std::size_t index) {
-      return fLoweredConsumedOperatorIndices.count(index) == 0 &&
-             fLoweredOperators.find(index) == fLoweredOperators.end();
-   };
+   auto alive = [this](std::size_t index) { return OriginalOperatorEmitted(index); };
    const std::set<std::string> graphOutputs(fOutputTensorNames.begin(), fOutputTensorNames.end());
 
    // Keyed on everything that defines the decode: the carrier and the grid it is read on.
@@ -832,6 +776,7 @@ void RModel::DeduplicateCarrierDecodes(EQuantizedBackend backend)
       // be told, or it sizes the survivor's lifetime from its own last use alone.
       AddAliasTensor(dequantize->GetOutputTensor(), std::string(survivorOutput));
       ++deduplicated;
+      ++fQuantizationReport.decodeDedups;
    }
 
    if (std::getenv("SOFIE_DEDUP_DECODE_TRACE") != nullptr)
@@ -852,34 +797,17 @@ void RModel::PropagateLowPrecisionThroughMovement(EQuantizedBackend backend)
    if (!fSubGraphs.empty())
       return;
 
-   auto alive = [this](std::size_t index) {
-      return fLoweredConsumedOperatorIndices.count(index) == 0 &&
-             fLoweredOperators.find(index) == fLoweredOperators.end();
-   };
+   auto alive = [this](std::size_t index) { return OriginalOperatorEmitted(index); };
 
    // Only a byte-wide carrier can be moved as bytes. A DequantizeLinear whose input is
-   // already float -- a source that some earlier pass collapsed -- has nothing to propagate.
+   // already float, a source that some earlier pass collapsed, has nothing to propagate.
    auto isCarrierType = [](ETensorType type) {
       return type == ETensorType::INT8 || type == ETensorType::UINT8 ||
              type == ETensorType::FLOAT8E4M3FN || type == ETensorType::FLOAT8E4M3FNUZ ||
              type == ETensorType::FLOAT8E5M2 || type == ETensorType::FLOAT8E5M2FNUZ;
    };
 
-   std::unordered_map<std::string, std::vector<std::size_t>> consumers;
-   for (std::size_t index = 0; index < fOperators.size(); ++index) {
-      if (!alive(index))
-         continue;
-      for (const auto &input : fOperators[index]->GetOpInputTensors())
-         consumers[std::string(input)].push_back(index);
-   }
-   // Lowered regions are not `alive` -- that means "an original operator still emitted" --
-   // but they are emitted and they read tensors, so their inputs count as consumers too.
-   for (const auto &lowered : fLoweredOperators) {
-      if (!lowered.second)
-         continue;
-      for (const auto &input : lowered.second->GetOpInputTensors())
-         consumers[std::string(input)].push_back(lowered.first);
-   }
+   auto consumers = EmittedConsumersByTensor();
    const std::set<std::string> graphOutputs(fOutputTensorNames.begin(), fOutputTensorNames.end());
 
    const bool traceGuards = std::getenv("SOFIE_MOVEMENT_CARRIER_TRACE") != nullptr;
@@ -991,6 +919,7 @@ void RModel::PropagateLowPrecisionThroughMovement(EQuantizedBackend backend)
       fLoweredConsumedOperatorIndices.insert(quantizeIndex);
       ++propagatedChains;
       propagatedMovements += static_cast<int>(movements.size());
+      fQuantizationReport.movementRewires += movements.size();
    }
 
    if (traceGuards) {
@@ -1006,53 +935,19 @@ void RModel::PropagateLowPrecisionThroughMovement(EQuantizedBackend backend)
 
 void RModel::FuseUnabsorbedFakeQuantBoundaries()
 {
-   auto alive = [this](std::size_t index) {
-      return fLoweredConsumedOperatorIndices.count(index) == 0 &&
-             fLoweredOperators.find(index) == fLoweredOperators.end();
-   };
+   auto alive = [this](std::size_t index) { return OriginalOperatorEmitted(index); };
 
    auto readScalar = [this](const std::string &name, double &value) {
-      if (name.empty() || !CheckIfTensorAlreadyExist(name) || !IsInitializedTensor(name))
-         return false;
-      std::size_t elements = 1;
-      for (auto extent : GetTensorShape(name))
-         elements *= extent;
-      if (elements != 1)
-         return false;
-      if (GetTensorType(name) == ETensorType::FLOAT) {
-         const auto data = GetTensorData<float>(name);
-         if (data.empty())
-            return false;
-         value = static_cast<double>(data[0]);
-         return true;
-      }
-      if (GetTensorType(name) == ETensorType::DOUBLE) {
-         const auto data = GetTensorData<double>(name);
-         if (data.empty())
-            return false;
-         value = data[0];
-         return true;
-      }
-      return false;
+      return ReadScalarInitializer(*this, name, value);
    };
 
+   auto consumers = EmittedConsumersByTensor();
    std::unordered_map<std::string, std::size_t> producer;
-   std::unordered_map<std::string, std::vector<std::size_t>> consumers;
    for (std::size_t index = 0; index < fOperators.size(); ++index) {
       if (!alive(index))
          continue;
       for (const auto &output : fOperators[index]->GetOpOutputTensors())
          producer[std::string(output)] = index;
-      for (const auto &input : fOperators[index]->GetOpInputTensors())
-         consumers[std::string(input)].push_back(index);
-   }
-   // Lowered regions are not `alive` -- that means "an original operator still emitted" --
-   // but they are emitted and they read tensors, so their inputs count as consumers too.
-   for (const auto &lowered : fLoweredOperators) {
-      if (!lowered.second)
-         continue;
-      for (const auto &input : lowered.second->GetOpInputTensors())
-         consumers[std::string(input)].push_back(lowered.first);
    }
    const std::set<std::string> graphOutputs(fOutputTensorNames.begin(), fOutputTensorNames.end());
 
@@ -1179,9 +1074,10 @@ void RModel::FuseUnabsorbedFakeQuantBoundaries()
 
       quantize->FuseFakeQuantRoundTrip(dequantize->GetOutputTensor(), clipInput, hasClip, clipLow, clipHigh);
       ++fusedRoundTrips;
+      ++fQuantizationReport.fusedSnapOps;
 
       // Fold candidate: collected rather than acted on, because the fold rewrites the outputs
-      // this loop iterates over. Clipped boundaries are excluded -- the clamp is arithmetic.
+      // this loop iterates over. Clipped boundaries are excluded because the clamp is arithmetic.
       if (hasClip)
          ++clippedRoundTrips;
       if (!hasClip)
@@ -1206,8 +1102,8 @@ void RModel::FuseUnabsorbedFakeQuantBoundaries()
                break;
             }
             // Only value-preserving movement, and only when this is its sole reader.
-            const bool movement = dynamic_cast<ROperator_Reshape *>(op) != nullptr ||
-                                  dynamic_cast<ROperator_Transpose<float> *>(op) != nullptr;
+            const bool movement =
+               op->CarrierSupport() == ELowPrecisionCarrierSupport::ValuePreserving;
             auto readers = consumers.find(cursor);
             if (!movement || readers == consumers.end() || readers->second.size() != 1)
                break;
@@ -1224,7 +1120,7 @@ void RModel::FuseUnabsorbedFakeQuantBoundaries()
    }
 
    // Round-trip fold: a producer applying the fake-quant snap in its own epilogue absorbs
-   // the boundary outright, adopting its output tensor -- no carrier, no type change.
+   // the boundary outright, adopting its output tensor with no carrier and no type change.
    std::size_t foldedRoundTrips = 0;
    std::map<std::string, int> unfoldableProducers;
    for (const auto &fold : roundTripFolds) {
@@ -1234,23 +1130,24 @@ void RModel::FuseUnabsorbedFakeQuantBoundaries()
       if (!alive(upstream->second))
          continue;
       auto *producerOp = fOperators[upstream->second].get();
-      if (!producerOp->CanFuseFakeQuantOutput()) {
+      if (!producerOp->CanFuseOutputOnGrid(EQuantizedOutputEmit::Snap)) {
          // Producers declining the fold, by name.
          if (traceGuards)
             ++unfoldableProducers[producerOp->Name()];
          continue;
       }
-      // After the fold the producer's own output tensor is gone, so any other reader --
-      // operator or graph output -- would lose its value; both guards are correctness.
+      // After the fold the producer's own output tensor is gone, so any other reader, an
+      // operator or a graph output, would lose its value; both guards are correctness.
       auto readers = consumers.find(fold.source);
       if (readers == consumers.end() || readers->second.size() != 1)
          continue;
       if (graphOutputs.count(fold.source) != 0)
          continue;
 
-      producerOp->FuseFakeQuantOutput(fold.boundaryOutput, fold.grid);
+      producerOp->FuseOutputOnGrid(fold.boundaryOutput, fold.grid, EQuantizedOutputEmit::Snap);
       fLoweredConsumedOperatorIndices.insert(fold.quantizeIndex);
       ++foldedRoundTrips;
+      ++fQuantizationReport.fakeQuantFolds;
    }
 
    if (traceGuards) {
@@ -1300,7 +1197,7 @@ void RModel::CheckLowPrecisionCarrierFrontier()
    }
 
    // A lowered region is the absorbed form, so it is never itself a violation and never the
-   // neighbour that owes one -- it already took its boundary.
+   // neighbour that owes one; it already took its boundary.
    auto neighborSupport = [&](std::size_t index) {
       const auto *op = emitted(index);
       return op == nullptr ? ELowPrecisionCarrierSupport::RequiresFloat : op->CarrierSupport();
@@ -1348,7 +1245,7 @@ void RModel::CheckLowPrecisionCarrierFrontier()
       const auto inputs = op->GetOpInputTensors();
       const auto outputs = op->GetOpOutputTensors();
       // A Dequantize decodes, so its float side is downstream. A Quantize encodes, so its
-      // float side is upstream -- unless it fused its round trip, in which case it is both.
+      // float side is upstream, unless it fused its round trip, in which case it is both.
       const bool fusedRoundTrip =
          isQuantize && GetTensorType(std::string(outputs.front())) == ETensorType::FLOAT;
       if (isDequantize || fusedRoundTrip) {
@@ -1379,7 +1276,7 @@ void RModel::CheckLowPrecisionCarrierFrontier()
 
       // Walk through value-preserving operators before judging: a value arriving as float
       // from a model edge must be encoded once wherever the reshape sits.
-      constexpr int kMaxWalk = 8;
+      constexpr int kMaxWalk = kQuantizationWalkMaxHops;
       bool justified = false;
       std::size_t owed = static_cast<std::size_t>(-1);
       // Which operator's float requirement justified this boundary; unset for a model edge,
@@ -1397,7 +1294,7 @@ void RModel::CheckLowPrecisionCarrierFrontier()
                break;
             }
             // Reaching another Quantize/Dequantize means this pair decodes only so the next
-            // can re-encode -- a grid conversion spelled as a round trip; its own bucket.
+            // can re-encode: a grid conversion spelled as a round trip, in its own bucket.
             const auto *cursorOperator = emitted(cursor);
             if (dynamic_cast<const ROperator_ONNXQuantizeLinear *>(cursorOperator) != nullptr ||
                 dynamic_cast<const ROperator_ONNXDequantizeLinear *>(cursorOperator) != nullptr) {
@@ -1422,7 +1319,7 @@ void RModel::CheckLowPrecisionCarrierFrontier()
                   owed = cursor;
                break;
             }
-            // ValuePreserving: keep going the way we came.
+            // ValuePreserving: keep walking in the same direction.
             const auto *cursorOp = emitted(cursor);
             const auto next = isDequantize || fusedRoundTrip
                                  ? cursorOp->GetOpOutputTensors()
@@ -1437,7 +1334,7 @@ void RModel::CheckLowPrecisionCarrierFrontier()
                cursor = reader->second.front();
             } else {
                auto source = producer.find(name);
-               // No producer means a model input or an initializer -- float enters here.
+               // No producer means a model input or an initializer, so float enters here.
                if (source == producer.end()) { justified = true; break; }
                cursor = source->second;
             }
@@ -1448,6 +1345,12 @@ void RModel::CheckLowPrecisionCarrierFrontier()
       // A boundary with nothing on its float side is at the edge of the graph and has no
       // operator that could absorb it.
       if (justified || floatSide.empty() || owed == static_cast<std::size_t>(-1)) {
+         // Frontier classification: a boundary-to-boundary chain is its own bucket; everything else that
+         // survives without a violation counts as justified (float-requiring or graph edge).
+         if (boundaryChain)
+            ++fQuantizationReport.roundTripConversions;
+         else
+            ++fQuantizationReport.justifiedBoundaries;
          if (boundaryChain) {
             ++boundaryChainCount;
             ++boundaryChainShapes[boundaryChainShape];
@@ -1473,6 +1376,7 @@ void RModel::CheckLowPrecisionCarrierFrontier()
       }
 
       const auto *owedOp = emitted(owed);
+      ++fQuantizationReport.owedBoundaries;
       fCarrierFrontierViolations.push_back(
          {isQuantize ? "QuantizeLinear" : "DequantizeLinear",
           std::string(isQuantize ? outputs.front() : inputs.front()),

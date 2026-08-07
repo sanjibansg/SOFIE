@@ -1,4 +1,5 @@
 #include "SOFIE/RQuantization_Analysis.hxx"
+#include "SOFIE/RModel.hxx"
 #include "SOFIE/ROperator_Reshape.hxx"
 #include "SOFIE/ROperator_Transpose.hxx"
 #include "SOFIE/ROperator_BasicBinary.hxx"
@@ -21,7 +22,7 @@ QuantizedDenseLinearPatternMatch MatchQuantizedDenseLinearPattern(
    region.beta = gemm.GetBeta();
    region.transA = gemm.GetTransA();
    region.transB = gemm.GetTransB();
-   region.gemmOpIndex = opIndex;
+   region.denseOpIndex = opIndex;
 
    const auto inputs = gemm.GetOpInputTensors();
    const auto outputs = gemm.GetOpOutputTensors();
@@ -84,10 +85,7 @@ QuantizationGraphIndex BuildQuantizationGraphIndex(const std::vector<std::unique
 
 bool IsQuantizationBoundarySearchTransparent(const ROperator &op)
 {
-   // Transpose is a template; float is the activation instantiation (the int64_t one is
-   // shape plumbing and never sits on a region output).
-   return dynamic_cast<const ROperator_Reshape *>(&op) != nullptr ||
-          dynamic_cast<const ROperator_Transpose<float> *>(&op) != nullptr ||
+   return op.CarrierSupport() == ELowPrecisionCarrierSupport::ValuePreserving ||
           op.GetKind() == OperatorKind::CLIP;
 }
 
@@ -153,21 +151,30 @@ std::optional<std::size_t> MatchQuantizationBoundaryProducer(
    }
 }
 
-std::optional<std::size_t> MatchSingleTensorConsumer(const QuantizationGraphIndex &graph,
-                                                     const std::string &tensor,
-                                                     const std::string &role,
-                                                     std::vector<std::string> &reasons)
+bool ReadScalarInitializer(RModel &model, const std::string &name, double &value)
 {
-   auto consumers = graph.consumersByTensor.find(tensor);
-   if (consumers == graph.consumersByTensor.end() || consumers->second.empty()) {
-      reasons.push_back(role + " has no consumer");
-      return std::nullopt;
+   if (name.empty() || !model.CheckIfTensorAlreadyExist(name) || !model.IsInitializedTensor(name))
+      return false;
+   std::size_t elements = 1;
+   for (auto extent : model.GetTensorShape(name))
+      elements *= extent;
+   if (elements != 1)
+      return false;
+   if (model.GetTensorType(name) == ETensorType::FLOAT) {
+      const auto data = model.GetTensorData<float>(name);
+      if (data.empty())
+         return false;
+      value = static_cast<double>(data[0]);
+      return true;
    }
-   if (consumers->second.size() != 1) {
-      reasons.push_back(role + " has multiple consumers");
-      return std::nullopt;
+   if (model.GetTensorType(name) == ETensorType::DOUBLE) {
+      const auto data = model.GetTensorData<double>(name);
+      if (data.empty())
+         return false;
+      value = data[0];
+      return true;
    }
-   return consumers->second.front();
+   return false;
 }
 
 bool IsFloatAddOperator(const ROperator &op)
@@ -199,7 +206,7 @@ void CheckQuantizationInfo(const QuantizationInfo &info, const std::string &role
       reasons.push_back(role + " overflow mode is unsupported");
 }
 
-void CheckQuantizedGemmAttributes(const QuantizedGemmRegion &region,
+void CheckQuantizedGemmAttributes(const QuantizedDenseLinearRegion &region,
                                   std::vector<std::string> &reasons)
 {
    if (!std::isfinite(region.alpha))
@@ -220,7 +227,7 @@ void CheckQuantizedGemmRank2Shape(const std::vector<std::size_t> &shape,
       reasons.push_back(role + " tensor is not rank-2 for quantized Gemm lowering");
 }
 
-std::vector<std::string> QuantizedGemmLoweringUnsupportedReasons(const QuantizedGemmRegion &region)
+std::vector<std::string> QuantizedGemmLoweringUnsupportedReasons(const QuantizedDenseLinearRegion &region)
 {
    return DenseLinearQuantizationParameterUnsupportedReasons(region.inputQuant, region.weightQuant,
                                                               region.outputQuant, region.biasQuant, 0,
@@ -238,12 +245,17 @@ std::string JoinQuantizationReasons(const std::vector<std::string> &reasons)
    return out.str();
 }
 
-std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedGemmRegion &region)
+// The four mandatory indices plus one spelling-specific optional extra (Gemm's bias
+// quantize / MatMul's epilogue add), sorted.
+std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedDenseLinearRegion &region)
 {
+   const auto &extraOpIndex = region.spelling == EQuantizedDenseLinearSpelling::MatMul
+                                 ? region.epilogue.addOpIndex
+                                 : region.biasQuantOpIndex;
    std::vector<std::size_t> indices = {region.inputQuantOpIndex, region.weightQuantOpIndex,
-                                       region.gemmOpIndex, region.outputQuantOpIndex};
-   if (region.biasQuantOpIndex)
-      indices.push_back(*region.biasQuantOpIndex);
+                                       region.denseOpIndex, region.outputQuantOpIndex};
+   if (extraOpIndex)
+      indices.push_back(*extraOpIndex);
    if (region.inputPairQuantizeOpIndex)
       indices.push_back(*region.inputPairQuantizeOpIndex);
    if (region.outputDequantOpIndex)
@@ -254,50 +266,6 @@ std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedG
                   region.absorbedOutputChainOpIndices.end());
    std::sort(indices.begin(), indices.end());
    return indices;
-}
-
-std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedMatMulRegion &region)
-{
-   std::vector<std::size_t> indices = {region.inputQuantOpIndex, region.weightQuantOpIndex,
-                                       region.matmulOpIndex, region.outputQuantOpIndex};
-   if (region.epilogue.addOpIndex)
-      indices.push_back(*region.epilogue.addOpIndex);
-   if (region.inputPairQuantizeOpIndex)
-      indices.push_back(*region.inputPairQuantizeOpIndex);
-   if (region.outputDequantOpIndex)
-      indices.push_back(*region.outputDequantOpIndex);
-   if (region.outputReluOpIndex)
-      indices.push_back(*region.outputReluOpIndex);
-   indices.insert(indices.end(), region.absorbedOutputChainOpIndices.begin(),
-                  region.absorbedOutputChainOpIndices.end());
-   std::sort(indices.begin(), indices.end());
-   return indices;
-}
-
-QuantizedMatMulRegion MakeQuantizedMatMulRegionFromGemmLikeRegion(const QuantizedGemmRegion &region)
-{
-   QuantizedMatMulRegion matmul;
-   matmul.inputTensor = region.inputTensor;
-   matmul.weightTensor = region.weightTensor;
-   matmul.matmulOutputTensor = region.gemmOutputTensor;
-   matmul.outputTensor = region.outputTensor;
-   matmul.inputSourceTensor = region.inputSourceTensor;
-   matmul.weightSourceTensor = region.weightSourceTensor;
-   matmul.inputQuantOpIndex = region.inputQuantOpIndex;
-   matmul.weightQuantOpIndex = region.weightQuantOpIndex;
-   matmul.matmulOpIndex = region.gemmOpIndex;
-   matmul.outputQuantOpIndex = region.outputQuantOpIndex;
-   matmul.absorbedOutputChainOpIndices = region.absorbedOutputChainOpIndices;
-   matmul.outputClamp = region.outputClamp;
-   matmul.inputPairQuantizeOpIndex = region.inputPairQuantizeOpIndex;
-   matmul.outputDequantOpIndex = region.outputDequantOpIndex;
-   matmul.outputReluOpIndex = region.outputReluOpIndex;
-   matmul.outputRequantize = region.outputRequantize;
-   matmul.outputAlpha = region.outputAlpha;
-   matmul.inputQuant = region.inputQuant;
-   matmul.weightQuant = region.weightQuant;
-   matmul.outputQuant = region.outputQuant;
-   return matmul;
 }
 
 bool IsDenseLinearBiasLikeShape(const std::vector<std::size_t> &biasShape,

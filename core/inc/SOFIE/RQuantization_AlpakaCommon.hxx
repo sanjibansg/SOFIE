@@ -181,15 +181,6 @@ enum class EQuantizedFP8OutputCarrier {
    Float32
 };
 
-using EQuantizedCudaWeightType = EQuantizedWeightCarrier;
-using EQuantizedCudaEpilogueMode = EQuantizedEpilogueMode;
-using EQuantizedCudaInputCarrier = EQuantizedInputCarrier;
-using EQuantizedCudaBiasCarrier = EQuantizedBiasCarrier;
-using EQuantizedCudaOutputCarrier = EQuantizedOutputCarrier;
-using EQuantizedCudaScaleMode = EQuantizedScaleMode;
-using EQuantizedCudaFP8Format = EQuantizedFP8Format;
-using EQuantizedCudaFP8Accumulation = EQuantizedFP8Accumulation;
-using EQuantizedCudaFP8OutputCarrier = EQuantizedFP8OutputCarrier;
 struct QuantizedFP8DenseLinearInvocation {
    std::size_t m = 0;
    std::size_t n = 0;
@@ -378,12 +369,6 @@ struct QuantizedGatherInvocation {
    bool indicesInt64 = true;
 };
 
-
-// Provider-local legacy names resolve to the same invocation contracts.
-using QuantizedGemmCudaLtFP8Params = QuantizedFP8DenseLinearInvocation;
-using QuantizedGemmCudaLtParams = QuantizedDenseLinearInvocation;
-using QuantizedConvCudaLtParams = QuantizedConvolutionInvocation;
-using QuantizedConvCudaLtFP8Params = QuantizedFP8ConvolutionInvocation;
 } // namespace SOFIE
 
 #endif // SOFIE_RQUANTIZATION_ALPAKA_COMMON

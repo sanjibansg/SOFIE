@@ -114,7 +114,7 @@ inline bool QuantizationTraceEnabled()
 }
 
 // The grid every FP8 absorption requires: per-tensor E4M3 with zero point 0 and a usable
-// scale. One predicate for the walkers, the adoption finder, and the decode-fuse driver.
+// scale. One predicate for the walkers, the adoption finder, and the decode-fuse hook.
 inline bool IsPerTensorE4M3(const QuantizationGrid &grid)
 {
    return grid.kind == EQuantizationGridKind::Float8E4M3 &&
@@ -128,14 +128,6 @@ inline std::pair<double, double> GridInterval(const QuantizationGrid &grid)
 {
    return {(grid.codeMin - static_cast<double>(grid.zeroPoint)) * grid.scale,
            (grid.codeMax - static_cast<double>(grid.zeroPoint)) * grid.scale};
-}
-
-// The largest magnitude this grid can hold, for saturation checks; one spelling covers
-// the scaled integer range and 448 * scale alike.
-inline double GridMagnitude(const QuantizationGrid &grid)
-{
-   const auto [low, high] = GridInterval(grid);
-   return std::max(std::abs(low), std::abs(high));
 }
 
 inline std::pair<std::int64_t, std::int64_t> QuantizedIntegerRange(const QuantizationInfo &info)
@@ -208,8 +200,8 @@ inline std::string FP8EncodeExpression(const std::string &valueExpr, const Quant
           ExactDoubleLiteral(grid.scale) + "))";
 }
 
-// Emits a fused fake-quant boundary's statements -- encode onto the grid, decode straight
-// back -- declaring `resultVar`. Mirrors ROperator_ONNXQuantizeLinear's round-trip bodies.
+// Emits a fused fake-quant boundary's statements, an encode onto the grid and a decode
+// straight back, declaring `resultVar`. Mirrors ROperator_ONNXQuantizeLinear's round trips.
 inline std::string FakeQuantRoundTripStatements(const std::string &resultVar,
                                                 const std::string &valueExpr,
                                                 const QuantizationGrid &grid,
@@ -298,72 +290,44 @@ struct QuantizedEpilogue {
 
 #include "SOFIE/RQuantization_DenseLinearTypes.hxx"
 
-struct QuantizedMatMulRegion {
-   // Quantized carrier tensors, i.e. outputs of quantization boundaries.
-   std::string inputTensor;
-   std::string weightTensor;
-   std::string matmulOutputTensor;
+// Fields every lowered region carries: the emitted tensor, the float input source
+// (Gather keys on indices and leaves it empty), and the lowering verdict with its reason.
+struct QuantizedRegionBase {
    std::string outputTensor;
-
-   // Source tensors consumed by the quantization boundaries.
    std::string inputSourceTensor;
-   std::string weightSourceTensor;
-
-   std::size_t inputQuantOpIndex = static_cast<std::size_t>(-1);
-   std::size_t weightQuantOpIndex = static_cast<std::size_t>(-1);
-   std::size_t matmulOpIndex = static_cast<std::size_t>(-1);
-   std::size_t outputQuantOpIndex = static_cast<std::size_t>(-1);
-   // Leading QuantizeLinear of a Q/DQ input pair, absorbed so the region reads the Q's
-   // float source directly.
-   std::optional<std::size_t> inputPairQuantizeOpIndex;
-   // Trailing DequantizeLinear of a Q/DQ output pair; the pair is one fake-quant, so the
-   // region emits the DQ's float output.
-   std::optional<std::size_t> outputDequantOpIndex;
-   // Relu consuming the output boundary, applied by the epilogue's hasRelu instead of a
-   // standalone kernel. The region then emits the Relu's output.
-   std::optional<std::size_t> outputReluOpIndex;
-   // Value-preserving ops between the region output and its quantization boundary,
-   // absorbed so no standalone glue op survives.
-   std::vector<std::size_t> absorbedOutputChainOpIndices;
-   // Effective [qmin, qmax] for the epilogue when an absorbed Clip narrows the grid below
-   // what the carrier's bit width implies. Empty means use the carrier range.
-   std::optional<std::pair<std::int64_t, std::int64_t>> outputClamp;
-   // Consuming region's input grid; the epilogue re-quantizes onto it and emits an int8
-   // carrier instead of a float.
-   std::optional<QuantizationInfo> outputRequantize;
-   // Constant scalar Mul absorbed off the output chain and folded into the epilogue's
-   // alpha, which scales inputScale*weightScale/outputScale while the GEMM runs alpha=1.
-   double outputAlpha = 1.0;
-
-   QuantizedEpilogue epilogue;
-   QuantizedMatMulShapeAssessment shape;
-
-   QuantizationInfo inputQuant;
-   QuantizationInfo weightQuant;
-   QuantizationInfo outputQuant;
-
    EQuantizedLoweringStatus status = EQuantizedLoweringStatus::UNDEFINED;
    std::string reason;
 };
 
-struct QuantizedGemmRegion {
+// The ONNX form a dense-linear region was recognized from: Gemm carries alpha/beta/trans
+// and the bias quartet; MatMul is alpha=1/beta=0, batched, bias applied by the epilogue.
+enum class EQuantizedDenseLinearSpelling {
+   Gemm = 0,
+   MatMul = 1
+};
+
+// One dense-linear region for both spellings. Fields marked per-spelling stay at their
+// defaults on the other spelling; consumers key on `spelling`, never on field presence.
+struct QuantizedDenseLinearRegion : QuantizedRegionBase {
+   EQuantizedDenseLinearSpelling spelling = EQuantizedDenseLinearSpelling::Gemm;
+
    // Quantized carrier tensors, i.e. outputs of quantization boundaries.
    std::string inputTensor;
    std::string weightTensor;
-   std::string biasTensor;
+   std::string biasTensor;         // Gemm spelling (MatMul carries bias via epilogue).
+   // Raw output of the anchor operator, before any absorbed output chain.
    std::string gemmOutputTensor;
-   std::string outputTensor;
 
    // Source tensors consumed by the quantization boundaries. Fused region code
    // uses these names when it suppresses the literal Quant nodes.
-   std::string inputSourceTensor;
    std::string weightSourceTensor;
-   std::string biasSourceTensor;
+   std::string biasSourceTensor;   // Gemm spelling.
 
    std::size_t inputQuantOpIndex = static_cast<std::size_t>(-1);
    std::size_t weightQuantOpIndex = static_cast<std::size_t>(-1);
-   std::optional<std::size_t> biasQuantOpIndex;
-   std::size_t gemmOpIndex = static_cast<std::size_t>(-1);
+   std::optional<std::size_t> biasQuantOpIndex;   // Gemm spelling.
+   // Anchor operator index (the recognized Gemm/MatMul operator).
+   std::size_t denseOpIndex = static_cast<std::size_t>(-1);
    std::size_t outputQuantOpIndex = static_cast<std::size_t>(-1);
    // Leading QuantizeLinear of a Q/DQ input pair, absorbed so the region reads the Q's
    // float source directly.
@@ -387,28 +351,27 @@ struct QuantizedGemmRegion {
    // alpha, which scales inputScale*weightScale/outputScale while the GEMM runs alpha=1.
    double outputAlpha = 1.0;
 
+   QuantizedEpilogue epilogue;            // MatMul spelling.
+   QuantizedMatMulShapeAssessment shape;  // MatMul spelling.
+
    QuantizationInfo inputQuant;
    QuantizationInfo weightQuant;
-   std::optional<QuantizationInfo> biasQuant;
+   std::optional<QuantizationInfo> biasQuant;   // Gemm spelling.
    QuantizationInfo outputQuant;
 
+   // Gemm attributes; the MatMul spelling is semantically alpha=1/beta=0.
    float alpha = 1.0f;
    float beta = 1.0f;
    std::int64_t transA = 0;
    std::int64_t transB = 0;
-
-   EQuantizedLoweringStatus status = EQuantizedLoweringStatus::UNDEFINED;
-   std::string reason;
 };
 
-struct QuantizedConvRegion {
+struct QuantizedConvRegion : QuantizedRegionBase {
    std::string inputTensor;
    std::string weightTensor;
    std::string biasTensor;
    std::string convOutputTensor;
-   std::string outputTensor;
 
-   std::string inputSourceTensor;
    std::string weightSourceTensor;
    std::string biasSourceTensor;
 
@@ -421,16 +384,12 @@ struct QuantizedConvRegion {
 
    QuantizedConvolutionAttributes attributes;
    EQuantizedEpilogueKind epilogueKind = EQuantizedEpilogueKind::None;
-   std::optional<QuantizationInfo> inputQuant;
-   std::optional<QuantizationInfo> weightQuant;
    std::optional<QuantizationInfo> biasQuant;
-   std::optional<QuantizationInfo> outputQuant;
+   // One slot per operand: an affine grid (Affine* carrier, grid in
+   // affineQuantization) or a native FP8 contract. IsAffineOperand discriminates.
    std::optional<LowPrecisionTensorInfo> inputLowPrecision;
    std::optional<LowPrecisionTensorInfo> weightLowPrecision;
    std::optional<LowPrecisionTensorInfo> outputLowPrecision;
-
-   EQuantizedLoweringStatus status = EQuantizedLoweringStatus::UNDEFINED;
-   std::string reason;
 };
 
 enum class EQuantizedElementwiseKind {
@@ -445,18 +404,16 @@ inline constexpr int kQuantizedElementwiseMaxRank = 8;
 
 // A quantized/low-precision elementwise Add or Mul. A constant operand is canonicalized
 // into the B slot to reuse the shared weight-storage path.
-struct QuantizedElementwiseRegion {
+struct QuantizedElementwiseRegion : QuantizedRegionBase {
    EQuantizedElementwiseKind kind = EQuantizedElementwiseKind::UNDEFINED;
 
    // Quantized carrier tensors (outputs of the operand quantization boundaries).
    std::string inputTensor;
    std::string operandBTensor;
    std::string elementwiseOutputTensor;
-   std::string outputTensor;
 
-   // Source tensors consumed by the boundaries; operandBSourceTensor doubles as the
-   // weight-source slot for the shared storage/pruning path.
-   std::string inputSourceTensor;
+   // Source tensor consumed by the B boundary; doubles as the weight-source slot for the
+   // shared storage/pruning path.
    std::string operandBSourceTensor;
 
    std::size_t inputQuantOpIndex = static_cast<std::size_t>(-1);
@@ -467,88 +424,68 @@ struct QuantizedElementwiseRegion {
    // boundary, absorbed so no standalone glue op survives.
    std::vector<std::size_t> absorbedOutputChainOpIndices;
 
-   // Affine INT8 carriers.
-   std::optional<QuantizationInfo> inputQuant;
-   std::optional<QuantizationInfo> operandBQuant;
+   // The output is affine-only.
    std::optional<QuantizationInfo> outputQuant;
-   // Native low-precision (FP8) carriers.
+   // One slot per input operand: an affine INT8 grid (Affine* carrier, grid in
+   // affineQuantization) or a native FP8 contract. IsAffineOperand discriminates.
    std::optional<LowPrecisionTensorInfo> inputLowPrecision;
    std::optional<LowPrecisionTensorInfo> operandBLowPrecision;
-   std::optional<LowPrecisionTensorInfo> outputLowPrecision;
 
    std::vector<std::size_t> inputShape;
    std::vector<std::size_t> operandBShape;
    std::vector<std::size_t> outputShape;
 
    bool operandBIsConstant = false;
-   bool hasRelu = false;
-
-   EQuantizedLoweringStatus status = EQuantizedLoweringStatus::UNDEFINED;
-   std::string reason;
 };
 
-// A weight-only quantized/low-precision Gather (embedding/head): a quantized constant
-// table gathered by integral indices, dequantized on the gathered payload.
-struct QuantizedGatherRegion {
+// A weight-only quantized Gather: a quantized constant table gathered by integral indices,
+// dequantized on the payload. inputSourceTensor stays empty; the accessor reads the indices.
+struct QuantizedGatherRegion : QuantizedRegionBase {
    // The quantized table carrier (boundary output) and its physical source.
    std::string tableTensor;
    std::string tableSourceTensor;
    std::string indicesTensor;
    std::string gatherOutputTensor;
-   std::string outputTensor;
 
    std::size_t tableQuantOpIndex = static_cast<std::size_t>(-1);
    std::size_t gatherOpIndex = static_cast<std::size_t>(-1);
 
    std::int64_t axis = 0;
 
-   std::optional<QuantizationInfo> tableQuant;
+   // One slot for the table's contract: an affine grid (Affine* carrier, grid in
+   // affineQuantization) or a native FP8 contract. IsAffineOperand discriminates.
    std::optional<LowPrecisionTensorInfo> tableLowPrecision;
 
    std::vector<std::size_t> tableShape;
    std::vector<std::size_t> indicesShape;
-   std::vector<std::size_t> outputShape;
-
-   EQuantizedLoweringStatus status = EQuantizedLoweringStatus::UNDEFINED;
-   std::string reason;
 };
 
-using QuantizedRegion = std::variant<QuantizedGemmRegion, QuantizedMatMulRegion, QuantizedConvRegion,
+using QuantizedRegion = std::variant<QuantizedDenseLinearRegion, QuantizedConvRegion,
                                      QuantizedElementwiseRegion, QuantizedGatherRegion>;
 
-inline std::size_t QuantizedRegionAnchorIndex(const QuantizedGemmRegion &region) { return region.gemmOpIndex; }
-inline std::size_t QuantizedRegionAnchorIndex(const QuantizedMatMulRegion &region) { return region.matmulOpIndex; }
+inline std::size_t QuantizedRegionAnchorIndex(const QuantizedDenseLinearRegion &region) { return region.denseOpIndex; }
 inline std::size_t QuantizedRegionAnchorIndex(const QuantizedConvRegion &region) { return region.convOpIndex; }
 inline std::size_t QuantizedRegionAnchorIndex(const QuantizedElementwiseRegion &region) { return region.elementwiseOpIndex; }
 inline std::size_t QuantizedRegionAnchorIndex(const QuantizedGatherRegion &region) { return region.gatherOpIndex; }
 
-inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedGemmRegion &region) { return region.inputSourceTensor; }
-inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedMatMulRegion &region) { return region.inputSourceTensor; }
-inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedConvRegion &region) { return region.inputSourceTensor; }
-inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedElementwiseRegion &region) { return region.inputSourceTensor; }
+inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedRegionBase &region) { return region.inputSourceTensor; }
 // The indices tensor is the runtime input; the table is the persistent carrier.
 inline const std::string &QuantizedRegionInputSourceTensor(const QuantizedGatherRegion &region) { return region.indicesTensor; }
 
-inline const std::string &QuantizedRegionOutputTensor(const QuantizedGemmRegion &region) { return region.outputTensor; }
-inline const std::string &QuantizedRegionOutputTensor(const QuantizedMatMulRegion &region) { return region.outputTensor; }
-inline const std::string &QuantizedRegionOutputTensor(const QuantizedConvRegion &region) { return region.outputTensor; }
-inline const std::string &QuantizedRegionOutputTensor(const QuantizedElementwiseRegion &region) { return region.outputTensor; }
-inline const std::string &QuantizedRegionOutputTensor(const QuantizedGatherRegion &region) { return region.outputTensor; }
-
-inline const std::string &QuantizedRegionWeightSourceTensor(const QuantizedGemmRegion &region) { return region.weightSourceTensor; }
-inline const std::string &QuantizedRegionWeightSourceTensor(const QuantizedMatMulRegion &region) { return region.weightSourceTensor; }
-inline const std::string &QuantizedRegionWeightSourceTensor(const QuantizedConvRegion &region) { return region.weightSourceTensor; }
+inline const std::string &QuantizedRegionOutputTensor(const QuantizedRegionBase &region) { return region.outputTensor; }
 
 // Neutral accessor for the persistent operand the shared storage/pruning path
 // materializes: the weight for dense-linear/Conv, the constant operand for elementwise.
-inline const std::string &QuantizedRegionSecondaryStorageTensor(const QuantizedGemmRegion &region) { return region.weightSourceTensor; }
-inline const std::string &QuantizedRegionSecondaryStorageTensor(const QuantizedMatMulRegion &region) { return region.weightSourceTensor; }
+inline const std::string &QuantizedRegionSecondaryStorageTensor(const QuantizedDenseLinearRegion &region) { return region.weightSourceTensor; }
 inline const std::string &QuantizedRegionSecondaryStorageTensor(const QuantizedConvRegion &region) { return region.weightSourceTensor; }
 inline const std::string &QuantizedRegionSecondaryStorageTensor(const QuantizedElementwiseRegion &region) { return region.operandBSourceTensor; }
 inline const std::string &QuantizedRegionSecondaryStorageTensor(const QuantizedGatherRegion &region) { return region.tableSourceTensor; }
 
-inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedGemmRegion &region) { return region.biasSourceTensor; }
-inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedMatMulRegion &region) { return region.epilogue.biasSourceTensor; }
+inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedDenseLinearRegion &region)
+{
+   return region.spelling == EQuantizedDenseLinearSpelling::MatMul ? region.epilogue.biasSourceTensor
+                                                                   : region.biasSourceTensor;
+}
 inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedConvRegion &region) { return region.biasSourceTensor; }
 inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedElementwiseRegion &) {
    static const std::string kNoBias;
@@ -559,24 +496,43 @@ inline const std::string &QuantizedRegionBiasSourceTensor(const QuantizedGatherR
    return kNoBias;
 }
 
-std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedGemmRegion &region);
-std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedMatMulRegion &region);
+std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedDenseLinearRegion &region);
 std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedConvRegion &region);
 std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedElementwiseRegion &region);
 std::vector<std::size_t> QuantizedRegionConsumedOperatorIndices(const QuantizedGatherRegion &region);
 
-inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedGemmRegion &region) { return region.status; }
-inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedMatMulRegion &region) { return region.status; }
-inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedConvRegion &region) { return region.status; }
-inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedElementwiseRegion &region) { return region.status; }
-inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedGatherRegion &region) { return region.status; }
+inline EQuantizedLoweringStatus QuantizedRegionStatus(const QuantizedRegionBase &region) { return region.status; }
 
-inline const std::string &QuantizedRegionReason(const QuantizedGemmRegion &region) { return region.reason; }
-inline const std::string &QuantizedRegionReason(const QuantizedMatMulRegion &region) { return region.reason; }
-inline const std::string &QuantizedRegionReason(const QuantizedConvRegion &region) { return region.reason; }
-inline const std::string &QuantizedRegionReason(const QuantizedElementwiseRegion &region) { return region.reason; }
-inline const std::string &QuantizedRegionReason(const QuantizedGatherRegion &region) { return region.reason; }
+inline const std::string &QuantizedRegionReason(const QuantizedRegionBase &region) { return region.reason; }
 
+
+// One region's row in the pipeline report: the region's identity and the verdict the
+// active backend's plan reached for it.
+struct QuantizedRegionReportEntry {
+   std::string outputTensor;
+   std::string family;          // "gemm" | "matmul" | "conv" | "elementwise" | "gather"
+   EQuantizedLoweringStatus status;   // the chosen backend plan's status
+   std::string capabilityTag;         // the chosen backend plan's tag
+   bool adoptedOutput = false;        // dense-linear: region absorbed its trailing encode
+};
+
+// Read-only report of one BuildLoweredOperatorView run: what each pass absorbed, rewired,
+// or dropped, and what the frontier classified afterwards. Filled for tests; never read back.
+struct QuantizationPipelineReport {
+   std::size_t producerEncodeHandoffs = 0;
+   std::size_t fakeQuantFolds = 0;
+   std::size_t fusedSnapOps = 0;
+   std::size_t decodeFusions = 0;
+   std::size_t movementRewires = 0;
+   std::size_t decodeDedups = 0;
+   std::size_t noOpClipsDropped = 0;
+   std::size_t adoptedOutputs = 0;
+   // frontier classification
+   std::size_t justifiedBoundaries = 0;
+   std::size_t owedBoundaries = 0;
+   std::size_t roundTripConversions = 0;
+   std::vector<QuantizedRegionReportEntry> regions;
+};
 
 struct QuantizationModelState {
    std::unordered_map<std::string, QuantizationInfo> tensorInfos;
@@ -584,18 +540,16 @@ struct QuantizationModelState {
    std::unordered_map<std::string, QuantizedTensorStorage> tensorStorages;
    std::unordered_map<std::size_t, QuantizedRegion> regions;
    std::unordered_map<std::size_t, std::unordered_map<EQuantizedBackend, QuantizedLoweringPlan>> loweringPlans;
-   std::vector<std::string> metadataDiagnostics;
    // Grids for producers that should write a low-precision carrier instead of a float,
    // keyed by the tensor each writes; planned at the consumer, applied at the producer.
-   std::unordered_map<std::string, QuantizationGrid> softmaxInt8Handoffs;
+   std::unordered_map<std::string, QuantizationGrid> producerEncodeHandoffs;
 
    void ClearDerivedAnalysis()
    {
       tensorStorages.clear();
       regions.clear();
       loweringPlans.clear();
-      metadataDiagnostics.clear();
-      softmaxInt8Handoffs.clear();
+      producerEncodeHandoffs.clear();
    }
 };
 

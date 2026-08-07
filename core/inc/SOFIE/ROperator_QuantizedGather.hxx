@@ -34,22 +34,6 @@ private:
    QuantizedLoweringPlan fPlan;
    QuantizedGatherCodegenContext fContext;
 
-   static std::string DoubleLiteral(double value)
-   {
-      std::ostringstream out;
-      out << std::setprecision(std::numeric_limits<double>::max_digits10) << value;
-      return out.str();
-   }
-
-   static std::string TableCarrierEnum(ETensorType type)
-   {
-      switch (type) {
-      case ETensorType::INT8: return "SOFIE::EQuantizedInputCarrier::Int8";
-      case ETensorType::UINT8: return "SOFIE::EQuantizedInputCarrier::UInt8";
-      default: return "SOFIE::EQuantizedInputCarrier::Float";
-      }
-   }
-
 public:
    ROperator_QuantizedGather(QuantizedGatherRegion region, QuantizedLoweringPlan plan,
                                 QuantizedGatherCodegenContext context)
@@ -110,24 +94,26 @@ public:
       out << std::setprecision(std::numeric_limits<double>::max_digits10);
       // Per-channel affine tables resolve the scale at runtime by the quantization-axis
       // stride in the table's layout; per-tensor tables and FP8 pass a null scale vector.
-      const bool perChannel = !fp8 && fRegion.tableQuant->granularity == EQuantizationGranularity::PerChannel;
+      const bool perChannel =
+         !fp8 && fRegion.tableLowPrecision->affineQuantization->granularity == EQuantizationGranularity::PerChannel;
       std::string scaleVector = "static_cast<const float *>(nullptr)";
       if (fp8) {
          out << "      " << params << ".lowPrecisionFP8 = true;\n";
       } else if (perChannel) {
-         const auto quantAxis = static_cast<std::size_t>(fRegion.tableQuant->axis);
+         const auto quantAxis = static_cast<std::size_t>(fRegion.tableLowPrecision->affineQuantization->axis);
          const std::size_t quantAxisStride =
             std::accumulate(fRegion.tableShape.begin() + quantAxis + 1, fRegion.tableShape.end(),
                             std::size_t{1}, std::multiplies<std::size_t>{});
          out << "      " << params << ".perChannel = true;\n";
          out << "      " << params << ".quantAxisStride = " << quantAxisStride << ";\n";
          out << "      " << params << ".quantAxisLength = " << fRegion.tableShape[quantAxis] << ";\n";
-         out << "      " << params << ".tableCarrier = " << TableCarrierEnum(fContext.tableSourceType) << ";\n";
+         out << "      " << params << ".tableCarrier = " << INTERNAL::QuantizedInputCarrierEnumName(fContext.tableSourceType) << ";\n";
          scaleVector = "alpaka::getPtrNative(deviceBuf_" + fPlan.weightScaleTensor + ")";
       } else {
-         out << "      " << params << ".scale = " << DoubleLiteral(fRegion.tableQuant->scale) << ";\n";
-         out << "      " << params << ".zeroPoint = " << fRegion.tableQuant->zeroPoint << ";\n";
-         out << "      " << params << ".tableCarrier = " << TableCarrierEnum(fContext.tableSourceType) << ";\n";
+         const auto &tableQuant = *fRegion.tableLowPrecision->affineQuantization;
+         out << "      " << params << ".scale = " << INTERNAL::QuantizedDoubleLiteral(tableQuant.scale) << ";\n";
+         out << "      " << params << ".zeroPoint = " << tableQuant.zeroPoint << ";\n";
+         out << "      " << params << ".tableCarrier = " << INTERNAL::QuantizedInputCarrierEnumName(fContext.tableSourceType) << ";\n";
       }
       out << "      " << params << ".indicesInt64 = "
           << (fContext.indicesType == ETensorType::INT64 ? "true" : "false") << ";\n";

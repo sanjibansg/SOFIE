@@ -152,6 +152,11 @@ inline LowPrecisionTensorInfo MakeONNXFP8TensorInfo(RModel &model, const std::st
                                                     ETensorType carrierType, const std::string &sourceTensor,
                                                     const std::string &opName)
 {
+   // Every emitter codes E4M3FN (EncodeFP8E4M3/DecodeFP8E4M3, DecodeHostFP8E4M3), so any
+   // other float8 flavor would be encoded with the wrong codec; reject it here instead.
+   if (carrierType != ETensorType::FLOAT8E4M3FN)
+      throw std::runtime_error("SOFIE " + opName + " supports the FLOAT8E4M3FN carrier only; " +
+                               ConvertTypeToString(carrierType) + " has no matching codec");
    if (!model.IsInitializedTensor(scaleTensor))
       throw std::runtime_error("SOFIE " + opName + " float8 scale must be an initialized tensor");
    const auto scales = GetFloatScaleInitializer(model, scaleTensor, opName);
@@ -174,10 +179,7 @@ inline LowPrecisionTensorInfo MakeONNXFP8TensorInfo(RModel &model, const std::st
    affine.zeroPointTensor = zeroPointTensor;
 
    auto info = LowPrecisionTensorInfoFromFP8Carrier(
-      carrierType == ETensorType::FLOAT8E5M2 || carrierType == ETensorType::FLOAT8E5M2FNUZ
-         ? ELowPrecisionCarrier::FP8E5M2
-         : ELowPrecisionCarrier::FP8E4M3,
-      sourceTensor, "SOFIE " + opName + " float8 Q/DQ boundary");
+      ELowPrecisionCarrier::FP8E4M3, sourceTensor, "SOFIE " + opName + " float8 Q/DQ boundary");
    info.affineQuantization = affine;
    return info;
 }
@@ -287,17 +289,14 @@ public:
    {
       QuantizationGrid grid;
       if (fIsFP8) {
-         grid.kind = fOutputType == ETensorType::FLOAT8E5M2 || fOutputType == ETensorType::FLOAT8E5M2FNUZ
-                        ? EQuantizationGridKind::Float8E5M2
-                        : EQuantizationGridKind::Float8E4M3;
+         // The parse admits FLOAT8E4M3FN only, so an FP8 boundary's grid is always E4M3:
+         // symmetric, no infinities, largest finite value 448.
+         grid.kind = EQuantizationGridKind::Float8E4M3;
          grid.scale = fFP8Scale;
          grid.zeroPoint = 0;
          grid.granularity = EQuantizationGranularity::PerTensor;
-         // E4M3 tops out at 448 and E5M2 at 57344; both are symmetric and have no infinity
-         // in the ONNX "fn" spellings, so the extreme code is the largest finite value.
-         const double limit = grid.kind == EQuantizationGridKind::Float8E4M3 ? 448.0 : 57344.0;
-         grid.codeMin = -limit;
-         grid.codeMax = limit;
+         grid.codeMin = -448.0;
+         grid.codeMax = 448.0;
          return grid;
       }
       if (fInfo.bitWidth == 0)
@@ -599,17 +598,14 @@ public:
    {
       QuantizationGrid grid;
       if (fIsFP8) {
-         grid.kind = fInputType == ETensorType::FLOAT8E5M2 || fInputType == ETensorType::FLOAT8E5M2FNUZ
-                        ? EQuantizationGridKind::Float8E5M2
-                        : EQuantizationGridKind::Float8E4M3;
+         // The parse admits FLOAT8E4M3FN only, so an FP8 boundary's grid is always E4M3:
+         // symmetric, no infinities, largest finite value 448.
+         grid.kind = EQuantizationGridKind::Float8E4M3;
          grid.scale = fFP8Scale;
          grid.zeroPoint = 0;
          grid.granularity = EQuantizationGranularity::PerTensor;
-         // E4M3 tops out at 448 and E5M2 at 57344; both are symmetric and have no infinity
-         // in the ONNX "fn" spellings, so the extreme code is the largest finite value.
-         const double limit = grid.kind == EQuantizationGridKind::Float8E4M3 ? 448.0 : 57344.0;
-         grid.codeMin = -limit;
-         grid.codeMax = limit;
+         grid.codeMin = -448.0;
+         grid.codeMax = 448.0;
          return grid;
       }
       if (fInfo.bitWidth == 0)
