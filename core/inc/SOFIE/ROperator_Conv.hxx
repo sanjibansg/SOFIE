@@ -430,6 +430,9 @@ public:
       out << SP << SP << "}\n";
       out << SP << "}\n";
 
+      // dilation already folded into the expanded kernel and dilated _f layout above
+      fAttrDilations = std::vector<size_t>(3, 1);
+
       //out << SP << "char " << OpName << "_transA = 'T';\n";
       out << SP << "char " << OpName << "_transA = 'N';\n";
       out << SP << "char " << OpName << "_transB = 'N';\n";
@@ -634,6 +637,10 @@ public:
       size_t ocstride    = fShapeW[1] * icstride;
       size_t wTotalElements = ConvertShapeToLength(fShapeW);
 
+      // effective (dilation-expanded) kernel extents, used for the dense im2col decode
+      size_t kHeightEff = (fDim > 1) ? fAttrKernelShape[ih] : 1;
+      size_t kWidthEff  = fAttrKernelShape[iw];
+
       std::string op;
 
       // Kernel 1: Weight vectorisation — reorder W into _f with dilation layout
@@ -709,13 +716,13 @@ public:
       op += SP + SP + SP + SP + "std::size_t const ic    = col_row / " + std::to_string(kernelSize) + "u;\n";
       op += SP + SP + SP + SP + "std::size_t const k_rem = col_row % " + std::to_string(kernelSize) + "u;\n";
       if (fDim > 2) {
-         op += SP + SP + SP + SP + "std::size_t const kd = k_rem / " + std::to_string(kHeight * kWidth) + "u;\n";
-         op += SP + SP + SP + SP + "std::size_t const kh = (k_rem / " + std::to_string(kWidth) + "u) % " + std::to_string(kHeight) + "u;\n";
-         op += SP + SP + SP + SP + "std::size_t const kw = k_rem % " + std::to_string(kWidth) + "u;\n\n";
+         op += SP + SP + SP + SP + "std::size_t const kd = k_rem / " + std::to_string(kHeightEff * kWidthEff) + "u;\n";
+         op += SP + SP + SP + SP + "std::size_t const kh = (k_rem / " + std::to_string(kWidthEff) + "u) % " + std::to_string(kHeightEff) + "u;\n";
+         op += SP + SP + SP + SP + "std::size_t const kw = k_rem % " + std::to_string(kWidthEff) + "u;\n\n";
       } else if (fDim > 1) {
          op += SP + SP + SP + SP + "std::size_t const kd = 0u;\n";
-         op += SP + SP + SP + SP + "std::size_t const kh = k_rem / " + std::to_string(kWidth) + "u;\n";
-         op += SP + SP + SP + SP + "std::size_t const kw = k_rem % " + std::to_string(kWidth) + "u;\n\n";
+         op += SP + SP + SP + SP + "std::size_t const kh = k_rem / " + std::to_string(kWidthEff) + "u;\n";
+         op += SP + SP + SP + SP + "std::size_t const kw = k_rem % " + std::to_string(kWidthEff) + "u;\n\n";
       } else {
          op += SP + SP + SP + SP + "std::size_t const kd = 0u;\n";
          op += SP + SP + SP + SP + "std::size_t const kh = 0u;\n";
@@ -740,7 +747,7 @@ public:
       // applying it here would make id_in negative and zero the whole output.
       if (fDim >= 3) {
          op += SP + SP + SP + SP + "int64_t const id_in = static_cast<int64_t>(od * " + std::to_string(fAttrStrides[0])
-            + "u + kd * " + std::to_string(fAttrDilations[0]) + "u) - " + std::to_string(fAttrPads[0]) + ";\n";
+            + "u + kd) - " + std::to_string(fAttrPads[0]) + ";\n";
       } else {
          op += SP + SP + SP + SP + "int64_t const id_in = 0;\n";
       }
@@ -750,7 +757,7 @@ public:
          size_t const hIdx = (fDim > 2) ? 1 : 0;
          if (fDim >= 2) {
             op += SP + SP + SP + SP + "int64_t const ih_in = static_cast<int64_t>(oh * " + std::to_string(fAttrStrides[hIdx])
-               + "u + kh * " + std::to_string(fAttrDilations[hIdx]) + "u) - " + std::to_string(fAttrPads[hIdx]) + ";\n";
+               + "u + kh) - " + std::to_string(fAttrPads[hIdx]) + ";\n";
          } else {
             op += SP + SP + SP + SP + "int64_t const ih_in = 0;\n";
          }
@@ -759,7 +766,7 @@ public:
       {
          size_t const wIdx = fDim - 1;
          op += SP + SP + SP + SP + "int64_t const iw_in = static_cast<int64_t>(ow * " + std::to_string(fAttrStrides[wIdx])
-            + "u + kw * " + std::to_string(fAttrDilations[wIdx]) + "u) - " + std::to_string(fAttrPads[wIdx]) + ";\n\n";
+            + "u + kw) - " + std::to_string(fAttrPads[wIdx]) + ";\n\n";
       }
 
       op += SP + SP + SP + SP + "bool const in_bounds =\n";
@@ -845,6 +852,14 @@ public:
 
       std::stringstream out;
       out << "\n//------ CONV_GPU_ALPAKA\n";
+
+      // dilation>1 leaves gaps in the dilated _f layout; zero it so those slots stay 0
+      bool hasDilation = false;
+      for (size_t d = 0; d < fDim; ++d) if (fAttrDilations[d] > 1) hasDilation = true;
+      if (hasDilation) {
+         out << SP << "alpaka::memset(queue, deviceBuf_" << convK << ", 0);\n";
+         out << SP << "alpaka::wait(queue);\n";
+      }
 
       // -----------------------------------------------------------------------
       // Step 1: Weight vectorisation kernel — runs once, fully on GPU
