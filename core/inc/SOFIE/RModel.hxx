@@ -116,6 +116,10 @@ private:
    // Moves a Reshape/Transpose run onto the quantized carrier, deleting the bracketing
    // Dequantize/Quantize pair; runs before the fusion below, which would otherwise absorb it.
    void PropagateLowPrecisionThroughMovement(EQuantizedBackend backend = EQuantizedBackend::CPU);
+   // Rewires a movement run to read the head carrier and write the target tensor, retyping
+   // the tensors between hops to the carrier type.
+   void RewireCarrierMovementRun(const std::vector<std::size_t> &runOpIndices,
+                                 const std::string &headCarrierTensor, const std::string &targetTensor);
    // Collapses each surviving Clip? -> Quantize -> Dequantize into one kernel. Runs last,
    // so it only sees boundaries no region absorbed.
    void FuseUnabsorbedFakeQuantBoundaries();

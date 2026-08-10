@@ -105,6 +105,11 @@ inline bool SameGrid(const QuantizationGrid &a, const QuantizationGrid &b)
           a.codeMax == b.codeMax;
 }
 
+// Element count above which a folded quantization constant carries its bytes in the weight
+// file rather than in an initializer list. Scale scalars, zero points and per-channel
+// parameters sit below it and stay embedded, where build-time readers expect them.
+inline constexpr std::size_t kQuantizedFoldedConstantEmbedMaxLength = 4096;
+
 // The one switch for every quantization trace line: planner, applier, walkers, adoption,
 // recovery, decode fusion.
 inline bool QuantizationTraceEnabled()
@@ -219,8 +224,8 @@ inline std::string FakeQuantRoundTripStatements(const std::string &resultVar,
    const std::string zp = std::to_string(grid.zeroPoint);
    const std::string qMin = std::to_string(static_cast<std::int64_t>(grid.codeMin));
    const std::string qMax = std::to_string(static_cast<std::int64_t>(grid.codeMax));
-   op += indent + "double " + resultVar + "_q = nearbyint((static_cast<double>(" + valueExpr +
-         ") / " + scale + ") + " + zp + ");\n";
+   op += indent + "double " + resultVar + "_q = nearbyint(static_cast<double>(" + valueExpr +
+         ") / " + scale + ") + " + zp + ";\n";
    op += indent + resultVar + "_q = (" + resultVar + "_q < " + qMin + ") ? " + qMin + " : ((" +
          resultVar + "_q > " + qMax + ") ? " + qMax + " : " + resultVar + "_q);\n";
    op += indent + "double const " + resultVar + " = (" + resultVar + "_q - " + zp + ") * " + scale + ";\n";
@@ -242,8 +247,8 @@ inline std::string EncodeToGridStatements(const std::string &destExpr, const std
    const std::string qMin = std::to_string(static_cast<std::int64_t>(grid.codeMin));
    const std::string qMax = std::to_string(static_cast<std::int64_t>(grid.codeMax));
    op += indent + "{\n";
-   op += indent + "   double q = nearbyint((static_cast<double>(" + valueExpr + ") / " + scale +
-         ") + " + zp + ");\n";
+   op += indent + "   double q = nearbyint(static_cast<double>(" + valueExpr + ") / " + scale +
+         ") + " + zp + ";\n";
    op += indent + "   q = (q < " + qMin + ") ? " + qMin + " : ((q > " + qMax + ") ? " + qMax + " : q);\n";
    op += indent + "   " + destExpr + " = static_cast<std::remove_reference_t<decltype(" + destExpr +
          ")>>(q);\n";
@@ -254,7 +259,8 @@ inline std::string EncodeToGridStatements(const std::string &destExpr, const std
 inline std::int64_t QuantizeScalarToIntegerGrid(float value, const QuantizationInfo &info)
 {
    const auto range = QuantizedIntegerRange(info);
-   auto quantized = static_cast<std::int64_t>(std::llround((static_cast<double>(value) / info.scale) + info.zeroPoint));
+   auto quantized = static_cast<std::int64_t>(std::nearbyint(static_cast<double>(value) / info.scale)) +
+                    info.zeroPoint;
    if (quantized < range.first)
       quantized = range.first;
    if (quantized > range.second)
@@ -341,6 +347,10 @@ struct QuantizedDenseLinearRegion : QuantizedRegionBase {
    // Value-preserving ops between the region output and its quantization boundary,
    // absorbed so no standalone glue op survives.
    std::vector<std::size_t> absorbedOutputChainOpIndices;
+   // Movement run between the region output and an adopted encode. The run stays emitted
+   // and is rewired to carry the adopted codes into the boundary's output tensor.
+   std::vector<std::size_t> outputMovementRunOpIndices;
+   std::string outputMovementTargetTensor;
    // Effective [qmin, qmax] for the epilogue when an absorbed Clip narrows the grid below
    // what the carrier's bit width implies. Empty means use the carrier range.
    std::optional<std::pair<std::int64_t, std::int64_t>> outputClamp;

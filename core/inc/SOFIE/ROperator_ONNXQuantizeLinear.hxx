@@ -229,6 +229,19 @@ inline void RequirePerTensorQDQForGpu(const QuantizationInfo &info, const std::s
 
 using SOFIE::ExactDoubleLiteral;
 
+// Registers the float result of folding a DequantizeLinear over an initialized carrier.
+// A small result stays a constant tensor, embedded where the operators that fold against it
+// look for it; a folded weight becomes an initialized tensor and travels in the weight file.
+inline void AddFoldedDequantizedTensor(RModel &model, const std::string &name,
+                                       const std::vector<std::size_t> &shape,
+                                       const std::vector<float> &values)
+{
+   if (values.size() > kQuantizedFoldedConstantEmbedMaxLength)
+      model.AddInitializedTensor(name, shape, values);
+   else
+      model.AddConstantTensor(name, shape, values);
+}
+
 } // namespace DETAIL
 
 class ROperator_ONNXQuantizeLinear final : public ROperator {
@@ -403,8 +416,8 @@ public:
       std::stringstream out;
       out << "\n//------ ONNX QUANTIZELINEAR " << OpName << "\n";
       out << SP << "for (size_t id = 0; id < " << length << "; ++id) {\n";
-      out << SP << SP << "double q = std::nearbyint((static_cast<double>(tensor_" << fNX << "[id]) / "
-          << fInfo.scale << ") + " << fInfo.zeroPoint << ");\n";
+      out << SP << SP << "double q = std::nearbyint(static_cast<double>(tensor_" << fNX << "[id]) / "
+          << fInfo.scale << ") + " << fInfo.zeroPoint << ";\n";
       out << SP << SP << "q = (q < " << qMin << ") ? " << qMin << " : ((q > " << qMax << ") ? " << qMax << " : q);\n";
       out << SP << SP << "tensor_" << fNY << "[id] = static_cast<" << ConvertTypeToString(fOutputType) << ">(q);\n";
       out << SP << "}\n";
@@ -468,8 +481,8 @@ public:
                DETAIL::ExactDoubleLiteral(fFusedClipHigh) + " ? " +
                DETAIL::ExactDoubleLiteral(fFusedClipHigh) + " : v);\n";
       }
-      op += SP + SP + SP + "double q = nearbyint((v / " +
-            DETAIL::ExactDoubleLiteral(fInfo.scale) + ") + " + std::to_string(fInfo.zeroPoint) + ");\n";
+      op += SP + SP + SP + "double q = nearbyint(v / " +
+            DETAIL::ExactDoubleLiteral(fInfo.scale) + ") + " + std::to_string(fInfo.zeroPoint) + ";\n";
       op += SP + SP + SP + "q = (q < " + std::to_string(qMin) + ") ? " + std::to_string(qMin) + " : ((q > " +
             std::to_string(qMax) + ") ? " + std::to_string(qMax) + " : q);\n";
       if (IsFakeQuantRoundTripFused()) {
@@ -650,7 +663,7 @@ public:
             std::vector<float> values(bytes.size());
             for (std::size_t i = 0; i < bytes.size(); ++i)
                values[i] = DETAIL::DecodeHostFP8E4M3(bytes[i]) * scale;
-            model.AddConstantTensor(fNY, fShape, values);
+            DETAIL::AddFoldedDequantizedTensor(model, fNY, fShape, values);
             fIsOutputConstant = true;
          } else {
             model.AddIntermediateTensor(fNY, ETensorType::FLOAT, fShape);
@@ -673,7 +686,7 @@ public:
          default:
             throw std::runtime_error("SOFIE ONNX DequantizeLinear supports initialized integer carriers only");
          }
-         model.AddConstantTensor(fNY, fShape, values);
+         DETAIL::AddFoldedDequantizedTensor(model, fNY, fShape, values);
          // Folded at build time, so no runtime kernel is needed on either backend.
          fIsOutputConstant = true;
       } else {

@@ -303,27 +303,6 @@ struct QuantizedGemmCudaLtState {
    std::size_t WorkspaceSize() const { return 0; }
 };
 
-struct QuantizedGemmCudaLtProfile {
-   float inputQuantizeMs = 0.0f;
-   float gemmMs = 0.0f;
-   float epilogueMs = 0.0f;
-   float totalMs = 0.0f;
-   std::size_t workspaceSize = 0;
-   int heuristicResultCount = 0;
-   int selectedHeuristicIndex = 0;
-   float autotuneMs = 0.0f;
-   int autotunedCandidateCount = 0;
-   float selectedCandidateMs = 0.0f;
-   std::size_t accumulatorBytes = 0;
-   std::size_t outputBytes = 0;
-   std::size_t epilogueTrafficBytes = 0;
-   bool directOutputCarrier = false;
-};
-
-inline void QuantizedGemmCudaLt_SetProfiling(bool) {}
-inline bool QuantizedGemmCudaLt_ProfilingEnabled() { return false; }
-inline QuantizedGemmCudaLtProfile QuantizedGemmCudaLt_GetLastProfile() { return {}; }
-
 inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &, QuantizedGemmCudaStream, void *, const void *,
                                      const void *, const float *, const float *, const QuantizedDenseLinearInvocation &)
 {
@@ -397,13 +376,42 @@ __global__ void QuantizedGemmCudaBiasOutputOffsetKernel(float *__restrict__ bias
    const float biasScale = (params.weightScaleMode == EQuantizedScaleMode::PerOutputChannel)
                               ? static_cast<float>(params.inputScale * static_cast<double>(weightScaleVector[idx]))
                               : static_cast<float>(params.biasScale);
-   int bq = __float2int_rn((bias[idx] / biasScale) + static_cast<float>(params.biasZeroPoint));
+   int bq = __float2int_rn(bias[idx] / biasScale) + params.biasZeroPoint;
    bq = QuantizedCudaClamp(bq, params.biasQMin, params.biasQMax);
-   biasOutputOffset[idx] =
-      (static_cast<float>(params.beta) * static_cast<float>(bq - params.biasZeroPoint) * biasScale /
-       static_cast<float>(params.outputScale)) +
-      static_cast<float>(params.outputZeroPoint);
+   biasOutputOffset[idx] = static_cast<float>(params.beta) * static_cast<float>(bq - params.biasZeroPoint) *
+                           biasScale / static_cast<float>(params.outputScale);
 }
+// Per-output-channel sums of the int8 weight rows in [N, K] storage. An input at zero
+// point zp contributes zp * sum_k(w[n][k]) to every s8xs8 dot product in column n.
+__global__ void QuantizedGemmCudaWeightColumnSumKernel(std::int32_t *__restrict__ columnSums,
+                                                       const std::int8_t *__restrict__ weight,
+                                                       std::size_t outputChannels,
+                                                       std::size_t reduceLength)
+{
+   const std::size_t n = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+   if (n >= outputChannels)
+      return;
+   const std::int8_t *row = weight + n * reduceLength;
+   std::int32_t sum = 0;
+   for (std::size_t k = 0; k < reduceLength; ++k)
+      sum += row[k];
+   columnSums[n] = sum;
+}
+
+// Accumulator value with the asymmetric-input correction removed per column; a null
+// column-sum pointer is the symmetric case and returns the value unchanged.
+__device__ inline double QuantizedGemmCudaCorrectedAccumulator(std::int32_t accumulatorValue, std::size_t col,
+                                                               const std::int32_t *inputZeroPointColumnSums,
+                                                               const QuantizedDenseLinearInvocation &params)
+{
+   if (inputZeroPointColumnSums == nullptr)
+      return static_cast<double>(accumulatorValue);
+   const long long corrected = static_cast<long long>(accumulatorValue) -
+                               static_cast<long long>(params.inputZeroPoint) *
+                                  static_cast<long long>(inputZeroPointColumnSums[col]);
+   return static_cast<double>(corrected);
+}
+
 // Quantized-epilogue core shared by the dense-linear and Conv integer epilogues: fused
 // multiply-add onto the output grid, Relu on the code, then the range clamp.
 template <bool HasRelu>
@@ -412,7 +420,7 @@ __device__ inline std::int32_t QuantizedCudaFmaReluClampCode(float accumulatorVa
                                                              std::int32_t outputQMin,
                                                              std::int32_t outputQMax)
 {
-   int code = __float2int_rn(__fmaf_rn(accumulatorValue, scale, offset));
+   int code = __float2int_rn(__fmaf_rn(accumulatorValue, scale, offset)) + outputZeroPoint;
    if constexpr (HasRelu) {
       if (code < outputZeroPoint)
          code = outputZeroPoint;
@@ -425,6 +433,7 @@ __global__ void QuantizedGemmCudaQuantizedEpilogueKernel(OutputT *__restrict__ o
                                                         const std::int32_t *__restrict__ accumulator,
                                                         const float *__restrict__ biasOutputOffset,
                                                         const float *__restrict__ weightScaleVector,
+                                                        const std::int32_t *__restrict__ inputZeroPointColumnSums,
                                                         QuantizedDenseLinearInvocation params)
 {
    // Whole batch, not one slice. The accumulator is contiguous [batch][m][n], so idx and
@@ -438,10 +447,11 @@ __global__ void QuantizedGemmCudaQuantizedEpilogueKernel(OutputT *__restrict__ o
    const float scale = (params.weightScaleMode == EQuantizedScaleMode::PerOutputChannel)
                          ? static_cast<float>((params.alpha * params.inputScale * static_cast<double>(weightScaleVector[col])) / params.outputScale)
                          : static_cast<float>(params.accumulatorToOutputScale);
-   const float offset = HasBias ? biasOutputOffset[col] : static_cast<float>(params.outputZeroPoint);
+   const float offset = HasBias ? biasOutputOffset[col] : 0.0f;
    const std::int32_t yq = QuantizedCudaFmaReluClampCode<HasRelu>(
-      static_cast<float>(accumulator[idx]), scale, offset, params.outputZeroPoint,
-      params.outputQMin, params.outputQMax);
+      static_cast<float>(
+         QuantizedGemmCudaCorrectedAccumulator(accumulator[idx], col, inputZeroPointColumnSums, params)),
+      scale, offset, params.outputZeroPoint, params.outputQMin, params.outputQMax);
    output[idx] = static_cast<OutputT>(yq);
 }
 
@@ -457,12 +467,12 @@ __device__ inline std::size_t QuantizedGemmCudaLogicalElements(const QuantizedDe
 
 // Fake-quant output code of one accumulator element: alpha * acc * inputScale * weightScale
 // plus the grid-round-tripped bias, rounded onto the output grid with the Relu applied there.
-__device__ inline std::int32_t QuantizedCudaFakeQuantOutputCode(std::int32_t accumulatorValue,
+__device__ inline std::int32_t QuantizedCudaFakeQuantOutputCode(double accumulatorValue,
                                                                 const float *bias, std::size_t channel,
                                                                 double weightScale,
                                                                 const QuantizedDenseLinearInvocation &params)
 {
-   double real = params.alpha * static_cast<double>(accumulatorValue) * params.inputScale * weightScale;
+   double real = params.alpha * accumulatorValue * params.inputScale * weightScale;
    if (params.hasBias && bias != nullptr) {
       const double biasScale = params.weightScaleMode == EQuantizedScaleMode::PerOutputChannel
                                   ? params.inputScale * weightScale
@@ -483,6 +493,7 @@ __device__ inline std::int32_t QuantizedCudaFakeQuantOutputCode(std::int32_t acc
 // onto the output grid with the Relu applied there, then dequantized back to float.
 __device__ inline float QuantizedGemmCudaEpilogueValue(std::size_t idx, const std::int32_t *accumulator,
                                                        const float *bias, const float *weightScaleVector,
+                                                       const std::int32_t *inputZeroPointColumnSums,
                                                        const QuantizedDenseLinearInvocation &params)
 {
    const std::size_t logicalCols = params.logicalN != 0 ? params.logicalN : params.n;
@@ -492,19 +503,23 @@ __device__ inline float QuantizedGemmCudaEpilogueValue(std::size_t idx, const st
    const double weightScale = params.weightScaleMode == EQuantizedScaleMode::PerOutputChannel
                                  ? static_cast<double>(weightScaleVector[col])
                                  : params.weightScale;
-   auto yq = QuantizedCudaFakeQuantOutputCode(accumulator[accIdx], bias, col, weightScale, params);
+   const double corrected =
+      QuantizedGemmCudaCorrectedAccumulator(accumulator[accIdx], col, inputZeroPointColumnSums, params);
+   auto yq = QuantizedCudaFakeQuantOutputCode(corrected, bias, col, weightScale, params);
    yq = QuantizedCudaClamp(yq, params.outputQMin, params.outputQMax);
    return static_cast<float>(static_cast<double>(yq - params.outputZeroPoint) * params.outputScale);
 }
 
 __global__ void QuantizedGemmCudaEpilogueKernel(float *output, const std::int32_t *accumulator, const float *bias,
                                                 const float *weightScaleVector,
+                                                const std::int32_t *inputZeroPointColumnSums,
                                                 QuantizedDenseLinearInvocation params)
 {
    const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
    if (idx >= QuantizedGemmCudaLogicalElements(params))
       return;
-   output[idx] = QuantizedGemmCudaEpilogueValue(idx, accumulator, bias, weightScaleVector, params);
+   output[idx] =
+      QuantizedGemmCudaEpilogueValue(idx, accumulator, bias, weightScaleVector, inputZeroPointColumnSums, params);
 }
 
 // Re-quantizes the same fake-quant value onto the consuming region's input grid and stores an
@@ -512,12 +527,14 @@ __global__ void QuantizedGemmCudaEpilogueKernel(float *output, const std::int32_
 __global__ void QuantizedGemmCudaFusedRequantizeEpilogueKernel(std::int8_t *output,
                                                               const std::int32_t *accumulator, const float *bias,
                                                               const float *weightScaleVector,
+                                                              const std::int32_t *inputZeroPointColumnSums,
                                                               QuantizedDenseLinearInvocation params)
 {
    const std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
    if (idx >= QuantizedGemmCudaLogicalElements(params))
       return;
-   const float value = QuantizedGemmCudaEpilogueValue(idx, accumulator, bias, weightScaleVector, params);
+   const float value =
+      QuantizedGemmCudaEpilogueValue(idx, accumulator, bias, weightScaleVector, inputZeroPointColumnSums, params);
    output[idx] = static_cast<std::int8_t>(QuantizedCudaQuantizeClamp(
       static_cast<double>(value), params.requantizeScale, params.requantizeZeroPoint,
       params.requantizeQMin, params.requantizeQMax));
@@ -630,6 +647,15 @@ inline void SetRowMajorLayout(cublasLtMatrixLayout_t layout)
                        "cublasLtMatrixLayoutSetAttribute(row-major)");
 }
 
+inline cublasLtMatrixLayout_t CreateColumnMajorLayout(cudaDataType_t type, std::uint64_t rows,
+                                                      std::uint64_t cols, std::int64_t leadingDimension)
+{
+   cublasLtMatrixLayout_t layout = nullptr;
+   CheckCublasLtStatus(cublasLtMatrixLayoutCreate(&layout, type, rows, cols, leadingDimension),
+                       "cublasLtMatrixLayoutCreate");
+   return layout;
+}
+
 inline cublasLtMatrixLayout_t CreateRowMajorLayout(cudaDataType_t type, std::uint64_t rows, std::uint64_t cols,
                                                    std::int64_t leadingDimension)
 {
@@ -659,10 +685,13 @@ inline void SetStridedBatchLayout(cublasLtMatrixLayout_t layout, std::size_t bat
 
 // Shared heuristic query for both cuBLASLt states: selects candidate 0 and sizes the
 // workspace to the largest candidate; returns false, count zero, when no algorithm exists.
+// tolerateUnsupported turns the provider's "no algorithm for this combination" answer into a
+// false return instead of a throw, for a caller holding a second configuration to fall back to.
 template <typename State>
 inline bool QuantizedGemmCudaLtSelectHeuristics(State &state, cublasLtMatrixLayout_t cLayout,
                                                 cublasLtMatrixLayout_t dLayout,
-                                                std::size_t maxWorkspaceBytes)
+                                                std::size_t maxWorkspaceBytes,
+                                                bool tolerateUnsupported = false)
 {
    CheckCublasLtStatus(cublasLtMatmulPreferenceCreate(state.fPreference.Receive()),
                        "cublasLtMatmulPreferenceCreate");
@@ -671,13 +700,15 @@ inline bool QuantizedGemmCudaLtSelectHeuristics(State &state, cublasLtMatrixLayo
                           state.fPreference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
                           &state.fWorkspaceLimitBytes, sizeof(state.fWorkspaceLimitBytes)),
                        "cublasLtMatmulPreferenceSetAttribute(workspace)");
-   CheckCublasLtStatus(cublasLtMatmulAlgoGetHeuristic(state.fHandle, state.fOperation,
-                                                      state.fALayout, state.fBLayout, cLayout,
-                                                      dLayout, state.fPreference,
-                                                      State::kMaxHeuristicResults,
-                                                      state.fHeuristicResults,
-                                                      &state.fHeuristicResultCount),
-                       "cublasLtMatmulAlgoGetHeuristic");
+   const auto heuristicStatus = cublasLtMatmulAlgoGetHeuristic(state.fHandle, state.fOperation,
+                                                               state.fALayout, state.fBLayout, cLayout,
+                                                               dLayout, state.fPreference,
+                                                               State::kMaxHeuristicResults,
+                                                               state.fHeuristicResults,
+                                                               &state.fHeuristicResultCount);
+   if (tolerateUnsupported && heuristicStatus == CUBLAS_STATUS_NOT_SUPPORTED)
+      return false;
+   CheckCublasLtStatus(heuristicStatus, "cublasLtMatmulAlgoGetHeuristic");
    if (state.fHeuristicResultCount == 0)
       return false;
    state.fSelectedHeuristicIndex = 0;
@@ -1164,50 +1195,6 @@ inline void QuantizedGemmCudaLtFP8State::Execute(void *output, const void *input
    }
 }
 
-struct QuantizedGemmCudaLtProfile {
-   float inputQuantizeMs = 0.0f;
-   float gemmMs = 0.0f;
-   float epilogueMs = 0.0f;
-   float totalMs = 0.0f;
-   std::size_t workspaceSize = 0;
-   int heuristicResultCount = 0;
-   int selectedHeuristicIndex = 0;
-   float autotuneMs = 0.0f;
-   int autotunedCandidateCount = 0;
-   float selectedCandidateMs = 0.0f;
-   std::size_t accumulatorBytes = 0;
-   std::size_t outputBytes = 0;
-   std::size_t epilogueTrafficBytes = 0;
-   bool directOutputCarrier = false;
-};
-
-inline bool &QuantizedGemmCudaLt_ProfileEnabledStorage()
-{
-   static bool enabled = false;
-   return enabled;
-}
-
-inline QuantizedGemmCudaLtProfile &QuantizedGemmCudaLt_LastProfileStorage()
-{
-   static QuantizedGemmCudaLtProfile profile{};
-   return profile;
-}
-
-inline void QuantizedGemmCudaLt_SetProfiling(bool enabled)
-{
-   QuantizedGemmCudaLt_ProfileEnabledStorage() = enabled;
-}
-
-inline bool QuantizedGemmCudaLt_ProfilingEnabled()
-{
-   return QuantizedGemmCudaLt_ProfileEnabledStorage();
-}
-
-inline QuantizedGemmCudaLtProfile QuantizedGemmCudaLt_GetLastProfile()
-{
-   return QuantizedGemmCudaLt_LastProfileStorage();
-}
-
 inline void QuantizedGemmCudaPadInt8Matrix(QuantizedGemmCudaStream stream, const std::int8_t *input,
                                            std::int8_t *padded, std::size_t logicalRows,
                                            std::size_t logicalCols, std::size_t physicalRows,
@@ -1254,89 +1241,44 @@ inline void QuantizedGemmCudaUnpadUInt8Matrix(QuantizedGemmCudaStream stream, co
    QuantizedGemmCudaUnpadMatrix(stream, padded, output, logicalRows, logicalCols, physicalRows, physicalCols);
 }
 
-struct QuantizedGemmCudaLtEventTimer {
-   cudaEvent_t totalStart = nullptr;
-   cudaEvent_t inputStop = nullptr;
-   cudaEvent_t gemmStop = nullptr;
-   cudaEvent_t epilogueStop = nullptr;
-   bool active = false;
-
-   explicit QuantizedGemmCudaLtEventTimer(bool enabled)
-      : active(enabled)
-   {
-      if (!active)
-         return;
-      INTERNAL::CheckCudaStatus(cudaEventCreate(&totalStart), "cudaEventCreate(totalStart)");
-      INTERNAL::CheckCudaStatus(cudaEventCreate(&inputStop), "cudaEventCreate(inputStop)");
-      INTERNAL::CheckCudaStatus(cudaEventCreate(&gemmStop), "cudaEventCreate(gemmStop)");
-      INTERNAL::CheckCudaStatus(cudaEventCreate(&epilogueStop), "cudaEventCreate(epilogueStop)");
-   }
-
-   QuantizedGemmCudaLtEventTimer(const QuantizedGemmCudaLtEventTimer &) = delete;
-   QuantizedGemmCudaLtEventTimer &operator=(const QuantizedGemmCudaLtEventTimer &) = delete;
-
-   ~QuantizedGemmCudaLtEventTimer()
-   {
-      if (epilogueStop != nullptr)
-         cudaEventDestroy(epilogueStop);
-      if (gemmStop != nullptr)
-         cudaEventDestroy(gemmStop);
-      if (inputStop != nullptr)
-         cudaEventDestroy(inputStop);
-      if (totalStart != nullptr)
-         cudaEventDestroy(totalStart);
-   }
-
-   void RecordStart(QuantizedGemmCudaStream stream)
-   {
-      if (active)
-         INTERNAL::CheckCudaStatus(cudaEventRecord(totalStart, stream), "cudaEventRecord(totalStart)");
-   }
-
-   void RecordInputStop(QuantizedGemmCudaStream stream)
-   {
-      if (active)
-         INTERNAL::CheckCudaStatus(cudaEventRecord(inputStop, stream), "cudaEventRecord(inputStop)");
-   }
-
-   void RecordGemmStop(QuantizedGemmCudaStream stream)
-   {
-      if (active)
-         INTERNAL::CheckCudaStatus(cudaEventRecord(gemmStop, stream), "cudaEventRecord(gemmStop)");
-   }
-
-   void RecordEpilogueStop(QuantizedGemmCudaStream stream, std::size_t workspaceSize,
-                           int heuristicResultCount, int selectedHeuristicIndex,
-                           float autotuneMs, int autotunedCandidateCount, float selectedCandidateMs,
-                           std::size_t accumulatorBytes, std::size_t outputBytes, bool directOutputCarrier)
-   {
-      if (!active)
-         return;
-      INTERNAL::CheckCudaStatus(cudaEventRecord(epilogueStop, stream), "cudaEventRecord(epilogueStop)");
-      INTERNAL::CheckCudaStatus(cudaEventSynchronize(epilogueStop), "cudaEventSynchronize(epilogueStop)");
-
-      QuantizedGemmCudaLtProfile profile{};
-      INTERNAL::CheckCudaStatus(cudaEventElapsedTime(&profile.inputQuantizeMs, totalStart, inputStop),
-                                "cudaEventElapsedTime(inputQuantize)");
-      INTERNAL::CheckCudaStatus(cudaEventElapsedTime(&profile.gemmMs, inputStop, gemmStop),
-                                "cudaEventElapsedTime(gemm)");
-      INTERNAL::CheckCudaStatus(cudaEventElapsedTime(&profile.epilogueMs, gemmStop, epilogueStop),
-                                "cudaEventElapsedTime(epilogue)");
-      INTERNAL::CheckCudaStatus(cudaEventElapsedTime(&profile.totalMs, totalStart, epilogueStop),
-                                "cudaEventElapsedTime(total)");
-      profile.workspaceSize = workspaceSize;
-      profile.heuristicResultCount = heuristicResultCount;
-      profile.selectedHeuristicIndex = selectedHeuristicIndex;
-      profile.autotuneMs = autotuneMs;
-      profile.autotunedCandidateCount = autotunedCandidateCount;
-      profile.selectedCandidateMs = selectedCandidateMs;
-      profile.accumulatorBytes = accumulatorBytes;
-      profile.outputBytes = outputBytes;
-      profile.directOutputCarrier = directOutputCarrier;
-      profile.epilogueTrafficBytes = directOutputCarrier ? outputBytes : (accumulatorBytes + outputBytes);
-      QuantizedGemmCudaLt_LastProfileStorage() = profile;
-   }
-};
+// Whether the integer epilogue can ride the GEMM's own narrowing store instead of a readback
+// pass over the accumulator. cuBLASLt writes an int8 D from a float scale, rounding half to
+// even and saturating, which is the epilogue's contract; what remains has to be expressible
+// as the scalar alpha and the per-column float offset the bias kernel already builds.
+inline bool QuantizedGemmCudaLt_NarrowsQuantizedOutput(const QuantizedDenseLinearInvocation &params)
+{
+   // Forces the readback epilogue, so one binary can run either output path.
+   // Read once, off the per-call path.
+   static const bool forceReadbackEpilogue = std::getenv("SOFIE_INT8_NO_NARROWED_D") != nullptr;
+   if (forceReadbackEpilogue)
+      return false;
+   if (params.epilogueMode != EQuantizedEpilogueMode::Quantized)
+      return false;
+   // The narrowing store exists for a signed D only.
+   if (params.outputCarrier != EQuantizedOutputCarrier::Int8)
+      return false;
+   // A per-output-channel weight scale turns alpha into a per-row vector, which the provider
+   // rejects on this path.
+   if (params.weightScaleMode == EQuantizedScaleMode::PerOutputChannel)
+      return false;
+   // The output zero point is an integer shift of the code applied after the rounding, and the
+   // store rounds the biased value, so carrying it in the offset would move half-way ties by
+   // its parity.
+   if (params.outputZeroPoint != 0)
+      return false;
+   // The asymmetric-input correction subtracts a per-column multiple of the weight column sums
+   // from the accumulator, which a narrowing store never materializes.
+   if (params.inputZeroPoint != 0)
+      return false;
+   // The store saturates to the whole int8 grid; a narrower code range needs the readback pass.
+   if (params.outputQMin != -128 || params.outputQMax != 127)
+      return false;
+   // The transposed descriptor a narrowed store runs reads the input as row-major [m, k]; the
+   // Conv direct-input layout stores it the other way round.
+   if (params.aColumnMajorInput)
+      return false;
+   return true;
+}
 
 struct QuantizedGemmCudaLtState {
    // Declaration order fixes the default teardown order (reverse of this list): destruction
@@ -1346,6 +1288,7 @@ struct QuantizedGemmCudaLtState {
    INTERNAL::QuantizedCudaLtMatrixLayout fALayout;
    INTERNAL::QuantizedCudaLtMatrixLayout fBLayout;
    INTERNAL::QuantizedCudaLtMatrixLayout fCLayout;
+   INTERNAL::QuantizedCudaLtMatrixLayout fDLayout;
    INTERNAL::QuantizedCudaLtPreference fPreference;
    static constexpr int kMaxHeuristicResults = 8;
    cublasLtMatmulHeuristicResult_t fHeuristicResults[kMaxHeuristicResults]{};
@@ -1378,6 +1321,18 @@ struct QuantizedGemmCudaLtState {
    std::int64_t fBatchStrideC = 0;
    bool fAColumnMajorInput = false;
    bool fInitialized = false;
+   // Output configuration the descriptor and layouts were built for. The requested flag is
+   // what the caller asked for and the narrowed flag is what the provider accepted, so a shape
+   // the heuristic declined settles on the wide accumulator and stays there.
+   bool fNarrowOutputRequested = false;
+   bool fNarrowedOutput = false;
+   bool fEpilogueHasBias = false;
+   bool fEpilogueHasRelu = false;
+   // Per-output-channel weight sums for the asymmetric-input correction, built once from
+   // the constant weight storage. Survives Reset(): the weight bound to this state does
+   // not change.
+   INTERNAL::QuantizedCudaDeviceBuffer<std::int32_t> fInputZpColumnSums;
+   bool fInputZpColumnSumsBuilt = false;
    // Remembers a provider rejection of the direct column-major input layout so an ineligible
    // shape is probed once. Survives Reset(): the shape bound to this state does not change.
    bool fDirectInputLayoutUnsupported = false;
@@ -1417,6 +1372,7 @@ struct QuantizedGemmCudaLtState {
    void Reset() noexcept
    {
       fPreference.Reset();
+      fDLayout.Reset();
       fCLayout.Reset();
       fBLayout.Reset();
       fALayout.Reset();
@@ -1453,11 +1409,18 @@ struct QuantizedGemmCudaLtState {
       fBatchStrideC = 0;
       fAColumnMajorInput = false;
       fInitialized = false;
+      fNarrowOutputRequested = false;
+      fNarrowedOutput = false;
+      fEpilogueHasBias = false;
+      fEpilogueHasRelu = false;
    }
 
-   void Initialize(const QuantizedDenseLinearInvocation &params)
+   // narrowOutput asks for the GEMM to write output codes directly. The caller reads
+   // NarrowsOutput() afterwards for what the provider accepted and picks its destination
+   // buffer from that.
+   void Initialize(const QuantizedDenseLinearInvocation &params, bool narrowOutput = false)
    {
-      InitializeInternal(params, true);
+      InitializeInternal(params, narrowOutput, true);
    }
 
    // Attempts initialization for a unit-kernel Conv's direct column-major input layout;
@@ -1466,31 +1429,38 @@ struct QuantizedGemmCudaLtState {
    {
       if (fDirectInputLayoutUnsupported)
          return false;
-      if (!InitializeInternal(params, false)) {
+      if (!InitializeInternal(params, false, false)) {
          fDirectInputLayoutUnsupported = true;
          return false;
       }
       return true;
    }
 
-private:
-   bool InitializeInternal(const QuantizedDenseLinearInvocation &params, bool throwOnNoAlgorithm)
-   {
-      if (fInitialized && fM == params.m && fN == params.n && fK == params.k &&
-          fBatchCount == params.batchCount && fBatchStrideA == params.batchStrideA &&
-          fBatchStrideB == params.batchStrideB && fBatchStrideC == params.batchStrideC &&
-          fAColumnMajorInput == params.aColumnMajorInput &&
-          fWorkspaceLimitBytes == params.maxWorkspaceBytes)
-         return true;
+   bool NarrowsOutput() const { return fNarrowedOutput; }
 
+private:
+   // Builds the descriptor, layouts and heuristics for one output configuration: a narrowed D
+   // holding output codes, or the wide int32 accumulator the readback epilogue consumes.
+   // Returns false with the state reset when the provider offers no algorithm for it.
+   bool TryConfigure(const QuantizedDenseLinearInvocation &params, bool narrow)
+   {
       Reset();
       try {
          INTERNAL::CheckCublasLtStatus(cublasLtCreate(fHandle.Receive()), "cublasLtCreate");
-         INTERNAL::CheckCublasLtStatus(cublasLtMatmulDescCreate(fOperation.Receive(), CUBLAS_COMPUTE_32I, CUDA_R_32I),
-                                       "cublasLtMatmulDescCreate");
+         // A narrowing store scales in float on the way out, so the descriptor carries a float
+         // scale type even though the accumulation stays integer.
+         INTERNAL::CheckCublasLtStatus(
+            cublasLtMatmulDescCreate(fOperation.Receive(), CUBLAS_COMPUTE_32I,
+                                     narrow ? CUDA_R_32F : CUDA_R_32I),
+            "cublasLtMatmulDescCreate");
 
-         const cublasOperation_t transA = params.aColumnMajorInput ? CUBLAS_OP_T : CUBLAS_OP_N;
-         const cublasOperation_t transB = CUBLAS_OP_T;
+         // A narrowed store runs the transposed problem: a row-major [m, n] D with leading
+         // dimension n is the same memory as a column-major [n, m] D, and that transpose is
+         // what feeding the weight first computes. The provider offers no bias epilogue on an
+         // int8 D in the row-major form, and this reinterpretation costs no data movement.
+         const cublasOperation_t transA = narrow ? CUBLAS_OP_T
+                                                 : (params.aColumnMajorInput ? CUBLAS_OP_T : CUBLAS_OP_N);
+         const cublasOperation_t transB = narrow ? CUBLAS_OP_N : CUBLAS_OP_T;
          INTERNAL::CheckCublasLtStatus(cublasLtMatmulDescSetAttribute(fOperation, CUBLASLT_MATMUL_DESC_TRANSA,
                                                                       &transA, sizeof(transA)),
                                        "cublasLtMatmulDescSetAttribute(transA)");
@@ -1498,28 +1468,71 @@ private:
                                                                       &transB, sizeof(transB)),
                                        "cublasLtMatmulDescSetAttribute(transB)");
 
-         // Column-major [m, k] input is described to the row-major convention
-         // as its transpose: a [k, m] row-major matrix with leading dimension m.
-         fALayout = params.aColumnMajorInput
-                       ? INTERNAL::CreateRowMajorLayout(CUDA_R_8I, params.k, params.m,
-                                                        static_cast<std::int64_t>(params.m))
-                       : INTERNAL::CreateRowMajorLayout(CUDA_R_8I, params.m, params.k,
-                                                        static_cast<std::int64_t>(params.k));
-         fBLayout = INTERNAL::CreateRowMajorLayout(CUDA_R_8I, params.n, params.k,
-                                                  static_cast<std::int64_t>(params.k));
-         fCLayout = INTERNAL::CreateRowMajorLayout(CUDA_R_32I, params.m, params.n,
-                                                  static_cast<std::int64_t>(params.n));
-         INTERNAL::SetStridedBatchLayout(fALayout, params.batchCount, params.batchStrideA);
-         INTERNAL::SetStridedBatchLayout(fBLayout, params.batchCount, params.batchStrideB);
-         INTERNAL::SetStridedBatchLayout(fCLayout, params.batchCount, params.batchStrideC);
-
-         if (!INTERNAL::QuantizedGemmCudaLtSelectHeuristics(*this, fCLayout, fCLayout,
-                                                            params.maxWorkspaceBytes)) {
-            if (!throwOnNoAlgorithm) {
-               Reset();
-               return false;
+         if (narrow) {
+            // Relu on the code is a clamp at a zero point of 0, which the provider's Relu on the
+            // value reaches through the same monotone rounding.
+            cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_DEFAULT;
+            if (params.hasBias && params.hasRelu)
+               epilogue = CUBLASLT_EPILOGUE_RELU_BIAS;
+            else if (params.hasBias)
+               epilogue = CUBLASLT_EPILOGUE_BIAS;
+            else if (params.hasRelu)
+               epilogue = CUBLASLT_EPILOGUE_RELU;
+            if (epilogue != CUBLASLT_EPILOGUE_DEFAULT)
+               INTERNAL::CheckCublasLtStatus(
+                  cublasLtMatmulDescSetAttribute(fOperation, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue,
+                                                 sizeof(epilogue)),
+                  "cublasLtMatmulDescSetAttribute(epilogue)");
+            if (params.hasBias) {
+               // Only float32 is accepted alongside an int8 D, and the offset vector the bias
+               // kernel builds is already float in output units.
+               const cudaDataType_t biasType = CUDA_R_32F;
+               INTERNAL::CheckCublasLtStatus(
+                  cublasLtMatmulDescSetAttribute(fOperation, CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+                                                 &biasType, sizeof(biasType)),
+                  "cublasLtMatmulDescSetAttribute(bias data type)");
             }
-            throw std::runtime_error("SOFIE cuBLASLt quantized GEMM found no algorithm for the selected int8 shape");
+         }
+
+         const cudaDataType_t outputType = narrow ? CUDA_R_8I : CUDA_R_32I;
+         if (narrow) {
+            // Row-major [n, k] weight and [m, k] input read column-major as [k, n] and [k, m];
+            // the first operand is the weight, so D comes out column-major [n, m].
+            fALayout = INTERNAL::CreateColumnMajorLayout(CUDA_R_8I, params.k, params.n,
+                                                         static_cast<std::int64_t>(params.k));
+            fBLayout = INTERNAL::CreateColumnMajorLayout(CUDA_R_8I, params.k, params.m,
+                                                         static_cast<std::int64_t>(params.k));
+            fCLayout = INTERNAL::CreateColumnMajorLayout(outputType, params.n, params.m,
+                                                         static_cast<std::int64_t>(params.n));
+            fDLayout = INTERNAL::CreateColumnMajorLayout(outputType, params.n, params.m,
+                                                         static_cast<std::int64_t>(params.n));
+            INTERNAL::SetStridedBatchLayout(fALayout, params.batchCount, params.batchStrideB);
+            INTERNAL::SetStridedBatchLayout(fBLayout, params.batchCount, params.batchStrideA);
+         } else {
+            // Column-major [m, k] input is described to the row-major convention
+            // as its transpose: a [k, m] row-major matrix with leading dimension m.
+            fALayout = params.aColumnMajorInput
+                          ? INTERNAL::CreateRowMajorLayout(CUDA_R_8I, params.k, params.m,
+                                                           static_cast<std::int64_t>(params.m))
+                          : INTERNAL::CreateRowMajorLayout(CUDA_R_8I, params.m, params.k,
+                                                           static_cast<std::int64_t>(params.k));
+            fBLayout = INTERNAL::CreateRowMajorLayout(CUDA_R_8I, params.n, params.k,
+                                                     static_cast<std::int64_t>(params.k));
+            // C goes unread at beta 0 and carries D's type so the provider accepts the pair.
+            fCLayout = INTERNAL::CreateRowMajorLayout(outputType, params.m, params.n,
+                                                     static_cast<std::int64_t>(params.n));
+            fDLayout = INTERNAL::CreateRowMajorLayout(outputType, params.m, params.n,
+                                                     static_cast<std::int64_t>(params.n));
+            INTERNAL::SetStridedBatchLayout(fALayout, params.batchCount, params.batchStrideA);
+            INTERNAL::SetStridedBatchLayout(fBLayout, params.batchCount, params.batchStrideB);
+         }
+         INTERNAL::SetStridedBatchLayout(fCLayout, params.batchCount, params.batchStrideC);
+         INTERNAL::SetStridedBatchLayout(fDLayout, params.batchCount, params.batchStrideC);
+
+         if (!INTERNAL::QuantizedGemmCudaLtSelectHeuristics(*this, fCLayout, fDLayout,
+                                                            params.maxWorkspaceBytes, narrow)) {
+            Reset();
+            return false;
          }
 
          fM = params.m;
@@ -1530,11 +1543,39 @@ private:
          fBatchStrideB = params.batchStrideB;
          fBatchStrideC = params.batchStrideC;
          fAColumnMajorInput = params.aColumnMajorInput;
+         fNarrowedOutput = narrow;
+         fEpilogueHasBias = params.hasBias;
+         fEpilogueHasRelu = params.hasRelu;
          fInitialized = true;
       } catch (...) {
          Reset();
          throw;
       }
+      return true;
+   }
+
+   bool InitializeInternal(const QuantizedDenseLinearInvocation &params, bool narrowOutput,
+                           bool throwOnNoAlgorithm)
+   {
+      if (fInitialized && fM == params.m && fN == params.n && fK == params.k &&
+          fBatchCount == params.batchCount && fBatchStrideA == params.batchStrideA &&
+          fBatchStrideB == params.batchStrideB && fBatchStrideC == params.batchStrideC &&
+          fAColumnMajorInput == params.aColumnMajorInput &&
+          fWorkspaceLimitBytes == params.maxWorkspaceBytes &&
+          fNarrowOutputRequested == narrowOutput && fEpilogueHasBias == params.hasBias &&
+          fEpilogueHasRelu == params.hasRelu)
+         return true;
+
+      // A narrowed configuration the heuristic declines falls back to the accumulator, so a
+      // shape without an int8-D algorithm still runs through the readback epilogue.
+      if (!(narrowOutput && TryConfigure(params, true)) && !TryConfigure(params, false)) {
+         if (!throwOnNoAlgorithm) {
+            Reset();
+            return false;
+         }
+         throw std::runtime_error("SOFIE cuBLASLt quantized GEMM found no algorithm for the selected int8 shape");
+      }
+      fNarrowOutputRequested = narrowOutput;
       return true;
    }
 
@@ -1582,6 +1623,32 @@ public:
       return fBiasOutputOffset;
    }
 
+   // Column sums of the constant int8 weight for the asymmetric-input correction; null for
+   // a symmetric input, so the epilogue's symmetric path is untouched.
+   const std::int32_t *EnsureInputZeroPointColumnSums(const std::int8_t *weight,
+                                                      const QuantizedDenseLinearInvocation &params,
+                                                      QuantizedGemmCudaStream stream)
+   {
+      if (params.inputZeroPoint == 0)
+         return nullptr;
+      // Built once from constant weight storage, so a batch whose B slices differ would
+      // read sums belonging to the first slice.
+      if (params.batchCount > 1 && params.batchStrideB != 0)
+         throw std::runtime_error("SOFIE cuBLASLt quantized GEMM cannot correct a nonzero input zero point "
+                                  "against a per-slice batched weight");
+      if (!fInputZpColumnSumsBuilt) {
+         INTERNAL::CheckCudaStatus(cudaMalloc(fInputZpColumnSums.Receive(), params.n * sizeof(std::int32_t)),
+                                   "cudaMalloc(input zero-point column sums)");
+         constexpr int threads = 256;
+         const int blocks = static_cast<int>((params.n + threads - 1) / threads);
+         INTERNAL::QuantizedGemmCudaWeightColumnSumKernel<<<blocks, threads, 0, stream>>>(
+            fInputZpColumnSums.Get(), weight, params.n, params.k);
+         INTERNAL::CheckCudaStatus(cudaGetLastError(), "QuantizedGemmCudaWeightColumnSumKernel launch");
+         fInputZpColumnSumsBuilt = true;
+      }
+      return fInputZpColumnSums.Get();
+   }
+
    std::int8_t *InputQuantizedBuffer() const { return fInputQuantized; }
    std::int32_t *AccumulatorBuffer() const { return fAccumulator; }
    void *OutputQuantizedBuffer() const { return fOutputQuantized; }
@@ -1593,31 +1660,80 @@ public:
    int AutotunedCandidateCount() const { return fAutotunedCandidateCount; }
    float SelectedCandidateMs() const { return fSelectedCandidateMs; }
 
-   void Autotune(std::int32_t *accumulator, const std::int8_t *inputQuantized, const std::int8_t *weightQuantized,
+   // Scaling constants for one launch: a narrowed store folds the accumulator-to-output scale
+   // into alpha and writes codes, while the wide store carries the accumulator out unscaled.
+   struct LaunchScalars {
+      std::int32_t alphaInt = 1;
+      std::int32_t betaInt = 0;
+      float alphaFloat = 1.0f;
+      float betaFloat = 0.0f;
+      bool narrowed = false;
+      const void *Alpha() const { return narrowed ? static_cast<const void *>(&alphaFloat)
+                                                  : static_cast<const void *>(&alphaInt); }
+      const void *Beta() const { return narrowed ? static_cast<const void *>(&betaFloat)
+                                                 : static_cast<const void *>(&betaInt); }
+   };
+
+   LaunchScalars MakeLaunchScalars(const QuantizedDenseLinearInvocation &params) const
+   {
+      LaunchScalars scalars;
+      scalars.narrowed = fNarrowedOutput;
+      scalars.alphaFloat = static_cast<float>(params.accumulatorToOutputScale);
+      return scalars;
+   }
+
+   // A narrowed store runs the transposed problem, so the weight is the first operand there.
+   const void *FirstOperand(const std::int8_t *inputQuantized, const std::int8_t *weightQuantized) const
+   {
+      return fNarrowedOutput ? static_cast<const void *>(weightQuantized)
+                             : static_cast<const void *>(inputQuantized);
+   }
+
+   const void *SecondOperand(const std::int8_t *inputQuantized, const std::int8_t *weightQuantized) const
+   {
+      return fNarrowedOutput ? static_cast<const void *>(inputQuantized)
+                             : static_cast<const void *>(weightQuantized);
+   }
+
+   void Autotune(void *target, const std::int8_t *inputQuantized, const std::int8_t *weightQuantized,
                  const QuantizedDenseLinearInvocation &params, QuantizedGemmCudaStream stream)
    {
-      const std::int32_t alpha = 1;
-      const std::int32_t beta = 0;
+      const LaunchScalars scalars = MakeLaunchScalars(params);
+      const void *operandA = FirstOperand(inputQuantized, weightQuantized);
+      const void *operandB = SecondOperand(inputQuantized, weightQuantized);
       INTERNAL::QuantizedGemmCudaLtAutotuneWalk(
          *this, params.enableAutotuning, params.autotuneIterations, stream,
          [&](const cublasLtMatmulAlgo_t &algo) {
-            return cublasLtMatmul(fHandle, fOperation, &alpha, inputQuantized, fALayout,
-                                  weightQuantized, fBLayout, &beta, accumulator, fCLayout,
-                                  accumulator, fCLayout, &algo, fWorkspace,
+            return cublasLtMatmul(fHandle, fOperation, scalars.Alpha(), operandA, fALayout,
+                                  operandB, fBLayout, scalars.Beta(), target, fCLayout,
+                                  target, fDLayout, &algo, fWorkspace,
                                   fWorkspaceAllocatedBytes, stream);
          });
    }
 
-   void Execute(std::int32_t *accumulator, const std::int8_t *inputQuantized, const std::int8_t *weightQuantized,
-                const QuantizedDenseLinearInvocation &params, QuantizedGemmCudaStream stream)
+   // target is the int32 accumulator, or the output code buffer when the caller asked for a
+   // narrowed store and NarrowsOutput() confirmed it. biasOutputOffset is the per-column offset
+   // in output units, required by a narrowed store that carries a bias.
+   void Execute(void *target, const std::int8_t *inputQuantized, const std::int8_t *weightQuantized,
+                const QuantizedDenseLinearInvocation &params, QuantizedGemmCudaStream stream,
+                bool narrowOutput = false, const float *biasOutputOffset = nullptr)
    {
-      Initialize(params);
-      Autotune(accumulator, inputQuantized, weightQuantized, params, stream);
-      const std::int32_t alpha = 1;
-      const std::int32_t beta = 0;
-      INTERNAL::CheckCublasLtStatus(cublasLtMatmul(fHandle, fOperation, &alpha, inputQuantized, fALayout,
-                                                   weightQuantized, fBLayout, &beta, accumulator, fCLayout,
-                                                   accumulator, fCLayout, &fHeuristic.algo, fWorkspace,
+      Initialize(params, narrowOutput);
+      if (fNarrowedOutput && params.hasBias) {
+         if (biasOutputOffset == nullptr)
+            throw std::runtime_error("SOFIE cuBLASLt quantized GEMM narrowed output requires the bias offset vector");
+         INTERNAL::CheckCublasLtStatus(
+            cublasLtMatmulDescSetAttribute(fOperation, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                                           &biasOutputOffset, sizeof(biasOutputOffset)),
+            "cublasLtMatmulDescSetAttribute(bias pointer)");
+      }
+      Autotune(target, inputQuantized, weightQuantized, params, stream);
+      const LaunchScalars scalars = MakeLaunchScalars(params);
+      INTERNAL::CheckCublasLtStatus(cublasLtMatmul(fHandle, fOperation, scalars.Alpha(),
+                                                   FirstOperand(inputQuantized, weightQuantized), fALayout,
+                                                   SecondOperand(inputQuantized, weightQuantized), fBLayout,
+                                                   scalars.Beta(), target, fCLayout,
+                                                   target, fDLayout, &fHeuristic.algo, fWorkspace,
                                                    fWorkspaceAllocatedBytes, stream),
                                     "cublasLtMatmul");
    }
@@ -1637,8 +1753,10 @@ inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &state, QuantizedG
    if (params.weightType != EQuantizedWeightCarrier::Int8) {
       throw std::runtime_error("SOFIE cuBLASLt quantized GEMM currently supports signed int8 weights only");
    }
-   if (params.inputZeroPoint != 0 || params.weightZeroPoint != 0) {
-      throw std::runtime_error("SOFIE cuBLASLt quantized GEMM currently requires input and weight zero points to be 0");
+   // A nonzero input zero point is corrected in the epilogue from the weight column sums.
+   // A nonzero weight zero point would need per-element activation sums, which no pass builds.
+   if (params.weightZeroPoint != 0) {
+      throw std::runtime_error("SOFIE cuBLASLt quantized GEMM currently requires the weight zero point to be 0");
    }
    if (params.weightScaleMode == EQuantizedScaleMode::PerOutputChannel && weightScaleVector == nullptr) {
       throw std::runtime_error("SOFIE cuBLASLt quantized GEMM per-channel weight scale mode requires a scale vector");
@@ -1685,10 +1803,12 @@ inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &state, QuantizedG
    const std::size_t outputElements = batchCount * effectiveParams.m * effectiveParams.n;
    const std::size_t logicalOutputElements =
       batchCount * effectiveParams.logicalM * effectiveParams.logicalN;
-   state.Initialize(effectiveParams);
+   // The provider decides whether this shape can narrow, and the destination follows from the
+   // answer, so both are settled before the GEMM is launched.
+   const bool narrowRequested = QuantizedGemmCudaLt_NarrowsQuantizedOutput(effectiveParams);
+   state.Initialize(effectiveParams, narrowRequested);
    state.PrepareScratch(effectiveParams);
-   QuantizedGemmCudaLtEventTimer profileTimer(QuantizedGemmCudaLt_ProfilingEnabled());
-   profileTimer.RecordStart(stream);
+   const bool narrowedOutput = narrowRequested && state.NarrowsOutput();
 
    constexpr int threads = 256;
    const std::int8_t *inputQuantized = nullptr;
@@ -1715,56 +1835,62 @@ inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &state, QuantizedG
       INTERNAL::CheckCudaStatus(cudaGetLastError(), "QuantizedGemmCudaQuantizeInputKernel launch");
       inputQuantized = state.InputQuantizedBuffer();
    }
-   profileTimer.RecordInputStop(stream);
 
-   state.Execute(state.AccumulatorBuffer(), inputQuantized, static_cast<const std::int8_t *>(weight), effectiveParams,
-                 stream);
-   profileTimer.RecordGemmStop(stream);
-
-   const int outputBlocks = static_cast<int>((outputElements + threads - 1) / threads);
-   std::size_t outputBytes = outputElements * sizeof(float);
-   bool directOutputCarrier = false;
+   // The quantized epilogue's destination and its bias offsets are also the narrowed store's,
+   // so both are prepared ahead of the GEMM that may now write them itself.
+   void *epilogueOutput = nullptr;
+   const float *biasOutputOffset = nullptr;
    if (effectiveParams.epilogueMode == EQuantizedEpilogueMode::Quantized) {
-      directOutputCarrier = true;
-      const float *biasOutputOffset = state.EnsureBiasOutputOffsetBuffer(effectiveParams, bias, weightScaleVector, stream);
-
-      outputBytes = logicalOutputElements * (effectiveParams.outputCarrier == EQuantizedOutputCarrier::UInt8 ? sizeof(std::uint8_t) : sizeof(std::int8_t));
-      void *epilogueOutput = effectiveParams.paddedExecution ? state.OutputQuantizedBuffer() : output;
+      biasOutputOffset = state.EnsureBiasOutputOffsetBuffer(effectiveParams, bias, weightScaleVector, stream);
+      epilogueOutput = effectiveParams.paddedExecution ? state.OutputQuantizedBuffer() : output;
       if (epilogueOutput == nullptr) {
          throw std::runtime_error("SOFIE cuBLASLt quantized GEMM padded execution did not allocate an output scratch buffer");
       }
-      if (effectiveParams.outputCarrier == EQuantizedOutputCarrier::UInt8) {
+   }
+
+   void *gemmTarget = narrowedOutput ? epilogueOutput : static_cast<void *>(state.AccumulatorBuffer());
+   state.Execute(gemmTarget, inputQuantized, static_cast<const std::int8_t *>(weight), effectiveParams,
+                 stream, narrowedOutput, biasOutputOffset);
+
+   const std::int32_t *inputZpColumnSums = state.EnsureInputZeroPointColumnSums(
+      static_cast<const std::int8_t *>(weight), effectiveParams, stream);
+   const int outputBlocks = static_cast<int>((outputElements + threads - 1) / threads);
+   if (effectiveParams.epilogueMode == EQuantizedEpilogueMode::Quantized) {
+      if (narrowedOutput) {
+         // The GEMM already wrote the codes; only a padded execution still owes the slice.
+      } else if (effectiveParams.outputCarrier == EQuantizedOutputCarrier::UInt8) {
          auto *quantizedOutput = static_cast<std::uint8_t *>(epilogueOutput);
          if (effectiveParams.hasBias && bias != nullptr) {
             if (effectiveParams.hasRelu) {
-               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::uint8_t, true, true><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), biasOutputOffset, weightScaleVector, effectiveParams);
+               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::uint8_t, true, true><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), biasOutputOffset, weightScaleVector, inputZpColumnSums, effectiveParams);
             } else {
-               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::uint8_t, true, false><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), biasOutputOffset, weightScaleVector, effectiveParams);
+               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::uint8_t, true, false><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), biasOutputOffset, weightScaleVector, inputZpColumnSums, effectiveParams);
             }
          } else {
             if (effectiveParams.hasRelu) {
-               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::uint8_t, false, true><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), nullptr, weightScaleVector, effectiveParams);
+               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::uint8_t, false, true><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), nullptr, weightScaleVector, inputZpColumnSums, effectiveParams);
             } else {
-               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::uint8_t, false, false><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), nullptr, weightScaleVector, effectiveParams);
+               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::uint8_t, false, false><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), nullptr, weightScaleVector, inputZpColumnSums, effectiveParams);
             }
          }
       } else {
          auto *quantizedOutput = static_cast<std::int8_t *>(epilogueOutput);
          if (effectiveParams.hasBias && bias != nullptr) {
             if (effectiveParams.hasRelu) {
-               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::int8_t, true, true><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), biasOutputOffset, weightScaleVector, effectiveParams);
+               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::int8_t, true, true><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), biasOutputOffset, weightScaleVector, inputZpColumnSums, effectiveParams);
             } else {
-               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::int8_t, true, false><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), biasOutputOffset, weightScaleVector, effectiveParams);
+               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::int8_t, true, false><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), biasOutputOffset, weightScaleVector, inputZpColumnSums, effectiveParams);
             }
          } else {
             if (effectiveParams.hasRelu) {
-               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::int8_t, false, true><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), nullptr, weightScaleVector, effectiveParams);
+               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::int8_t, false, true><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), nullptr, weightScaleVector, inputZpColumnSums, effectiveParams);
             } else {
-               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::int8_t, false, false><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), nullptr, weightScaleVector, effectiveParams);
+               INTERNAL::QuantizedGemmCudaQuantizedEpilogueKernel<std::int8_t, false, false><<<outputBlocks, threads, 0, stream>>>(quantizedOutput, state.AccumulatorBuffer(), nullptr, weightScaleVector, inputZpColumnSums, effectiveParams);
             }
          }
       }
-      INTERNAL::CheckCudaStatus(cudaGetLastError(), "QuantizedGemmCudaQuantizedEpilogueKernel launch");
+      if (!narrowedOutput)
+         INTERNAL::CheckCudaStatus(cudaGetLastError(), "QuantizedGemmCudaQuantizedEpilogueKernel launch");
       if (effectiveParams.paddedExecution) {
          if (effectiveParams.outputCarrier == EQuantizedOutputCarrier::UInt8) {
             QuantizedGemmCudaUnpadUInt8Matrix(stream, static_cast<const std::uint8_t *>(state.OutputQuantizedBuffer()),
@@ -1785,18 +1911,15 @@ inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &state, QuantizedG
       if (effectiveParams.fuseOutputRequantize) {
          // Writes the logical output compactly, so a padded GEMM needs no scratch or unpad.
          INTERNAL::QuantizedGemmCudaFusedRequantizeEpilogueKernel<<<logicalOutputBlocks, threads, 0, stream>>>(
-            static_cast<std::int8_t *>(output), state.AccumulatorBuffer(), bias, weightScaleVector, effectiveParams);
+            static_cast<std::int8_t *>(output), state.AccumulatorBuffer(), bias, weightScaleVector,
+            inputZpColumnSums, effectiveParams);
          INTERNAL::CheckCudaStatus(cudaGetLastError(), "QuantizedGemmCudaFusedRequantizeEpilogueKernel launch");
       } else {
          auto *floatOutput = static_cast<float *>(output);
-         INTERNAL::QuantizedGemmCudaEpilogueKernel<<<logicalOutputBlocks, threads, 0, stream>>>(floatOutput, state.AccumulatorBuffer(), bias, weightScaleVector, effectiveParams);
+         INTERNAL::QuantizedGemmCudaEpilogueKernel<<<logicalOutputBlocks, threads, 0, stream>>>(floatOutput, state.AccumulatorBuffer(), bias, weightScaleVector, inputZpColumnSums, effectiveParams);
          INTERNAL::CheckCudaStatus(cudaGetLastError(), "QuantizedGemmCudaEpilogueKernel launch");
       }
    }
-   profileTimer.RecordEpilogueStop(stream, state.WorkspaceSize(), state.HeuristicResultCount(),
-                                   state.SelectedHeuristicIndex(), state.AutotuneMs(),
-                                   state.AutotunedCandidateCount(), state.SelectedCandidateMs(),
-                                   state.AccumulatorBytes(), outputBytes, directOutputCarrier);
 }
 
 #endif // SOFIE_USE_CUBLASLT

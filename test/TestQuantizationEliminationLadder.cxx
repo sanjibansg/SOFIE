@@ -186,6 +186,25 @@ TEST(ScaledFP8QdqCodegen, AdoptedOutputQuantNarrowsDAndDecodesSeparately)
       << "no standalone dequantize decodes the adopted carrier back to float";
 }
 
+// A trailing encode behind a Transpose: the region narrows D onto the far grid, the
+// Transpose moves the one-byte codes, and no standalone encode kernel survives.
+TEST(ScaledFP8QdqCodegen, MovementRunCarriesAdoptedCodesThroughTranspose)
+{
+   std::ifstream file("FP8_QDQ_TransposedFakeQuantOut_FromONNX_GPU_ALPAKA.hxx");
+   ASSERT_TRUE(file.good()) << "generated header missing";
+   const std::string code((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+
+   EXPECT_NE(code.find("outputCarrier = SOFIE::EQuantizedFP8OutputCarrier::FP8E4M3"), std::string::npos)
+      << "the region did not adopt the encode behind the Transpose as its FP8 output carrier";
+   EXPECT_EQ(SOFIE_TEST::CountOccurrences(code, "ONNX_QUANTIZELINEAR_FP8_KERNEL_ALPAKA"), 1u)
+      << "expected only the input encode kernel: a second quantize kernel means the "
+         "adopted trailing encode came back as a launch";
+   EXPECT_NE(code.find("transposeKernel"), std::string::npos)
+      << "the movement run lost its Transpose, which must stay emitted to move the codes";
+   EXPECT_NE(code.find("DequantizeLinearKernel"), std::string::npos)
+      << "no standalone dequantize decodes the transposed carrier back to float";
+}
+
 // Asserts the regions reach the FP8 call, which the numeric tests cannot observe: the
 // operands are exactly representable, so an FP32 fallback computes the same numbers.
 TEST(NativeFP8MatMulCodegen, RegionsLowerToCublasLtFP8)

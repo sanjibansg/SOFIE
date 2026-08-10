@@ -398,9 +398,9 @@ public:
                // order and the same types.
                const auto qMin = static_cast<std::int64_t>(fOutputGrid->codeMin);
                const auto qMax = static_cast<std::int64_t>(fOutputGrid->codeMax);
-               op += I4 + "double q = nearbyint((static_cast<double>(v) / " +
+               op += I4 + "double q = nearbyint(static_cast<double>(v) / " +
                      ExactDoubleLiteral(fOutputGrid->scale) + ") + " +
-                     std::to_string(fOutputGrid->zeroPoint) + ");\n";
+                     std::to_string(fOutputGrid->zeroPoint) + ";\n";
                op += I4 + "q = (q < " + std::to_string(qMin) + ") ? " + std::to_string(qMin) +
                      " : ((q > " + std::to_string(qMax) + ") ? " + std::to_string(qMax) + " : q);\n";
                op += I4 + "Y[base + k] = static_cast<TOut>(q);\n";

@@ -194,10 +194,11 @@ bool IsQuantizedElementwiseCandidate(const ROperator &op)
 }
 
 void CheckQuantizationInfo(const QuantizationInfo &info, const std::string &role,
-                           std::vector<std::string> &reasons)
+                           std::vector<std::string> &reasons, unsigned maxBitWidth)
 {
-   if (info.bitWidth == 0 || info.bitWidth > 8)
-      reasons.push_back(role + " bit width is not in the supported quantized integer range [1, 8]");
+   if (info.bitWidth == 0 || info.bitWidth > maxBitWidth)
+      reasons.push_back(role + " bit width is not in the supported quantized integer range [1, " +
+                        std::to_string(maxBitWidth) + "]");
    if (info.scale <= 0.0 || !std::isfinite(info.scale))
       reasons.push_back(role + " scale is not positive and finite");
    if (info.rounding != EQuantizationRoundingMode::ROUND)

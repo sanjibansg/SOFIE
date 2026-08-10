@@ -257,17 +257,13 @@ QuantizedDenseLinearProfileAssessment AssessDenseLinearComputeProfile(
       inputQuant, weightQuant, outputQuant, std::nullopt, expectedWeightPerChannelAxis, operatorName);
    assessment.reasons.insert(assessment.reasons.end(), parameterReasons.begin(), parameterReasons.end());
 
-   const bool hasAsymmetricInput = !IsScalarZeroPointZero(inputQuant);
+   // An asymmetric input is corrected in the epilogue (the accumulator sheds
+   // inputZeroPoint times the weight column sum), and an asymmetric output rides the
+   // epilogue's output offset. An asymmetric weight would need per-element activation
+   // sums the lowering does not compute, so it still declines.
    const bool hasAsymmetricWeight = !IsScalarZeroPointZero(weightQuant);
-   const bool hasAsymmetricOutput = !outputFloatConsumed && !IsScalarZeroPointZero(outputQuant);
-   if (hasAsymmetricInput) {
-      assessment.reasons.push_back(operatorName + " input zero point is nonzero; cuBLASLt int8 lowering requires row-sum zero-point correction");
-   }
    if (hasAsymmetricWeight) {
       assessment.reasons.push_back(operatorName + " weight zero point is nonzero; cuBLASLt int8 lowering requires activation-sum/weight-sum zero-point correction");
-   }
-   if (hasAsymmetricOutput) {
-      assessment.reasons.push_back(operatorName + " output zero point is nonzero; cuBLASLt int8 lowering emits zero-centered int8 output only");
    }
 
    if (!input8 || !weight8 || !output8 || !inputPerTensor || !outputPerTensor || (!weightPerTensor && !weightPerChannel)) {
@@ -275,7 +271,7 @@ QuantizedDenseLinearProfileAssessment AssessDenseLinearComputeProfile(
       return assessment;
    }
 
-   if (hasAsymmetricInput || hasAsymmetricWeight || hasAsymmetricOutput) {
+   if (hasAsymmetricWeight) {
       assessment.profile = EQuantizedComputeProfile::AsymmetricZeroPointRank2;
       return assessment;
    }

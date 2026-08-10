@@ -170,7 +170,7 @@ public:
              << "std::int64_t qx = static_cast<std::int64_t>(std::nearbyint("
              << "static_cast<double>(tensor_" << fRegion.inputSourceTensor
              << "[inputIndex]) / " << INTERNAL::QuantizedDoubleLiteral(fRegion.inputLowPrecision->affineQuantization->scale)
-             << " + " << fRegion.inputLowPrecision->affineQuantization->zeroPoint << "));\n";
+             << ") + " << fRegion.inputLowPrecision->affineQuantization->zeroPoint << ");\n";
          out << SP << SP << SP << SP << SP << SP << SP << SP << SP
              << "qx = std::clamp<std::int64_t>(qx, " << inputRange.first
              << ", " << inputRange.second << ");\n";
@@ -237,7 +237,7 @@ public:
          out << SP << SP << SP << SP << SP << SP << "std::int64_t qy = "
              << "static_cast<std::int64_t>(std::nearbyint(realValue / "
              << INTERNAL::QuantizedDoubleLiteral(fRegion.outputLowPrecision->affineQuantization->scale)
-             << " + " << fRegion.outputLowPrecision->affineQuantization->zeroPoint << "));\n";
+             << ")) + " << fRegion.outputLowPrecision->affineQuantization->zeroPoint << ";\n";
          out << SP << SP << SP << SP << SP << SP << "qy = std::clamp<std::int64_t>(qy, "
              << outputRange.first << ", " << outputRange.second << ");\n";
          if (fPlan.outputMode == EQuantizedOutputMode::Quantized) {

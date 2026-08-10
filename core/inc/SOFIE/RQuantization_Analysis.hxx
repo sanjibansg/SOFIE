@@ -76,7 +76,7 @@ bool IsFloatMulOperator(const ROperator &op);
 // A Q/DQ pair feeding one must keep its int8 carrier, exactly as for GEMM/CONV.
 bool IsQuantizedElementwiseCandidate(const ROperator &op);
 void CheckQuantizationInfo(const QuantizationInfo &info, const std::string &role,
-                           std::vector<std::string> &reasons);
+                           std::vector<std::string> &reasons, unsigned maxBitWidth = 8);
 void CheckQuantizedGemmAttributes(const QuantizedDenseLinearRegion &region,
                                   std::vector<std::string> &reasons);
 void CheckQuantizedGemmRank2Shape(const std::vector<std::size_t> &shape,

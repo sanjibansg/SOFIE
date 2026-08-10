@@ -201,7 +201,7 @@ __global__ void QuantizedConvCudaQuantizedEpilogueKernel(
    const float scale = static_cast<float>(
       (params.matrix.alpha * params.matrix.inputScale * weightScale) /
       params.matrix.outputScale);
-   float offset = static_cast<float>(params.matrix.outputZeroPoint);
+   float offset = 0.0f;
    if constexpr (HasBias) {
       const double biasScale = params.matrix.weightScaleMode == EQuantizedScaleMode::PerOutputChannel
          ? params.matrix.inputScale * weightScale

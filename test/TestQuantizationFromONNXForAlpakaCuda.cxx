@@ -1079,9 +1079,11 @@ TEST_F(QuantizationAlpakaTest, ConvolutionKernels)
                                     static_cast<std::int64_t>(weightValue - weightZeroPoint);
                   }
                }
+               // saturate(round(x / scale) + zeroPoint): the zero point shifts the code
+               // after the rounding, so it cannot move a half-way tie by its parity.
                const auto quantized = static_cast<long>(std::nearbyint(
-                  static_cast<double>(accumulator) * accumulatorScale / outputScale +
-                  outputZeroPoint));
+                                         static_cast<double>(accumulator) * accumulatorScale / outputScale)) +
+                                      outputZeroPoint;
                expected[oc * width + output] = static_cast<std::uint8_t>(
                   std::clamp(std::max(quantized, static_cast<long>(outputZeroPoint)),
                              0L, 255L));

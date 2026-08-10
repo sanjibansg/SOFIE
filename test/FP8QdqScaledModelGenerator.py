@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Emit FP8_QDQ_Scaled / FP8_QDQ_FakeQuantOut / FP8_QDQ_OddScale.onnx: exporter-shaped FP8
-Q/DQ fixtures with non-unit scales whose values are exact multiples, so outputs are bit-exact."""
+"""Emit FP8_QDQ_Scaled / FP8_QDQ_FakeQuantOut / FP8_QDQ_TransposedFakeQuantOut /
+FP8_QDQ_OddScale.onnx: exporter-shaped FP8 Q/DQ fixtures with non-unit scales whose
+values are exact multiples, so outputs are bit-exact."""
 
 import ml_dtypes
 import numpy as np
@@ -73,11 +74,12 @@ def build(input_scale, weight_scale):
 def main():
     nodes, initializers = build(INPUT_SCALE, WEIGHT_SCALE)
 
-    def emit(name, extra_nodes, output_name, nodes=nodes, initializers=initializers):
+    def emit(name, extra_nodes, output_name, nodes=nodes, initializers=initializers,
+             output_shape=(M, N)):
         graph = helper.make_graph(
             nodes + extra_nodes, name,
             [helper.make_tensor_value_info("X", TensorProto.FLOAT, [M, K])],
-            [helper.make_tensor_value_info(output_name, TensorProto.FLOAT, [M, N])],
+            [helper.make_tensor_value_info(output_name, TensorProto.FLOAT, list(output_shape))],
             initializers)
         # Opset 19 is where the four float8 formats were added.
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 19)])
@@ -96,6 +98,14 @@ def main():
           helper.make_node("DequantizeLinear", ["y_q", "a_scale", "fp8_zp"], ["Yq"], name="dq_y")],
          "Yq")
     print(f"M={M} K={K} N={N} inputScale={INPUT_SCALE} weightScale={WEIGHT_SCALE}")
+
+    # The trailing pair behind a Transpose: the region narrows D onto the far grid and the
+    # Transpose moves the one-byte codes.
+    emit("FP8_QDQ_TransposedFakeQuantOut",
+         [helper.make_node("Transpose", ["Y"], ["y_t"], name="t_y", perm=[1, 0]),
+          helper.make_node("QuantizeLinear", ["y_t", "a_scale", "fp8_zp"], ["y_q"], name="q_y"),
+          helper.make_node("DequantizeLinear", ["y_q", "a_scale", "fp8_zp"], ["Yq"], name="dq_y")],
+         "Yq", output_shape=(N, M))
 
     # Same graph, non-power-of-two scales. See the note on ODD_INPUT_SCALE above.
     odd_nodes, odd_inits = build(ODD_INPUT_SCALE, ODD_WEIGHT_SCALE)

@@ -149,7 +149,7 @@ inline std::int32_t QuantizedGemmClamp(std::int32_t value, std::int32_t qmin, st
 inline std::int32_t QuantizedGemmQuantizeClamp(double value, double scale, std::int32_t zero, std::int32_t qmin,
                                                std::int32_t qmax)
 {
-   auto quantized = static_cast<std::int32_t>(std::nearbyint((value / scale) + zero));
+   auto quantized = static_cast<std::int32_t>(std::nearbyint(value / scale) + zero);
    return QuantizedGemmClamp(quantized, qmin, qmax);
 }
 
@@ -226,7 +226,7 @@ inline float QuantizedGemmFinalizeAccumulator(std::int32_t accumulator, std::siz
    }
 
    const auto yq = QuantizedGemmFinalizeY(
-      static_cast<std::int64_t>(std::nearbyint((real / params.scaleY) + params.zeroY)), params);
+      static_cast<std::int64_t>(std::nearbyint(real / params.scaleY)) + params.zeroY, params);
    return static_cast<float>(static_cast<double>(yq - params.zeroY) * params.scaleY);
 }
 

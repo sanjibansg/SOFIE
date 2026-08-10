@@ -508,6 +508,19 @@ void RModel::AddLoweredQuantizedOperators(EQuantizedBackend backend)
       installLoweredOperator(
          opIndex, *plan, QuantizedRegionInputSourceTensor(region),
          QuantizedRegionOutputTensor(region), std::move(lowered));
+
+      // An adopted encode behind a movement run: the region's carrier output was just
+      // retyped, so the run is rewired here to move the codes into the boundary's tensor.
+      std::visit(
+         [this](const auto &typed) {
+            using T = std::decay_t<decltype(typed)>;
+            if constexpr (std::is_base_of_v<QuantizedDenseLinearRegion, T>) {
+               if (!typed.outputMovementRunOpIndices.empty())
+                  RewireCarrierMovementRun(typed.outputMovementRunOpIndices, typed.outputTensor,
+                                           typed.outputMovementTargetTensor);
+            }
+         },
+         region);
    }
 }
 
@@ -597,6 +610,9 @@ void RModel::ApplyPlannedCarrierHandoffs()
          ++fQuantizationReport.producerEncodeHandoffs;
       fLoweredConsumedOperatorIndices.insert(absorbedIndex);
       applied.insert(fusedOutput);
+      if (traceApply)
+         std::fprintf(stderr, "[apply] %s absorbs %s%s\n", fOperators[index]->Name().c_str(),
+                      fusedOutput.c_str(), hasHandoff ? " (carrier)" : " (clip fold)");
    }
 
    // The planner's guards mirror the applier's, so a recorded handoff the applier did not
@@ -604,10 +620,36 @@ void RModel::ApplyPlannedCarrierHandoffs()
    for (const auto &handoff : fQuantizationState.producerEncodeHandoffs) {
       if (applied.count(handoff.first) != 0)
          continue;
+      // Names the boundary and its producer with their states, so the diverged guard is
+      // identifiable from the message alone.
+      std::string diagnosis;
+      for (std::size_t index = 0; index < fOperators.size(); ++index) {
+         const auto outs = fOperators[index]->GetOpOutputTensors();
+         if (outs.size() != 1 || std::string(outs[0]) != handoff.first)
+            continue;
+         diagnosis = "; boundary " + fOperators[index]->Name() +
+                     (alive(index) ? " is alive" : " was consumed");
+         const auto ins = fOperators[index]->GetOpInputTensors();
+         if (!ins.empty()) {
+            const std::string source(ins[0]);
+            for (std::size_t p = 0; p < fOperators.size(); ++p) {
+               const auto pouts = fOperators[p]->GetOpOutputTensors();
+               if (pouts.size() == 1 && std::string(pouts[0]) == source) {
+                  diagnosis += "; producer " + fOperators[p]->Name() +
+                               (alive(p) ? " is alive" : " was consumed") +
+                               (fOperators[p]->CanFuseOutputOnGrid(EQuantizedOutputEmit::Carrier)
+                                   ? ", offers the carrier emit"
+                                   : ", does not offer the carrier emit");
+                  break;
+               }
+            }
+         }
+         break;
+      }
       throw std::runtime_error(
          "SOFIE quantization planned a producer-encode handoff for tensor '" + handoff.first +
          "' but the applier did not absorb it; the consuming region would read a carrier "
-         "nothing writes");
+         "nothing writes" + diagnosis);
    }
 
    // The consumer-side twin of the absorption above: a dequantize whose float is read by
@@ -786,6 +828,33 @@ void RModel::DeduplicateCarrierDecodes(EQuantizedBackend backend)
 
 // Rewires a DQ -> movement -> Q chain onto the carrier so the movement moves codes and the
 // boundary pair dies; exact because both boundaries share a grid, so Q(DQ(c)) == c.
+// Rewires a movement run onto a byte-wide carrier: each hop reads and writes codes, the
+// tensors between hops are retyped in place, and the last hop takes over the target tensor.
+void RModel::RewireCarrierMovementRun(const std::vector<std::size_t> &runOpIndices,
+                                      const std::string &headCarrierTensor,
+                                      const std::string &targetTensor)
+{
+   const auto carrierType = GetTensorType(headCarrierTensor);
+   std::string input = headCarrierTensor;
+   for (std::size_t hop = 0; hop < runOpIndices.size(); ++hop) {
+      auto *op = fOperators.at(runOpIndices[hop]).get();
+      if (op->CarrierSupport() != ELowPrecisionCarrierSupport::ValuePreserving)
+         throw std::runtime_error("SOFIE quantization carrier rewire reached a non-movement operator while carrying " +
+                                  headCarrierTensor);
+      const bool last = hop + 1 == runOpIndices.size();
+      const std::string output = last ? targetTensor : std::string(op->GetOpOutputTensors().front());
+      if (!last)
+         SetKnownTensorType(output, carrierType);
+      op->RewireLowPrecisionCarrier(input, output);
+      // A device form that emits a view makes the two names one allocation; declaring the
+      // alias keeps the pooled carrier arena from ending the source's lifetime early.
+      if (op->CarrierOutputAliasesInput())
+         AddAliasTensor(output, input);
+      input = output;
+   }
+   fQuantizationReport.movementRewires += runOpIndices.size();
+}
+
 void RModel::PropagateLowPrecisionThroughMovement(EQuantizedBackend backend)
 {
    // Verified on the Alpaka path only, where the device forms are type-agnostic; the CPU
@@ -888,30 +957,7 @@ void RModel::PropagateLowPrecisionThroughMovement(EQuantizedBackend backend)
       if (GetTensorType(target) != GetTensorType(carrier))
          { decline("carrier_type_mismatch"); continue; }
 
-      // Rewire: the run now reads the incoming carrier and writes the outgoing one. The
-      // tensors between hops keep their names and are retyped, since they now hold codes.
-      const auto carrierType = GetTensorType(carrier);
-      auto rewire = [this](std::size_t opIndex, const std::string &input, const std::string &output) {
-         auto *op = fOperators[opIndex].get();
-         op->RewireLowPrecisionCarrier(input, output);
-         // A device form that emits a view makes the two names one allocation; declaring the
-         // alias keeps the pooled carrier arena from ending the source's lifetime early.
-         if (op->CarrierOutputAliasesInput())
-            AddAliasTensor(output, input);
-      };
-      auto outputOf = [this](std::size_t opIndex) {
-         return std::string(fOperators[opIndex]->GetOpOutputTensors().front());
-      };
-
-      std::string input = carrier;
-      for (std::size_t hop = 0; hop < movements.size(); ++hop) {
-         const bool last = hop + 1 == movements.size();
-         const std::string output = last ? target : outputOf(movements[hop]);
-         if (!last)
-            SetKnownTensorType(output, carrierType);
-         rewire(movements[hop], input, output);
-         input = output;
-      }
+      RewireCarrierMovementRun(movements, carrier, target);
 
       // The DequantizeLinear dies to dead-code elimination on its own; the QuantizeLinear
       // must go explicitly, or its still-read output would give the target two writers.
@@ -919,7 +965,6 @@ void RModel::PropagateLowPrecisionThroughMovement(EQuantizedBackend backend)
       fLoweredConsumedOperatorIndices.insert(quantizeIndex);
       ++propagatedChains;
       propagatedMovements += static_cast<int>(movements.size());
-      fQuantizationReport.movementRewires += movements.size();
    }
 
    if (traceGuards) {
@@ -989,6 +1034,10 @@ void RModel::FuseUnabsorbedFakeQuantBoundaries()
       const auto &carrier = quantize->GetOutputTensor();
       if (graphOutputs.count(carrier) != 0)
          { decline("carrier_is_graph_output"); continue; }
+      // A planned carrier handoff commits a consumer to reading these codes; the pair
+      // belongs to the handoff applier, not to a fold.
+      if (fQuantizationState.producerEncodeHandoffs.count(carrier) != 0)
+         { decline("carrier_is_planned_handoff"); continue; }
 
       // Optional preceding Clip, likewise only when this Q is its sole reader; the Clip
       // stays absorbable however the carrier leaving the Q is consumed.

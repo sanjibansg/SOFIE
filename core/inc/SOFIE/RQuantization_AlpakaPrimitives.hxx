@@ -32,11 +32,14 @@ __device__ inline std::int32_t QuantizedCudaClamp(std::int32_t value, std::int32
 }
 
 // Affine requantize with round-half-to-even, matching the ONNX QuantizeLinear
-// and PQuant contract used across the quantized subsystem.
+// and PQuant contract used across the quantized subsystem. The zero point is added
+// after the rounding, as `saturate(round(x / scale) + zeroPoint)` specifies: it is an
+// integer shift of the code, and rounding with it folded in moves half-way ties by its
+// parity.
 __device__ inline std::int32_t QuantizedCudaQuantizeClamp(double value, double scale, std::int32_t zero,
                                                           std::int32_t qmin, std::int32_t qmax)
 {
-   const auto quantized = static_cast<std::int32_t>(nearbyint((value / scale) + static_cast<double>(zero)));
+   const auto quantized = static_cast<std::int32_t>(nearbyint(value / scale) + static_cast<double>(zero));
    return QuantizedCudaClamp(quantized, qmin, qmax);
 }
 
@@ -48,7 +51,7 @@ __device__ inline std::int32_t QuantizedCudaQuantizeClampRecip(double value, dou
                                                                std::int32_t qmax)
 {
    const double scaled = fma(value, scaleReciprocal, value * scaleReciprocalError);
-   const auto quantized = static_cast<std::int32_t>(nearbyint(scaled + static_cast<double>(zero)));
+   const auto quantized = static_cast<std::int32_t>(nearbyint(scaled) + static_cast<double>(zero));
    return QuantizedCudaClamp(quantized, qmin, qmax);
 }
 
