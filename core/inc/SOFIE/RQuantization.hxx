@@ -118,13 +118,23 @@ inline bool QuantizationTraceEnabled()
    return enabled;
 }
 
-// The grid every FP8 absorption requires: per-tensor E4M3 with zero point 0 and a usable
-// scale. One predicate for the walkers, the adoption finder, and the decode-fuse hook.
+// The grids an adoption or a decode fusion can carry: per-tensor, zero point 0, usable scale,
+// and either E4M3 or the full-range signed int8 the epilogues and the narrowing store write.
+inline bool IsAdoptableCarrierGrid(const QuantizationGrid &grid)
+{
+   if (grid.granularity != EQuantizationGranularity::PerTensor || grid.zeroPoint != 0 ||
+       !(grid.scale > 0.0))
+      return false;
+   if (grid.kind == EQuantizationGridKind::Float8E4M3)
+      return true;
+   return grid.kind == EQuantizationGridKind::Integer && grid.codeMin == -128.0 &&
+          grid.codeMax == 127.0;
+}
+
+// The E4M3 arm of the above, for the sites that need that carrier specifically.
 inline bool IsPerTensorE4M3(const QuantizationGrid &grid)
 {
-   return grid.kind == EQuantizationGridKind::Float8E4M3 &&
-          grid.granularity == EQuantizationGranularity::PerTensor && grid.zeroPoint == 0 &&
-          grid.scale > 0.0;
+   return grid.kind == EQuantizationGridKind::Float8E4M3 && IsAdoptableCarrierGrid(grid);
 }
 
 // The real-valued interval this grid can represent. Asymmetric for an offset grid, which is

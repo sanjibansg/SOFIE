@@ -27,6 +27,7 @@
 #include "ONNX_QDQ_QuantMLP_FromONNX_GPU_ALPAKA.hxx"
 #include "ONNX_QDQ_ReshapeGemm_FromONNX_GPU_ALPAKA.hxx"
 #include "ONNX_QDQ_ResidualAdd_FromONNX_GPU_ALPAKA.hxx"
+#include "ONNX_QDQ_AttentionChain_FromONNX_GPU_ALPAKA.hxx"
 #include "ONNX_QDQ_BatchedMatMul_FromONNX_GPU_ALPAKA.hxx"
 #include "ONNX_QDQ_BatchedMatMul_NarrowClip_FromONNX_GPU_ALPAKA.hxx"
 #include "ONNX_QDQ_BatchedMatMul_TransposedOutput_FromONNX_GPU_ALPAKA.hxx"
@@ -841,4 +842,102 @@ TEST_F(QuantizationAlpakaTest, NativeFP8BatchedMatMulMatchesExactReference)
    const auto *res_ptr = reinterpret_cast<const float *>(alpaka::getPtrNative(result_h));
    for (Idx i = 0; i < outputSize; ++i)
       EXPECT_EQ(res_ptr[i], expected[i]) << "i=" << i;
+}
+
+// The adopted run's numbers. The Transpose permutes codes rather than floats, so a wrong index
+// maps one code onto another element and the scores diverge.
+TEST_F(QuantizationAlpakaTest, QdqAttentionChainMatchesExactReference)
+{
+   constexpr Idx kB = 8, kT = 64, kD = 128, kHeads = 4, kHeadDim = 32;
+   constexpr Idx kM = kB * kT;
+   constexpr double kAct = 0.0078125, kWeight = 0.00390625, kScore = 0.0009765625;
+
+   // Mirrors make_qdq_attention_chain_fixture.py; keep the two in sync.
+   auto weightValue = [](std::size_t k, std::size_t n, int salt) {
+      return static_cast<int>((k * 31 + n * 17 + salt) % 15) - 7;
+   };
+   auto clampTo = [](double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); };
+   auto encode = [&clampTo](double real, double scale) {
+      return static_cast<int>(clampTo(std::nearbyint(real / scale), -128.0, 127.0));
+   };
+
+   std::vector<float> input(static_cast<std::size_t>(kM) * kD);
+   for (std::size_t i = 0; i < input.size(); ++i)
+      input[i] = static_cast<float>((static_cast<int>(i * 13 + 5) % 65) - 32) * static_cast<float>(kAct);
+
+   std::vector<int> inputQ(input.size());
+   for (std::size_t i = 0; i < input.size(); ++i)
+      inputQ[i] = encode(input[i], kAct);
+
+   // Both projections, each clipped onto its output grid and encoded, which is what the
+   // region's epilogue writes into the head of the run.
+   auto project = [&](int salt, int biasMod, double biasOffset) {
+      std::vector<int> codes(static_cast<std::size_t>(kM) * kD);
+      for (std::size_t m = 0; m < kM; ++m) {
+         for (std::size_t n = 0; n < kD; ++n) {
+            std::int64_t acc = 0;
+            for (std::size_t k = 0; k < kD; ++k)
+               acc += static_cast<std::int64_t>(inputQ[m * kD + k]) * weightValue(k, n, salt);
+            const double bias = (static_cast<double>(n % biasMod) - biasOffset) * kAct * kWeight * 4.0;
+            const double real = clampTo(static_cast<double>(acc) * kAct * kWeight + bias,
+                                        -128.0 * kAct, 127.0 * kAct);
+            codes[m * kD + n] = encode(real, kAct);
+         }
+      }
+      return codes;
+   };
+   const std::vector<int> qCodes = project(0, 5, 2.0);
+   const std::vector<int> kCodes = project(5, 7, 3.0);
+
+   // [B, T, heads, headDim] is the layout both runs carry; the permutations pick from it.
+   auto at = [&](const std::vector<int> &codes, std::size_t b, std::size_t t, std::size_t h,
+                 std::size_t d) {
+      return codes[((b * kT + t) * kHeads + h) * kHeadDim + d];
+   };
+
+   std::vector<float> expected(static_cast<std::size_t>(kB) * kHeads * kT * kT);
+   for (std::size_t b = 0; b < kB; ++b) {
+      for (std::size_t h = 0; h < kHeads; ++h) {
+         for (std::size_t i = 0; i < kT; ++i) {
+            for (std::size_t j = 0; j < kT; ++j) {
+               std::int64_t acc = 0;
+               for (std::size_t d = 0; d < kHeadDim; ++d)
+                  acc += static_cast<std::int64_t>(at(qCodes, b, i, h, d)) *
+                         static_cast<std::int64_t>(at(kCodes, b, j, h, d));
+               const double real = clampTo(static_cast<double>(acc) * kAct * kAct,
+                                           -128.0 * kScore, 127.0 * kScore);
+               expected[((b * kHeads + h) * kT + i) * kT + j] =
+                  static_cast<float>(encode(real, kScore) * kScore);
+            }
+         }
+      }
+   }
+
+   const Idx inputSize = static_cast<Idx>(input.size());
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(inputSize));
+   std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(inputSize));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+
+   SOFIE_ONNX_QDQ_AttentionChain::Session<alpaka::TagGpuCudaRt> model(
+      "ONNX_QDQ_AttentionChain_FromONNX_GPU_ALPAKA.dat");
+   auto result = model.infer(input_d);
+   alpaka::wait(queue);
+   cudaDeviceSynchronize();
+
+   const Idx outputSize = static_cast<Idx>(expected.size());
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(outputSize));
+   alpaka::memcpy(queue, result_h, result);
+   alpaka::wait(queue);
+   const auto *res_ptr = reinterpret_cast<const float *>(alpaka::getPtrNative(result_h));
+
+   int mismatches = 0;
+   for (Idx i = 0; i < outputSize && mismatches < 5; ++i) {
+      if (res_ptr[i] != expected[i]) {
+         ++mismatches;
+         EXPECT_EQ(res_ptr[i], expected[i]) << "at i=" << i;
+      }
+   }
+   EXPECT_EQ(mismatches, 0) << "the adopted run's codes reached the score MatMul permuted wrongly";
 }

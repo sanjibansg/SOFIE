@@ -99,6 +99,12 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
       return ReadScalarInitializer(model, name, value);
    };
 
+   // Ops that become a quantized region. A Q/DQ pair bridging two of them keeps its int8
+   // carrier, so the pair is only collapsed to a float value beside a genuine float op.
+   auto isRegionFormingOpKind = [](OperatorKind kind) {
+      return kind == OperatorKind::GEMM || kind == OperatorKind::CONV;
+   };
+
    struct AbsorbedOutputChain {
       std::size_t boundaryIndex = static_cast<std::size_t>(-1);
       std::vector<std::size_t> opIndices;
@@ -112,6 +118,14 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
       // False once the walk passes something see-through but not absorbable, where the
       // boundary still defines the grid but the chain stays in the graph.
       bool absorbable = true;
+      // True for a chain extended past the boundary's own fake-quant pair onto a later
+      // boundary of the same grid. Such a chain ends on codes, so the trailing dequantize
+      // stays in the graph rather than folding into a float epilogue.
+      bool deepened = false;
+      // Movement operators the graph keeps and rewires to carry the adopted codes. The region
+      // writes the head; the last hop takes over `movementTargetTensor`.
+      std::vector<std::size_t> movementRunOpIndices;
+      std::string movementTargetTensor;
    };
 
    // Walks forward from a region output to the boundary defining its grid, collecting the
@@ -187,6 +201,257 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
       return chain;
    };
 
+   // Whether a decoded float leads on to an op forming its own quantized region, through the
+   // zero-copy Reshapes and boundary pairs that region's own input walk sees through. The pair
+   // producing the float is then the consumer's input boundary and belongs to it.
+   auto decodedFloatFeedsRegionFormingOp = [&graph, &operators, &isRegionFormingOpKind](
+                                              const std::string &dequantOutput) {
+      std::string ahead = dequantOutput;
+      for (int hop = 0; hop < kQuantizationWalkMaxHops; ++hop) {
+         auto aheadConsumers = graph.consumersByTensor.find(ahead);
+         if (aheadConsumers == graph.consumersByTensor.end() || aheadConsumers->second.size() != 1)
+            return false;
+         const auto aheadIndex = aheadConsumers->second.front();
+         if (aheadIndex >= operators.size())
+            return false;
+         auto *aheadOp = operators[aheadIndex].get();
+         // Elementwise counts too: collapsing the pair would leave whichever tensor that
+         // consumer picks, int8 carrier or float, unwritten.
+         if (isRegionFormingOpKind(aheadOp->GetKind()) || IsQuantizedElementwiseCandidate(*aheadOp))
+            return true;
+         if (dynamic_cast<const ROperator_Reshape *>(aheadOp) == nullptr &&
+             !aheadOp->IsQuantizationBoundary())
+            return false;
+         const auto aheadOutputs = aheadOp->GetOpOutputTensors();
+         if (aheadOutputs.size() != 1)
+            return false;
+         ahead = std::string(aheadOutputs[0]);
+      }
+      return false;
+   };
+
+   // Whether a run of see-through operators carries codes rather than values: every hop is a
+   // relabel or a permutation, and no tensor it stops writing is one the graph hands back.
+   // `retired` names the tensors the caller's adoption removes. Returns the refusing guard.
+   auto movementRunCarriesCodes = [&operators, &model](const std::vector<std::size_t> &runOpIndices,
+                                                       bool runHasClip,
+                                                       std::initializer_list<std::string> retired)
+      -> const char * {
+      if (runHasClip)
+         return "the run carries a Clip";
+      const auto &graphOutputNames = model.GetOutputTensorNames();
+      auto isGraphOutput = [&graphOutputNames](const std::string &tensor) {
+         return std::find(graphOutputNames.begin(), graphOutputNames.end(), tensor) !=
+                graphOutputNames.end();
+      };
+      for (const auto &tensor : retired)
+         if (isGraphOutput(tensor))
+            return "the run retires a tensor the graph hands back";
+      for (auto hopIndex : runOpIndices) {
+         if (operators[hopIndex]->CarrierSupport() != ELowPrecisionCarrierSupport::ValuePreserving)
+            return "a hop on the run is not value-preserving movement";
+         const auto hopOutputs = operators[hopIndex]->GetOpOutputTensors();
+         if (hopOutputs.size() != 1)
+            return "a hop on the run does not have exactly one output";
+         if (isGraphOutput(std::string(hopOutputs[0])))
+            return "a hop on the run writes a graph output";
+      }
+      return nullptr;
+   };
+
+   // Accepts the run behind a fake-quant pair as a carrier of the adopted codes rather than as
+   // something the region writes through: every hop stays emitted and is rewired onto the
+   // carrier. Returns the guard that refused, or nullptr once the run is recorded on the chain.
+   auto takeMovementRun = [&graph, &operators, &movementRunCarriesCodes](
+                             AbsorbedOutputChain &chain, std::size_t dequantIndex,
+                             const AbsorbedOutputChain &run,
+                             const QuantizationGrid &grid) -> const char * {
+      auto *farQuantize = dynamic_cast<ROperator_ONNXQuantizeLinear *>(operators[run.boundaryIndex].get());
+      if (farQuantize == nullptr)
+         return "the run's far boundary is not a QuantizeLinear";
+      if (!SameGrid(farQuantize->GetGrid(), grid))
+         return "the run's far boundary names a different grid";
+      const auto farOutputs = operators[run.boundaryIndex]->GetOpOutputTensors();
+      if (farOutputs.size() != 1)
+         return "the run's far boundary does not have exactly one output";
+      if (const char *refused =
+             movementRunCarriesCodes(run.opIndices, run.hasClip, {std::string(farOutputs[0])}))
+         return refused;
+
+      // A downstream region may read through the far boundary, unlike on an absorbed run: the
+      // run still writes that tensor. The consumer is kept from absorbing the taken boundary
+      // by `movementRunCarrierTensors`.
+
+      // The pair's dequantize and the far boundary both stop being emitted: the run reads the
+      // head's codes directly and writes the far boundary's tensor at its last hop.
+      chain.opIndices.push_back(dequantIndex);
+      chain.opIndices.push_back(run.boundaryIndex);
+      chain.movementRunOpIndices = run.opIndices;
+      chain.movementTargetTensor = std::string(farOutputs[0]);
+      return nullptr;
+   };
+
+   // Extends an absorbed chain past the boundary's own Quantize/Dequantize pair onto a later
+   // boundary of the same grid, reached through movement and clamps. Snapping to a grid a value
+   // already sits on is the identity, and a Clip on grid points commutes with the snap.
+   auto deepenAbsorbedOutputChain = [&graph, &operators, &model, &findAbsorbableOutputChain,
+                                     &decodedFloatFeedsRegionFormingOp,
+                                     &takeMovementRun](AbsorbedOutputChain &chain) {
+      const char *decline = nullptr;
+      std::string head;
+      // Names the guard that stopped the extension, per chain, so a chain left on a float
+      // epilogue is attributable to one term rather than to the walk as a whole.
+      struct Trace {
+         const char *&decline;
+         const std::string &head;
+         const AbsorbedOutputChain &chain;
+         const std::vector<std::unique_ptr<ROperator>> &ops;
+         ~Trace()
+         {
+            if (!QuantizationTraceEnabled() || head.empty())
+               return;
+            std::string landed;
+            if (chain.deepened && chain.boundaryIndex < ops.size()) {
+               const auto landedOutputs = ops[chain.boundaryIndex]->GetOpOutputTensors();
+               if (!landedOutputs.empty())
+                  landed = " -> " + std::string(landedOutputs[0]);
+            }
+            if (!chain.movementRunOpIndices.empty()) {
+               std::fprintf(stderr, "[int8-deepen] %s%s carried by a %zu-hop movement run -> %s\n",
+                            head.c_str(), landed.c_str(), chain.movementRunOpIndices.size(),
+                            chain.movementTargetTensor.c_str());
+               return;
+            }
+            std::fprintf(stderr, "[int8-deepen] %s%s %s%s\n", head.c_str(), landed.c_str(),
+                         chain.deepened ? "deepened, stopped at: " : "not deepened: ",
+                         decline != nullptr ? decline : "walk bound reached");
+         }
+      } trace{decline, head, chain, operators};
+
+      if (chain.boundaryIndex >= operators.size() || !chain.absorbable || !chain.clipBoundsReadable)
+         return;
+      {
+         const auto boundaryOutputs = operators[chain.boundaryIndex]->GetOpOutputTensors();
+         if (!boundaryOutputs.empty())
+            head = std::string(boundaryOutputs[0]);
+      }
+      const auto &graphOutputNames = model.GetOutputTensorNames();
+      auto isGraphOutput = [&graphOutputNames](const std::string &tensor) {
+         return std::find(graphOutputNames.begin(), graphOutputNames.end(), tensor) !=
+                graphOutputNames.end();
+      };
+      auto soleConsumer = [&](const std::string &tensor) -> std::size_t {
+         auto it = graph.consumersByTensor.find(tensor);
+         if (it == graph.consumersByTensor.end() || it->second.size() != 1 ||
+             it->second.front() >= operators.size())
+            return static_cast<std::size_t>(-1);
+         return it->second.front();
+      };
+
+      for (int hop = 0; hop < kQuantizationWalkMaxHops; ++hop) {
+         auto *quantize =
+            dynamic_cast<ROperator_ONNXQuantizeLinear *>(operators[chain.boundaryIndex].get());
+         if (quantize == nullptr) {
+            decline = "boundary is not a QuantizeLinear";
+            return;
+         }
+         const auto &grid = quantize->GetGrid();
+         if (!grid.IsDefined() || grid.granularity != EQuantizationGranularity::PerTensor) {
+            decline = "boundary grid is not per-tensor";
+            return;
+         }
+         const auto quantOutputs = operators[chain.boundaryIndex]->GetOpOutputTensors();
+         if (quantOutputs.size() != 1) {
+            decline = "boundary does not have exactly one output";
+            return;
+         }
+         const std::string boundaryOutput(quantOutputs[0]);
+
+         // The pair is what makes the extra snap free: the dequantize must decode exactly
+         // what the boundary encoded, and nothing else may read the codes.
+         const auto dequantIndex = soleConsumer(boundaryOutput);
+         auto *dequantize =
+            dequantIndex != static_cast<std::size_t>(-1)
+               ? dynamic_cast<ROperator_ONNXDequantizeLinear *>(operators[dequantIndex].get())
+               : nullptr;
+         if (dequantize == nullptr) {
+            decline = "boundary codes are not read by a sole DequantizeLinear";
+            return;
+         }
+         if (!SameGrid(dequantize->GetGrid(), grid)) {
+            decline = "the pair's dequantize names a different grid";
+            return;
+         }
+         const auto dequantOutputs = operators[dequantIndex]->GetOpOutputTensors();
+         if (dequantOutputs.size() != 1) {
+            decline = "pair dequantize does not have exactly one output";
+            return;
+         }
+         const std::string dequantOutput(dequantOutputs[0]);
+
+         // The boundary belongs to whichever region reads through it; swallowing it would
+         // leave that region's input carrier unwritten.
+         if (decodedFloatFeedsRegionFormingOp(dequantOutput)) {
+            decline = "the pair is the input boundary of a downstream region";
+            return;
+         }
+
+         const auto next = findAbsorbableOutputChain(dequantOutput);
+         if (next.boundaryIndex == static_cast<std::size_t>(-1)) {
+            decline = "no further boundary behind the pair";
+            return;
+         }
+         if (!next.absorbable) {
+            // A run that moves data cannot be written through, but it can carry the codes.
+            // The head is fixed at this boundary either way, so the walk ends here.
+            decline = takeMovementRun(chain, dequantIndex, next, grid);
+            return;
+         }
+         if (!next.clipBoundsReadable || next.alphaScale != 1.0) {
+            decline = "the run to the next boundary carries a scale or unreadable clip bounds";
+            return;
+         }
+         auto *nextQuantize =
+            dynamic_cast<ROperator_ONNXQuantizeLinear *>(operators[next.boundaryIndex].get());
+         if (nextQuantize == nullptr) {
+            decline = "next boundary is not a QuantizeLinear";
+            return;
+         }
+         if (!SameGrid(nextQuantize->GetGrid(), grid)) {
+            decline = "next boundary names a different grid, so the run rounds twice";
+            return;
+         }
+
+         // Every tensor the run swallows stops being written, so none of them may be one the
+         // graph hands back.
+         if (isGraphOutput(boundaryOutput) || isGraphOutput(dequantOutput)) {
+            decline = "the pair's tensors include a graph output";
+            return;
+         }
+         bool consumesGraphOutput = false;
+         for (auto nextOpIndex : next.opIndices) {
+            const auto hopOutputs = operators[nextOpIndex]->GetOpOutputTensors();
+            if (hopOutputs.size() != 1 || isGraphOutput(std::string(hopOutputs[0]))) {
+               consumesGraphOutput = true;
+               break;
+            }
+         }
+         if (consumesGraphOutput) {
+            decline = "the run swallows a graph output";
+            return;
+         }
+
+         chain.opIndices.push_back(chain.boundaryIndex);
+         chain.opIndices.push_back(dequantIndex);
+         chain.opIndices.insert(chain.opIndices.end(), next.opIndices.begin(), next.opIndices.end());
+         chain.boundaryIndex = next.boundaryIndex;
+         chain.hasClip = chain.hasClip || next.hasClip;
+         chain.clipLow = std::max(chain.clipLow, next.clipLow);
+         chain.clipHigh = std::min(chain.clipHigh, next.clipHigh);
+         chain.deepened = true;
+      }
+   };
+
    // A trailing per-tensor E4M3 QuantizeLinear an FP8 region can adopt: cuBLASLt narrows D
    // onto that grid, with an absorbed Clip as a code-space clamp and a deep Relu in the epilogue.
    struct AdoptableFP8OutputQuant {
@@ -205,7 +470,8 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
       const char *decline = nullptr;   // names the guard that refused; nullptr means adoptable
       bool adopted() const { return decline == nullptr; }
    };
-   auto findAdoptableFP8OutputQuant = [&graph, &operators, &model, &findAbsorbableOutputChain](
+   auto findAdoptableFP8OutputQuant = [&graph, &operators, &model, &findAbsorbableOutputChain,
+                                       &movementRunCarriesCodes](
                                          const std::string &outputTensor,
                                          const QuantizedMatrixShapePolicy &shapePolicy) {
       AdoptableFP8OutputQuant result;
@@ -219,28 +485,10 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
       // output tensor at its last hop.
       const bool viaMovementRun = !chain.absorbable;
       if (viaMovementRun) {
-         if (chain.hasClip) {
-            result.decline = "movement-run chain carries a Clip";
+         if (const char *refused =
+                movementRunCarriesCodes(chain.opIndices, chain.hasClip, {outputTensor})) {
+            result.decline = refused;
             return result;
-         }
-         const auto &graphOutputNames = model.GetOutputTensorNames();
-         if (std::find(graphOutputNames.begin(), graphOutputNames.end(), outputTensor) !=
-             graphOutputNames.end()) {
-            result.decline = "movement-run head tensor is a graph output";
-            return result;
-         }
-         for (auto chainOpIndex : chain.opIndices) {
-            if (operators[chainOpIndex]->CarrierSupport() !=
-                ELowPrecisionCarrierSupport::ValuePreserving) {
-               result.decline = "movement-run chain op is not value-preserving movement";
-               return result;
-            }
-            const std::string hopOutput(operators[chainOpIndex]->GetOpOutputTensors().front());
-            if (std::find(graphOutputNames.begin(), graphOutputNames.end(), hopOutput) !=
-                graphOutputNames.end()) {
-               result.decline = "movement-run chain tensor is a graph output";
-               return result;
-            }
          }
       }
       if (chain.alphaScale != 1.0) {
@@ -385,6 +633,11 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
    // producer's plan is Optimized, so a float fallback never leaves a consumer expecting int8.
    std::unordered_set<std::string> fusedInt8HandoffTensors;
 
+   // Boundary tensors a lowered region's movement run has taken over. A region reading through
+   // one reads the carrier rather than absorbing a quantize that is not emitted, and the
+   // entry appears only once the producing plan is Optimized.
+   std::unordered_set<std::string> movementRunCarrierTensors;
+
    // True when the input source is produced by a non-quantized op, i.e. an intermediate
    // float activation. A graph input (no producer) keeps the int8 carrier.
    auto inputSourceIsFloatOp = [&graph, &operators,
@@ -475,12 +728,6 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
           !info.isSigned)
          return;
       tryPlanCarrierHandoff(region.inputSourceTensor, IntegerGridFrom(info));
-   };
-
-   // Ops that become a quantized region. A Q/DQ pair bridging two of them keeps its int8
-   // carrier, so the pair is only collapsed to a float value beside a genuine float op.
-   auto isRegionFormingOpKind = [](OperatorKind kind) {
-      return kind == OperatorKind::GEMM || kind == OperatorKind::CONV;
    };
 
    // Walks back through zero-copy Reshapes for a DequantizeLinear on `grid` and returns
@@ -909,7 +1156,11 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                      quantSourceProducer != graph.producerByTensor.end() &&
                      quantSourceProducer->second < operators.size() &&
                      isRegionFormingOpKind(operators[quantSourceProducer->second]->GetKind());
-                  if (!fromRegionFormingOp) {
+                  // A movement run already writes the codes here and took the boundary with
+                  // it; absorbing it a second time would claim an operator that is gone.
+                  const bool carriedByMovementRun =
+                     movementRunCarrierTensors.count(info.inputSourceTensor) != 0;
+                  if (!fromRegionFormingOp && !carriedByMovementRun) {
                      info.inputPairQuantizeOpIndex = sourceProducer->second;
                      info.inputSourceTensor = leadingQuantSource;
                   }
@@ -995,7 +1246,8 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
             auto consumerIndex = consumers->second.front();
             // gridOnly reads the boundary's grid but suppresses nothing, for a chain that
             // is see-through yet not absorbable. The intervening ops preserve the values.
-            auto setOutputQuantFromBoundary = [&](std::size_t quantIndex, bool gridOnly = false) {
+            auto setOutputQuantFromBoundary = [&](std::size_t quantIndex, bool gridOnly = false,
+                                                  bool endsOnCodes = false) {
                if (!gridOnly)
                   info.outputQuantOpIndex = quantIndex;
                auto quantOutputs = operators[quantIndex]->GetOpOutputTensors();
@@ -1022,6 +1274,10 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                // trailing DQ and emit its float output so the pair matches QONNX's single Quant.
                info.outputTensor = boundaryOutput;
                auto boundaryConsumers = graph.consumersByTensor.find(boundaryOutput);
+               // A run that already swallowed one such pair to reach this boundary is here for
+               // the codes; folding this dequantize in would put it back on a float epilogue.
+               if (endsOnCodes)
+                  boundaryConsumers = graph.consumersByTensor.end();
                if (boundaryConsumers != graph.consumersByTensor.end() &&
                    boundaryConsumers->second.size() == 1) {
                   const auto dequantIndex = boundaryConsumers->second.front();
@@ -1030,39 +1286,10 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                      const auto dequantOutputs = operators[dequantIndex]->GetOpOutputTensors();
                      if (dequantOutputs.size() == 1) {
                         // Not when the DQ feeds another quantized region: it is that region's
-                        // int8 input boundary. The consuming region reaches its boundary
-                        // through the same zero-copy Reshapes and relabel pairs its carrier
-                        // walk sees through, so this look-ahead uses the same transparency:
-                        // a pair the consumer can reach is owned by the consumer's input
-                        // boundary, and collapsing it here would leave the carrier unwritten.
+                        // int8 input boundary, and collapsing it here would leave the carrier
+                        // unwritten.
                         const std::string dequantOutput = std::string(dequantOutputs[0]);
-                        bool feedsRegionFormingOp = false;
-                        std::string ahead = dequantOutput;
-                        for (int hop = 0; hop < kQuantizationWalkMaxHops; ++hop) {
-                           auto aheadConsumers = graph.consumersByTensor.find(ahead);
-                           if (aheadConsumers == graph.consumersByTensor.end() ||
-                               aheadConsumers->second.size() != 1)
-                              break;
-                           const auto aheadIndex = aheadConsumers->second.front();
-                           if (aheadIndex >= operators.size())
-                              break;
-                           auto *aheadOp = operators[aheadIndex].get();
-                           // Elementwise counts too: collapsing the pair would leave whichever
-                           // tensor that consumer picks, int8 carrier or float, unwritten.
-                           if (isRegionFormingOpKind(aheadOp->GetKind()) ||
-                               IsQuantizedElementwiseCandidate(*aheadOp)) {
-                              feedsRegionFormingOp = true;
-                              break;
-                           }
-                           if (dynamic_cast<const ROperator_Reshape *>(aheadOp) == nullptr &&
-                               !aheadOp->IsQuantizationBoundary())
-                              break;
-                           const auto aheadOutputs = aheadOp->GetOpOutputTensors();
-                           if (aheadOutputs.size() != 1)
-                              break;
-                           ahead = std::string(aheadOutputs[0]);
-                        }
-                        if (!feedsRegionFormingOp) {
+                        if (!decodedFloatFeedsRegionFormingOp(dequantOutput)) {
                            info.outputDequantOpIndex = dequantIndex;
                            info.outputTensor = dequantOutput;
                         }
@@ -1112,10 +1339,18 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                }
             };
 
+            // A boundary sitting directly on the region output, as the zero-hop chain that
+            // absorbs on the same terms as one reached through transparent ops.
+            auto absorbAdjacentOutputBoundary = [&](std::size_t boundaryIndex) {
+               AbsorbedOutputChain chain;
+               chain.boundaryIndex = boundaryIndex;
+               return chain;
+            };
             // Absorbs a boundary reached through transparent ops and the ops between. A
             // non-absorbable chain takes the grid alone and leaves every op in place.
-            auto absorbOutputChain = [&](const AbsorbedOutputChain &chain) {
-               setOutputQuantFromBoundary(chain.boundaryIndex, !chain.absorbable);
+            auto absorbOutputChain = [&](AbsorbedOutputChain chain) {
+               deepenAbsorbedOutputChain(chain);
+               setOutputQuantFromBoundary(chain.boundaryIndex, !chain.absorbable, chain.deepened);
                if (!reasons.empty())
                   return;
                // Grid only: nothing on the chain is suppressed, so a following Clip still
@@ -1165,10 +1400,14 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                }
                info.outputAlpha = chain.alphaScale;
                info.absorbedOutputChainOpIndices = chain.opIndices;
+               // The region keeps writing the head; the run carries those codes and its last
+               // hop takes over the far boundary's tensor.
+               info.outputMovementRunOpIndices = chain.movementRunOpIndices;
+               info.outputMovementTargetTensor = chain.movementTargetTensor;
             };
 
             if (operators[consumerIndex]->IsQuantizationBoundary()) {
-               setOutputQuantFromBoundary(consumerIndex);
+               absorbOutputChain(absorbAdjacentOutputBoundary(consumerIndex));
             } else if (isMatMulSpelling && IsFloatAddOperator(*operators[consumerIndex])) {
                const auto addInputs = operators[consumerIndex]->GetOpInputTensors();
                const auto addOutputs = operators[consumerIndex]->GetOpOutputTensors();
@@ -1206,7 +1445,8 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                            matmulEpilogue.biasQuant = MakeAccumulatorBiasQuantization(info.inputQuant, info.weightQuant);
                            matmulEpilogue.addOpIndex = consumerIndex;
                            if (adjacentBoundary)
-                              setOutputQuantFromBoundary(addOutputConsumers->second.front());
+                              absorbOutputChain(absorbAdjacentOutputBoundary(
+                                 addOutputConsumers->second.front()));
                            else
                               absorbOutputChain(chain);
                         }
@@ -1340,6 +1580,9 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                   alpakaPlan.computeProfile = selectedCapability.profile;
                   alpakaPlan.capabilityTag = selectedCapability.tag;
                   alpakaPlan.reason = matmul.reason + "; " + selectedCapability.reason;
+                  if (!matmul.outputMovementTargetTensor.empty() &&
+                      IsQuantizedLoweringOptimized(alpakaPlan.status))
+                     movementRunCarrierTensors.insert(matmul.outputMovementTargetTensor);
                   plans[EQuantizedBackend::ALPAKA] = std::move(alpakaPlan);
                   matmul.reason += runtimeOperandB
                                       ? "; runtime int8 operand B read in place"
@@ -1472,6 +1715,9 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
 
          auto &plans = state.loweringPlans[opIndex];
          plans[EQuantizedBackend::CPU] = std::move(cpuPlan);
+         if (!info.outputMovementTargetTensor.empty() &&
+             IsQuantizedLoweringOptimized(alpakaPlan.status))
+            movementRunCarrierTensors.insert(info.outputMovementTargetTensor);
          if (info.outputRequantize) {
             if (IsQuantizedLoweringOptimized(alpakaPlan.status)) {
                fusedInt8HandoffTensors.insert(info.outputTensor);

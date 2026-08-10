@@ -612,6 +612,14 @@ TEST(QuantizationMetadata, Convolution)
             {"causal_depthwise_conv1d", "NOTSET", {1, 4, 16}, {4, 1, 4}, {4}, {1, 4, 16},
              {1}, 4, {4}, {3, 0}, {1},
              SOFIE::EQuantizedConvolutionKind::Depthwise, ""},
+            // Dilation widens the receptive field through the pads while the kernel shape
+            // stays as declared, so the geometry check reads the effective extent only.
+            {"dilated_conv1d", "NOTSET", {1, 4, 16}, {8, 4, 3}, {8}, {1, 8, 16},
+             {2}, 1, {3}, {2, 2}, {1},
+             SOFIE::EQuantizedConvolutionKind::Standard, ""},
+            {"dilated_conv2d", "NOTSET", {1, 4, 8, 8}, {8, 4, 3, 3}, {}, {1, 8, 8, 8},
+             {2, 2}, 1, {3, 3}, {2, 2, 2, 2}, {1, 1},
+             SOFIE::EQuantizedConvolutionKind::Standard, ""},
             {"inconsistent_group_channels", "NOTSET", {1, 4, 16}, {8, 3, 3}, {}, {1, 8, 16},
              {1}, 2, {3}, {1, 1}, {1},
              SOFIE::EQuantizedConvolutionKind::Grouped,
@@ -1825,6 +1833,431 @@ TEST_F(QuantizationAlpakaTest, ConvolutionKernels)
          const auto *actual = alpaka::getPtrNative(output_h);
          for (Idx index = 0; index < expected.size(); ++index)
             EXPECT_NEAR(actual[index], expected[index], 0.05f) << "index=" << index;
+      #endif
+   }
+}
+
+TEST_F(QuantizationAlpakaTest, ConvolutionDilation)
+{
+   {
+      SCOPED_TRACE("dilation reaches the launch geometry unexpanded");
+         // A dilated Conv keeps its declared kernel shape, so the reduction depth stays
+         // channels times taps and the spacing travels beside it as its own factor.
+         constexpr std::size_t inputChannels = 32;
+         constexpr std::size_t outputChannels = 64;
+         constexpr std::size_t kernel = 3;
+         constexpr std::size_t dilation = 2;
+         constexpr std::size_t inputLength = 260;
+         constexpr std::size_t outputLength = inputLength - dilation * (kernel - 1);
+
+         SOFIE::RModel model("dilated_conv_lowering");
+         const std::vector<std::size_t> weightShape{outputChannels, inputChannels, kernel};
+         model.AddInputTensorInfo("input", SOFIE::ETensorType::FLOAT,
+                                  std::vector<std::size_t>{1, inputChannels, inputLength});
+         model.AddInitializedTensor(
+            "weight", SOFIE::ETensorType::FLOAT, weightShape,
+            std::shared_ptr<void>(new float[SOFIE::ConvertShapeToLength(weightShape)]{},
+                                  std::default_delete<float[]>()));
+         model.AddInitializedTensor("scale", std::vector<std::size_t>{},
+                                    std::vector<float>{0.125f});
+         model.AddInitializedTensor("zero_point", std::vector<std::size_t>{},
+                                    std::vector<float>{0.0f});
+         model.AddInitializedTensor("bit_width", std::vector<std::size_t>{},
+                                    std::vector<float>{8.0f});
+         const auto addBoundary = [&](const std::string &name, const std::string &source,
+                                      const std::string &target) {
+            AddNamedOperator<SOFIE::ROperator_QONNXQuant>(
+               model, name, source, "scale", "zero_point", "bit_width", target, true, false,
+               SOFIE::EQuantizationRoundingMode::ROUND,
+               SOFIE::EQuantizationOverflowMode::SAT);
+         };
+         addBoundary("quantize_input", "input", "input_quantized");
+         addBoundary("quantize_weight", "weight", "weight_quantized");
+         AddNamedOperator<SOFIE::ROperator_Conv<float>>(
+            model, "conv", "NOTSET", std::vector<std::size_t>{dilation}, 1,
+            std::vector<std::size_t>{kernel}, std::vector<std::size_t>{0, 0},
+            std::vector<std::size_t>{1}, "input_quantized", "weight_quantized", "",
+            "conv_output");
+         addBoundary("quantize_output", "conv_output", "output_quantized");
+         model.Initialize();
+
+         ASSERT_EQ(SOFIE_TEST::CountRegions(SOFIE_TEST::AlpakaPipelineReport(model), "conv"), 1U);
+         const auto &region = *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(
+            model.GetQuantizationState());
+         EXPECT_EQ(region.attributes.dilations, std::vector<std::size_t>{dilation});
+         EXPECT_EQ(region.attributes.kernelShape, std::vector<std::size_t>{kernel});
+         const auto *plan = SOFIE::FindQuantizedLoweringPlan(
+            model.GetQuantizationState(), region.convOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+         ASSERT_NE(plan, nullptr);
+         ASSERT_EQ(plan->status, SOFIE::EQuantizedLoweringStatus::Optimized)
+            << plan->capabilityTag << " | " << plan->reason;
+
+         SOFIE::ROperator_QuantizedConv lowered(
+            region, *plan, SOFIE::MakeQuantizedConvCodegenContext(model, region));
+         const auto generated = lowered.Generate_GPU_ALPAKA("dilated_conv");
+         EXPECT_NE(generated.find(".dilationWidth = " + std::to_string(dilation)),
+                   std::string::npos);
+         EXPECT_NE(generated.find(".kernelWidth = " + std::to_string(kernel)),
+                   std::string::npos);
+         EXPECT_NE(generated.find(".outputWidth = " + std::to_string(outputLength)),
+                   std::string::npos);
+         EXPECT_NE(generated.find(".matrix.k = " + std::to_string(inputChannels * kernel)),
+                   std::string::npos);
+   }
+   {
+      SCOPED_TRACE("INT8 affine dilated Conv");
+         constexpr Idx inputChannels = 2;
+         constexpr Idx outputChannels = 2;
+         constexpr Idx width = 7;
+         constexpr Idx kernel = 3;
+         constexpr Idx dilation = 2;
+         constexpr Idx padLeft = 2;
+         const std::vector<std::uint8_t> input = {
+            5, 7, 4, 8, 6, 9, 3,
+            3, 9, 5, 4, 10, 6, 8};
+         const std::vector<std::uint8_t> weight = {
+            7, 8, 6, 9, 7, 5,
+            6, 7, 10, 8, 5, 7};
+         const std::vector<float> bias = {0.125f, -0.125f};
+         const std::vector<float> weightScales = {0.5f, 0.25f};
+         constexpr std::int32_t inputZeroPoint = 5;
+         constexpr std::int32_t weightZeroPoint = 7;
+         constexpr std::int32_t outputZeroPoint = 11;
+         constexpr double inputScale = 0.25;
+         constexpr double outputScale = 0.125;
+
+         std::vector<std::uint8_t> expected(outputChannels * width);
+         for (Idx oc = 0; oc < outputChannels; ++oc) {
+            const double accumulatorScale = inputScale * weightScales[oc];
+            const auto biasAccumulator = static_cast<std::int64_t>(
+               std::nearbyint(static_cast<double>(bias[oc]) / accumulatorScale));
+            for (Idx output = 0; output < width; ++output) {
+               std::int64_t accumulator = biasAccumulator;
+               for (Idx ic = 0; ic < inputChannels; ++ic) {
+                  for (Idx k = 0; k < kernel; ++k) {
+                     // The tap spacing is the dilation, applied once to the kernel offset.
+                     const auto source =
+                        static_cast<std::int64_t>(output + k * dilation) - padLeft;
+                     if (source < 0 || source >= static_cast<std::int64_t>(width))
+                        continue;
+                     const auto inputValue = input[ic * width + static_cast<Idx>(source)];
+                     const auto weightValue = weight[(oc * inputChannels + ic) * kernel + k];
+                     accumulator += static_cast<std::int64_t>(inputValue - inputZeroPoint) *
+                                    static_cast<std::int64_t>(weightValue - weightZeroPoint);
+                  }
+               }
+               const auto quantized = static_cast<long>(std::nearbyint(
+                                         static_cast<double>(accumulator) * accumulatorScale /
+                                         outputScale)) +
+                                      outputZeroPoint;
+               expected[oc * width + output] = static_cast<std::uint8_t>(
+                  std::clamp(std::max(quantized, static_cast<long>(outputZeroPoint)),
+                             0L, 255L));
+            }
+         }
+
+         auto input_h = alpaka::allocBuf<std::uint8_t, Idx>(host, Ext1D::all(input.size()));
+         auto weight_h = alpaka::allocBuf<std::uint8_t, Idx>(host, Ext1D::all(weight.size()));
+         auto bias_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(bias.size()));
+         auto scales_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(weightScales.size()));
+         std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
+         std::copy(weight.begin(), weight.end(), alpaka::getPtrNative(weight_h));
+         std::copy(bias.begin(), bias.end(), alpaka::getPtrNative(bias_h));
+         std::copy(weightScales.begin(), weightScales.end(), alpaka::getPtrNative(scales_h));
+
+         auto input_d = alpaka::allocBuf<std::uint8_t, Idx>(device, Ext1D::all(input.size()));
+         auto weight_d = alpaka::allocBuf<std::uint8_t, Idx>(device, Ext1D::all(weight.size()));
+         auto bias_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(bias.size()));
+         auto scales_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(weightScales.size()));
+         auto output_d = alpaka::allocBuf<std::uint8_t, Idx>(device, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, input_d, input_h);
+         alpaka::memcpy(queue, weight_d, weight_h);
+         alpaka::memcpy(queue, bias_d, bias_h);
+         alpaka::memcpy(queue, scales_d, scales_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedConvolutionInvocation params{};
+         params.batch = 1;
+         params.inputChannels = inputChannels;
+         params.inputHeight = 1;
+         params.inputWidth = width;
+         params.outputChannels = outputChannels;
+         params.outputHeight = 1;
+         params.outputWidth = width;
+         params.kernelHeight = 1;
+         params.kernelWidth = kernel;
+         params.groups = 1;
+         params.strideWidth = 1;
+         params.dilationWidth = dilation;
+         params.padLeft = padLeft;
+         params.matrix.inputScale = inputScale;
+         params.matrix.weightScale = weightScales.front();
+         params.matrix.outputScale = outputScale;
+         params.matrix.inputZeroPoint = inputZeroPoint;
+         params.matrix.weightZeroPoint = weightZeroPoint;
+         params.matrix.outputZeroPoint = outputZeroPoint;
+         params.matrix.inputQMin = 0;
+         params.matrix.inputQMax = 255;
+         params.matrix.biasQMin = std::numeric_limits<std::int32_t>::min();
+         params.matrix.biasQMax = std::numeric_limits<std::int32_t>::max();
+         params.matrix.outputQMin = 0;
+         params.matrix.outputQMax = 255;
+         params.matrix.hasBias = true;
+         params.matrix.hasRelu = true;
+         params.matrix.inputCarrier = SOFIE::EQuantizedInputCarrier::UInt8;
+         params.matrix.weightType = SOFIE::EQuantizedWeightCarrier::UInt8;
+         params.matrix.outputCarrier = SOFIE::EQuantizedOutputCarrier::UInt8;
+         params.matrix.weightScaleMode = SOFIE::EQuantizedScaleMode::PerOutputChannel;
+         params.biasCarrier = SOFIE::EQuantizedBiasCarrier::Float;
+
+         SOFIE::QuantizedConvCudaAffine_Call(
+            alpaka::getNativeHandle(queue), alpaka::getPtrNative(output_d),
+            alpaka::getPtrNative(input_d), alpaka::getPtrNative(weight_d),
+            alpaka::getPtrNative(bias_d), alpaka::getPtrNative(scales_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto output_h = alpaka::allocBuf<std::uint8_t, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, output_h, output_d);
+         alpaka::wait(queue);
+         EXPECT_EQ(std::vector<std::uint8_t>(alpaka::getPtrNative(output_h),
+                                             alpaka::getPtrNative(output_h) + expected.size()),
+                   expected);
+   }
+   {
+      SCOPED_TRACE("INT8 depthwise dilated Conv");
+         constexpr Idx channels = 4;
+         constexpr Idx width = 8;
+         constexpr Idx kernel = 3;
+         constexpr Idx dilation = 3;
+         constexpr Idx padLeft = 3;
+         constexpr double inputScale = 0.25;
+         constexpr double outputScale = 0.125;
+         // Ratios of one and two: the output code is an exact integer, so a dilation
+         // fault shows as a changed value rather than a rounding tie.
+         const std::vector<float> weightScales = {0.5f, 1.0f, 0.5f, 1.0f};
+
+         std::vector<std::int8_t> input(channels * width);
+         std::vector<std::int8_t> weight(channels * kernel);
+         std::vector<float> bias(channels);
+         for (Idx channel = 0; channel < channels; ++channel) {
+            bias[channel] = channel % 2 == 0 ? 0.5f : -0.5f;
+            for (Idx k = 0; k < kernel; ++k)
+               weight[channel * kernel + k] =
+                  static_cast<std::int8_t>(static_cast<int>((channel + 2 * k) % 5) - 2);
+            for (Idx position = 0; position < width; ++position)
+               input[channel * width + position] = static_cast<std::int8_t>(
+                  static_cast<int>((channel * 3 + position) % 7) - 3);
+         }
+
+         std::vector<std::int8_t> expected(channels * width);
+         for (Idx channel = 0; channel < channels; ++channel) {
+            const double accumulatorScale = inputScale * weightScales[channel];
+            const auto biasAccumulator = static_cast<std::int64_t>(
+               std::nearbyint(static_cast<double>(bias[channel]) / accumulatorScale));
+            for (Idx output = 0; output < width; ++output) {
+               std::int64_t accumulator = biasAccumulator;
+               for (Idx k = 0; k < kernel; ++k) {
+                  const auto source =
+                     static_cast<std::int64_t>(output + k * dilation) - padLeft;
+                  if (source < 0 || source >= static_cast<std::int64_t>(width))
+                     continue;
+                  accumulator += static_cast<std::int64_t>(
+                                    input[channel * width + static_cast<Idx>(source)]) *
+                                 static_cast<std::int64_t>(weight[channel * kernel + k]);
+               }
+               const auto quantized = static_cast<long>(std::nearbyint(
+                  static_cast<double>(accumulator) * accumulatorScale / outputScale));
+               expected[channel * width + output] =
+                  static_cast<std::int8_t>(std::clamp(quantized, -128L, 127L));
+            }
+         }
+
+         auto input_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(input.size()));
+         auto weight_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(weight.size()));
+         auto bias_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(bias.size()));
+         auto scales_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(weightScales.size()));
+         std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
+         std::copy(weight.begin(), weight.end(), alpaka::getPtrNative(weight_h));
+         std::copy(bias.begin(), bias.end(), alpaka::getPtrNative(bias_h));
+         std::copy(weightScales.begin(), weightScales.end(), alpaka::getPtrNative(scales_h));
+
+         auto input_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(input.size()));
+         auto weight_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(weight.size()));
+         auto bias_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(bias.size()));
+         auto scales_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(weightScales.size()));
+         auto output_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, input_d, input_h);
+         alpaka::memcpy(queue, weight_d, weight_h);
+         alpaka::memcpy(queue, bias_d, bias_h);
+         alpaka::memcpy(queue, scales_d, scales_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedConvolutionInvocation params{};
+         params.batch = 1;
+         params.inputChannels = channels;
+         params.inputHeight = 1;
+         params.inputWidth = width;
+         params.outputChannels = channels;
+         params.outputHeight = 1;
+         params.outputWidth = width;
+         params.kernelHeight = 1;
+         params.kernelWidth = kernel;
+         params.groups = channels;
+         params.strideWidth = 1;
+         params.dilationWidth = dilation;
+         params.padLeft = padLeft;
+         params.matrix.inputScale = inputScale;
+         params.matrix.weightScale = weightScales.front();
+         params.matrix.outputScale = outputScale;
+         params.matrix.inputZeroPoint = 0;
+         params.matrix.weightZeroPoint = 0;
+         params.matrix.outputZeroPoint = 0;
+         params.matrix.inputQMin = -128;
+         params.matrix.inputQMax = 127;
+         params.matrix.outputQMin = -128;
+         params.matrix.outputQMax = 127;
+         params.matrix.hasBias = true;
+         params.matrix.inputCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.matrix.outputCarrier = SOFIE::EQuantizedOutputCarrier::Int8;
+         params.matrix.weightScaleMode = SOFIE::EQuantizedScaleMode::PerOutputChannel;
+
+         SOFIE::QuantizedConvCudaDepthwise_Call(
+            alpaka::getNativeHandle(queue), alpaka::getPtrNative(output_d),
+            alpaka::getPtrNative(input_d), alpaka::getPtrNative(weight_d),
+            alpaka::getPtrNative(bias_d), alpaka::getPtrNative(scales_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto output_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, output_h, output_d);
+         alpaka::wait(queue);
+         const auto *actual = alpaka::getPtrNative(output_h);
+         for (Idx index = 0; index < expected.size(); ++index)
+            EXPECT_EQ(static_cast<int>(actual[index]), static_cast<int>(expected[index]))
+               << "index=" << index;
+   }
+   {
+      SCOPED_TRACE("INT8 im2col dilated Conv");
+      #ifndef SOFIE_USE_CUBLASLT
+         GTEST_SKIP() << "SOFIE_USE_CUBLASLT is not enabled";
+      #else
+         // Two live taps on the kernel diagonal: at spacing two they read the pixels
+         // diagonally adjacent to the output, which no other spacing reaches.
+         constexpr Idx inputChannels = 8;
+         constexpr Idx outputChannels = 16;
+         constexpr Idx extent = 8;
+         constexpr Idx kernel = 2;
+         constexpr Idx dilation = 2;
+         constexpr Idx pad = 1;
+         constexpr Idx spatial = extent * extent;
+
+         std::vector<std::int8_t> input(inputChannels * spatial);
+         std::vector<std::int8_t> weight(outputChannels * inputChannels * kernel * kernel, 0);
+         std::vector<float> bias(outputChannels);
+         for (Idx channel = 0; channel < inputChannels; ++channel)
+            for (Idx position = 0; position < spatial; ++position)
+               input[channel * spatial + position] = static_cast<std::int8_t>(
+                  static_cast<int>((channel * 5 + position * 3) % 7) - 3);
+         for (Idx outputChannel = 0; outputChannel < outputChannels; ++outputChannel) {
+            bias[outputChannel] = outputChannel % 2 == 0 ? 1.0f : -1.0f;
+            const Idx channel = outputChannel % inputChannels;
+            const Idx base = (outputChannel * inputChannels + channel) * kernel * kernel;
+            weight[base] = 1;
+            weight[base + kernel + 1] = 1;
+         }
+
+         std::vector<std::int8_t> expected(outputChannels * spatial);
+         for (Idx outputChannel = 0; outputChannel < outputChannels; ++outputChannel) {
+            const Idx channel = outputChannel % inputChannels;
+            for (Idx outputHeight = 0; outputHeight < extent; ++outputHeight) {
+               for (Idx outputWidth = 0; outputWidth < extent; ++outputWidth) {
+                  auto accumulator = static_cast<std::int64_t>(bias[outputChannel]);
+                  for (Idx tap = 0; tap < kernel; ++tap) {
+                     const auto row =
+                        static_cast<std::int64_t>(outputHeight + tap * dilation) - pad;
+                     const auto column =
+                        static_cast<std::int64_t>(outputWidth + tap * dilation) - pad;
+                     if (row < 0 || column < 0 || row >= extent || column >= extent)
+                        continue;
+                     accumulator += static_cast<std::int64_t>(
+                        input[channel * spatial + static_cast<Idx>(row) * extent +
+                              static_cast<Idx>(column)]);
+                  }
+                  expected[outputChannel * spatial + outputHeight * extent + outputWidth] =
+                     static_cast<std::int8_t>(std::clamp(accumulator, std::int64_t{-128},
+                                                         std::int64_t{127}));
+               }
+            }
+         }
+
+         auto input_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(input.size()));
+         auto weight_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(weight.size()));
+         auto bias_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(bias.size()));
+         std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
+         std::copy(weight.begin(), weight.end(), alpaka::getPtrNative(weight_h));
+         std::copy(bias.begin(), bias.end(), alpaka::getPtrNative(bias_h));
+         auto input_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(input.size()));
+         auto weight_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(weight.size()));
+         auto bias_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(bias.size()));
+         auto output_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(expected.size()));
+         const Idx scratchBytes = SOFIE::kQuantizedCudaLtMaxWorkspaceBytes + (1u << 20);
+         auto scratch_d = alpaka::allocBuf<std::uint8_t, Idx>(device, Ext1D::all(scratchBytes));
+         alpaka::memcpy(queue, input_d, input_h);
+         alpaka::memcpy(queue, weight_d, weight_h);
+         alpaka::memcpy(queue, bias_d, bias_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedConvolutionInvocation params{};
+         params.batch = 1;
+         params.inputChannels = inputChannels;
+         params.inputHeight = extent;
+         params.inputWidth = extent;
+         params.outputChannels = outputChannels;
+         params.outputHeight = extent;
+         params.outputWidth = extent;
+         params.kernelHeight = kernel;
+         params.kernelWidth = kernel;
+         params.groups = 1;
+         params.strideHeight = 1;
+         params.strideWidth = 1;
+         params.dilationHeight = dilation;
+         params.dilationWidth = dilation;
+         params.padTop = pad;
+         params.padLeft = pad;
+         params.matrix.m = spatial;
+         params.matrix.n = outputChannels;
+         params.matrix.k = inputChannels * kernel * kernel;
+         params.matrix.logicalM = spatial;
+         params.matrix.logicalN = outputChannels;
+         params.matrix.logicalK = inputChannels * kernel * kernel;
+         params.matrix.inputScale = 1.0;
+         params.matrix.weightScale = 1.0;
+         params.matrix.biasScale = 1.0;
+         params.matrix.outputScale = 1.0;
+         params.matrix.hasBias = true;
+         params.matrix.inputCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.matrix.outputCarrier = SOFIE::EQuantizedOutputCarrier::Int8;
+         params.matrix.epilogueMode = SOFIE::EQuantizedEpilogueMode::Quantized;
+
+         SOFIE::QuantizedGemmCudaLtState state;
+         SOFIE::QuantizedCudaScratchView scratch{
+            reinterpret_cast<std::byte *>(alpaka::getPtrNative(scratch_d)),
+            static_cast<std::size_t>(scratchBytes)};
+         SOFIE::QuantizedConvCudaLt_Call(
+            state, scratch, alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(output_d), alpaka::getPtrNative(input_d),
+            alpaka::getPtrNative(weight_d), alpaka::getPtrNative(bias_d), nullptr, params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto output_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, output_h, output_d);
+         alpaka::wait(queue);
+         const auto *actual = alpaka::getPtrNative(output_h);
+         for (Idx index = 0; index < expected.size(); ++index)
+            EXPECT_EQ(static_cast<int>(actual[index]), static_cast<int>(expected[index]))
+               << "index=" << index;
       #endif
    }
 }

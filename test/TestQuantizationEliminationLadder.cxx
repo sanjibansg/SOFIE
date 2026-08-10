@@ -221,3 +221,69 @@ TEST(NativeFP8MatMulCodegen, RegionsLowerToCublasLtFP8)
          << header << " still emits an FP32 BLAS call";
    }
 }
+
+// Reads a generated header, or fails the calling test with the name that could not be opened.
+static std::string ReadGeneratedHeader(const char *header)
+{
+   std::ifstream in(header);
+   EXPECT_TRUE(in.good()) << "cannot open " << header;
+   return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+// An adopted run that reaches its boundary through movement: the region writes the codes at
+// the head, the Transpose permutes them, and every boundary the run passed is gone. Asserted
+// on the generated text because the values are identical either way.
+TEST(OutputAdoptionCodegen, DeepenedRunIsCarriedByTheTranspose)
+{
+   const std::string code =
+      ReadGeneratedHeader("ONNX_QDQ_AttentionChain_FromONNX_GPU_ALPAKA.hxx");
+
+   // Both projections and the score MatMul. A run that swallows a boundary the score MatMul
+   // reads through drops that region instead, which shows up here as a missing call.
+   EXPECT_EQ(SOFIE_TEST::CountOccurrences(code, "QuantizedGemmCudaLt_Call"), 3U)
+      << "a region stopped lowering: the run and its consumer are contending for one boundary";
+
+   // The projection tails carry four fake-quant pairs between them and keep none: the head is
+   // written as codes and the run moves those codes to the tensor attention reads.
+   EXPECT_EQ(SOFIE_TEST::CountOccurrences(code, "struct QuantizeLinearKernel"), 0U)
+      << "a boundary on an adopted run survived as a kernel";
+   EXPECT_EQ(SOFIE_TEST::CountOccurrences(code, "struct DequantizeLinearKernel"), 0U)
+      << "a boundary on an adopted run survived as a kernel";
+   EXPECT_EQ(SOFIE_TEST::CountOccurrences(code, "struct TransposeKernel"), 2U)
+      << "the movement run must stay emitted; only its operands change";
+
+   // One statement per hop names both ends, so this reads the rewire directly: the Transpose
+   // takes the region's carrier and writes the boundary tensor the run took over.
+   auto transposeCarries = [&code](const std::string &head, const std::string &target) {
+      for (std::size_t at = code.find("transposeKernel_"); at != std::string::npos;
+           at = code.find("transposeKernel_", at + 1)) {
+         const std::string statement = code.substr(at, 400);
+         if (statement.find("deviceBuf_" + head) != std::string::npos &&
+             statement.find("deviceBuf_" + target) != std::string::npos)
+            return true;
+      }
+      return false;
+   };
+   EXPECT_TRUE(transposeCarries("q_heads_q", "q_t_q"))
+      << "the q Transpose is not reading the adopted carrier and writing the run's target";
+   EXPECT_TRUE(transposeCarries("k_heads_q", "k_t_q"))
+      << "the k Transpose is not reading the adopted carrier and writing the run's target";
+}
+
+// The same walk on a run whose two boundaries name grids one octave apart. The coarse grid's
+// points lie on the fine one, so a single encode cannot reproduce the pair and the crossing
+// boundary has to survive.
+TEST(OutputAdoptionCodegen, GridCrossingKeepsItsBoundary)
+{
+   const std::string code =
+      ReadGeneratedHeader("ONNX_QDQ_GridCrossing_FromONNX_GPU_ALPAKA.hxx");
+
+   EXPECT_EQ(SOFIE_TEST::CountOccurrences(code, "QuantizedGemmCudaLt_Call"), 2U)
+      << "a projection stopped lowering across the grid crossing";
+   EXPECT_EQ(SOFIE_TEST::CountOccurrences(code, "struct QuantizeLinearKernel"), 1U)
+      << "the unsigned boundary at the finer step was collapsed; the run would round twice";
+   // The first region hands the crossing a fake-quant float rather than codes, which is what
+   // refusing to deepen means here.
+   EXPECT_NE(code.find("deviceBuf_h_dq"), std::string::npos)
+      << "the region before the crossing does not emit its dequantized output";
+}
