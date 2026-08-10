@@ -80,6 +80,7 @@ public:
       }
       fInputTensorNames = { fNX };
       fOutputTensorNames = { fNY };
+      fKind = OperatorKind::POOL;
    }
 
    // return input type (defined abstract in ROperator class )
@@ -281,20 +282,20 @@ public:
       assert(fAttrKernelShape.size() == 3);
       // find lower bounds of filtered area
       int hmin = - fAttrPads[0];   // minimum lower bound value of filter area
-      int hmax = fShapeX[2] + fAttrPads[1] - fAttrKernelShape[0] +1;  // maximum lower bound value + 1
+      int hmax = fShapeX[2] + fAttrPads[fDim] - fAttrKernelShape[0] +1;  // maximum lower bound value + 1
       int wmin,wmax,dmin,dmax;
 
       if(fDim >= 2){
-         wmin = - fAttrPads[2];   // minimum lower bound value of filter area
-         wmax = fShapeX[3] + fAttrPads[3] - fAttrKernelShape[1] +1;  // maximum lower bound value + 1
+         wmin = - fAttrPads[1];   // minimum lower bound value of filter area
+         wmax = fShapeX[3] + fAttrPads[fDim + 1] - fAttrKernelShape[1] +1;  // maximum lower bound value + 1
       }
       else{
          wmin=1;
          wmax=1;
       }
       if(fDim == 3){
-         dmin = - fAttrPads[4];   // minimum lower bound value of filter area
-         dmax = fShapeX[4] + fAttrPads[5] - fAttrKernelShape[2] +1;  // maximum lower bound value + 1
+         dmin = - fAttrPads[2];   // minimum lower bound value of filter area
+         dmax = fShapeX[4] + fAttrPads[fDim + 2] - fAttrKernelShape[2] +1;  // maximum lower bound value + 1
       }
       else{
          dmin=1;
@@ -471,6 +472,209 @@ public:
       // end scope
       out << SP << "}\n";
 
+
+      return out.str();
+   }
+
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      if (fShapeX.empty() || fShapeY.empty())
+         throw std::runtime_error("SOFIE Pool called to Generate without being initialized first");
+      if (fPoolMode != MaxPool && fPoolMode != AveragePool)
+         return "";
+
+      const bool isAvg = (fPoolMode == AveragePool);
+      bool doPadding = false;
+      for (auto & e : fAttrPads) doPadding |= (e > 0);
+      // count_include_pad == 0 with padding: divide by the in-bounds cells counted
+      // at run time; otherwise by the constant kernel area (CPU Generate above).
+      const bool runtimeCount = isAvg && fAttrCountIncludePad == 0 && doPadding;
+
+      const std::string kname = (isAvg ? "AvgPoolKernel_" : "MaxPoolKernel_") + opName;
+
+      // Mode dependent fragments, so the index math stays shared across 1D/2D/3D.
+      auto emitInit = [&](const std::string & ind) {
+         std::string s;
+         if (isAvg) {
+            s += ind + "T value = static_cast<T>(0);\n";
+            if (runtimeCount) s += ind + "int count = 0;\n";
+         } else {
+            s += ind + "T value = static_cast<T>(-INFINITY);\n";
+         }
+         return s;
+      };
+      auto emitAccum = [&](const std::string & ind, const std::string & xidx) {
+         std::string s;
+         if (isAvg) {
+            s += ind + "value += X[" + xidx + "];\n";
+            if (runtimeCount) s += ind + "++count;\n";
+         } else {
+            s += ind + "T xv = X[" + xidx + "];\n";
+            s += ind + "if (xv > value) value = xv;\n";
+         }
+         return s;
+      };
+      auto emitFinal = [&](const std::string & ind, const std::string & area) {
+         std::string s;
+         if (isAvg)
+            s += ind + "value /= static_cast<T>(" + (runtimeCount ? std::string("count") : area) + ");\n";
+         return s;
+      };
+
+      std::stringstream op;
+      op << "\n//------ " << (isAvg ? "AVGPOOL" : "MAXPOOL") << "_KERNEL_ALPAKA\n";
+      op << SP << "struct " << kname << " {\n";
+      op << SP << SP << "template<typename TAcc, typename T>\n";
+      op << SP << SP << "ALPAKA_FN_ACC void operator()(\n";
+      op << SP << SP << SP << "TAcc const& acc,\n";
+      op << SP << SP << SP << "T const* __restrict__ X,\n";
+      op << SP << SP << SP << "T* __restrict__ Y,\n";
+      op << SP << SP << SP << "std::size_t const totalOut) const {\n\n";
+
+      if (fDim == 1) {
+         op << SP << SP << SP << "constexpr int H        = " << fShapeX[2]          << ";\n";
+         op << SP << SP << SP << "constexpr int OH       = " << fShapeY[2]          << ";\n";
+         op << SP << SP << SP << "constexpr int kh       = " << fAttrKernelShape[0] << ";\n";
+         op << SP << SP << SP << "constexpr int sh       = " << fAttrStrides[0]     << ";\n";
+         op << SP << SP << SP << "constexpr int pad_top  = " << fAttrPads[0]        << ";\n\n";
+
+         op << SP << SP << SP << "auto const tid    = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+         op << SP << SP << SP << "auto const stride = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+
+         op << SP << SP << SP << "for (std::size_t idx = tid; idx < totalOut; idx += stride) {\n";
+         op << SP << SP << SP << SP << "int oh = idx % OH;\n";
+         op << SP << SP << SP << SP << "int nc = idx / OH;\n";
+         op << SP << SP << SP << SP << "int i  = oh * sh - pad_top;\n";
+         op << SP << SP << SP << SP << "std::size_t base = static_cast<std::size_t>(nc) * H;\n\n";
+         op << emitInit(SP + SP + SP + SP);
+         op << SP << SP << SP << SP << "for (int l = i; l < i + kh; ++l) {\n";
+         op << SP << SP << SP << SP << SP << "if (l < 0 || l >= H) continue;\n";
+         op << emitAccum(SP + SP + SP + SP + SP, "base + l");
+         op << SP << SP << SP << SP << "}\n";
+         op << emitFinal(SP + SP + SP + SP, "kh");
+         op << SP << SP << SP << SP << "Y[idx] = value;\n";
+         op << SP << SP << SP << "}\n";
+      }
+      else if (fDim == 2) {
+         op << SP << SP << SP << "constexpr int H        = " << fShapeX[2]          << ";\n";
+         op << SP << SP << SP << "constexpr int W        = " << fShapeX[3]          << ";\n";
+         op << SP << SP << SP << "constexpr int OH       = " << fShapeY[2]          << ";\n";
+         op << SP << SP << SP << "constexpr int OW       = " << fShapeY[3]          << ";\n";
+         op << SP << SP << SP << "constexpr int kh       = " << fAttrKernelShape[0] << ";\n";
+         op << SP << SP << SP << "constexpr int kw       = " << fAttrKernelShape[1] << ";\n";
+         op << SP << SP << SP << "constexpr int sh       = " << fAttrStrides[0]     << ";\n";
+         op << SP << SP << SP << "constexpr int sw       = " << fAttrStrides[1]     << ";\n";
+         op << SP << SP << SP << "constexpr int pad_top  = " << fAttrPads[0]        << ";\n";
+         op << SP << SP << SP << "constexpr int pad_left = " << fAttrPads[2]        << ";\n\n";
+
+         op << SP << SP << SP << "auto const tid    = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+         op << SP << SP << SP << "auto const stride = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+
+         op << SP << SP << SP << "for (std::size_t idx = tid; idx < totalOut; idx += stride) {\n";
+         op << SP << SP << SP << SP << "int ow = idx % OW;\n";
+         op << SP << SP << SP << SP << "int oh = (idx / OW) % OH;\n";
+         op << SP << SP << SP << SP << "int nc = idx / (OH * OW);\n";
+         op << SP << SP << SP << SP << "int i  = oh * sh - pad_top;\n";
+         op << SP << SP << SP << SP << "int j  = ow * sw - pad_left;\n";
+         op << SP << SP << SP << SP << "std::size_t base = static_cast<std::size_t>(nc) * (H * W);\n\n";
+         op << emitInit(SP + SP + SP + SP);
+         op << SP << SP << SP << SP << "for (int l = i; l < i + kh; ++l) {\n";
+         op << SP << SP << SP << SP << SP << "if (l < 0 || l >= H) continue;\n";
+         op << SP << SP << SP << SP << SP << "for (int m = j; m < j + kw; ++m) {\n";
+         op << SP << SP << SP << SP << SP << SP << "if (m < 0 || m >= W) continue;\n";
+         op << emitAccum(SP + SP + SP + SP + SP + SP, "base + l * W + m");
+         op << SP << SP << SP << SP << SP << "}\n";
+         op << SP << SP << SP << SP << "}\n";
+         op << emitFinal(SP + SP + SP + SP, "kh * kw");
+         op << SP << SP << SP << SP << "Y[idx] = value;\n";
+         op << SP << SP << SP << "}\n";
+      }
+      else if (fDim == 3) {
+         op << SP << SP << SP << "constexpr int H         = " << fShapeX[2]          << ";\n";
+         op << SP << SP << SP << "constexpr int W         = " << fShapeX[3]          << ";\n";
+         op << SP << SP << SP << "constexpr int D         = " << fShapeX[4]          << ";\n";
+         op << SP << SP << SP << "constexpr int OH        = " << fShapeY[2]          << ";\n";
+         op << SP << SP << SP << "constexpr int OW        = " << fShapeY[3]          << ";\n";
+         op << SP << SP << SP << "constexpr int OD        = " << fShapeY[4]          << ";\n";
+         op << SP << SP << SP << "constexpr int kh        = " << fAttrKernelShape[0] << ";\n";
+         op << SP << SP << SP << "constexpr int kw        = " << fAttrKernelShape[1] << ";\n";
+         op << SP << SP << SP << "constexpr int kd        = " << fAttrKernelShape[2] << ";\n";
+         op << SP << SP << SP << "constexpr int sh        = " << fAttrStrides[0]     << ";\n";
+         op << SP << SP << SP << "constexpr int sw        = " << fAttrStrides[1]     << ";\n";
+         op << SP << SP << SP << "constexpr int sd        = " << fAttrStrides[2]     << ";\n";
+         op << SP << SP << SP << "constexpr int pad_top   = " << fAttrPads[0]        << ";\n";
+         op << SP << SP << SP << "constexpr int pad_left  = " << fAttrPads[2]        << ";\n";
+         op << SP << SP << SP << "constexpr int pad_front = " << fAttrPads[4]        << ";\n\n";
+
+         op << SP << SP << SP << "auto const tid    = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+         op << SP << SP << SP << "auto const stride = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+
+         op << SP << SP << SP << "for (std::size_t idx = tid; idx < totalOut; idx += stride) {\n";
+         op << SP << SP << SP << SP << "int od = idx % OD;\n";
+         op << SP << SP << SP << SP << "int ow = (idx / OD) % OW;\n";
+         op << SP << SP << SP << SP << "int oh = (idx / (OD * OW)) % OH;\n";
+         op << SP << SP << SP << SP << "int nc = idx / (OD * OW * OH);\n";
+         op << SP << SP << SP << SP << "int i  = oh * sh - pad_top;\n";
+         op << SP << SP << SP << SP << "int j  = ow * sw - pad_left;\n";
+         op << SP << SP << SP << SP << "int k  = od * sd - pad_front;\n";
+         op << SP << SP << SP << SP << "std::size_t base = static_cast<std::size_t>(nc) * (H * W * D);\n\n";
+         op << emitInit(SP + SP + SP + SP);
+         op << SP << SP << SP << SP << "for (int l = i; l < i + kh; ++l) {\n";
+         op << SP << SP << SP << SP << SP << "if (l < 0 || l >= H) continue;\n";
+         op << SP << SP << SP << SP << SP << "for (int m = j; m < j + kw; ++m) {\n";
+         op << SP << SP << SP << SP << SP << SP << "if (m < 0 || m >= W) continue;\n";
+         op << SP << SP << SP << SP << SP << SP << "for (int p = k; p < k + kd; ++p) {\n";
+         op << SP << SP << SP << SP << SP << SP << SP << "if (p < 0 || p >= D) continue;\n";
+         op << emitAccum(SP + SP + SP + SP + SP + SP + SP, "base + l * (W * D) + m * D + p");
+         op << SP << SP << SP << SP << SP << SP << "}\n";
+         op << SP << SP << SP << SP << SP << "}\n";
+         op << SP << SP << SP << SP << "}\n";
+         op << emitFinal(SP + SP + SP + SP, "kh * kw * kd");
+         op << SP << SP << SP << SP << "Y[idx] = value;\n";
+         op << SP << SP << SP << "}\n";
+      }
+      else {
+         return "";
+      }
+
+      op << SP << SP << "}\n";
+      op << SP << "};\n";
+
+      return op.str();
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      if (fPoolMode == MaxPool)
+         return SP + "MaxPoolKernel_" + opName + " maxPoolKernel_" + opName + ";\n";
+      if (fPoolMode == AveragePool)
+         return SP + "AvgPoolKernel_" + opName + " avgPoolKernel_" + opName + ";\n";
+      return "";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string opName) override {
+      opName = "op_" + opName;
+      if (fShapeX.empty() || fShapeY.empty())
+         throw std::runtime_error("SOFIE Pool called to Generate without being initialized first");
+      if (fPoolMode != MaxPool && fPoolMode != AveragePool)
+         return "";
+
+      const bool isAvg = (fPoolMode == AveragePool);
+      std::size_t totalOut = ConvertShapeToLength(fShapeY);
+      std::string kname = (isAvg ? "avgPoolKernel_" : "maxPoolKernel_") + opName;
+
+      std::stringstream out;
+      out << "\n//------ " << (isAvg ? "AVGPOOL" : "MAXPOOL") << "_GPU_ALPAKA\n";
+      out << SP << "auto const elementsPerThread_" << fNY << " = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_"   << fNY << " = Vec::all(Idx{" << totalOut << "});\n";
+      out << SP << "auto const workDiv_" << fNY << " = sofie_workdiv(elementsPerGrid_" << fNY << ");\n";
+
+      out << SP << "auto task_" << fNY << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNY
+          << ", " << kname
+          << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
+          << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+          << ", static_cast<Idx>(" << totalOut << "));\n";
+      out << SP << "alpaka::enqueue(queue, task_" << fNY << ");\n";
 
       return out.str();
    }

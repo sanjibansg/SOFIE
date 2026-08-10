@@ -29,7 +29,6 @@ jobs:
   benchmark:
     name: Benchmark Comparison (H100)
     runs-on: ml4ep-h100
-    container: registry.cern.ch/ngt/lxplus-like:9
     timeout-minutes: 120
 
     steps:
@@ -41,11 +40,11 @@ jobs:
           set -euo pipefail
 
           if [ -f "${{ env.LCG_VIEW }}/setup.sh" ]; then
-            source "${{ env.LCG_VIEW }}/setup.sh"
+            set +u; source "${{ env.LCG_VIEW }}/setup.sh"; set -u
           else
             echo "LCG view not found — installing from dnf"
-            dnf install -y epel-release
-            dnf install -y cmake ninja-build gcc-c++ python3 git \
+            sudo dnf install -y epel-release
+            sudo dnf install -y cmake ninja-build gcc-c++ python3 git \
                            protobuf-devel openblas-devel
           fi
 
@@ -56,9 +55,9 @@ jobs:
             echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
             echo "CUDA_HOME=/usr/local/cuda" >> "$GITHUB_ENV"
           else
-            dnf config-manager --add-repo \
+            sudo dnf config-manager --add-repo \
               https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
-            dnf install -y cuda-compiler-12-4 cuda-cudart-devel-12-4 cuda-libraries-devel-12-4
+            sudo dnf install -y cuda-compiler-12-4 cuda-cudart-devel-12-4 cuda-libraries-devel-12-4
             echo "/usr/local/cuda-12.4/bin" >> "$GITHUB_PATH"
             echo "CUDA_HOME=/usr/local/cuda-12.4" >> "$GITHUB_ENV"
           fi

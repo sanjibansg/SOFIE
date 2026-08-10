@@ -49,7 +49,8 @@ enum class OperatorKind {
    QUANTIZED_CONV=31,
    UNARY_SOFTPLUS=28,
    UNARY_ATAN=29,
-   UNARY_FLOOR=30
+   UNARY_FLOOR=30,
+   POOL=32
 };
 
 inline const char* toString(OperatorKind kind) {

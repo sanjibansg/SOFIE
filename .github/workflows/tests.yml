@@ -1,48 +1,42 @@
 name: Unit Tests
-
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
-
 concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
-
 env:
   LCG_VIEW:   /cvmfs/sft.cern.ch/lcg/views/LCG_106a/x86_64-el9-gcc13-opt
   CUDA_CVMFS: /cvmfs/sft.cern.ch/lcg/contrib/cuda/12.4/x86_64-el9
   CUDA_ARCH:  "90"
   BUILD_TYPE: Release
   DEPS_CACHE: /tmp/sofie-cmake-deps
-
 jobs:
   gpu-tests:
     name: GPU Unit Tests (NVIDIA/H100)
     runs-on: ml4ep-h100
-    container: registry.cern.ch/ngt/lxplus-like:9
+    container:
+      image: registry.cern.ch/ngt/lxplus-like:9
+      options: --user 0:0
     timeout-minutes: 60
-
     steps:
       - name: GPU check
         run: nvidia-smi
-
       - name: Setup build environment
         run: |
           set -euo pipefail
-
           # LCG view (cmake, gcc-13, protobuf, openblas)
           if [ -f "${{ env.LCG_VIEW }}/setup.sh" ]; then
-            source "${{ env.LCG_VIEW }}/setup.sh"
+            set +u; source "${{ env.LCG_VIEW }}/setup.sh"; set -u
           else
             echo "LCG view not found — installing from dnf"
             dnf install -y epel-release
             dnf install -y cmake ninja-build gcc-c++ python3 git \
                            protobuf-devel openblas-devel
           fi
-
           # CUDA toolkit (nvcc + headers)
           if [ -x "${{ env.CUDA_CVMFS }}/bin/nvcc" ]; then
             echo "${{ env.CUDA_CVMFS }}/bin" >> "$GITHUB_PATH"
@@ -58,7 +52,6 @@ jobs:
             echo "/usr/local/cuda-12.4/bin" >> "$GITHUB_PATH"
             echo "CUDA_HOME=/usr/local/cuda-12.4" >> "$GITHUB_ENV"
           fi
-
           # GTest
           dnf install -y gtest-devel 2>/dev/null || \
           dnf install -y googletest-devel 2>/dev/null || (
@@ -69,21 +62,17 @@ jobs:
             cmake --build gtest-build -j$(nproc)
             cmake --install gtest-build
           )
-
           echo "PATH=$PATH"                               >> "$GITHUB_ENV"
           echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"    >> "$GITHUB_ENV"
           echo "CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH:-}" >> "$GITHUB_ENV"
-
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Cache FetchContent dependencies
         uses: actions/cache@v4
         with:
           path: ${{ env.DEPS_CACHE }}
           key: cmake-deps-tests-${{ hashFiles('test/CMakeLists.txt') }}
           restore-keys: cmake-deps-tests-
-
       - name: Configure
         run: |
           cmake -B build -S . \
@@ -94,17 +83,14 @@ jobs:
             -DALPAKA_BACKEND=cuda \
             "-DCMAKE_CUDA_ARCHITECTURES=${{ env.CUDA_ARCH }}" \
             "-DFETCHCONTENT_BASE_DIR=${{ env.DEPS_CACHE }}"
-
       - name: Build tests
         run: |
           cmake --build build \
             --target TestCustomModelsFromONNXForAlpakaCuda \
             -j$(nproc)
-
       - name: Run tests
         working-directory: build
         run: ctest --output-on-failure -j1
-
       - name: Upload test log
         if: always()
         uses: actions/upload-artifact@v4
