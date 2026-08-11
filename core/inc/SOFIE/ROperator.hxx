@@ -81,6 +81,7 @@ public:
    virtual std::string Header() { return "";}
    virtual std::string GetFusableOutputTensorName() { return "";}
    virtual std::string GetBlasConfig() { return ""; }
+   virtual bool UsesBatchedGemm() { return false; }
    virtual void UpdateFusableTensorName(std::string, const std::function<void(const std::string&)>& removal_func){ return;};
 
    // Elementwise kernel fusion interface

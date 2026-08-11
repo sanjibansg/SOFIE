@@ -889,22 +889,22 @@ public:
       // Step 3 + 4: Im2Col then GEMM — structure differs for grouped vs non-grouped
       // -----------------------------------------------------------------------
       if (fAttrGroup == 1) {
-         // Non-grouped: single im2col per batch, then GEMM
-         out << SP << SP << "// Step 3: im2col\n";
+         // batched gives each sample its own _xcol slice, otherwise all reuse slice 0
+         out << SP << SP << "std::size_t const col_offset = fBatchedGemm ? n * " << colElements << "u : 0u;\n\n";
          out << SP << SP << "{\n";
          out << SP << SP << SP << "auto const elementsPerThread_im2col = Vec::all(static_cast<Idx>(1));\n";
          out << SP << SP << SP << "auto const elementsPerGrid_im2col   = Vec::all(Idx{" << colElements << "});\n";
          out << SP << SP << SP << "auto const workDiv_im2col = sofie_workdiv(elementsPerGrid_im2col);\n";
          out << SP << SP << SP << "alpaka::exec<Acc>(queue, workDiv_im2col, im2colKernel_" << opName
             << ", alpaka::getPtrNative(deviceBuf_" << fNX << ") + x_offset"
-            << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+            << ", alpaka::getPtrNative(deviceBuf_" << imcol << ") + col_offset"
             << ", static_cast<Idx>(" << colElements << "));\n";
-         out << SP << SP << SP << "alpaka::wait(queue);\n";
+         out << SP << SP << SP << "if (!fBatchedGemm) alpaka::wait(queue);\n";
          out << SP << SP << "}\n\n";
 
          if (!fNB.empty()) {
                size_t biasElements = gemm_n * gemm_m;
-               out << SP << SP << "// Step 4a: broadcast bias into output slice\n";
+               out << SP << SP << "// broadcast bias into this sample's output slice\n";
                out << SP << SP << "{\n";
                out << SP << SP << SP << "auto const elementsPerThread_bias = Vec::all(static_cast<Idx>(1));\n";
                out << SP << SP << SP << "auto const elementsPerGrid_bias   = Vec::all(Idx{" << biasElements << "});\n";
@@ -913,24 +913,19 @@ public:
                   << ", alpaka::getPtrNative(deviceBuf_" << fNB << ")"
                   << ", alpaka::getPtrNative(deviceBuf_" << fNY << ") + out_offset"
                   << ", static_cast<Idx>(" << biasElements << "));\n";
-               out << SP << SP << SP << "alpaka::wait(queue);\n";
+               out << SP << SP << SP << "if (!fBatchedGemm) alpaka::wait(queue);\n";
                out << SP << SP << "}\n\n";
-               out << SP << SP << "// Step 4b: GEMM beta=1 accumulates onto bias-initialised output\n";
-               out << SP << SP << "blas.matmul('n', 'n', "
-                  << gemm_m << ", " << gemm_n << ", " << gemm_k
-                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << imcol << ")"
-                  << ", alpaka::getPtrNative(deviceBuf_" << convK << ")"
-                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << fNY << ") + out_offset);\n\n";
-         } else {
-               out << SP << SP << "// Step 4: GEMM beta=0 (no bias)\n";
-               out << SP << SP << "blas.matmul('n', 'n', "
-                  << gemm_m << ", " << gemm_n << ", " << gemm_k
-                  << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << imcol << ")"
-                  << ", alpaka::getPtrNative(deviceBuf_" << convK << ")"
-                  << ", 0.0f, alpaka::getPtrNative(deviceBuf_" << fNY << ") + out_offset);\n\n";
          }
-         // Wait for GEMM to finish before next batch overwrites the shared _xcol buffer.
-         out << SP << SP << "alpaka::wait(queue);\n\n";
+
+         out << SP << SP << "if (!fBatchedGemm) {\n";
+         out << SP << SP << SP << "blas.matmul('n', 'n', "
+            << gemm_m << ", " << gemm_n << ", " << gemm_k
+            << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << imcol << ")"
+            << ", alpaka::getPtrNative(deviceBuf_" << convK << ")"
+            << ", " << (fNB.empty() ? "0.0f" : "1.0f")
+            << ", alpaka::getPtrNative(deviceBuf_" << fNY << ") + out_offset);\n";
+         out << SP << SP << SP << "alpaka::wait(queue);\n";
+         out << SP << SP << "}\n\n";
 
       } else {
          // Grouped convolution: im2col and GEMM per group with group-adjusted input pointer.
@@ -985,6 +980,20 @@ public:
       }
 
       out << SP << "}\n"; // end batch loop
+
+      if (fAttrGroup == 1) {
+         std::string convBeta = fNB.empty() ? "0.0f" : "1.0f";
+         out << SP << "if (fBatchedGemm) {\n";
+         out << SP << SP << "alpaka::wait(queue);\n";
+         out << SP << SP << "blas.gemmStridedBatched('n', 'n', "
+            << gemm_m << ", " << gemm_n << ", " << gemm_k << ", 1.0f, "
+            << "alpaka::getPtrNative(deviceBuf_" << imcol << "), " << gemm_m << ", " << colElements << ", "
+            << "alpaka::getPtrNative(deviceBuf_" << convK << "), " << gemm_k << ", 0, "
+            << convBeta << ", alpaka::getPtrNative(deviceBuf_" << fNY << "), "
+            << gemm_m << ", " << gemm_n * gemm_m << ", " << bsize << ");\n";
+         out << SP << SP << "alpaka::wait(queue);\n";
+         out << SP << "}\n";
+      }
       return out.str();
    }
 
@@ -993,7 +1002,39 @@ public:
    std::vector<std::string> GetBlasRoutines() override { return { std::string("Gemm"), std::string("Axpy") }; }
 
 
+   bool UsesBatchedGemm() override { return fAttrGroup == 1; }
+
+   std::string GenerateInitCode_GPU_ALPAKA() override {
+      if (fAttrGroup != 1) return "";
+      if (fShapeX.empty() || fShapeW.empty() || fShapeY.empty()) return "";
+
+      size_t bsize      = fShapeX[0].dim;
+      size_t oDepth     = (fDim > 2) ? fShapeY[2].dim    : 1;
+      size_t oHeight    = (fDim > 1) ? fShapeY[fDim].dim : 1;
+      size_t oWidth     = fShapeY[fDim + 1].dim;
+      size_t kernelSize = fAttrKernelShape[0] * fAttrKernelShape[1] * fAttrKernelShape[2];
+      size_t colElements = fShapeW[1] * kernelSize * oDepth * oHeight * oWidth;
+
+      // _xcol is declared for one sample, batching needs a slice per sample
+      std::stringstream out;
+      out << SP << "if (!fBatchedGemm) {\n";
+      out << SP << SP << "blas.addLayoutConfig(" << BlasLayoutConfig() << ");\n";
+      if (bsize > 1) {
+         out << SP << "} else {\n";
+         out << SP << SP << "deviceBuf_" << imcol << " = alpaka::allocBuf<" << fType
+             << ", size_t>(devAcc, Ext1D::all(Idx{" << bsize * colElements << "}));\n";
+      }
+      out << SP << "}\n";
+      return out.str();
+   }
+
    std::string GetBlasConfig(){
+      // batched path is legacy cuBLAS, the fallback registers its own layout
+      if (fAttrGroup == 1) return "";
+      return BlasLayoutConfig();
+   }
+
+   std::string BlasLayoutConfig(){
       size_t oDepth_  = (fDim > 2) ? fShapeY[2].dim    : 1;
       size_t oHeight_ = (fDim > 1) ? fShapeY[fDim].dim : 1;
       size_t oWidth_  = fShapeY[fDim + 1].dim;
