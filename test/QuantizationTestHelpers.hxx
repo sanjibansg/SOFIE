@@ -11,6 +11,7 @@
 
 #include "SOFIE/RModel.hxx"
 #include "SOFIE/RQuantization.hxx"
+#include "SOFIE/RQuantization_Pipeline.hxx"
 
 #include "gtest/gtest.h"
 
@@ -84,7 +85,7 @@ FindRegion(const SOFIE::QuantizationPipelineReport &report, const std::string &o
 // ALPAKA build here exactly as the generation entry point would.
 inline const SOFIE::QuantizationPipelineReport &AlpakaPipelineReport(SOFIE::RModel &model)
 {
-   model.BuildLoweredOperatorViewForDiagnostics(SOFIE::EQuantizedBackend::ALPAKA);
+   SOFIE::BuildLoweredViewForDiagnostics(model, SOFIE::EQuantizedBackend::ALPAKA);
    return model.GetQuantizationPipelineReport();
 }
 

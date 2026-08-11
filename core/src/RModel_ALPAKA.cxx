@@ -17,6 +17,7 @@
 #include "SOFIE/ROperator_Gemm.hxx"
 #include "SOFIE/ROperator_LeakyRelu.hxx"
 #include "SOFIE/ROperator_Relu.hxx"
+#include "SOFIE/RQuantization_Pipeline.hxx"
 
 namespace SOFIE {
 
@@ -231,8 +232,6 @@ void RModel::GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA()
 
 void RModel::GenerateGPU_ALPAKA_Buffers()
 {
-   fQuantizedMemoryDiagnostics.graphValuePeakBytes = 0;
-   fQuantizedMemoryDiagnostics.graphValueUnpooledBytes = 0;
    fAlpakaIntermediateDeviceBytes = 0;
    if (!fIntermediateTensorInfos.empty()) {
       struct TensorUse {
@@ -276,63 +275,30 @@ void RModel::GenerateGPU_ALPAKA_Buffers()
          aliases.insert(origin);
       }
       std::unordered_set<std::string> modelOutputs(fOutputTensorNames.begin(), fOutputTensorNames.end());
-      std::unordered_set<std::string> lowPrecisionValues;
-      for (const auto &[name, info] : fQuantizationState.lowPrecisionTensorInfos) {
-         (void)info;
-         lowPrecisionValues.insert(UTILITY::Clean_name(name));
-      }
-
-      auto storageFor = [&](const std::string &name, ETensorType type) {
-         if (auto info = fQuantizationState.lowPrecisionTensorInfos.find(name);
-             info != fQuantizationState.lowPrecisionTensorInfos.end())
-            return QuantizedStorageTypeForLowPrecisionCarrier(info->second.carrier);
-         switch (type) {
-         case ETensorType::FLOAT: return EQuantizedStorageType::FloatCarrier;
-         case ETensorType::FLOAT16: return EQuantizedStorageType::Float16Carrier;
-         case ETensorType::INT8: return EQuantizedStorageType::Int8;
-         case ETensorType::UINT8: return EQuantizedStorageType::UInt8;
-         case ETensorType::FLOAT8E4M3FN:
-         case ETensorType::FLOAT8E4M3FNUZ: return EQuantizedStorageType::FP8E4M3;
-         case ETensorType::FLOAT8E5M2:
-         case ETensorType::FLOAT8E5M2FNUZ: return EQuantizedStorageType::FP8E5M2;
-         default: return EQuantizedStorageType::UNDEFINED;
-         }
-      };
-      auto isPhysicalCarrier = [](ETensorType type) {
-         return type == ETensorType::INT8 || type == ETensorType::UINT8 ||
-                type == ETensorType::FLOAT16 || type == ETensorType::FLOAT8E4M3FN ||
-                type == ETensorType::FLOAT8E4M3FNUZ || type == ETensorType::FLOAT8E5M2 ||
-                type == ETensorType::FLOAT8E5M2FNUZ;
-      };
-
-      std::vector<QuantizedCarrierLifetime> carrierLifetimes;
+      // Tensors the generator would allocate individually, offered to the pass in case it
+      // can place them in one arena instead.
+      std::vector<PoolableTensor> poolable;
       for (const auto &[name, info] : fIntermediateTensorInfos) {
          const auto use = tensorUses.find(name);
          if (use == tensorUses.end() || modelOutputs.count(name) || aliases.count(name) ||
              fFusionIntermediateTensors.count(name))
             continue;
-         if (!isPhysicalCarrier(info.type) && lowPrecisionValues.count(name) == 0)
-            continue;
          const auto elementBytes = GetTypeSize(info.type);
          if (elementBytes == 0)
             continue;
-         carrierLifetimes.push_back({
-            name, storageFor(name, info.type), ConvertShapeToLength(info.shape) * elementBytes,
-            256, use->second.first, use->second.last});
+         poolable.push_back({name, info.type, ConvertShapeToLength(info.shape) * elementBytes,
+                             use->second.first, use->second.last});
       }
-      const auto carrierPlan = PlanQuantizedCarrierMemory(std::move(carrierLifetimes));
-      fQuantizedMemoryDiagnostics.graphValuePeakBytes = carrierPlan.peakBytes;
-      fQuantizedMemoryDiagnostics.graphValueUnpooledBytes = carrierPlan.unpooledBytes;
-      fAlpakaIntermediateDeviceBytes += carrierPlan.peakBytes;
-      std::unordered_map<std::string, QuantizedCarrierAllocation> carrierAllocations;
-      for (const auto &allocation : carrierPlan.allocations)
-         carrierAllocations.emplace(allocation.lifetime.tensorName, allocation);
+      PooledStoragePlan pooled;
+      if (auto *pass = InstalledCodegenPass())
+         pooled = pass->PlanPooledStorage(*this, poolable);
+      fAlpakaIntermediateDeviceBytes += pooled.arenaBytes;
 
       std::string tensorDeclarationBlock;
-      if (carrierPlan.peakBytes != 0) {
+      if (pooled.arenaBytes != 0) {
          tensorDeclarationBlock +=
-            "BufUI81D quantizedGraphValueArena = alpaka::allocBuf<std::uint8_t, size_t>"
-            "(devAcc, Ext1D::all(Idx{" + std::to_string(carrierPlan.peakBytes) + "}));\n";
+            "BufUI81D " + pooled.arenaName + " = alpaka::allocBuf<std::uint8_t, size_t>"
+            "(devAcc, Ext1D::all(Idx{" + std::to_string(pooled.arenaBytes) + "}));\n";
       }
 
       for (const auto &[name, info] : fIntermediateTensorInfos) {
@@ -343,10 +309,10 @@ void RModel::GenerateGPU_ALPAKA_Buffers()
             continue;
 
          const auto length = ConvertShapeToLength(info.shape);
-         if (auto allocation = carrierAllocations.find(name); allocation != carrierAllocations.end()) {
-            const auto offset = std::to_string(allocation->second.offset);
+         if (auto allocation = pooled.offsets.find(name); allocation != pooled.offsets.end()) {
+            const auto offset = std::to_string(allocation->second);
             const auto extent = "Ext1D::all(Idx{" + std::to_string(length) + "})";
-            const auto pointer = "alpaka::getPtrNative(quantizedGraphValueArena) + " + offset;
+            const auto pointer = "alpaka::getPtrNative(" + pooled.arenaName + ") + " + offset;
             if (info.type == ETensorType::FLOAT) {
                tensorDeclarationBlock += "ViewF1D deviceBuf_" + name + "{reinterpret_cast<float *>(" +
                                          pointer + "), devAcc, " + extent + "};\n";
@@ -864,35 +830,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    GenerateInitializedTensorInfo_GPU_ALPAKA();
    GenerateGPU_ALPAKA_Buffers();
    GenerateOperatorDeclarations();
-   std::size_t quantizedCudaScratchBytes = 0;
-   std::size_t quantizedWorkspaceCapacityBytes = 0;
-   for (const auto &[opIndex, backendPlans] : fQuantizationState.loweringPlans) {
-      (void)opIndex;
-      const auto planIt = backendPlans.find(EQuantizedBackend::ALPAKA);
-      if (planIt == backendPlans.end() || !IsQuantizedLoweringAvailable(planIt->second.status))
-         continue;
-      quantizedCudaScratchBytes = std::max(
-         quantizedCudaScratchBytes, QuantizedPackedReusableScratchBytes(planIt->second.resources));
-      for (const auto &resource : planIt->second.resources.entries) {
-         if (resource.role == EQuantizedResourceRole::BackendWorkspace)
-            quantizedWorkspaceCapacityBytes = std::max(quantizedWorkspaceCapacityBytes, resource.bytes);
-      }
-   }
-   fQuantizedMemoryDiagnostics.persistentCarrierBytes = 0;
-   for (const auto &[name, storage] : fQuantizationState.tensorStorages) {
-      (void)name;
-      if (storage.residentBackend != EQuantizedBackend::ALPAKA)
-         continue;
-      fQuantizedMemoryDiagnostics.persistentCarrierBytes +=
-         ConvertShapeToLength(storage.shape) * QuantizedStorageElementSize(storage.storageType);
-   }
-   fQuantizedMemoryDiagnostics.reusableScratchPeakBytes = quantizedCudaScratchBytes;
-   fQuantizedMemoryDiagnostics.workspaceCapacityBytes = quantizedWorkspaceCapacityBytes;
-   fQuantizedMemoryDiagnostics.selectedWorkspaceBytes = 0;
-   if (quantizedCudaScratchBytes != 0) {
-      fGC += "SOFIE::QuantizedCudaScratchArena quantizedCudaScratchArena{" +
-             std::to_string(quantizedCudaScratchBytes) + "};\n";
-   }
+   if (auto *pass = InstalledCodegenPass())
+      fGC += pass->ContributeSessionDeclarations(*this, ECodegenTarget::ALPAKA);
    // inject profiling session data member
    if (fProfile) {
       fGC += RModelProfilerGPU::GenerateSessionMembers();
@@ -992,42 +931,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
    GenerateOutput_GPU_ALPAKA();
 
-   fGC += "\n   SOFIE::QuantizedMemoryDiagnostics GetQuantizedMemoryDiagnostics() const {\n";
-   fGC += "      SOFIE::QuantizedMemoryDiagnostics result{};\n";
-   fGC += "      result.persistentCarrierBytes = " +
-          std::to_string(fQuantizedMemoryDiagnostics.persistentCarrierBytes) + ";\n";
-   fGC += "      result.graphValuePeakBytes = " +
-          std::to_string(fQuantizedMemoryDiagnostics.graphValuePeakBytes) + ";\n";
-   fGC += "      result.graphValueUnpooledBytes = " +
-          std::to_string(fQuantizedMemoryDiagnostics.graphValueUnpooledBytes) + ";\n";
-   fGC += "      result.reusableScratchPeakBytes = " +
-          std::to_string(fQuantizedMemoryDiagnostics.reusableScratchPeakBytes) + ";\n";
-   fGC += "      result.workspaceCapacityBytes = " +
-          std::to_string(fQuantizedMemoryDiagnostics.workspaceCapacityBytes) + ";\n";
-   for (const auto &[opIndex, backendPlans] : fQuantizationState.loweringPlans) {
-      const auto planIt = backendPlans.find(EQuantizedBackend::ALPAKA);
-      if (planIt == backendPlans.end() || !IsOptimizedQuantizedAlpakaPlainDevicePlan(planIt->second))
-         continue;
-      std::string stateName;
-      if (const auto *dense =
-             FindQuantizedRegion<QuantizedDenseLinearRegion>(fQuantizationState, opIndex)) {
-         if (dense->spelling == EQuantizedDenseLinearSpelling::Gemm) {
-            stateName = QuantizedPlanUsesFP8DenseLinear(planIt->second)
-                          ? "quantizedGemmCudaLtFP8State_"
-                          : "quantizedGemmCudaLtState_";
-         } else {
-            stateName = QuantizedPlanUsesFP8DenseLinear(planIt->second)
-                          ? "quantizedMatMulCudaLtFP8State_"
-                          : "quantizedMatMulCudaLtState_";
-         }
-      }
-      if (!stateName.empty()) {
-         fGC += "      result.selectedWorkspaceBytes = std::max(result.selectedWorkspaceBytes, " +
-                stateName + std::to_string(opIndex) + ".WorkspaceSize());\n";
-      }
-   }
-   fGC += "      return result;\n";
-   fGC += "   }\n\n";
+   if (auto *pass = InstalledCodegenPass())
+      fGC += pass->ContributeSessionMembers(*this, ECodegenTarget::ALPAKA);
 
    // inject GPU profiling utility functions and memory report inside Session struct
    if (fProfile && fUseSession) {
@@ -1089,15 +994,19 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
       static_cast<std::underlying_type_t<Options>>(Options::kTextWeightFile);
    if ((options & explicitFileWeightPolicy) != 0)
       fUseWeightFile = true;
-   if ((options & explicitWeightPolicy) == 0 && !fQuantizationState.tensorInfos.empty()) {
+   auto *pass = InstalledCodegenPass();
+   if ((options & explicitWeightPolicy) == 0 && pass && pass->RequiresWeightFile(*this)) {
       fUseWeightFile = true;
       fWeightFile = WeightFileType::Binary;
    }
-   AddNeededCustomHeader("SOFIE/RQuantization.hxx");
+   if (pass)
+      pass->ContributeSupportHeaders(*this, ECodegenTarget::ALPAKA);
    if (fWeightFile == WeightFileType::Binary)
       AddNeededCustomHeader("SOFIE/RWeightFile.hxx");
-   BuildLoweredOperatorView(EQuantizedBackend::ALPAKA);
-   AddQuantizedGeneratedHeaders(EQuantizedBackend::ALPAKA);
+   if (pass) {
+      pass->BuildLoweredView(*this, ECodegenTarget::ALPAKA);
+      pass->ContributeGeneratedHeaders(*this, ECodegenTarget::ALPAKA);
+   }
    FuseGemmActivations_GPU();   // must run before elementwise fusion (redirects tensors)
    ComputeEltwiseFusionGroups();
 
@@ -1105,13 +1014,10 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
    if (!fIsSubGraph) {
       fGC.clear();
       GenerateHeaderInfo_GPU_ALPAKA(hgname);
-      // Counts boundaries next to an operator that could have taken a carrier and did not;
-      // emitted into the artifact so it can be read and asserted on.
-      fGC += "// SOFIE carrier frontier: " + std::to_string(fCarrierFrontierViolations.size()) +
-             " unabsorbed Quantize/Dequantize boundaries\n";
-      for (const auto &violation : fCarrierFrontierViolations)
-         fGC += "//   " + violation.boundaryOperator + " on '" + violation.boundaryTensor +
-                "' owed by " + violation.neighborOperator + "\n";
+      if (pass) {
+         for (const auto &line : pass->DiagnosticComments(*this))
+            fGC += line + "\n";
+      }
    }
 
    if (fVerbose)
@@ -1128,12 +1034,9 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
 void RModel::MoveInitializedTensorsToBuffers_ALPAKA(){
       for (auto &i : fInitializedTensors) {
          if (i.second.IsNotWritable())  continue;
-         if (HasQuantizedTensorStorage(i.first)) {
-            const auto &storage = GetQuantizedTensorStorage(i.first);
-            if (storage.layout == EQuantizedLayout::PackedCPU ||
-                storage.residentBackend != EQuantizedBackend::ALPAKA)
-               continue;
-         }
+         if (auto *pass = InstalledCodegenPass();
+             pass && !pass->WantsDeviceUpload(*this, i.first, ECodegenTarget::ALPAKA))
+            continue;
          const auto type = i.second.type();
          if (type != ETensorType::FLOAT && type != ETensorType::INT32 && type != ETensorType::INT64 &&
              type != ETensorType::INT8 && !IsByteBackedAlpakaTensorType(type))

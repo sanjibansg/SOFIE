@@ -16,6 +16,15 @@ endif()
 
 option(ENABLE_ALPAKA_TESTS "Enable Alpaka-based SOFIE tests" OFF)
 
+############################################################################
+# Package boundary
+############################################################################
+# Linking against SOFIE_core alone fails as soon as base references a symbol the
+# quantization package defines, and running it exercises the no-pass-installed path.
+add_executable(SofieCoreStandsAlone CoreStandsAlone.cxx)
+target_link_libraries(SofieCoreStandsAlone PRIVATE SOFIE_core)
+add_test(NAME SofieCoreStandsAlone COMMAND SofieCoreStandsAlone)
+
 set(ALPAKA_BACKEND "cuda"
     CACHE STRING "Alpaka backend to test (cuda, cpu, hip, sycl)")
 set_property(CACHE ALPAKA_BACKEND PROPERTY STRINGS cuda cpu hip sycl)
@@ -87,7 +96,7 @@ if (ENABLE_ALPAKA_TESTS)
   ROOTTEST_GENERATE_EXECUTABLE(
     emitFromONNXAlpaka
     EmitFromONNX_GPU_ALPAKA_all.cxx
-    LIBRARIES protobuf::libprotobuf SOFIE_core SOFIE_parsers
+    LIBRARIES protobuf::libprotobuf SOFIE_quantization SOFIE_parsers
     FIXTURES_SETUP sofie-compile-models-onnx-alpaka-build
   )
 
@@ -147,7 +156,7 @@ if (ENABLE_ALPAKA_TESTS)
     ROOTTEST_GENERATE_EXECUTABLE(
       TestCustomModelsFromONNXForAlpakaCuda
       ${ALPAKA_CUDA_TEST_SOURCES}
-      LIBRARIES SOFIE_core GTest::gtest GTest::gtest_main
+      LIBRARIES SOFIE_quantization GTest::gtest GTest::gtest_main
       FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka
       FIXTURES_SETUP sofie-test-models-onnx-alpaka-build
     )
@@ -155,7 +164,7 @@ if (ENABLE_ALPAKA_TESTS)
     ROOTTEST_GENERATE_EXECUTABLE(
       TestQuantizationFromONNXForAlpakaCuda
       TestQuantizationFromONNXForAlpakaCuda.cxx
-      LIBRARIES SOFIE_core GTest::gtest GTest::gtest_main
+      LIBRARIES SOFIE_quantization GTest::gtest GTest::gtest_main
       FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka
       FIXTURES_SETUP sofie-quantization-models-onnx-alpaka-build
     )

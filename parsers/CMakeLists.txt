@@ -93,7 +93,7 @@ set(sources_cxx
   ${DEPENDENCIES}
     ${SOFIE_core}
 )
-target_link_libraries(SOFIE_parsers PRIVATE SOFIE_core)
+target_link_libraries(SOFIE_parsers PUBLIC SOFIE_quantization)
 target_sources(SOFIE_parsers PRIVATE ${sources_headers} ${sources_cxx})
 
 target_include_directories(SOFIE_parsers BEFORE PUBLIC

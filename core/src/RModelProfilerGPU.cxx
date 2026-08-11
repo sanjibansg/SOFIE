@@ -1,4 +1,5 @@
 #include "SOFIE/RModelProfilerGPU.hxx"
+#include "SOFIE/RModelCodegenPass.hxx"
 #include "SOFIE/SOFIE_common.hxx"
 
 namespace SOFIE {
@@ -96,7 +97,14 @@ RModelProfilerGPU::MemoryInfo RModelProfilerGPU::ComputeMemoryInfo(const RModel 
    info.intermediateCPUBytes = model.fOtherTensorSize;
 
    info.intermediateGPUBytes = model.fAlpakaIntermediateDeviceBytes;
-   info.quantized = model.fQuantizedMemoryDiagnostics;
+   if (auto *pass = InstalledCodegenPass()) {
+      const auto usage = pass->MemoryUsage(model);
+      info.quantizedPersistentCarrierBytes = usage.persistentBytes;
+      info.quantizedGraphValuePeakBytes = usage.pooledPeakBytes;
+      info.quantizedGraphValueUnpooledBytes = usage.pooledUnpooledBytes;
+      info.quantizedReusableScratchPeakBytes = usage.scratchPeakBytes;
+      info.quantizedWorkspaceCapacityBytes = usage.workspaceBytes;
+   }
 
    return info;
 }
@@ -107,7 +115,7 @@ std::string RModelProfilerGPU::GenerateMemoryReport(const MemoryInfo &info)
 
    size_t totalCPU = info.constantTensorBytes + info.weightTensorBytes + info.intermediateCPUBytes;
    size_t totalGPU = info.weightDeviceBytes + info.intermediateGPUBytes +
-                     info.quantized.reusableScratchPeakBytes;
+                     info.quantizedReusableScratchPeakBytes;
 
    std::string gc;
    gc += "   // Print memory usage breakdown computed at code-generation time.\n";
@@ -136,15 +144,15 @@ std::string RModelProfilerGPU::GenerateMemoryReport(const MemoryInfo &info)
          + std::to_string(info.intermediateGPUBytes) + " bytes  ("
          + std::to_string(toMB(info.intermediateGPUBytes)).substr(0, 6) + " MB)\" << std::endl;\n";
    gc += "      std::cout << \"    Quantized persistent carriers: "
-         + std::to_string(info.quantized.persistentCarrierBytes) + " bytes\" << std::endl;\n";
+         + std::to_string(info.quantizedPersistentCarrierBytes) + " bytes\" << std::endl;\n";
    gc += "      std::cout << \"    Quantized graph-value peak : "
-         + std::to_string(info.quantized.graphValuePeakBytes) + " / "
-         + std::to_string(info.quantized.graphValueUnpooledBytes)
+         + std::to_string(info.quantizedGraphValuePeakBytes) + " / "
+         + std::to_string(info.quantizedGraphValueUnpooledBytes)
          + " unpooled bytes\" << std::endl;\n";
    gc += "      std::cout << \"    Quantized reusable scratch : "
-         + std::to_string(info.quantized.reusableScratchPeakBytes) + " bytes\" << std::endl;\n";
+         + std::to_string(info.quantizedReusableScratchPeakBytes) + " bytes\" << std::endl;\n";
    gc += "      std::cout << \"    cuBLASLt workspace capacity: "
-         + std::to_string(info.quantized.workspaceCapacityBytes) + " bytes\" << std::endl;\n";
+         + std::to_string(info.quantizedWorkspaceCapacityBytes) + " bytes\" << std::endl;\n";
    gc += "      std::cout << \"    Total GPU                 : "
          + std::to_string(totalGPU) + " bytes  ("
          + std::to_string(toMB(totalGPU)).substr(0, 6) + " MB)\" << std::endl;\n";

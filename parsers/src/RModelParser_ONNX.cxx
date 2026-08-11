@@ -1,4 +1,7 @@
 #include "SOFIE/RModelParser_ONNX.hxx"
+#include "SOFIE/RQuantization.hxx"
+#include "SOFIE/RQuantization_Pipeline.hxx"
+#include "SOFIE/RQuantization_Lowering.hxx"
 #include "onnx_proto3.pb.h"
 
 #include <stdexcept>
@@ -547,6 +550,10 @@ RModelParser_ONNX::ParseOperator(const size_t i, const onnx::GraphProto &graphpr
 RModel RModelParser_ONNX::Parse(std::string filename, bool verbose)
 {
    fVerbose = verbose;
+
+   // The parser writes quantization metadata onto a model, so it is what makes code
+   // generation read it. Naming the entry point also keeps the linker from dropping it.
+   InstallQuantizationCodegenPass();
 
    fTensorTypeMap.clear();
    fOpsetVersionMap.clear();

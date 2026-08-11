@@ -3,20 +3,20 @@
 
 #include "SOFIE/RModel_Base.hxx"
 #include "SOFIE/SOFIE_common.hxx"
-#include "SOFIE/RQuantization.hxx"
+#include "SOFIE/RModelExtension.hxx"
 #include "SOFIE/ROperator.hxx"
 
 
 namespace SOFIE {
 
-// One surviving Quantize/Dequantize kernel that no adjacent operator asked for. A boundary
-// is justified only when a float-side neighbour reports RequiresFloat; this names the rest.
-struct CarrierFrontierViolation {
-   std::string boundaryOperator;   // "QuantizeLinear" / "DequantizeLinear"
-   std::string boundaryTensor;     // the carrier it produces or consumes
-   std::string neighborOperator;   // the operator that should have absorbed it
-   ELowPrecisionCarrierSupport neighborSupport = ELowPrecisionCarrierSupport::RequiresFloat;
-};
+// Declared by the quantization pass library. Named here only in declarations, so this
+// header stays parseable without the pass library's types.
+struct QuantizationInfo;
+struct LowPrecisionTensorInfo;
+struct QuantizedTensorStorage;
+struct QuantizationModelState;
+struct QuantizationPipelineReport;
+struct CarrierFrontierViolation;
 
 class RModel final : public RModel_Base {
 
@@ -42,9 +42,7 @@ private:
    std::unordered_map<std::string, InitializedTensor> fInitializedTensors;
    std::unordered_map<std::string, TensorInfo> fIntermediateTensorInfos;
    std::unordered_map<std::string, DynamicTensorInfo> fDynamicTensorInfos;
-   QuantizationModelState fQuantizationState; // quantization metadata, regions, storage, and backend lowering plans
-   QuantizationPipelineReport fQuantizationReport; // report of the last lowered-view build (transient)
-   QuantizedMemoryDiagnostics fQuantizedMemoryDiagnostics; // transient generated-memory contract
+   std::unique_ptr<RModelExtension> fExtension;    ///<!  pass-library state, opaque to this class (transient)
    std::size_t fAlpakaIntermediateDeviceBytes = 0; // transient live intermediate allocation total
    std::unordered_map<std::string, std::pair<std::vector<Dim>, bool>> fShapeTensors; // constant tensors describing a shape
    std::unordered_map<std::string, std::string> fAliasTensors; // alias tensors (name -> original tensor name)
@@ -89,41 +87,13 @@ private:
    std::unordered_map<size_t, size_t> fOpToFusionGroupIdx; ///<!  op_idx -> fusion group index
    std::set<std::string> fFusionIntermediateTensors;        ///<!  intermediate tensors whose alloc is skipped
    std::set<size_t>      fSkipOperators;                    ///<!  ops swallowed by a preceding fusion (e.g. GEMM+LeakyReLU)
-   std::vector<CarrierFrontierViolation> fCarrierFrontierViolations; ///<!
    void ComputeEltwiseFusionGroups();
    /// GPU-only pass: fuse GEMM→LeakyReLU (and GEMM→ReLU where not already
    /// handled by the ONNX parser) into a single in-place kernel sequence.
    void FuseGemmActivations_GPU();
-   void BuildLoweredOperatorView(EQuantizedBackend backend = EQuantizedBackend::CPU);
-   // True while an original operator is still emitted: neither consumed by a lowered
-   // region nor replaced by one. The lowered-view passes' shared aliveness test.
-   bool OriginalOperatorEmitted(std::size_t index) const;
-   // Consumers of every emitted reader: alive original operators plus lowered regions,
-   // which are emitted and read tensors even though they are not alive.
-   std::unordered_map<std::string, std::vector<std::size_t>> EmittedConsumersByTensor() const;
-   void PrepareQuantizedTensorStorage(EQuantizedBackend backend);
-   void AddQuantizedGeneratedHeaders(EQuantizedBackend backend = EQuantizedBackend::CPU);
-   void AddLoweredQuantizedOperators(EQuantizedBackend backend = EQuantizedBackend::CPU);
-   void SetKnownTensorType(const std::string &tensorName, ETensorType type);
-   // Collapses DequantizeLinear nodes that decode the same carrier on the same grid,
-   // which an exporter duplicates once per consumer.
-   void DeduplicateCarrierDecodes(EQuantizedBackend backend = EQuantizedBackend::CPU);
-   // Drops a Clip that cannot clamp anything because the QuantizeLinear it feeds
-   // already saturates at the same bound.
-   void DropNoOpClipsBeforeQuantize(EQuantizedBackend backend = EQuantizedBackend::CPU);
-   // Records every surviving Q/DQ boundary that no adjacent operator asked for.
-   void CheckLowPrecisionCarrierFrontier();
-   // Moves a Reshape/Transpose run onto the quantized carrier, deleting the bracketing
-   // Dequantize/Quantize pair; runs before the fusion below, which would otherwise absorb it.
-   void PropagateLowPrecisionThroughMovement(EQuantizedBackend backend = EQuantizedBackend::CPU);
-   // Rewires a movement run to read the head carrier and write the target tensor, retyping
-   // the tensors between hops to the carrier type.
-   void RewireCarrierMovementRun(const std::vector<std::size_t> &runOpIndices,
-                                 const std::string &headCarrierTensor, const std::string &targetTensor);
-   // Collapses each surviving Clip? -> Quantize -> Dequantize into one kernel. Runs last,
-   // so it only sees boundaries no region absorbed.
-   void FuseUnabsorbedFakeQuantBoundaries();
-   void ApplyPlannedCarrierHandoffs();
+   // The lowered-view passes, declared in RQuantization_Pipeline.hxx. They rewrite this
+   // model's operators and reach its internals through this one declaration.
+   friend struct QuantizationPipeline;
    // Stops emitting operators whose outputs nobody reads. Not quantization specific.
    void EliminateDeadOperators();
    // Puts a batched MatMul's B operand in [.., N, K] by re-permuting the Transpose that
@@ -151,11 +121,8 @@ public:
    int Verbose() const { return fVerbose;}
 
    // Surviving Q/DQ boundaries that no adjacent operator asked for; populated by the
-   // last stage of BuildLoweredOperatorView.
-   const std::vector<CarrierFrontierViolation> &GetCarrierFrontierViolations() const
-   {
-      return fCarrierFrontierViolations;
-   }
+   // last stage of the lowered-view build.
+   const std::vector<CarrierFrontierViolation> &GetCarrierFrontierViolations() const;
 
    std::vector<size_t> GetTensorShape(const std::string & name) const;
    std::vector<Dim> GetDimTensorShape(const std::string & name) const;
@@ -175,16 +142,15 @@ public:
    const QuantizedTensorStorage & GetQuantizedTensorStorage(const std::string & storage_tensor_name) const;
 
    void AnalyzeQuantizedRegions();
-   const QuantizationModelState & GetQuantizationState() const { return fQuantizationState; }
-   // Report of the last BuildLoweredOperatorView run: per-pass event counts, the frontier
+   const QuantizationModelState & GetQuantizationState() const;
+   // Report of the last lowered-view build: per-pass event counts, the frontier
    // classification, and one entry per planned region.
-   const QuantizationPipelineReport &GetQuantizationPipelineReport() const { return fQuantizationReport; }
+   const QuantizationPipelineReport &GetQuantizationPipelineReport() const;
 
-   // Read-only view of the lowering decision, for diagnostics.
-   void BuildLoweredOperatorViewForDiagnostics(EQuantizedBackend backend)
-   {
-      BuildLoweredOperatorView(backend);
-   }
+   // The pass library's state, or null when nothing has attached any.
+   RModelExtension *GetExtension() { return fExtension.get(); }
+   const RModelExtension *GetExtension() const { return fExtension.get(); }
+   void SetExtension(std::unique_ptr<RModelExtension> extension) { fExtension = std::move(extension); }
    std::size_t GetOperatorCount() const { return fOperators.size(); }
    bool IsOperatorLowered(std::size_t index) const
    {

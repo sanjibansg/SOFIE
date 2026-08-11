@@ -17,6 +17,7 @@
 #include "SOFIE/ROperator_Cast.hxx"
 #include "SOFIE/ROperator_Gemm.hxx"
 #include "SOFIE/ROperator_ONNXQuantizeLinear.hxx"
+#include "SOFIE/RModelCodegenPass.hxx"
 #include "SOFIE/ROperator_Transpose.hxx"
 
 #include <unordered_map>
@@ -60,34 +61,6 @@ std::string TensorMember(std::string const &name)
 }
 
 } // namespace
-
-void RModel::BuildLoweredOperatorView(EQuantizedBackend backend)
-{
-   fLoweredOperators.clear();
-   fLoweredConsumedOperatorIndices.clear();
-   fQuantizationReport = QuantizationPipelineReport{};
-   PrepareQuantizedTensorStorage(backend);
-   AddLoweredQuantizedOperators(backend);
-   // Canonicalization before any further absorption: duplicated decodes are what make a
-   // carrier look multi-consumer, and several passes below decline on exactly that.
-   DeduplicateCarrierDecodes(backend);
-   // Also canonicalization: a no-op Clip is still an operator, and the movement walk stops
-   // at one. Dropping it lets those chains be seen as the movement they are.
-   DropNoOpClipsBeforeQuantize(backend);
-   // Before the fusion, which would collapse the Quantize producing a propagated carrier
-   // and leave the rewired movement reading a carrier nothing writes.
-   PropagateLowPrecisionThroughMovement(backend);
-   // Both must only see the boundaries no region absorbed, and dead-code elimination
-   // must see the final emit set, so it runs after the fusion rather than before.
-   FuseUnabsorbedFakeQuantBoundaries();
-   // Runs on both sides of the handoff applier: before, because a dead reader blocks
-   // that fusion's single-consumer guard; after, because it changes the emitted set.
-   EliminateDeadOperators();
-   ApplyPlannedCarrierHandoffs();
-   EliminateDeadOperators();
-   // Last: the residual is only meaningful once every absorption has had its chance.
-   CheckLowPrecisionCarrierFrontier();
-}
 
 void RModel::CanonicaliseBatchedMatMulOperands()
 {
@@ -847,7 +820,8 @@ void RModel::Initialize(const std::map<std::string, size_t> & inputParams, bool 
       i++;
    }
 
-   AnalyzeQuantizedRegions();
+   if (auto *pass = InstalledCodegenPass())
+      pass->Analyze(*this);
 
    // Check whether tensors flagged as not writable are used by runtime operators.
    // Integer initializers remain embedded for compatibility, except for physical
@@ -860,7 +834,8 @@ void RModel::Initialize(const std::map<std::string, size_t> & inputParams, bool 
             std::cout << "Initialized tensor " << it.first << " is flagged as not writable but is used by non constant operators, set it as writable \n";
          }
       }
-      const bool isFileBackedQuantizedStorage = HasQuantizedTensorStorage(it.first);
+      const bool isFileBackedQuantizedStorage =
+         InstalledCodegenPass() != nullptr && InstalledCodegenPass()->HasExternalStorage(*this, it.first);
       if (it.second.type() != ETensorType::FLOAT && !isFileBackedQuantizedStorage) {
          it.second.SetConstant();
       }
@@ -1722,15 +1697,19 @@ void RModel::Generate(std::underlying_type_t<Options> options, int batchSize, lo
 
    // initialize the model including all operators and sub-graphs
    Initialize(batchSize, verbose);
-   if ((options & explicitWeightPolicy) == 0 && !fQuantizationState.tensorInfos.empty()) {
+   auto *pass = InstalledCodegenPass();
+   if ((options & explicitWeightPolicy) == 0 && pass && pass->RequiresWeightFile(*this)) {
       fUseWeightFile = true;
       fWeightFile = WeightFileType::Binary;
    }
+   if (pass)
+      pass->ContributeSupportHeaders(*this, ECodegenTarget::CPU);
    if (fWeightFile == WeightFileType::Binary)
       AddNeededCustomHeader("SOFIE/RWeightFile.hxx");
-   BuildLoweredOperatorView(EQuantizedBackend::CPU);
-
-   AddQuantizedGeneratedHeaders(EQuantizedBackend::CPU);
+   if (pass) {
+      pass->BuildLoweredView(*this, ECodegenTarget::CPU);
+      pass->ContributeGeneratedHeaders(*this, ECodegenTarget::CPU);
+   }
 
    // if having dynamic tensor we need to have a Session
    if (!fDynamicTensorInfos.empty()) {

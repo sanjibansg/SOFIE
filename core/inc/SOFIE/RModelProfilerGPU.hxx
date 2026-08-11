@@ -29,7 +29,12 @@ public:
       // GPU-side
       size_t weightDeviceBytes = 0;     // ALL initialized tensor device buffers (const + weights)
       size_t intermediateGPUBytes = 0;  // live owning buffers plus planned carrier arena
-      QuantizedMemoryDiagnostics quantized;
+      // Quantized carrier memory, contributed by the quantization pass library.
+      size_t quantizedPersistentCarrierBytes = 0;
+      size_t quantizedGraphValuePeakBytes = 0;
+      size_t quantizedGraphValueUnpooledBytes = 0;
+      size_t quantizedReusableScratchPeakBytes = 0;
+      size_t quantizedWorkspaceCapacityBytes = 0;
    };
 
    static MemoryInfo ComputeMemoryInfo(const RModel &model);
