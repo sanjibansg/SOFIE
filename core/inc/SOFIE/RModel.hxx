@@ -77,7 +77,9 @@ private:
    struct EltwiseFusionGroup {
       std::vector<size_t> opIndices; ///< dependency-chain operator indices forming this group
       std::vector<FusionExternalInput> externalInputs; ///< tensors entering the fusion group from outside
-      std::string outputTensor;      ///< output tensor name of the last op
+      std::string outputTensor; ///< tensor defining the fused iteration domain
+      std::vector<std::string> outputTensors; ///< tensors materialized by the fused kernel
+      std::vector<std::string> internalTensors; ///< tensors kept only as local fused values
       size_t numElements = 0;
       size_t launchOpIndex = 0;
 
@@ -88,10 +90,83 @@ private:
          return s;
       }
    };
+
+   struct FusionTensorUseGraph {
+      std::unordered_map<std::string, std::vector<size_t>> consumers;
+      std::unordered_map<std::string, size_t> producers;
+   };
+
+   struct FusionBuildState {
+      EltwiseFusionGroup group;
+      std::vector<std::string> producedTensors;
+      std::vector<size_t> groupOutputShape;
+      std::vector<size_t> currentLogicalShape;
+      size_t currentOpIdx = 0;
+      bool hasReorganize = false;
+   };
+
+   struct FusionStructuralScore {
+      size_t launchesRemoved = 0;
+      size_t liveRangeExtensionByteSteps = 0;
+      size_t eliminatedBytes = 0;
+      size_t materializedOutputs = 0;
+      size_t externalInputs = 0;
+   };
+
+   struct FusionCandidate {
+      std::vector<size_t> opIndices;
+      std::vector<std::string> externalInputs;
+      std::vector<std::string> materializedOutputs;
+      std::vector<std::string> internalTensors;
+      FusionStructuralScore score;
+      size_t launchOpIndex = 0;
+
+      bool isFused() const { return opIndices.size() > 1; }
+   };
+
+   struct FusionPlan {
+      std::vector<size_t> candidateIndices;
+      FusionStructuralScore score;
+   };
+
    std::vector<EltwiseFusionGroup> fEltwiseFusionGroups; ///<!
    std::unordered_map<size_t, size_t> fOpToFusionGroupIdx; ///<!  op_idx -> fusion group index
    std::set<std::string> fFusionIntermediateTensors;        ///<!  intermediate tensors whose alloc is skipped
    std::set<size_t>      fSkipOperators;                    ///<!  ops swallowed by a preceding fusion (e.g. GEMM+LeakyReLU)
+
+   FusionTensorUseGraph BuildFusionTensorUseGraph() const;
+
+   FusionCandidate BuildFusionCandidate(const std::vector<size_t> &opIndices, const FusionTensorUseGraph &tensorUses) const;
+
+   bool IsValidFusionCandidate(const FusionCandidate &candidate, const FusionTensorUseGraph &tensorUses) const;
+
+   std::vector<size_t> EnumerateFusionLaunchIndices(const FusionCandidate &candidate, const FusionTensorUseGraph &tensorUses) const;
+
+   std::vector<FusionCandidate> EnumerateFusionCandidates(const FusionTensorUseGraph &tensorUses) const;
+
+   std::vector<FusionCandidate> EnumerateLinearFusionCandidates(const FusionTensorUseGraph &tensorUses) const;
+
+   FusionStructuralScore ComputeFusionStructuralScore(const FusionCandidate &candidate, const FusionTensorUseGraph &tensorUses) const;
+
+   size_t ComputeFusionLiveRangeExtensionByteSteps(const FusionCandidate &candidate, const FusionTensorUseGraph &tensorUses) const;
+
+   size_t ComputeFusionPlanLiveRangeExtensionByteSteps(const std::vector<size_t> &candidateIndices, const std::vector<FusionCandidate> &candidates) const;
+
+   bool FusionCandidatesConflict(const FusionCandidate &left, const FusionCandidate &right, const FusionTensorUseGraph &tensorUses) const;
+
+   FusionPlan SelectFusionPlan(const std::vector<FusionCandidate> &candidates, const FusionTensorUseGraph &tensorUses) const;
+
+   static bool IsBetterFusionStructuralScore(const FusionStructuralScore &left, const FusionStructuralScore &right);
+
+   bool IsFuseSafeIntermediate(const std::string &tensorName, const FusionTensorUseGraph &tensorUses) const;
+
+   FusionBuildState InitializeFusionBuildState(size_t firstOpIdx) const;
+
+   bool TryExtendFusionBuildState(FusionBuildState &state, const FusionTensorUseGraph &tensorUses,
+                              const std::vector<bool> *blockedOps, bool allowReorganize = true) const;
+
+   EltwiseFusionGroup BuildEltwiseFusionGroup(const FusionCandidate &candidate) const;
+
    void ComputeEltwiseFusionGroups();
 
    std::string GenerateFusedEltwiseLaunch_GPU_ALPAKA(const EltwiseFusionGroup &group) const;
@@ -186,6 +261,7 @@ public:
    void AddShapeTensor(const std::string & name, const std::vector<Dim> & shapeValues, bool scalar = false);
    void AddAliasTensor(const std::string & name, const std::string & origin);
    bool IsAliasTensor(const std::string & tensor_name) const;
+   std::string ResolveAliasTensor(const std::string &tensorName) const;
 
    void AddExtraCodeForDimShapes(const std::string & code) { fExtraCodeForDimShapes += code; }
 

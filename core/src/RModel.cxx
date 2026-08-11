@@ -256,6 +256,20 @@ bool RModel::IsAliasTensor(const std::string & tensor_name) const {
    return fAliasTensors.count(tensor_name) != 0;
 }
 
+std::string RModel::ResolveAliasTensor(const std::string &tensorName) const {
+   std::string resolved = tensorName;
+   std::set<std::string> visited;
+
+   while (IsAliasTensor(resolved)) {
+      if (!visited.insert(resolved).second)
+         throw std::runtime_error("sofie: alias cycle detected for tensor " + tensorName);
+
+      resolved = fAliasTensors.at(resolved);
+   }
+
+   return resolved;
+}
+
 const std::vector<Dim> & RModel::GetShapeTensorValues(const std::string & tensor_name) const {
    //if (!IsShapeTensor(tensor_name) ) return std::vector<Dim>{};
    return fShapeTensors.at(tensor_name).first;

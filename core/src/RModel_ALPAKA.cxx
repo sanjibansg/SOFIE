@@ -346,8 +346,10 @@ std::string RModel::GenerateFusedEltwiseLaunch_GPU_ALPAKA(const EltwiseFusionGro
    for (const auto &externalInput : group.externalInputs)
       launchCode += ", alpaka::getPtrNative(deviceBuf_" + externalInput.tensorName + ")";
 
-   launchCode += ", alpaka::getPtrNative(deviceBuf_" + group.outputTensor + "), static_cast<Idx>(" +
-                 std::to_string(group.numElements) + "));\n";
+   for (const auto &outputName : group.outputTensors)
+      launchCode += ", alpaka::getPtrNative(deviceBuf_" + outputName + ")";
+
+   launchCode += ", static_cast<Idx>(" + std::to_string(group.numElements) + "));\n";
 
    launchCode += SP + SP + "alpaka::enqueue(queue, task_fused" + suffix + ");\n";
    launchCode += SP + "}\n";
@@ -884,9 +886,7 @@ void RModel::CheckAndFlushIntermediateMemory_GPU_ALPAKA(std::span<const std::str
       if (fVerbose) std::cout << ".. input tensors : " << iv;
 
       // for alias tensors replace name with its alias
-      std::string it{iv};  // convert view to string
-      if (IsAliasTensor(it))
-         it = fAliasTensors[it];
+      const std::string it = ResolveAliasTensor(std::string(iv));
       auto freqIt = fIntermediateTensorFrequencyLookup.find(it);
       if (freqIt == fIntermediateTensorFrequencyLookup.end()) {
          if (fVerbose) std::cout << std::endl;
@@ -1020,14 +1020,20 @@ std::string RModel::GenerateFusedEltwiseKernel_GPU_ALPAKA(const EltwiseFusionGro
    for (size_t inputIdx = 0; inputIdx < group.externalInputs.size(); ++inputIdx)
       kernelCode += ", typename TInput" + std::to_string(inputIdx);
 
-   kernelCode += ", typename TOutput>\n";
+   for (size_t outputIdx = 0; outputIdx < group.outputTensors.size(); ++outputIdx)
+      kernelCode += ", typename TOutput" + std::to_string(outputIdx);
+
+   kernelCode += ">\n";
    kernelCode += SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc";
 
    for (size_t inputIdx = 0; inputIdx < group.externalInputs.size(); ++inputIdx)
       kernelCode += ", TInput" + std::to_string(inputIdx) + " const* __restrict__ input" + std::to_string(inputIdx);
 
-   kernelCode += ", TOutput* __restrict__ out, std::size_t n) const {\n";
-   kernelCode += SP + SP + "using T = TOutput;\n";
+   for (size_t outputIdx = 0; outputIdx < group.outputTensors.size(); ++outputIdx)
+      kernelCode += ", TOutput" + std::to_string(outputIdx) + "* __restrict__ out" + std::to_string(outputIdx);
+
+   kernelCode += ", std::size_t n) const {\n";
+   kernelCode += SP + SP + "using T = TOutput0;\n";
    kernelCode += SP + SP + "const auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
    kernelCode += SP + SP + "if (idx < n) {\n";
 
@@ -1114,12 +1120,16 @@ std::string RModel::GenerateFusedEltwiseKernel_GPU_ALPAKA(const EltwiseFusionGro
       tensorValues[outputName] = localName;
    }
 
-   const auto finalValueIt = tensorValues.find(group.outputTensor);
+   for (size_t outputIdx = 0; outputIdx < group.outputTensors.size(); ++outputIdx) {
+      const auto &outputName = group.outputTensors[outputIdx];
+      const auto valueIt = tensorValues.find(outputName);
 
-   if (finalValueIt == tensorValues.end())
-      throw std::runtime_error("Missing final fused value for tensor " + group.outputTensor);
+      if (valueIt == tensorValues.end())
+         throw std::runtime_error("Missing fused output value for tensor " + outputName);
 
-   kernelCode += SP + SP + SP + "out[idx] = " + finalValueIt->second + ";\n";
+      kernelCode += SP + SP + SP + "out" + std::to_string(outputIdx) + "[idx] = " + valueIt->second + ";\n";
+   }
+
    kernelCode += SP + SP + "}\n";
    kernelCode += SP + "}\n";
    kernelCode += "};\n";
@@ -1259,12 +1269,9 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
       if (fSkipOperators.count(op_idx)) continue;
 
-      intermediate_memory_alloc_string +=
-         AllocateIntermediateMemory_GPU_ALPAKA(
-            fOperators[op_idx]->GetOpOutputTensors());
+      intermediate_memory_alloc_string += AllocateIntermediateMemory_GPU_ALPAKA(fOperators[op_idx]->GetOpOutputTensors());
 
-      CheckAndFlushIntermediateMemory_GPU_ALPAKA(
-         fOperators[op_idx]->GetOpInputTensors(), op_idx);
+      CheckAndFlushIntermediateMemory_GPU_ALPAKA(fOperators[op_idx]->GetOpInputTensors(), op_idx);
 
       const auto groupIt = fOpToFusionGroupIdx.find(op_idx);
 
