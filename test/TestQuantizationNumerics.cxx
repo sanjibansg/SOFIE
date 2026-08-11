@@ -28,6 +28,7 @@
 #include "ONNX_QDQ_ReshapeGemm_FromONNX_GPU_ALPAKA.hxx"
 #include "ONNX_QDQ_ResidualAdd_FromONNX_GPU_ALPAKA.hxx"
 #include "ONNX_QDQ_AttentionChain_FromONNX_GPU_ALPAKA.hxx"
+#include "ONNX_QDQ_DecodeAbsorb_FromONNX_GPU_ALPAKA.hxx"
 #include "ONNX_QDQ_BatchedMatMul_FromONNX_GPU_ALPAKA.hxx"
 #include "ONNX_QDQ_BatchedMatMul_NarrowClip_FromONNX_GPU_ALPAKA.hxx"
 #include "ONNX_QDQ_BatchedMatMul_TransposedOutput_FromONNX_GPU_ALPAKA.hxx"
@@ -940,4 +941,76 @@ TEST_F(QuantizationAlpakaTest, QdqAttentionChainMatchesExactReference)
       }
    }
    EXPECT_EQ(mismatches, 0) << "the adopted run's codes reached the score MatMul permuted wrongly";
+}
+
+// The absorbed decode's numbers. One kernel now spans the coarse grid's decode and the fine
+// grid's round trip, so a wrong scale on either side shifts every element of that branch.
+TEST_F(QuantizationAlpakaTest, QdqDecodeAbsorbMatchesExactReference)
+{
+   constexpr Idx kM = 64, kD = 128;
+   constexpr double kAct = 0.015625, kCoarse = 0.0625, kFine = 0.0078125;
+
+   // Codes are multiples of four, so the crossing onto the coarse grid divides exactly and
+   // the reference below carries no rounding of its own; the clamps still fire on both ends.
+   auto codeX = [](std::size_t i) { return 4 * (static_cast<int>((i * 13 + 5) % 33) - 16); };
+   auto codeY = [](std::size_t i) { return 4 * (static_cast<int>((i * 7 + 3) % 13) - 6); };
+   auto clampCode = [](int v) { return v < -128 ? -128 : (v > 127 ? 127 : v); };
+
+   const std::size_t elements = static_cast<std::size_t>(kM) * kD;
+   std::vector<float> x(elements), y(elements);
+   std::vector<float> expectedChained(elements), expectedFine(elements);
+   for (std::size_t i = 0; i < elements; ++i) {
+      const int cx = codeX(i);
+      const int cy = codeY(i);
+      x[i] = static_cast<float>(cx * kAct);
+      y[i] = static_cast<float>(cy * kAct);
+      const int coarse = clampCode((cx + cy) / 4);
+      expectedChained[i] = static_cast<float>(clampCode(4 * coarse + cx) * kAct);
+      expectedFine[i] = static_cast<float>(clampCode(8 * coarse) * kFine);
+   }
+
+   const Idx size = static_cast<Idx>(elements);
+   auto upload = [&](const std::vector<float> &values) {
+      auto host_buf = alpaka::allocBuf<float, Idx>(host, Ext1D::all(size));
+      std::copy(values.begin(), values.end(), alpaka::getPtrNative(host_buf));
+      auto device_buf = alpaka::allocBuf<float, Idx>(device, Ext1D::all(size));
+      alpaka::memcpy(queue, device_buf, host_buf);
+      alpaka::wait(queue);
+      return device_buf;
+   };
+   auto x_d = upload(x);
+   auto y_d = upload(y);
+
+   SOFIE_ONNX_QDQ_DecodeAbsorb::Session<alpaka::TagGpuCudaRt> model(
+      "ONNX_QDQ_DecodeAbsorb_FromONNX_GPU_ALPAKA.dat");
+   auto results = model.infer(x_d, y_d);
+   alpaka::wait(queue);
+   cudaDeviceSynchronize();
+
+   auto readBack = [&](auto &buffer) {
+      auto host_buf = alpaka::allocBuf<float, Idx>(host, Ext1D::all(size));
+      alpaka::memcpy(queue, host_buf, buffer);
+      alpaka::wait(queue);
+      std::vector<float> values(elements);
+      std::copy_n(reinterpret_cast<const float *>(alpaka::getPtrNative(host_buf)), elements,
+                  values.begin());
+      return values;
+   };
+   const auto chained = readBack(results[0]);
+   const auto fine = readBack(results[1]);
+
+   auto compare = [&](const std::vector<float> &actual, const std::vector<float> &expected,
+                      const char *what) {
+      int mismatches = 0;
+      for (std::size_t i = 0; i < elements && mismatches < 5; ++i) {
+         if (actual[i] != expected[i]) {
+            ++mismatches;
+            EXPECT_EQ(actual[i], expected[i]) << what << " at i=" << i;
+         }
+      }
+      EXPECT_EQ(mismatches, 0) << what;
+   };
+   compare(fine, expectedFine, "the branch whose decode the round trip absorbed");
+   // The branch that keeps the coarse carrier alive, which the absorption must not disturb.
+   compare(chained, expectedChained, "the branch reading the coarse carrier natively");
 }

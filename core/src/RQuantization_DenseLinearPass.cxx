@@ -291,11 +291,40 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
       return nullptr;
    };
 
+   // The fake-quant pair on a boundary's codes: one DequantizeLinear reading them, on the
+   // boundary's grid. Returns its index and float, or (-1, "") with a decline.
+   auto readFakeQuantPair = [&graph, &operators](std::size_t boundaryIndex,
+                                                 const QuantizationGrid &grid,
+                                                 const char **decline = nullptr) {
+      const auto fail = [decline](const char *why) {
+         if (decline != nullptr)
+            *decline = why;
+         return std::pair<std::size_t, std::string>{static_cast<std::size_t>(-1), std::string()};
+      };
+      const auto boundaryOutputs = operators[boundaryIndex]->GetOpOutputTensors();
+      if (boundaryOutputs.size() != 1)
+         return fail("boundary does not have exactly one output");
+      auto readers = graph.consumersByTensor.find(std::string(boundaryOutputs[0]));
+      if (readers == graph.consumersByTensor.end() || readers->second.size() != 1 ||
+          readers->second.front() >= operators.size())
+         return fail("boundary codes are not read by a sole DequantizeLinear");
+      const auto dequantIndex = readers->second.front();
+      auto *dequantize = dynamic_cast<ROperator_ONNXDequantizeLinear *>(operators[dequantIndex].get());
+      if (dequantize == nullptr)
+         return fail("boundary codes are not read by a sole DequantizeLinear");
+      if (!SameGrid(dequantize->GetGrid(), grid))
+         return fail("the pair's dequantize names a different grid");
+      const auto dequantOutputs = operators[dequantIndex]->GetOpOutputTensors();
+      if (dequantOutputs.size() != 1)
+         return fail("pair dequantize does not have exactly one output");
+      return std::pair<std::size_t, std::string>{dequantIndex, std::string(dequantOutputs[0])};
+   };
+
    // Extends an absorbed chain past the boundary's own Quantize/Dequantize pair onto a later
    // boundary of the same grid, reached through movement and clamps. Snapping to a grid a value
    // already sits on is the identity, and a Clip on grid points commutes with the snap.
    auto deepenAbsorbedOutputChain = [&graph, &operators, &model, &findAbsorbableOutputChain,
-                                     &decodedFloatFeedsRegionFormingOp,
+                                     &decodedFloatFeedsRegionFormingOp, &readFakeQuantPair,
                                      &takeMovementRun](AbsorbedOutputChain &chain) {
       const char *decline = nullptr;
       std::string head;
@@ -369,25 +398,10 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
 
          // The pair is what makes the extra snap free: the dequantize must decode exactly
          // what the boundary encoded, and nothing else may read the codes.
-         const auto dequantIndex = soleConsumer(boundaryOutput);
-         auto *dequantize =
-            dequantIndex != static_cast<std::size_t>(-1)
-               ? dynamic_cast<ROperator_ONNXDequantizeLinear *>(operators[dequantIndex].get())
-               : nullptr;
-         if (dequantize == nullptr) {
-            decline = "boundary codes are not read by a sole DequantizeLinear";
+         const auto [dequantIndex, dequantOutput] =
+            readFakeQuantPair(chain.boundaryIndex, grid, &decline);
+         if (dequantIndex == static_cast<std::size_t>(-1))
             return;
-         }
-         if (!SameGrid(dequantize->GetGrid(), grid)) {
-            decline = "the pair's dequantize names a different grid";
-            return;
-         }
-         const auto dequantOutputs = operators[dequantIndex]->GetOpOutputTensors();
-         if (dequantOutputs.size() != 1) {
-            decline = "pair dequantize does not have exactly one output";
-            return;
-         }
-         const std::string dequantOutput(dequantOutputs[0]);
 
          // The boundary belongs to whichever region reads through it; swallowing it would
          // leave that region's input carrier unwritten.
@@ -471,7 +485,7 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
       bool adopted() const { return decline == nullptr; }
    };
    auto findAdoptableFP8OutputQuant = [&graph, &operators, &model, &findAbsorbableOutputChain,
-                                       &movementRunCarriesCodes](
+                                       &readFakeQuantPair, &movementRunCarriesCodes](
                                          const std::string &outputTensor,
                                          const QuantizedMatrixShapePolicy &shapePolicy) {
       AdoptableFP8OutputQuant result;
@@ -558,12 +572,11 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                return static_cast<std::size_t>(-1);
             return it->second.front();
          };
-         const auto dqIndex = soleConsumer(result.quantOutputTensor);
-         auto *pairDq = dqIndex != static_cast<std::size_t>(-1)
-                           ? dynamic_cast<ROperator_ONNXDequantizeLinear *>(operators[dqIndex].get())
-                           : nullptr;
-         if (pairDq != nullptr && SameGrid(pairDq->GetGrid(), grid)) {
-            const auto reluIndex = soleConsumer(pairDq->GetOutputTensor());
+         // The same pair recognition the int8 walk steps through; only what each carrier
+         // looks for behind it differs, which here is a Relu feeding a second E4M3 boundary.
+         const auto [dqIndex, decodedTensor] = readFakeQuantPair(result.quantOpIndex, grid);
+         if (dqIndex != static_cast<std::size_t>(-1)) {
+            const auto reluIndex = soleConsumer(decodedTensor);
             if (reluIndex != static_cast<std::size_t>(-1) &&
                 operators[reluIndex]->GetKind() == OperatorKind::RELU &&
                 operators[reluIndex]->GetOpOutputTensors().size() == 1) {

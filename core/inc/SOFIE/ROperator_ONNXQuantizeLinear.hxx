@@ -268,6 +268,10 @@ private:
    // The incoming value is already on this grid, so the round trip is the identity and
    // becomes a zero-copy alias instead of a kernel.
    bool fFusedIsIdentity = false;
+   // Set when the upstream decode is absorbed: the kernel reads that carrier's codes and
+   // scales them itself, in place of reading the float the decode would have stored.
+   std::string fFusedDecodeCarrier;
+   double fFusedDecodeScale = 0.0;
 
 public:
    ROperator_ONNXQuantizeLinear() = default;
@@ -373,6 +377,18 @@ public:
    void MarkFakeQuantIdentity() { fFusedIsIdentity = true; }
    bool IsFakeQuantIdentity() const { return fFusedIsIdentity; }
 
+   // Absorbs the decode feeding this boundary, reading its codes and applying the upstream
+   // scale in the kernel. Exact for the scales the caller's guard admits.
+   void FuseUpstreamDecode(std::string carrier, double upstreamScale)
+   {
+      fFusedDecodeCarrier = std::move(carrier);
+      fFusedDecodeScale = upstreamScale;
+      fNX = fFusedDecodeCarrier;
+      if (!fInputTensorNames.empty())
+         fInputTensorNames[0] = fFusedDecodeCarrier;
+   }
+   bool HasFusedUpstreamDecode() const { return !fFusedDecodeCarrier.empty(); }
+
    std::vector<ETensorType> TypeInference(std::vector<ETensorType>) override { return {fOutputType}; }
    std::vector<std::vector<size_t>> ShapeInference(std::vector<std::vector<size_t>> input) override
    {
@@ -473,7 +489,13 @@ public:
                       "std::size_t const length) const {\n";
       op += SP + SP + SP + "auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
       op += SP + SP + SP + "if (idx >= length) return;\n";
-      op += SP + SP + SP + "double v = static_cast<double>(x[idx]);\n";
+      if (HasFusedUpstreamDecode()) {
+         // The absorbed decode, on the codes rather than on the float it would have stored.
+         op += SP + SP + SP + "double v = static_cast<double>(x[idx]) * " +
+               DETAIL::ExactDoubleLiteral(fFusedDecodeScale) + ";\n";
+      } else {
+         op += SP + SP + SP + "double v = static_cast<double>(x[idx]);\n";
+      }
       if (fFusedHasClip) {
          // The absorbed Clip runs before the quantize, exactly where it sat in the graph.
          op += SP + SP + SP + "v = v < " + DETAIL::ExactDoubleLiteral(fFusedClipLow) + " ? " +

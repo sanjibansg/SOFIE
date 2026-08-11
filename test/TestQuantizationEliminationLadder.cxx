@@ -287,3 +287,29 @@ TEST(OutputAdoptionCodegen, GridCrossingKeepsItsBoundary)
    EXPECT_NE(code.find("deviceBuf_h_dq"), std::string::npos)
       << "the region before the crossing does not emit its dequantized output";
 }
+
+// A fake-quant round trip whose float comes straight from a decode reads that decode's codes
+// instead. One kernel then spans both grids, and the decode has no reader left to emit for.
+TEST(OutputAdoptionCodegen, RoundTripAbsorbsTheDecodeInFrontOfIt)
+{
+   const std::string code =
+      ReadGeneratedHeader("ONNX_QDQ_DecodeAbsorb_FromONNX_GPU_ALPAKA.hxx");
+
+   // Both Adds stay regions. The coarse boundary emits its carrier only because the second
+   // one reads it, so a region that stopped lowering would take the absorption with it.
+   EXPECT_EQ(SOFIE_TEST::CountOccurrences(code, "QuantizedElementwise_Call"), 2U)
+      << "an Add stopped lowering, so the coarse carrier has no second reader";
+
+   // Two decodes stand on the coarse carrier before lowering: one the second region absorbs,
+   // one the round trip takes. Neither may survive as a kernel.
+   EXPECT_EQ(SOFIE_TEST::CountOccurrences(code, "struct DequantizeLinearKernel"), 1U)
+      << "the decode in front of the round trip is still emitting its own kernel";
+
+   // The absorbed decode, as the round trip's own first statement: the coarse scale applied
+   // to codes. Reading the float instead would leave the multiply out entirely.
+   EXPECT_NE(code.find("static_cast<double>(x[idx]) * 0.0625"), std::string::npos)
+      << "the round trip is not applying the absorbed decode's scale";
+   // And the far end of the same kernel, which the absorption must leave untouched.
+   EXPECT_NE(code.find("static_cast<TOut>((q - 0) * 0.0078125)"), std::string::npos)
+      << "the round trip stopped writing its own grid's snapped float";
+}
