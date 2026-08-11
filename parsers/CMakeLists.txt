@@ -85,6 +85,7 @@ set(sources_cxx
     src/ParseNot.cxx
     src/ParseClip.cxx
     src/ParseScatterElements.cxx
+    src/ParseScatterND.cxx
     src/ParseTrilu.cxx
     src/ParseLogic.cxx
     ${PROTO_SRCS}
