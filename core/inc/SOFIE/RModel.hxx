@@ -1,6 +1,8 @@
 #ifndef SOFIE_RMODEL
 #define SOFIE_RMODEL
 
+#include <optional>
+
 #include "SOFIE/RModel_Base.hxx"
 #include "SOFIE/SOFIE_common.hxx"
 #include "SOFIE/ROperator.hxx"
@@ -120,6 +122,7 @@ private:
       std::vector<std::string> internalTensors;
       FusionStructuralScore score;
       size_t launchOpIndex = 0;
+      std::optional<EltwiseFusionGroup> prebuiltGroup;
 
       bool isFused() const { return opIndices.size() > 1; }
    };
@@ -142,6 +145,8 @@ private:
 
    std::vector<size_t> EnumerateFusionLaunchIndices(const FusionCandidate &candidate, const FusionTensorUseGraph &tensorUses) const;
 
+   std::vector<FusionCandidate> EnumerateSpecialFusionCandidates(const FusionTensorUseGraph &tensorUses) const;
+   
    std::vector<FusionCandidate> EnumerateFusionCandidates(const FusionTensorUseGraph &tensorUses) const;
 
    std::vector<FusionCandidate> EnumerateLinearFusionCandidates(const FusionTensorUseGraph &tensorUses) const;

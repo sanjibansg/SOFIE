@@ -566,6 +566,58 @@ bool RModel::IsBetterFusionStructuralScore(const FusionStructuralScore &left, co
    return left.externalInputs < right.externalInputs;
 }
 
+std::vector<RModel::FusionCandidate> RModel::EnumerateSpecialFusionCandidates(const FusionTensorUseGraph &tensorUses) const
+{
+   std::vector<FusionCandidate> candidates;
+
+   for (size_t firstOpIdx = 0; firstOpIdx < fOperators.size(); ++firstOpIdx) {
+      if (!IsSupportedFusionOperator(firstOpIdx, true, false))
+         continue;
+
+      FusionBuildState state = InitializeFusionBuildState(firstOpIdx);
+
+      while (TryExtendFusionBuildState(state, tensorUses, nullptr)) {
+         const bool hasSpecialMapping = std::any_of(state.group.opIndices.begin(), state.group.opIndices.end(), [&](size_t opIdx) {
+            const auto mapping = fOperators[opIdx]->GetFusionMappingType();
+            return mapping == EFusionMappingType::Shuffle || mapping == EFusionMappingType::Reorganize;
+         });
+
+         if (!state.group.isFused() || !hasSpecialMapping)
+            continue;
+
+         EltwiseFusionGroup group = state.group;
+         group.outputTensor = std::string(fOperators[state.currentOpIdx]->GetOpOutputTensors()[0]);
+         group.outputTensors = {group.outputTensor};
+         group.internalTensors.clear();
+         group.numElements = ConvertShapeToLength(state.groupOutputShape);
+         group.launchOpIndex = state.currentOpIdx;
+
+         if (IsAliasTensor(group.outputTensor))
+            continue;
+
+         for (size_t groupOpIdx = 0; groupOpIdx + 1 < group.opIndices.size(); ++groupOpIdx) {
+            const auto outputs = fOperators[group.opIndices[groupOpIdx]]->GetOpOutputTensors();
+            if (!outputs.empty()) group.internalTensors.push_back(std::string(outputs[0]));
+         }
+
+         FusionCandidate candidate;
+         candidate.opIndices = group.opIndices;
+
+         for (const auto &externalInput : group.externalInputs)
+            candidate.externalInputs.push_back(externalInput.tensorName);
+
+         candidate.materializedOutputs = group.outputTensors;
+         candidate.internalTensors = group.internalTensors;
+         candidate.launchOpIndex = group.launchOpIndex;
+         candidate.prebuiltGroup = std::move(group);
+         candidate.score = ComputeFusionStructuralScore(candidate, tensorUses);
+         candidates.push_back(std::move(candidate));
+      }
+   }
+
+   return candidates;
+}
+
 std::vector<RModel::FusionCandidate> RModel::EnumerateFusionCandidates(const FusionTensorUseGraph &tensorUses) const
 {
    // Exhaustive subset enumeration is bounded for tractability. This is a search budget, not a fusion-legality restriction.
@@ -1065,6 +1117,9 @@ RModel::FusionBuildState RModel::InitializeFusionBuildState(size_t firstOpIdx) c
 
 RModel::EltwiseFusionGroup RModel::BuildEltwiseFusionGroup(const FusionCandidate &candidate) const
 {
+   if (candidate.prebuiltGroup)
+      return *candidate.prebuiltGroup;
+
    if (candidate.materializedOutputs.empty())
       throw std::runtime_error("Fusion candidate has no materialized output");
 
@@ -1100,55 +1155,7 @@ void RModel::ComputeEltwiseFusionGroups()
 
    const auto tensorUses = BuildFusionTensorUseGraph();
 
-   // Preserve the existing Shuffle/Reorganize fusion path.
-   // These groups are fixed for now while the general DAG planner handles pointwise regions.
-   std::vector<EltwiseFusionGroup> specialGroups;
-   std::vector<bool> specialAssigned(fOperators.size(), false);
-
-   for (size_t firstOpIdx = 0; firstOpIdx < fOperators.size(); ++firstOpIdx) {
-      if (specialAssigned[firstOpIdx] || !IsSupportedFusionOperator(firstOpIdx, true, false))
-         continue;
-
-      FusionBuildState state = InitializeFusionBuildState(firstOpIdx);
-      specialAssigned[firstOpIdx] = true;
-
-      while (TryExtendFusionBuildState(state, tensorUses, &specialAssigned))
-         specialAssigned[state.currentOpIdx] = true;
-
-      const bool hasSpecialMapping = std::any_of(state.group.opIndices.begin(), state.group.opIndices.end(), [&](size_t opIdx) {
-         const auto mapping = fOperators[opIdx]->GetFusionMappingType();
-         return mapping == EFusionMappingType::Shuffle || mapping == EFusionMappingType::Reorganize;
-      });
-
-      if (!state.group.isFused() || !hasSpecialMapping) {
-         for (const size_t opIdx : state.group.opIndices) specialAssigned[opIdx] = false;
-         continue;
-      }
-
-      state.group.outputTensor = std::string(fOperators[state.currentOpIdx]->GetOpOutputTensors()[0]);
-      state.group.outputTensors = {state.group.outputTensor};
-      state.group.numElements = ConvertShapeToLength(state.groupOutputShape);
-      state.group.launchOpIndex = state.currentOpIdx;
-
-      if (IsAliasTensor(state.group.outputTensor)) {
-         for (const size_t opIdx : state.group.opIndices) specialAssigned[opIdx] = false;
-         continue;
-      }
-
-      for (size_t groupOpIdx = 0; groupOpIdx + 1 < state.group.opIndices.size(); ++groupOpIdx) {
-         const auto outputs = fOperators[state.group.opIndices[groupOpIdx]]->GetOpOutputTensors();
-         if (!outputs.empty()) state.group.internalTensors.push_back(std::string(outputs[0]));
-      }
-
-      specialGroups.push_back(std::move(state.group));
-   }
-
-   std::vector<bool> reservedOps(fOperators.size(), false);
-
-   for (const auto &group : specialGroups) {
-      for (const size_t opIdx : group.opIndices) reservedOps[opIdx] = true;
-   }
-
+   auto specialCandidates = EnumerateSpecialFusionCandidates(tensorUses);
    auto dagCandidates = EnumerateFusionCandidates(tensorUses);
    auto linearCandidates = EnumerateLinearFusionCandidates(tensorUses);
    std::vector<FusionCandidate> candidates;
@@ -1156,18 +1163,16 @@ void RModel::ComputeEltwiseFusionGroups()
 
    auto AddCandidates = [&](std::vector<FusionCandidate> &source) {
       for (auto &candidate : source) {
-         const bool overlapsReserved = std::any_of(candidate.opIndices.begin(), candidate.opIndices.end(), [&](size_t opIdx) { return reservedOps[opIdx]; });
-         if (overlapsReserved || !seenCandidates.insert({candidate.opIndices, candidate.launchOpIndex}).second) continue;
+         if (!seenCandidates.insert({candidate.opIndices, candidate.launchOpIndex}).second) continue;
          candidates.push_back(std::move(candidate));
       }
    };
 
+   AddCandidates(specialCandidates);
    AddCandidates(dagCandidates);
    AddCandidates(linearCandidates);
 
    const FusionPlan plan = SelectFusionPlan(candidates, tensorUses);
-
-   fEltwiseFusionGroups = std::move(specialGroups);
 
    for (const size_t candidateIdx : plan.candidateIndices)
       fEltwiseFusionGroups.push_back(BuildEltwiseFusionGroup(candidates[candidateIdx]));
