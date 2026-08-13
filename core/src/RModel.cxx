@@ -1498,6 +1498,9 @@ void RModel::Generate(std::underlying_type_t<Options> options, int batchSize, lo
    fBatchSize = batchSize;
    fReadPos = pos;
 
+   if (static_cast<std::underlying_type_t<Options>>(Options::kKernelOnly) & options)
+      throw std::runtime_error("sofie: RModel::Generate: Options::kKernelOnly is only supported for generation with alpaka");
+
    // session flag is used in operator initialize
    if (static_cast<std::underlying_type_t<Options>>(Options::kNoSession) & options) {
       fUseSession = false;

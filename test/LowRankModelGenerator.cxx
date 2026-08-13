@@ -1,11 +1,16 @@
-// Standalone (no ROOT, no ONNX) generator for the low-rank factorization tests.
-// Builds the same Gemm+bias model programmatically via the RModel API, once with
-// low rank factorization disabled and once enabled, and emits both the CPU and
-// GPU (Alpaka) Session headers + weight files for TestLowRankFactorization.cxx
-// (CPU) and alpaka/TestAlpakaLowRank.cxx (GPU) to #include.
+// Standalone generator for tests that build an RModel
+// programmatically via the C++ API instead of parsing an ONNX file.
+//
+// - Builds the same Gemm+bias model, once with low rank factorization disabled
+//   and once enabled, and emits both the CPU and GPU (Alpaka) Session headers +
+//   weight files for TestLowRankFactorization.cxx (CPU) and
+//   alpaka/TestAlpakaLowRank.cxx (GPU) to #include.
+// - Emits a LeakyRelu model in Options::kKernelOnly mode (Alpaka kernel
+//   struct only, no Session/infer) for alpaka/TestAlpakaKernelOnly.cxx.
 
 #include "SOFIE/RModel.hxx"
 #include "SOFIE/ROperator_Gemm.hxx"
+#include "SOFIE/ROperator_LeakyRelu.hxx"
 
 #include <random>
 #include <iostream>
@@ -45,6 +50,17 @@ RModel BuildModel(const std::string &name, const std::vector<float> &W, const st
    return model;
 }
 
+RModel BuildLeakyReluModel()
+{
+   RModel model("LeakyReluKernelOnly", "now");
+   model.AddInputTensorInfo("X", ETensorType::FLOAT, std::vector<Dim>{Dim(6)});
+   model.AddInputTensorName("X");
+   auto op = std::make_unique<ROperator_LeakyRelu<float>>(0.1f, "X", "Y");
+   model.AddOperator(std::move(op));
+   model.AddOutputTensorNameList({"Y"});
+   return model;
+}
+
 } // namespace
 
 int main()
@@ -73,6 +89,12 @@ int main()
       lowrankGpu.SetLowRankRatio(0.5f);
       lowrankGpu.GenerateGPU_ALPAKA(Options::kLowRankFactorize, -1, false);
       lowrankGpu.OutputGenerated("LowRankGemm_LowRank_GPU_ALPAKA.hxx");
+   }
+
+   {
+      RModel leakyRelu = BuildLeakyReluModel();
+      leakyRelu.GenerateGPU_ALPAKA(Options::kKernelOnly, -1, false);
+      leakyRelu.OutputGenerated("LeakyRelu_KernelOnly_GPU_ALPAKA.hxx");
    }
 
    std::cout << "LowRankModelGenerator: emitted CPU and GPU dense/low-rank models\n";

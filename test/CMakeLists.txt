@@ -154,6 +154,7 @@ if (ENABLE_ALPAKA_TESTS)
       alpaka/TestAlpakaGNN.cxx
       alpaka/TestAlpakaPool.cxx
       alpaka/TestAlpakaLowRank.cxx
+      alpaka/TestAlpakaKernelOnly.cxx
     )
 
     set_source_files_properties(

@@ -641,6 +641,9 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    fGC += "        alpaka::Vec<TDim, TIdx>::all(TIdx{1}));\n";
    fGC += "}\n\n";
 
+   if (fKernelOnly)
+      return;
+
    // define the Session struct (for GNN this is generated in RModel_GNN)
   fGC += "\n\ntemplate <typename tagAcc>\n";
    if (fUseSession) {
@@ -807,6 +810,12 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
    if (fProfile)
       RModelProfilerGPU::AddNeededStdLibs(*this);
 
+   if (static_cast<std::underlying_type_t<Options>>(Options::kKernelOnly) & options) {
+      fKernelOnly = true;
+      fUseSession = false;
+      fUseWeightFile = false;
+      fWeightFile = WeightFileType::None;
+   }
    if (static_cast<std::underlying_type_t<Options>>(Options::kNoSession) & options) {
       fUseSession = false;
       fWeightFile = WeightFileType::None;
