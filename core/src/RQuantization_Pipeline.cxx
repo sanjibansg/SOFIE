@@ -10,6 +10,7 @@
 #include "SOFIE/RQuantization_Storage.hxx"
 #include "SOFIE/ROperator_Clip.hxx"
 #include "SOFIE/ROperator_ONNXQuantizeLinear.hxx"
+#include "SOFIE/ROperator_QuantizedMatMul.hxx"
 #include "SOFIE/ROperator_Reshape.hxx"
 #include "SOFIE/ROperator_Softmax.hxx"
 #include "SOFIE/ROperator_Transpose.hxx"
@@ -688,6 +689,74 @@ void QuantizationPipeline::ApplyPlannedCarrierHandoffs(RModel &model)
             std::fprintf(stderr, "[decode-fuse] %s reads %s at the load\n",
                          consumer->Name().c_str(), carrier.c_str());
       }
+   }
+
+   ApplyDeferredOutputEpilogues(model, consumers);
+}
+
+// The accumulator handoff: a lowered dense-linear region whose sole reader can apply the
+// epilogue itself stops emitting it. Both halves are asked -- see CanDeferOutputEpilogue and
+// ROperator::AcceptInt32Accumulator.
+void QuantizationPipeline::ApplyDeferredOutputEpilogues(
+   RModel &model, const std::unordered_map<std::string, std::vector<std::size_t>> &consumers)
+{
+   // Emits the same graph with the epilogue kernel back in place, so the handoff's
+   // bit-exactness can be diffed output-for-output.
+   if (std::getenv("SOFIE_DISABLE_DEFER_EPILOGUE") != nullptr)
+      return;
+
+   const std::set<std::string> graphOutputs(model.fOutputTensorNames.begin(), model.fOutputTensorNames.end());
+
+   for (auto &[opIndex, lowered] : model.fLoweredOperators) {
+      auto *producer = dynamic_cast<ROperator_QuantizedDenseLinear *>(lowered.get());
+      if (producer == nullptr || !producer->CanDeferOutputEpilogue())
+         continue;
+      const std::string &floatOut = producer->DeferredOutputTensor();
+      if (floatOut.empty() || graphOutputs.count(floatOut) != 0)
+         continue;
+      // A second reader would still need the float that is about to stop being written.
+      auto reader = consumers.find(floatOut);
+      if (reader == consumers.end() || reader->second.size() != 1)
+         continue;
+      const std::size_t readerIndex = reader->second.front();
+      // The accumulator is scratch bound from a shared arena base, so it survives only until
+      // the next lowered region runs: none may sit between producer and consumer. Ordinary
+      // kernels touch no scratch. Original operator indices order the same as emission, since
+      // codegen walks fOperators forward and absorbed ops are gone from both.
+      if (readerIndex <= opIndex)
+         continue;
+      bool loweredRegionInBetween = false;
+      for (std::size_t between = opIndex + 1; between < readerIndex && !loweredRegionInBetween; ++between)
+         loweredRegionInBetween = model.fLoweredOperators.count(between) != 0;
+      if (loweredRegionInBetween) {
+         if (QuantizationTraceEnabled())
+            std::fprintf(stderr, "[defer-epilogue] %s: a lowered region sits between %zu and %zu\n",
+                         floatOut.c_str(), opIndex, readerIndex);
+         continue;
+      }
+      auto loweredReader = model.fLoweredOperators.find(readerIndex);
+      ROperator *consumer = loweredReader != model.fLoweredOperators.end()
+                               ? loweredReader->second.get()
+                               : (OriginalOperatorEmitted(model, readerIndex) ? model.fOperators[readerIndex].get()
+                                                                             : nullptr);
+      if (consumer == nullptr || !consumer->CanAcceptInt32Accumulator())
+         continue;
+
+      const auto &shape = producer->DeferredOutputShape();
+      if (!consumer->AcceptInt32Accumulator(producer->DeferredEpilogueStateName(opIndex), shape.batchCount,
+                                            shape.logicalM, shape.logicalN,
+                                            producer->DeferredEpilogueSpecialization())) {
+         if (QuantizationTraceEnabled())
+            std::fprintf(stderr, "[defer-epilogue] %s declined the accumulator of %s (batch=%zu m=%zu n=%zu)\n",
+                         consumer->Name().c_str(), floatOut.c_str(), shape.batchCount, shape.logicalM,
+                         shape.logicalN);
+         continue;
+      }
+      producer->DeferOutputEpilogue();
+      ++QuantizationExtension::Of(model).report.deferredOutputEpilogues;
+      if (QuantizationTraceEnabled())
+         std::fprintf(stderr, "[defer-epilogue] %s applies the epilogue of %s at its load\n",
+                      consumer->Name().c_str(), floatOut.c_str());
    }
 }
 

@@ -7,6 +7,7 @@
 #include "SOFIE/RModel.hxx"
 
 #include <cstdint>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <optional>
@@ -37,6 +38,56 @@ private:
    double fQuantClipLow = 0.0;
    double fQuantClipHigh = 0.0;
 
+   // The producing GEMM's cuBLASLt state, when it deferred its float epilogue here; the launch
+   // reads the accumulator and epilogue parameters from it. Empty means read the float output.
+   std::string fAccumulatorStateName;
+   // The planner's epilogue shape, instantiated into the call so untaken branches are dropped.
+   QuantizedEpilogueSpecialization fAccumulatorSpec;
+
+   bool ReadsDeferredAccumulator() const { return !fAccumulatorStateName.empty(); }
+
+   // The absorbed DequantizeLinear's grid: its carrier is read and decoded at the load.
+   std::optional<QuantizationGrid> fInputGrid;
+
+   bool ReadsCarrierInput() const { return fInputGrid.has_value(); }
+
+   // Where pass 1's values come from, kept together because a parameter changed without its
+   // load, or a T deduced from a pointee that is no longer the working type, still compiles.
+   struct SoftmaxInputBinding {
+      std::string templateParams;   // after `typename TAcc, `, before `, typename TOut`
+      std::string parameter;        // the input parameter declaration
+      std::string workingType;      // T, when it cannot be deduced from the input; else empty
+      std::function<std::string(const std::string &)> load;   // one element, by index expression
+   };
+
+   SoftmaxInputBinding InputBinding() const
+   {
+      // Same function and params struct as QuantizedGemmCudaEpilogueKernel, passed through from
+      // the GEMM rather than rebuilt, so the value is bit-identical. The index is the producer's
+      // logical output index, which AcceptInt32Accumulator checked against this traversal.
+      if (ReadsDeferredAccumulator()) {
+         const std::string args = fAccumulatorSpec.TemplateArgs();
+         // No input template parameter: the epilogue struct is concrete and yields float.
+         return {"", "SOFIE::QuantizedDeferredEpilogue const& ep", "float",
+                 [args](const std::string &at) {
+                    return "SOFIE::INTERNAL::QuantizedGemmCudaEpilogueValueSpec" + args + "(" + at +
+                           ", ep.accumulator, ep.bias, ep.weightScaleVector, "
+                           "ep.inputZeroPointColumnSums, ep.params)";
+                 }};
+      }
+      // Spelled as ROperator_ONNXDequantizeLinear's FP8 kernel does, so absorbing it changes no
+      // bits. T is the decode's result, not the carrier.
+      if (ReadsCarrierInput()) {
+         const std::string scale = ExactDoubleLiteral(fInputGrid->scale);
+         return {"typename TIn", "TIn const* __restrict__ X", "float",
+                 [scale](const std::string &at) {
+                    return "static_cast<T>(SOFIE::DecodeFP8E4M3(X[" + at + "]) * " + scale + "f)";
+                 }};
+      }
+      return {"typename T", "T const* __restrict__ X", "",
+              [](const std::string &at) { return "X[" + at + "]"; }};
+   }
+
 public:
    ROperator_Softmax() {}
    ROperator_Softmax(int64_t attr_axis, std::string nameX, std::string nameY, bool logSoftmax = false)
@@ -48,8 +99,9 @@ public:
          fOutputTensorNames = { fNY };
    }
 
-   // Only the register-resident emission can fuse: the staged variant uses Y as scratch
-   // for the exponentials, so Y must keep the input's width.
+   // The fusion gate for every hook below: only the register-resident emission reads each
+   // element exactly once and keeps it, so only it can absorb work into the load or the store.
+   // The staged variant re-reads X in pass 2 and uses Y as scratch for the exponentials.
    bool CanFuseClip() const { return SoftmaxUsesRegisterResidentRows(); }
    // A log-softmax output is not on the grid the boundary describes, so it cannot encode.
    bool CanFuseOutputOnGrid(EQuantizedOutputEmit mode) const override
@@ -85,6 +137,58 @@ public:
       FuseClip(std::move(carrier), clipLow, clipHigh);
       fQuantHasClip = hasClip;
       fOutputGrid = grid;
+   }
+
+   // See CanFuseClip for why only this emission may fuse.
+   bool CanAcceptInt32Accumulator() const override { return SoftmaxUsesRegisterResidentRows(); }
+
+   // This traversal is `row * axisLen + k`, matching the producer's logical index only when its
+   // rows tile these and its columns are the axis length; a wrong mapping is silently wrong.
+   bool AcceptInt32Accumulator(const std::string &stateName, std::size_t batch, std::size_t rows,
+                               std::size_t cols, const QuantizedEpilogueSpecialization &spec) override
+   {
+      if (stateName.empty() || fShape.empty() || !CanAcceptInt32Accumulator())
+         return false;
+      const auto &axisDim = fShape[SoftmaxAxis()];
+      if (axisDim.isParam || axisDim.dim == 0)
+         return false;
+      if (cols != axisDim.dim)
+         return false;
+      // Rows are the product of the non-axis dimensions, visited in the producer's write order.
+      std::size_t ourRows = 1;
+      for (std::size_t i = 0; i < fShape.size(); ++i) {
+         if (i == SoftmaxAxis())
+            continue;
+         if (fShape[i].isParam)
+            return false;
+         ourRows *= fShape[i].dim;
+      }
+      const std::size_t batchCount = batch == 0 ? 1 : batch;
+      if (batchCount * rows != ourRows)
+         return false;
+      fAccumulatorStateName = stateName;
+      fAccumulatorSpec = spec;
+      return true;
+   }
+
+   // Read the carrier and decode at the load, dropping the DequantizeLinear kernel and the
+   // float round trip on both sides. Gated as CanFuseClip.
+   bool CanFuseDequantizedInput() const override
+   {
+      return SoftmaxUsesRegisterResidentRows() && !ReadsDeferredAccumulator();
+   }
+
+   bool FuseDequantizedInput(const std::string &from, const std::string &carrier,
+                             const QuantizationGrid &grid) override
+   {
+      // E4M3 only, as in ROperator_BasicBinary: an affine grid carries a zero point too, and
+      // E5M2 needs its own decode.
+      if (!IsPerTensorE4M3(grid) || fNX != from || fInputGrid || ReadsDeferredAccumulator())
+         return false;
+      fNX = carrier;
+      fInputGrid = grid;
+      fInputTensorNames = {fNX};
+      return true;
    }
 
    std::vector<ETensorType> TypeInference(std::vector<ETensorType> input) override { return input; }
@@ -287,19 +391,41 @@ private:
    {
       return !fShape.empty() && SoftmaxAxis() + 1 == fShape.size();
    }
-   // Shared-memory tree reduction over kSoftmaxBlockThreads, unrolled at codegen time.
-   // In `combine`, "@H" stands for the current half-width.
+   static std::string SubstitutePlaceholder(std::string text, const std::string &token,
+                                            const std::string &value)
+   {
+      for (auto at = text.find(token); at != std::string::npos; at = text.find(token, at))
+         text.replace(at, token.size(), value);
+      return text;
+   }
+
+   // Block-wide reduction over kSoftmaxBlockThreads, unrolled at codegen time. In `combine`,
+   // "@A" is the accumulator and "@B" the partner; both halves substitute their own names.
    std::string SoftmaxBlockReduce(const std::string &indent, const std::string &combine) const
    {
+      const auto step = [&combine](const std::string &a, const std::string &b) {
+         return SubstitutePlaceholder(SubstitutePlaceholder(combine, "@A", a), "@B", b);
+      };
       std::string out;
-      for (std::size_t half = kSoftmaxBlockThreads / 2; half > 0; half >>= 1) {
+      // Shared-memory tree only while the survivors span more than one warp; below 32 a
+      // block-wide barrier buys nothing. `alpaka::warp::shfl_down`, not `__shfl_down_sync`, so
+      // CPU and HIP keep their WarpSingleThread fallback. Lane `tid` still pairs with
+      // `tid + half` in the same order, so the result is bit-identical to the tree.
+      constexpr std::size_t kWarp = 32;
+      for (std::size_t half = kSoftmaxBlockThreads / 2; half >= kWarp; half >>= 1) {
          const std::string h = std::to_string(half) + "u";
-         std::string step = combine;
-         for (std::size_t at = step.find("@H"); at != std::string::npos; at = step.find("@H", at))
-            step.replace(at, 2, h);
-         out += indent + "if (tid < " + h + ") { " + step + " }\n";
+         out += indent + "if (tid < " + h + ") { " + step("shmem[tid]", "shmem[tid + " + h + "]") + " }\n";
          out += indent + "alpaka::syncBlockThreads(acc);\n";
       }
+      out += indent + "if (tid < " + std::to_string(kWarp) + "u) {\n";
+      out += indent + "   auto v = shmem[tid];\n";
+      for (std::size_t half = kWarp / 2; half > 0; half >>= 1) {
+         out += indent + "   { const auto other = alpaka::warp::shfl_down(acc, v, " +
+                std::to_string(half) + "u); " + step("v", "other") + " }\n";
+      }
+      out += indent + "   if (tid == 0u) shmem[0] = v;\n";
+      out += indent + "}\n";
+      out += indent + "alpaka::syncBlockThreads(acc);\n";
       return out;
    }
 
@@ -313,9 +439,17 @@ public:
       op += SP + "struct " + kname + " {\n";
       // TOut is deduced: it is T for an ordinary Softmax and the integer carrier type
       // when the output quantization is fused in.
-      op += SP + SP + "template<typename TAcc, typename T, typename TOut>\n";
-      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const* __restrict__ X, "
-            "TOut* __restrict__ Y, std::size_t numRows, std::size_t axisLen, std::size_t inner) const {\n";
+      const auto binding = InputBinding();
+      std::string templateParams = "typename TAcc";
+      if (!binding.templateParams.empty())
+         templateParams += ", " + binding.templateParams;
+      templateParams += ", typename TOut";
+      op += SP + SP + "template<" + templateParams + ">\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, " + binding.parameter +
+            ", TOut* __restrict__ Y, std::size_t numRows, std::size_t axisLen, "
+            "std::size_t inner) const {\n";
+      if (!binding.workingType.empty())
+         op += SP + SP + SP + "using T = " + binding.workingType + ";\n";
 
       if (SoftmaxRowIsContiguous()) {
          const std::string I3 = SP + SP + SP;
@@ -352,11 +486,12 @@ public:
             op += I3 + "#pragma unroll\n";
             op += I3 + "for (std::size_t j = 0; j < " + pt + "; ++j) {\n";
             op += I4 + "const std::size_t k = tid + j * " + bt + ";\n";
-            op += I4 + "if (k < axisLen) { vals[j] = X[base + k]; if (vals[j] > vmax) vmax = vals[j]; }\n";
+            op += I4 + "if (k < axisLen) { vals[j] = " + binding.load("base + k") +
+                  "; if (vals[j] > vmax) vmax = vals[j]; }\n";
             op += I3 + "}\n";
             op += I3 + "shmem[tid] = vmax;\n";
             op += I3 + "alpaka::syncBlockThreads(acc);\n";
-            op += SoftmaxBlockReduce(I3, "if (shmem[tid + @H] > shmem[tid]) shmem[tid] = shmem[tid + @H];");
+            op += SoftmaxBlockReduce(I3, "if (@B > @A) @A = @B;");
             op += I3 + "vmax = shmem[0];\n";
             op += I3 + "alpaka::syncBlockThreads(acc);\n\n";
 
@@ -369,7 +504,7 @@ public:
             op += I3 + "}\n";
             op += I3 + "shmem[tid] = sum;\n";
             op += I3 + "alpaka::syncBlockThreads(acc);\n";
-            op += SoftmaxBlockReduce(I3, "shmem[tid] += shmem[tid + @H];");
+            op += SoftmaxBlockReduce(I3, "@A += @B;");
             op += I3 + "const T inv = static_cast<T>(1) / shmem[0];\n";
             op += I3 + "alpaka::syncBlockThreads(acc);\n\n";
 
@@ -417,7 +552,7 @@ public:
                   ") { T v = X[base + k]; if (v > vmax) vmax = v; }\n";
             op += I3 + "shmem[tid] = vmax;\n";
             op += I3 + "alpaka::syncBlockThreads(acc);\n";
-            op += SoftmaxBlockReduce(I3, "if (shmem[tid + @H] > shmem[tid]) shmem[tid] = shmem[tid + @H];");
+            op += SoftmaxBlockReduce(I3, "if (@B > @A) @A = @B;");
             op += I3 + "vmax = shmem[0];\n";
             // Re-sync before reusing shmem, or a fast thread's pass-2 write races the slow
             // threads still reading shmem[0].
@@ -429,7 +564,7 @@ public:
                   ") { T e = static_cast<T>(exp(X[base + k] - vmax)); Y[base + k] = e; sum += e; }\n";
             op += I3 + "shmem[tid] = sum;\n";
             op += I3 + "alpaka::syncBlockThreads(acc);\n";
-            op += SoftmaxBlockReduce(I3, "shmem[tid] += shmem[tid + @H];");
+            op += SoftmaxBlockReduce(I3, "@A += @B;");
             op += I3 + "const T inv = static_cast<T>(1) / shmem[0];\n";
             op += I3 + "alpaka::syncBlockThreads(acc);\n\n";
 
@@ -499,9 +634,20 @@ public:
       // The fused form writes the Quantize's carrier; the bypassed float intermediate
       // has no reader and is never allocated.
       const std::string outBuf = fFusedOutputTensor.empty() ? fNY : fFusedOutputTensor;
+      // The GEMM's scratch is reused by the next quantized GEMM; safe only because this
+      // enqueue sits between them on one in-order queue.
+      const std::string inArg = ReadsDeferredAccumulator()
+                                   ? fAccumulatorStateName + ".DeferredEpilogue()"
+                                   : "alpaka::getPtrNative(deviceBuf_" + fNX + ")";
+      // The kernel is compiled for one epilogue shape, and a disagreement is a wrong number
+      // rather than a crash, so it is caught on the host.
+      if (ReadsDeferredAccumulator()) {
+         out << SP << "SOFIE::RequireDeferredEpilogueSpecialization(" << fAccumulatorStateName
+             << ".DeferredEpilogue(), " << fAccumulatorSpec.CallArgs() << ");\n";
+      }
       out << SP << "auto task_" << opName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNY
-          << ", softmaxKernel_" << opName << ", alpaka::getPtrNative(deviceBuf_" << fNX
-          << "), alpaka::getPtrNative(deviceBuf_" << outBuf << "), static_cast<Idx>(" << numRows
+          << ", softmaxKernel_" << opName << ", " << inArg
+          << ", alpaka::getPtrNative(deviceBuf_" << outBuf << "), static_cast<Idx>(" << numRows
           << "), static_cast<Idx>(" << axisLen << "), static_cast<Idx>(" << inner << "));\n";
       out << SP << "alpaka::enqueue(queue, task_" << opName << ");\n";
       return out.str();

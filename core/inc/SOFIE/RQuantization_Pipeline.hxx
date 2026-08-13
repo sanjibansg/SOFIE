@@ -72,6 +72,11 @@ struct QuantizationPipeline {
    // already saturates at the same bound.
    static void DropNoOpClipsBeforeQuantize(RModel &model, EQuantizedBackend backend);
 
+   // Hands a lowered region's int32 accumulator to its sole consumer, which then applies the
+   // float epilogue at its own load and the region emits none.
+   static void ApplyDeferredOutputEpilogues(
+      RModel &model, const std::unordered_map<std::string, std::vector<std::size_t>> &consumers);
+
    // Moves a Reshape/Transpose run onto the quantized carrier, deleting the bracketing
    // Dequantize/Quantize pair; runs before the fusion below, which would otherwise absorb it.
    static void PropagateLowPrecisionThroughMovement(RModel &model, EQuantizedBackend backend);

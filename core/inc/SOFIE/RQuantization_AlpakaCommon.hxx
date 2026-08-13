@@ -268,10 +268,60 @@ struct QuantizedDenseLinearInvocation {
    bool enableAutotuning = true;
    int autotuneIterations = 3;
    double accumulatorToOutputScale = 0.0;
+   // 1/outputScale as a double plus its residual, so the epilogue reaches the output grid with
+   // an fma rather than a per-element double divide. Zero means "not filled".
+   double outputScaleReciprocal = 0.0;
+   double outputScaleReciprocalError = 0.0;
    // When true, the A operand is stored column-major as [k, m]: the NCHW unit-kernel Conv
    // input layout, consumed directly without im2col staging. Provider support is shape-dependent.
    bool aColumnMajorInput = false;
+   // Leave the accumulator in place and emit no float epilogue; the consumer applies
+   // QuantizedGemmCudaEpilogueValue at its load, so the float output is never written.
+   bool deferOutputEpilogue = false;
 };
+
+// What a deferred epilogue is reproduced from: the accumulator plus every pointer and
+// parameter the epilogue kernel would have received, recorded by the call rather than rebuilt.
+// The accumulator is scratch, valid only until the next quantized GEMM on the queue.
+struct QuantizedDeferredEpilogue {
+   const std::int32_t *accumulator = nullptr;
+   const float *bias = nullptr;
+   const float *weightScaleVector = nullptr;
+   const std::int32_t *inputZeroPointColumnSums = nullptr;
+   QuantizedDenseLinearInvocation params{};
+};
+
+// Checks once per launch that the invocation the GEMM recorded matches the specialization the
+// consumer compiled against; a mismatch drops a term and returns a plausible wrong number.
+inline void RequireDeferredEpilogueSpecialization(const QuantizedDeferredEpilogue &deferred, bool hasBias,
+                                                  bool hasRelu, bool perChannelScale, bool correctZeroPoint,
+                                                  bool fusedAccumulatorScale = false)
+{
+   // Against the invocation the GEMM ran, not the planner's copy: the fold's exactness is a
+   // property of the runtime numbers.
+   if (fusedAccumulatorScale) {
+      const auto &q = deferred.params;
+      const bool exact = IsPowerOfTwoScale(q.alpha) && IsPowerOfTwoScale(q.inputScale) &&
+                         IsPowerOfTwoScale(q.weightScale) && IsPowerOfTwoScale(q.outputScale) &&
+                         q.accumulatorToOutputScale != 0.0;
+      if (!exact)
+         throw std::runtime_error(
+            "SOFIE deferred epilogue folded its scale chain into one constant, but the invocation's "
+            "scales are not all powers of two; that fold reassociates and would change results");
+   }
+   const auto &p = deferred.params;
+   const bool actualPerChannel = p.weightScaleMode == EQuantizedScaleMode::PerOutputChannel;
+   const bool actualCorrectZp = deferred.inputZeroPointColumnSums != nullptr;
+   const bool actualHasBias = p.hasBias && deferred.bias != nullptr;
+   if (deferred.accumulator == nullptr)
+      throw std::runtime_error("SOFIE deferred epilogue was consumed but the producing GEMM recorded none");
+   if (actualHasBias != hasBias || p.hasRelu != hasRelu || actualPerChannel != perChannelScale ||
+       actualCorrectZp != correctZeroPoint)
+      throw std::runtime_error(
+         "SOFIE deferred epilogue was specialized for a different invocation shape than the GEMM "
+         "recorded (bias/relu/per-channel-scale/zero-point-correction disagree); the consumer would "
+         "silently compute the wrong epilogue");
+}
 
 struct QuantizedConvolutionInvocation {
    QuantizedDenseLinearInvocation matrix;

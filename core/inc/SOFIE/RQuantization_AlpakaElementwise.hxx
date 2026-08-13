@@ -164,6 +164,24 @@ __global__ void QuantizedElementwiseAffineVectorKernel(
    }
 }
 
+// One FP8 elementwise result, each operand dequantized with its own per-tensor scale.
+//
+// The Add rounds A's product and contracts B's, matching ROperator_BasicBinary's FP8 arm,
+// which decodes only the sole-consumer operand inline and lets nvcc fold that multiply into
+// the add. A symmetric spelling rounds one step earlier and is not bit-exact against it.
+__device__ inline float QuantizedElementwiseFP8Combine(__nv_fp8_e4m3 ca, __nv_fp8_e4m3 cb,
+                                                       float scaleA, float scaleB,
+                                                       EQuantizedElementwiseOp op, bool hasRelu)
+{
+   const float a = static_cast<float>(ca) * scaleA;
+   float value = op == EQuantizedElementwiseOp::Add
+                    ? __fmaf_rn(static_cast<float>(cb), scaleB, a)
+                    : a * (static_cast<float>(cb) * scaleB);
+   if (hasRelu && value < 0.0f)
+      value = 0.0f;
+   return value;
+}
+
 __global__ void QuantizedElementwiseFP8Kernel(
    float *output, const __nv_fp8_e4m3 *inputA, const __nv_fp8_e4m3 *inputB,
    QuantizedElementwiseInvocation params)
@@ -181,32 +199,24 @@ __global__ void QuantizedElementwiseFP8Kernel(
       : INTERNAL::QuantizedBroadcastOffset(index, params.outputStride, params.outputExtent,
                                            params.operandBStride, params.rank);
 
-   const float a = static_cast<float>(inputA[aOffset]);
-   const float b = static_cast<float>(inputB[bOffset]);
-   float value = params.op == EQuantizedElementwiseOp::Add ? a + b : a * b;
-   if (params.hasRelu && value < 0.0f)
-      value = 0.0f;
-   output[index] = value;
+   output[index] = QuantizedElementwiseFP8Combine(
+      inputA[aOffset], inputB[bOffset], static_cast<float>(params.inputScale),
+      static_cast<float>(params.operandBScale), params.op, params.hasRelu);
 }
 
 // FP8 counterpart of the vectorised affine kernel: four carriers in via one 32-bit
 // load per operand, four results out via one 16-byte store.
 __global__ void QuantizedElementwiseFP8VectorKernel(
    float *output, const __nv_fp8_e4m3 *inputA, const __nv_fp8_e4m3 *inputB,
-   EQuantizedElementwiseOp op, bool hasRelu, std::size_t elements)
+   EQuantizedElementwiseOp op, bool hasRelu, float scaleA, float scaleB, std::size_t elements)
 {
    struct alignas(4) Carrier4 { __nv_fp8_e4m3 v[4]; };
 
    const std::size_t vectorCount = elements / 4;
    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 
-   const auto combine = [op, hasRelu](__nv_fp8_e4m3 ca, __nv_fp8_e4m3 cb) {
-      const float a = static_cast<float>(ca);
-      const float b = static_cast<float>(cb);
-      float value = op == EQuantizedElementwiseOp::Add ? a + b : a * b;
-      if (hasRelu && value < 0.0f)
-         value = 0.0f;
-      return value;
+   const auto combine = [op, hasRelu, scaleA, scaleB](__nv_fp8_e4m3 ca, __nv_fp8_e4m3 cb) {
+      return QuantizedElementwiseFP8Combine(ca, cb, scaleA, scaleB, op, hasRelu);
    };
 
    if (index < vectorCount) {
@@ -334,7 +344,9 @@ inline void QuantizedElementwise_Call(QuantizedGemmCudaStream stream, void *outp
       if (INTERNAL::QuantizedElementwiseIsVectorisable(params, a, b, output, sizeof(float))) {
          INTERNAL::QuantizedElementwiseFP8VectorKernel<<<
             INTERNAL::QuantizedElementwiseVectorBlocks(elements, threads), threads, 0, stream>>>(
-            static_cast<float *>(output), a, b, params.op, params.hasRelu, elements);
+            static_cast<float *>(output), a, b, params.op, params.hasRelu,
+            static_cast<float>(params.inputScale), static_cast<float>(params.operandBScale),
+            elements);
       } else {
          const int blocks = static_cast<int>((elements + threads - 1) / threads);
          INTERNAL::QuantizedElementwiseFP8Kernel<<<blocks, threads, 0, stream>>>(

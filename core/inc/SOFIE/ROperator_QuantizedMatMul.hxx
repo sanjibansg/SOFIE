@@ -7,6 +7,7 @@
 #include "SOFIE/ROperator_QuantizedMatrix.hxx"
 #include "SOFIE/ROperator_QuantizedGemm.hxx"
 
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -84,6 +85,7 @@ inline std::string GenerateFusedQuantizedMatMulCublasLtLaunch(std::string opName
       static_cast<float>(region.outputAlpha));
    call.outputRequantize = region.outputRequantize;
    call.outputClamp = region.outputClamp;
+   call.deferOutputEpilogue = region.deferOutputEpilogue;
    return INTERNAL::GenerateQuantizedCudaLtMatMulCall(call);
 }
 
@@ -106,15 +108,18 @@ inline std::string GenerateFusedQuantizedMatMulCublasLtFP8Launch(std::string opN
    if (fp8HasBias && region.epilogue.biasSourceTensor.empty()) {
       throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch has a bias epilogue with no bias tensor");
    }
-   if (region.outputAlpha != 1.0) {
-      throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch does not support an absorbed output scale");
+   // An absorbed scalar Mul arrives as outputAlpha. cuBLASLt applies alpha before the D-scale
+   // narrows, which is the position the Mul held, so carrying it does not reassociate.
+   if (!std::isfinite(region.outputAlpha) || region.outputAlpha == 0.0) {
+      throw std::runtime_error("SOFIE fused Quantized MatMul cuBLASLt FP8 launch has a non-finite or zero absorbed output scale");
    }
 
    auto call = INTERNAL::MakeQuantizedCudaLtFP8DenseLinearCall(
       "ROperator_QuantizedMatMul cuBLASLt FP8 dense-linear boundary " + opName,
       "quantizedMatMulCudaLtFP8State_" + opName, "params_quantizedMatMulFP8_" + opName,
       region.outputTensor, region.inputSourceTensor, plan.weightStorageTensor,
-      region.epilogue.biasSourceTensor, fp8HasBias, 1.0f, fp8HasBias ? 1.0f : 0.0f,
+      region.epilogue.biasSourceTensor, fp8HasBias, static_cast<float>(region.outputAlpha),
+      fp8HasBias ? 1.0f : 0.0f,
       std::to_string(matrixShape.logicalM),
       std::to_string(matrixShape.logicalN), std::to_string(matrixShape.logicalK), plan);
    // The FP8 layouts are column-major, so only the NT operand order leaves the weight at
@@ -137,6 +142,54 @@ private:
    bool IsMatMulSpelling() const { return fRegion.spelling == EQuantizedDenseLinearSpelling::MatMul; }
 
 public:
+   // Producer half of the accumulator handoff, paired by the pipeline with the consumer's
+   // ROperator::CanAcceptInt32Accumulator. Only the fake-quant float epilogue leaves an
+   // accumulator: Quantized mode may have cuBLASLt narrow the store, and a requantize fusion
+   // has already spent it.
+   bool CanDeferOutputEpilogue() const
+   {
+      return IsOptimizedQuantizedAlpakaPlainDevicePlan(fPlan) && !QuantizedPlanUsesFP8DenseLinear(fPlan) &&
+             fPlan.outputMode != EQuantizedOutputMode::Quantized && !fRegion.outputRequantize.has_value() &&
+             !fRegion.deferOutputEpilogue;
+   }
+
+   // Extents the consumer must match. From the lowering plan, not the region: the plan's shape
+   // policy is what the emitted params carry and so what the epilogue is indexed by.
+   const QuantizedMatrixShapePolicy &DeferredOutputShape() const
+   {
+      return RequireQuantizedMatrixShapePolicy(fPlan, "deferred output epilogue");
+   }
+   const std::string &DeferredOutputTensor() const { return fRegion.outputTensor; }
+
+   // The epilogue's per-element decisions, settled at plan time from the analysed region.
+   QuantizedEpilogueSpecialization DeferredEpilogueSpecialization() const
+   {
+      QuantizedEpilogueSpecialization spec;
+      spec.hasBias = IsMatMulSpelling() ? QuantizedEpilogueHasBias(fRegion.epilogue.kind)
+                                        : !fRegion.biasSourceTensor.empty();
+      spec.hasRelu = IsMatMulSpelling() ? QuantizedEpilogueHasRelu(fRegion.epilogue.kind)
+                                        : QuantizedEpilogueHasRelu(fRegion.epilogue.kind);
+      spec.perChannelScale = fPlan.weightScaleMode == EQuantizedParameterMode::PerOutputChannel;
+      // The runtime builds column sums only for a nonzero input zero point; match that.
+      spec.correctZeroPoint = fRegion.inputQuant.zeroPoint != 0;
+      // Exact only when every factor is a power of two (see IsPowerOfTwoScale). PQuant
+      // calibrates that way by convention rather than guarantee, so it is checked.
+      spec.fusedAccumulatorScale = !spec.hasBias && !spec.perChannelScale &&
+                                   IsPowerOfTwoScale(fRegion.outputAlpha) &&
+                                   IsPowerOfTwoScale(fRegion.inputQuant.scale) &&
+                                   IsPowerOfTwoScale(fRegion.weightQuant.scale) &&
+                                   IsPowerOfTwoScale(fRegion.outputQuant.scale);
+      return spec;
+   }
+
+   std::string DeferredEpilogueStateName(std::size_t opIndex) const
+   {
+      return (IsMatMulSpelling() ? "quantizedMatMulCudaLtState_" : "quantizedGemmCudaLtState_") +
+             std::to_string(opIndex);
+   }
+
+   void DeferOutputEpilogue() { fRegion.deferOutputEpilogue = true; }
+
    ROperator_QuantizedDenseLinear(QuantizedDenseLinearRegion region, QuantizedLoweringPlan plan,
                                   QuantizedGemmCodegenContext context)
       : fRegion(std::move(region)), fPlan(std::move(plan)), fContext(std::move(context))

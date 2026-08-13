@@ -56,6 +56,35 @@ inline std::string ExactDoubleLiteral(double value)
    return out.str();
 }
 
+// Epilogue decisions the planner already knows, carried to a consumer so its emitted call
+// specializes rather than branching on invocation fields per element.
+struct QuantizedEpilogueSpecialization {
+   bool hasBias = false;
+   bool hasRelu = false;
+   bool perChannelScale = false;
+   bool correctZeroPoint = false;   // nonzero input zero point needs the weight column sums
+   // Collapse alpha*inputScale*weightScale/outputScale into accumulatorToOutputScale; exact
+   // only for an all-power-of-two chain, see IsPowerOfTwoScale.
+   bool fusedAccumulatorScale = false;
+
+   std::string TemplateArgs() const { return "<" + CallArgs() + ">"; }
+   std::string CallArgs() const
+   {
+      auto b = [](bool v) { return v ? "true" : "false"; };
+      return std::string(b(hasBias)) + ", " + b(hasRelu) + ", " + b(perChannelScale) + ", " +
+             b(correctZeroPoint) + ", " + b(fusedAccumulatorScale);
+   }
+};
+
+// Exactly representable reciprocal: scaling by it only shifts the exponent, so a chain of
+// such factors reassociates without changing a bit.
+inline bool IsPowerOfTwoScale(double value)
+{
+   int exponent = 0;
+   const double mantissa = std::frexp(value, &exponent);
+   return std::isfinite(value) && value != 0.0 && (mantissa == 0.5 || mantissa == -0.5);
+}
+
 // True when a value quantized on `a` is bit-identical on `b`. Compares the encoding, not
 // the scale/zero-point tensor names, so separately named but equal parameters agree.
 inline bool SameQuantizationGrid(const QuantizationInfo &a, const QuantizationInfo &b)
@@ -367,6 +396,8 @@ struct QuantizedDenseLinearRegion : QuantizedRegionBase {
    // Consuming region's input grid; the epilogue re-quantizes onto it and emits an int8
    // carrier instead of a float.
    std::optional<QuantizationInfo> outputRequantize;
+   // The sole consumer accepted this region's accumulator; see ROperator::AcceptInt32Accumulator.
+   bool deferOutputEpilogue = false;
    // Constant scalar Mul absorbed off the output chain and folded into the epilogue's
    // alpha, which scales inputScale*weightScale/outputScale while the GEMM runs alpha=1.
    double outputAlpha = 1.0;
@@ -543,6 +574,7 @@ struct QuantizationPipelineReport {
    std::size_t fakeQuantFolds = 0;
    std::size_t fusedSnapOps = 0;
    std::size_t decodeFusions = 0;
+   std::size_t deferredOutputEpilogues = 0;
    std::size_t movementRewires = 0;
    std::size_t decodeDedups = 0;
    std::size_t noOpClipsDropped = 0;

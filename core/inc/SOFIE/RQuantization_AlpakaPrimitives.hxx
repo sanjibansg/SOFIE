@@ -26,7 +26,11 @@ inline void CheckCudaStatus(cudaError_t status, const char *where)
    }
 }
 
-__device__ inline std::int32_t QuantizedCudaClamp(std::int32_t value, std::int32_t qmin, std::int32_t qmax)
+// __host__ __device__, not __device__: ALPAKA_FN_ACC is both unless CUDA-only mode is on, and
+// nvcc refuses a __device__-only callee from one. A consumer applying a deferred epilogue calls
+// this whole chain from such a functor. Nothing here touches device intrinsics.
+__host__ __device__ inline std::int32_t QuantizedCudaClamp(std::int32_t value, std::int32_t qmin,
+                                                           std::int32_t qmax)
 {
    return value < qmin ? qmin : (value > qmax ? qmax : value);
 }
@@ -36,8 +40,9 @@ __device__ inline std::int32_t QuantizedCudaClamp(std::int32_t value, std::int32
 // after the rounding, as `saturate(round(x / scale) + zeroPoint)` specifies: it is an
 // integer shift of the code, and rounding with it folded in moves half-way ties by its
 // parity.
-__device__ inline std::int32_t QuantizedCudaQuantizeClamp(double value, double scale, std::int32_t zero,
-                                                          std::int32_t qmin, std::int32_t qmax)
+__host__ __device__ inline std::int32_t QuantizedCudaQuantizeClamp(double value, double scale,
+                                                                   std::int32_t zero, std::int32_t qmin,
+                                                                   std::int32_t qmax)
 {
    const auto quantized = static_cast<std::int32_t>(nearbyint(value / scale) + static_cast<double>(zero));
    return QuantizedCudaClamp(quantized, qmin, qmax);
@@ -45,10 +50,10 @@ __device__ inline std::int32_t QuantizedCudaQuantizeClamp(double value, double s
 
 // Same requantize with the divide replaced by a host-precomputed reciprocal pair whose
 // correction term keeps ties on the same side as the divide.
-__device__ inline std::int32_t QuantizedCudaQuantizeClampRecip(double value, double scaleReciprocal,
-                                                               double scaleReciprocalError,
-                                                               std::int32_t zero, std::int32_t qmin,
-                                                               std::int32_t qmax)
+__host__ __device__ inline std::int32_t QuantizedCudaQuantizeClampRecip(double value, double scaleReciprocal,
+                                                                        double scaleReciprocalError,
+                                                                        std::int32_t zero, std::int32_t qmin,
+                                                                        std::int32_t qmax)
 {
    const double scaled = fma(value, scaleReciprocal, value * scaleReciprocalError);
    const auto quantized = static_cast<std::int32_t>(nearbyint(scaled) + static_cast<double>(zero));

@@ -2533,6 +2533,57 @@ TEST_F(QuantizationAlpakaTest, ElementwiseKernels)
          for (Idx i = 0; i < n; ++i)
             EXPECT_FLOAT_EQ(result[i], expected[i]);
    }
+   {
+      // The case above leaves both scales at one, so it passes whether or not the kernel
+      // applies them. The two sides of a residual Add need not share a grid, so these differ.
+      SCOPED_TRACE("native FP8 E4M3 Add applies a distinct per-operand scale");
+         constexpr Idx n = 32;
+         constexpr float scaleA = 0.0022321429569274187f;
+         constexpr float scaleB = 0.0044642859138548374f;
+         std::vector<__nv_fp8_e4m3> a(n), b(n);
+         std::vector<float> expected(n);
+         for (Idx i = 0; i < n; ++i) {
+            a[i] = static_cast<__nv_fp8_e4m3>(0.5f * (static_cast<int>(i) - 16));
+            b[i] = static_cast<__nv_fp8_e4m3>(0.25f * (static_cast<int>(i) - 8));
+            // The kernel's asymmetric spelling: A's product rounded, B's contracted, in float.
+            expected[i] = std::fma(static_cast<float>(b[i]), scaleB,
+                                   static_cast<float>(a[i]) * scaleA);
+         }
+
+         auto a_d = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(device, Ext1D::all(n));
+         auto b_d = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(device, Ext1D::all(n));
+         auto out_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(n));
+         auto a_h = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(host, Ext1D::all(n));
+         auto b_h = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(host, Ext1D::all(n));
+         std::copy(a.begin(), a.end(), alpaka::getPtrNative(a_h));
+         std::copy(b.begin(), b.end(), alpaka::getPtrNative(b_h));
+         alpaka::memcpy(queue, a_d, a_h);
+         alpaka::memcpy(queue, b_d, b_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedElementwiseInvocation params{};
+         params.op = SOFIE::EQuantizedElementwiseOp::Add;
+         params.rank = 1;
+         params.outputExtent[0] = n; params.inputExtent[0] = n; params.operandBExtent[0] = n;
+         params.lowPrecisionFP8 = true;
+         params.inputScale = scaleA;
+         params.operandBScale = scaleB;
+         params.outputCarrier = SOFIE::EQuantizedOutputCarrier::Float;
+
+         SOFIE::QuantizedElementwise_Call(alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(out_d), alpaka::getPtrNative(a_d),
+            alpaka::getPtrNative(b_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto out_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(n));
+         alpaka::memcpy(queue, out_h, out_d);
+         alpaka::wait(queue);
+         const float *result = alpaka::getPtrNative(out_h);
+         // Exact, not approximate: the fusion changes no bits, so a tolerance would hide drift.
+         for (Idx i = 0; i < n; ++i)
+            EXPECT_EQ(result[i], expected[i]);
+   }
 }
 
 TEST(QuantizationMetadata, Elementwise)

@@ -313,3 +313,41 @@ TEST(OutputAdoptionCodegen, RoundTripAbsorbsTheDecodeInFrontOfIt)
    EXPECT_NE(code.find("static_cast<TOut>((q - 0) * 0.0078125)"), std::string::npos)
       << "the round trip stopped writing its own grid's snapped float";
 }
+
+// The accumulator handoff: a lowered int8 region whose sole consumer is a Softmax emits no
+// float epilogue, and the Softmax applies QuantizedGemmCudaEpilogueValueSpec at its own load.
+// Asserted on the emitted text because the handoff is bit-exact, so a build where it failed to
+// engage computes the same numbers and no numeric test can see the difference.
+TEST(DeferredEpilogueCodegen, SoftmaxConsumesTheAccumulator)
+{
+   std::ifstream in("ONNX_QDQ_AttentionSoftmax_FromONNX_GPU_ALPAKA.hxx");
+   ASSERT_TRUE(in.good()) << "fixture header missing; the Softmax-on-quantized-GEMM shape is "
+                             "the only one that reaches the deferred epilogue";
+   const std::string code((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+
+   ASSERT_NE(code.find("QuantizedGemmCudaLt_Call"), std::string::npos) << "region did not lower";
+   EXPECT_NE(code.find("deferOutputEpilogue = true"), std::string::npos)
+      << "the region still emits its float epilogue: the Softmax declined the accumulator, or "
+         "the pass never offered it";
+   EXPECT_NE(code.find("QuantizedGemmCudaEpilogueValueSpec<"), std::string::npos)
+      << "the Softmax is not applying the producer's epilogue at its load";
+   EXPECT_NE(code.find(".DeferredEpilogue()"), std::string::npos)
+      << "the Softmax launch is not reading the producing GEMM's recorded epilogue";
+}
+
+// Every specialized epilogue call is paired with its host-side guard. Without one, a call
+// compiled for the wrong invocation shape returns a plausible wrong number and nothing
+// downstream catches it.
+TEST(DeferredEpilogueCodegen, EverySpecializedEpilogueCarriesItsGuard)
+{
+   for (const char *header : {"ONNX_QDQ_AttentionSoftmax_FromONNX_GPU_ALPAKA.hxx"}) {
+      std::ifstream in(header);
+      ASSERT_TRUE(in.good()) << "cannot open " << header;
+      const std::string code((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+      const auto specs = SOFIE_TEST::CountOccurrences(code, "QuantizedGemmCudaEpilogueValueSpec<");
+      const auto guards = SOFIE_TEST::CountOccurrences(code, "RequireDeferredEpilogueSpecialization");
+      EXPECT_EQ(specs, guards)
+         << header << " emits " << specs << " specialized epilogue call(s) but " << guards
+         << " host-side guard(s); an unguarded specialization is a silent wrong answer";
+   }
+}

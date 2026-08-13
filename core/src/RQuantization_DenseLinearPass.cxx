@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <unordered_set>
 #include <iostream>
@@ -477,6 +478,9 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
       std::vector<std::size_t> movementRunOpIndices;
       std::string quantOutputTensor;
       double scale = 1.0;
+      // Product of the scalar Muls folded into the cuBLASLt alpha, applied to the accumulator
+      // before the D-scale narrows it -- where such a Mul sat.
+      double alphaScale = 1.0;
       bool hasRelu = false;
       bool hasClamp = false;
       double clampLow = 0.0;
@@ -489,7 +493,12 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
                                          const std::string &outputTensor,
                                          const QuantizedMatrixShapePolicy &shapePolicy) {
       AdoptableFP8OutputQuant result;
-      const auto chain = findAbsorbableOutputChain(outputTensor);
+      // Walk through constant scalar Muls, as the int8 walk does: attention spells 1/sqrt(d_k)
+      // as a Mul between the score GEMM and its encode, and stopping there leaves the encode
+      // unadopted. Switchable because this fold alone is not bit-exact, the Mul divided by
+      // the output scale in double where cuBLASLt multiplies by a float reciprocal.
+      const bool foldScaleIntoAlpha = std::getenv("SOFIE_DISABLE_FP8_ALPHA_FOLD") == nullptr;
+      const auto chain = findAbsorbableOutputChain(outputTensor, foldScaleIntoAlpha);
       if (chain.boundaryIndex == static_cast<std::size_t>(-1) || chain.boundaryIndex >= operators.size()) {
          result.decline = "no sole-consumer boundary chain";
          return result;
@@ -505,10 +514,9 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
             return result;
          }
       }
-      if (chain.alphaScale != 1.0) {
-         result.decline = "scale fold on the chain";
-         return result;
-      }
+      // The walk bails if a scale fold and a movement run meet, so a chain carrying alpha is
+      // always the absorbable kind whose ops leave the graph.
+      result.alphaScale = chain.alphaScale;
       if (chain.hasClip && !chain.clipBoundsReadable) {
          result.decline = "clip bounds are not constant scalars";
          return result;
@@ -628,6 +636,9 @@ void DiscoverQuantizedDenseLinearRegions(QuantizationPassContext &context)
       }
       if (adopt.hasRelu)
          region.outputReluOpIndex = adopt.reluOpIndex;
+      // The walked-through Muls leave the graph via chainOpIndices, so their product must
+      // reach the call or the scale is dropped.
+      region.outputAlpha = adopt.alphaScale;
       capability.outputCarrier = ELowPrecisionCarrier::FP8E4M3;
       capability.tag = "fp8_dense_linear_cublaslt_e4m3_tn_e4m3";
       capability.reason =

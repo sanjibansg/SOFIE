@@ -326,8 +326,10 @@ QuantizedLoweringPlan MakeAlpakaConvCandidatePlan(
             plan.resources, EQuantizedResourceCategory::BackendScratch,
             EQuantizedResourceRole::InputStaging,
             EQuantizedStorageType::Int8,
-            SaturatingResourceProduct({physicalM, physicalK}),
-            cudaAlignment, true, "cuBLASLt INT8 input padding buffer");
+            SaturatingResourceProduct({stagedGroups, physicalM, physicalK}),
+            cudaAlignment, true,
+            stagedGroups == 1 ? "cuBLASLt INT8 input padding buffer"
+                              : "contiguous all-group cuBLASLt INT8 input padding buffers");
          AddQuantizedResourceRequirement(
             plan.resources, EQuantizedResourceCategory::BackendScratch,
             EQuantizedResourceRole::Accumulator,
@@ -395,8 +397,8 @@ QuantizedLoweringPlan MakeAlpakaConvCandidatePlan(
                      plan.resources, EQuantizedResourceCategory::BackendScratch,
                      EQuantizedResourceRole::InputStaging,
                      EQuantizedStorageType::Int8,
-                     SaturatingResourceProduct({tileRows, k}),
-                     cudaAlignment, true, "cuBLASLt INT8 tile input buffer");
+                     SaturatingResourceProduct({groups, tileRows, k}),
+                     cudaAlignment, true, "cuBLASLt INT8 tile input buffers, one per group");
                   AddQuantizedResourceRequirement(
                      plan.resources, EQuantizedResourceCategory::BackendScratch,
                      EQuantizedResourceRole::Accumulator,

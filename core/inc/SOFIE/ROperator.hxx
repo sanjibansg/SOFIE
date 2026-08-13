@@ -16,6 +16,7 @@ class RModel;
 // Forward-declared: including RQuantization.hxx here creates an include cycle, and a
 // const reference in a declaration needs no definition.
 struct QuantizationGrid;
+struct QuantizedEpilogueSpecialization;
 
 enum class OperatorKind {
    GEMM = 0,
@@ -176,6 +177,21 @@ public:
    // Returns whether an input matched; a false return leaves the dequantize in place.
    virtual bool FuseDequantizedInput(const std::string & /*from*/, const std::string & /*carrier*/,
                                      const QuantizationGrid & /*grid*/)
+   {
+      return false;
+   }
+
+   // Consumer-side twin of CanFuseOutputOnGrid: reads a quantized GEMM's raw int32 accumulator
+   // and applies the producer's float epilogue at its own load, so the producer emits none.
+   // Unlike CanFuseDequantizedInput, the buffer read is scratch the producer never wrote out.
+   virtual bool CanAcceptInt32Accumulator() const { return false; }
+
+   // Redirects this operator to `stateName`'s deferred accumulator. batch/rows/cols are the
+   // producer's logical extents; returns false unless this traversal maps onto them elementwise,
+   // and declining always leaves the epilogue in place. `spec` is the shape to specialize on.
+   virtual bool AcceptInt32Accumulator(const std::string & /*stateName*/, std::size_t /*batch*/,
+                                       std::size_t /*rows*/, std::size_t /*cols*/,
+                                       const QuantizedEpilogueSpecialization & /*spec*/)
    {
       return false;
    }

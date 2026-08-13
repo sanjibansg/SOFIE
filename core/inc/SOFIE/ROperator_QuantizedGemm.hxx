@@ -238,6 +238,7 @@ inline std::string GenerateFusedQuantizedGemmCublasLtCoreLaunch(std::string opNa
       region.biasQuant, region.outputQuant, INTERNAL::HasQuantizedGemmBias(region),
       context.activation == EActivationType::RELU, region.weightQuant.isSigned, context.alpha, context.beta);
    call.outputRequantize = region.outputRequantize;
+   call.deferOutputEpilogue = region.deferOutputEpilogue;
    return INTERNAL::GenerateQuantizedCudaLtMatMulCall(call);
 }
 
@@ -273,11 +274,18 @@ inline std::string GenerateFusedQuantizedGemmCublasLtFP8Launch(std::string opNam
    const std::string kVal = ntSpelling ? context.inputShape[1].GetVal() : context.inputShape[0].GetVal();
    const std::string nVal = ntSpelling ? context.weightShape[0].GetVal() : context.weightShape[1].GetVal();
 
+   // The Gemm's own alpha attribute and the product of any scalar Muls the output chain
+   // absorbed multiply: the Mul acted on a result that already carried the attribute.
+   if (!std::isfinite(region.outputAlpha) || region.outputAlpha == 0.0) {
+      throw std::runtime_error("SOFIE fused Quantized Gemm cuBLASLt FP8 launch has a non-finite or zero absorbed output scale");
+   }
+   const float fp8Alpha = static_cast<float>(static_cast<double>(context.alpha) * region.outputAlpha);
+
    auto call = INTERNAL::MakeQuantizedCudaLtFP8DenseLinearCall(
       "ROperator_QuantizedGemm cuBLASLt FP8 dense-linear boundary " + opName,
       "quantizedGemmCudaLtFP8State_" + opName, "params_quantizedGemmFP8_" + opName,
       region.outputTensor, region.inputSourceTensor, plan.weightStorageTensor,
-      region.biasSourceTensor, INTERNAL::HasQuantizedGemmBias(region), context.alpha, context.beta,
+      region.biasSourceTensor, INTERNAL::HasQuantizedGemmBias(region), fp8Alpha, context.beta,
       mVal, nVal, kVal, plan);
    call.weightIsMatrixA = ntSpelling;
    call.hasRelu = context.activation == EActivationType::RELU;

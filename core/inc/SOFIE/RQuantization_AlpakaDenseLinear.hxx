@@ -294,11 +294,20 @@ inline bool QuantizedGemmCudaLtFP8_ProgramsOutputScale(const QuantizedFP8DenseLi
 }
 #endif
 
+// Shared by both builds of QuantizedGemmCudaLtState below, since generated code reads it
+// through DeferredEpilogue() either way. Borrowed pointers only, so no teardown ordering.
+struct QuantizedDeferredEpilogueHolder {
+   // Valid only after a call that ran with params.deferOutputEpilogue.
+   const QuantizedDeferredEpilogue &DeferredEpilogue() const { return fDeferredEpilogue; }
+
+   QuantizedDeferredEpilogue fDeferredEpilogue{};
+};
+
 #ifndef SOFIE_USE_CUBLASLT
 
 // Generated code emits BindScratch and WorkspaceSize unconditionally, so the stub
 // carries both as no-ops.
-struct QuantizedGemmCudaLtState {
+struct QuantizedGemmCudaLtState : QuantizedDeferredEpilogueHolder {
    void BindScratch(QuantizedCudaScratchView) {}
    std::size_t WorkspaceSize() const { return 0; }
 };
@@ -400,9 +409,9 @@ __global__ void QuantizedGemmCudaWeightColumnSumKernel(std::int32_t *__restrict_
 
 // Accumulator value with the asymmetric-input correction removed per column; a null
 // column-sum pointer is the symmetric case and returns the value unchanged.
-__device__ inline double QuantizedGemmCudaCorrectedAccumulator(std::int32_t accumulatorValue, std::size_t col,
-                                                               const std::int32_t *inputZeroPointColumnSums,
-                                                               const QuantizedDenseLinearInvocation &params)
+__host__ __device__ inline double QuantizedGemmCudaCorrectedAccumulator(
+   std::int32_t accumulatorValue, std::size_t col, const std::int32_t *inputZeroPointColumnSums,
+   const QuantizedDenseLinearInvocation &params)
 {
    if (inputZeroPointColumnSums == nullptr)
       return static_cast<double>(accumulatorValue);
@@ -465,49 +474,152 @@ __device__ inline std::size_t QuantizedGemmCudaLogicalElements(const QuantizedDe
    return batch * rows * cols;
 }
 
+// Epilogue shape decisions as runtime fields or compile-time constants. One implementation
+// reads both through this policy, so the standalone and inlined forms cannot drift apart.
+struct QuantizedEpilogueRuntimeFlags {
+   bool hasBias = false;
+   bool hasRelu = false;
+   bool perChannelScale = false;
+   bool correctZeroPoint = false;
+   // Never folded on the generic path: only the planner establishes the power-of-two chain.
+   static constexpr bool fusedAccumulatorScale = false;
+};
+
+template <bool HasBias, bool HasRelu, bool PerChannelScale, bool CorrectZeroPoint,
+          bool FusedAccumulatorScale>
+struct QuantizedEpilogueStaticFlags {
+   static constexpr bool hasBias = HasBias;
+   static constexpr bool hasRelu = HasRelu;
+   static constexpr bool perChannelScale = PerChannelScale;
+   static constexpr bool correctZeroPoint = CorrectZeroPoint;
+   static constexpr bool fusedAccumulatorScale = FusedAccumulatorScale;
+};
+
+// A null bias folds into hasBias and null column sums into correctZeroPoint, so this is the one
+// place either pointer is tested; RequireDeferredEpilogueSpecialization derives them the same way.
+__host__ __device__ inline QuantizedEpilogueRuntimeFlags
+QuantizedEpilogueFlagsOf(const QuantizedDenseLinearInvocation &params, const float *bias,
+                         const std::int32_t *inputZeroPointColumnSums)
+{
+   QuantizedEpilogueRuntimeFlags flags;
+   flags.hasBias = params.hasBias && bias != nullptr;
+   flags.hasRelu = params.hasRelu;
+   flags.perChannelScale = params.weightScaleMode == EQuantizedScaleMode::PerOutputChannel;
+   flags.correctZeroPoint = inputZeroPointColumnSums != nullptr;
+   return flags;
+}
+
 // Fake-quant output code of one accumulator element: alpha * acc * inputScale * weightScale
 // plus the grid-round-tripped bias, rounded onto the output grid with the Relu applied there.
-__device__ inline std::int32_t QuantizedCudaFakeQuantOutputCode(double accumulatorValue,
-                                                                const float *bias, std::size_t channel,
-                                                                double weightScale,
-                                                                const QuantizedDenseLinearInvocation &params)
+template <typename Flags>
+__host__ __device__ inline std::int32_t QuantizedCudaFakeQuantOutputCodeWith(
+   const Flags &flags, double accumulatorValue, const float *bias, std::size_t channel,
+   double weightScale, const QuantizedDenseLinearInvocation &params)
 {
-   double real = params.alpha * accumulatorValue * params.inputScale * weightScale;
-   if (params.hasBias && bias != nullptr) {
-      const double biasScale = params.weightScaleMode == EQuantizedScaleMode::PerOutputChannel
-                                  ? params.inputScale * weightScale
-                                  : params.biasScale;
-      const auto bq = QuantizedCudaQuantizeClamp(static_cast<double>(bias[channel]), biasScale,
-                                                 params.biasZeroPoint, params.biasQMin, params.biasQMax);
-      real += params.beta * static_cast<double>(bq - params.biasZeroPoint) * biasScale;
-   }
+   // The whole scale chain in one host-precomputed multiply, exact only for a power-of-two
+   // chain. `if constexpr` so the static_assert skips the arms that never fold.
+   if constexpr (Flags::fusedAccumulatorScale) {
+      static_assert(!Flags::hasBias && !Flags::perChannelScale,
+                    "a fused accumulator scale cannot carry a bias term or a per-column scale");
+      auto code = QuantizedCudaClamp(
+         static_cast<std::int32_t>(nearbyint(accumulatorValue * params.accumulatorToOutputScale) +
+                                   static_cast<double>(params.outputZeroPoint)),
+         params.outputQMin, params.outputQMax);
+      if (flags.hasRelu && code < params.outputZeroPoint)
+         code = params.outputZeroPoint;
+      return code;
+   } else {
+      double real = params.alpha * accumulatorValue * params.inputScale * weightScale;
+      if (flags.hasBias) {
+         const double biasScale =
+            flags.perChannelScale ? params.inputScale * weightScale : params.biasScale;
+         const auto bq = QuantizedCudaQuantizeClamp(static_cast<double>(bias[channel]), biasScale,
+                                                    params.biasZeroPoint, params.biasQMin, params.biasQMax);
+         real += params.beta * static_cast<double>(bq - params.biasZeroPoint) * biasScale;
+      }
 
-   auto code = QuantizedCudaQuantizeClamp(real, params.outputScale, params.outputZeroPoint,
-                                          params.outputQMin, params.outputQMax);
-   if (params.hasRelu && code < params.outputZeroPoint)
-      code = params.outputZeroPoint;
-   return code;
+      // Recip when the host filled it: its residual rides an fma so ties land as the divide.
+      auto code = params.outputScaleReciprocal != 0.0
+                     ? QuantizedCudaQuantizeClampRecip(real, params.outputScaleReciprocal,
+                                                       params.outputScaleReciprocalError,
+                                                       params.outputZeroPoint, params.outputQMin,
+                                                       params.outputQMax)
+                     : QuantizedCudaQuantizeClamp(real, params.outputScale, params.outputZeroPoint,
+                                                  params.outputQMin, params.outputQMax);
+      if (flags.hasRelu && code < params.outputZeroPoint)
+         code = params.outputZeroPoint;
+      return code;
+   }
 }
 
 // Fake-quant value of one logical output element: the accumulator scaled and biased, rounded
 // onto the output grid with the Relu applied there, then dequantized back to float.
-__device__ inline float QuantizedGemmCudaEpilogueValue(std::size_t idx, const std::int32_t *accumulator,
-                                                       const float *bias, const float *weightScaleVector,
-                                                       const std::int32_t *inputZeroPointColumnSums,
-                                                       const QuantizedDenseLinearInvocation &params)
+// __host__ __device__ so a consumer's alpaka kernel applies the same function and params,
+// which is what makes the fused form bit-identical.
+template <typename Flags>
+__host__ __device__ inline float QuantizedGemmCudaEpilogueValueWith(
+   const Flags &flags, std::size_t idx, const std::int32_t *accumulator, const float *bias,
+   const float *weightScaleVector, const std::int32_t *inputZeroPointColumnSums,
+   const QuantizedDenseLinearInvocation &params)
 {
    const std::size_t logicalCols = params.logicalN != 0 ? params.logicalN : params.n;
    const std::size_t col = idx % logicalCols;
    const std::size_t row = idx / logicalCols;
    const std::size_t accIdx = row * params.n + col;
-   const double weightScale = params.weightScaleMode == EQuantizedScaleMode::PerOutputChannel
-                                 ? static_cast<double>(weightScaleVector[col])
-                                 : params.weightScale;
+   const double weightScale =
+      flags.perChannelScale ? static_cast<double>(weightScaleVector[col]) : params.weightScale;
+   // Equivalent to calling the corrector unconditionally: it is a no-op on a null pointer.
    const double corrected =
-      QuantizedGemmCudaCorrectedAccumulator(accumulator[accIdx], col, inputZeroPointColumnSums, params);
-   auto yq = QuantizedCudaFakeQuantOutputCode(corrected, bias, col, weightScale, params);
+      flags.correctZeroPoint
+         ? QuantizedGemmCudaCorrectedAccumulator(accumulator[accIdx], col, inputZeroPointColumnSums, params)
+         : static_cast<double>(accumulator[accIdx]);
+   auto yq = QuantizedCudaFakeQuantOutputCodeWith(flags, corrected, bias, col, weightScale, params);
    yq = QuantizedCudaClamp(yq, params.outputQMin, params.outputQMax);
    return static_cast<float>(static_cast<double>(yq - params.outputZeroPoint) * params.outputScale);
+}
+
+__host__ __device__ inline std::int32_t QuantizedCudaFakeQuantOutputCode(
+   double accumulatorValue, const float *bias, std::size_t channel, double weightScale,
+   const QuantizedDenseLinearInvocation &params)
+{
+   // No column sums reach this entry point; the caller applies the correction before it.
+   return QuantizedCudaFakeQuantOutputCodeWith(QuantizedEpilogueFlagsOf(params, bias, nullptr),
+                                               accumulatorValue, bias, channel, weightScale, params);
+}
+
+__host__ __device__ inline float QuantizedGemmCudaEpilogueValue(
+   std::size_t idx, const std::int32_t *accumulator, const float *bias, const float *weightScaleVector,
+   const std::int32_t *inputZeroPointColumnSums, const QuantizedDenseLinearInvocation &params)
+{
+   return QuantizedGemmCudaEpilogueValueWith(
+      QuantizedEpilogueFlagsOf(params, bias, inputZeroPointColumnSums), idx, accumulator, bias,
+      weightScaleVector, inputZeroPointColumnSums, params);
+}
+
+// The same evaluation with its shape decisions as template parameters, so untaken branches are
+// dropped. A wrong specialization is silently wrong, so the launch checks it on the host.
+template <bool HasBias, bool HasRelu, bool PerChannelScale, bool CorrectZeroPoint,
+          bool FusedAccumulatorScale = false>
+__host__ __device__ inline std::int32_t QuantizedCudaFakeQuantOutputCodeSpec(
+   double accumulatorValue, const float *bias, std::size_t channel, double weightScale,
+   const QuantizedDenseLinearInvocation &params)
+{
+   return QuantizedCudaFakeQuantOutputCodeWith(
+      QuantizedEpilogueStaticFlags<HasBias, HasRelu, PerChannelScale, CorrectZeroPoint,
+                                   FusedAccumulatorScale>{},
+      accumulatorValue, bias, channel, weightScale, params);
+}
+
+template <bool HasBias, bool HasRelu, bool PerChannelScale, bool CorrectZeroPoint,
+          bool FusedAccumulatorScale = false>
+__host__ __device__ inline float QuantizedGemmCudaEpilogueValueSpec(
+   std::size_t idx, const std::int32_t *accumulator, const float *bias, const float *weightScaleVector,
+   const std::int32_t *inputZeroPointColumnSums, const QuantizedDenseLinearInvocation &params)
+{
+   return QuantizedGemmCudaEpilogueValueWith(
+      QuantizedEpilogueStaticFlags<HasBias, HasRelu, PerChannelScale, CorrectZeroPoint,
+                                   FusedAccumulatorScale>{},
+      idx, accumulator, bias, weightScaleVector, inputZeroPointColumnSums, params);
 }
 
 __global__ void QuantizedGemmCudaEpilogueKernel(float *output, const std::int32_t *accumulator, const float *bias,
@@ -1280,9 +1392,10 @@ inline bool QuantizedGemmCudaLt_NarrowsQuantizedOutput(const QuantizedDenseLinea
    return true;
 }
 
-struct QuantizedGemmCudaLtState {
+struct QuantizedGemmCudaLtState : QuantizedDeferredEpilogueHolder {
    // Declaration order fixes the default teardown order (reverse of this list): destruction
-   // must run preference, then C/B/A layouts, then operation, then handle.
+   // must run preference, then C/B/A layouts, then operation, then handle. The base holds only
+   // borrowed pointers and is destroyed after every member, so it does not enter that order.
    INTERNAL::QuantizedCudaLtHandle fHandle;
    INTERNAL::QuantizedCudaLtMatmulDesc fOperation;
    INTERNAL::QuantizedCudaLtMatrixLayout fALayout;
@@ -1649,6 +1762,19 @@ public:
       return fInputZpColumnSums.Get();
    }
 
+   void RecordDeferredEpilogue(const float *bias, const float *weightScaleVector,
+                               const std::int32_t *inputZeroPointColumnSums,
+                               const QuantizedDenseLinearInvocation &effectiveParams)
+   {
+      if (fAccumulator == nullptr)
+         throw std::runtime_error("SOFIE cuBLASLt quantized GEMM deferred its epilogue without an accumulator");
+      fDeferredEpilogue.accumulator = fAccumulator;
+      fDeferredEpilogue.bias = bias;
+      fDeferredEpilogue.weightScaleVector = weightScaleVector;
+      fDeferredEpilogue.inputZeroPointColumnSums = inputZeroPointColumnSums;
+      fDeferredEpilogue.params = effectiveParams;
+   }
+
    std::int8_t *InputQuantizedBuffer() const { return fInputQuantized; }
    std::int32_t *AccumulatorBuffer() const { return fAccumulator; }
    void *OutputQuantizedBuffer() const { return fOutputQuantized; }
@@ -1769,6 +1895,20 @@ inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &state, QuantizedG
        params.outputCarrier != EQuantizedOutputCarrier::Float) {
       throw std::runtime_error("SOFIE cuBLASLt quantized GEMM float epilogues require a float output carrier");
    }
+   // Only a fake-quant float epilogue leaves a raw accumulator; see CanDeferOutputEpilogue.
+   if (params.deferOutputEpilogue) {
+      if (params.epilogueMode != EQuantizedEpilogueMode::ExactFakeQuant)
+         throw std::runtime_error("SOFIE cuBLASLt quantized GEMM can only defer the exact fake-quant float epilogue");
+      if (params.fuseOutputRequantize)
+         throw std::runtime_error("SOFIE cuBLASLt quantized GEMM cannot both defer and requantize its output epilogue");
+      if (params.outputCarrier != EQuantizedOutputCarrier::Float)
+         throw std::runtime_error("SOFIE cuBLASLt quantized GEMM deferred epilogue requires a float output carrier");
+      // Padding is admissible (the consumer uses the epilogue's own logical->physical map);
+      // an accumulator the GEMM never wrote is not.
+      if (params.batchCount > 1 && params.batchStrideC != 0 &&
+          static_cast<std::size_t>(params.batchStrideC) != params.m * params.n)
+         throw std::runtime_error("SOFIE cuBLASLt quantized GEMM deferred epilogue requires a compact batch stride");
+   }
    if (params.fuseOutputRequantize) {
       if (params.epilogueMode == EQuantizedEpilogueMode::Quantized)
          throw std::runtime_error("SOFIE cuBLASLt quantized GEMM output requantize fusion applies to the fake-quant "
@@ -1795,6 +1935,12 @@ inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &state, QuantizedG
    if (effectiveParams.accumulatorToOutputScale == 0.0)
       effectiveParams.accumulatorToOutputScale =
          (effectiveParams.alpha * effectiveParams.inputScale * effectiveParams.weightScale) / effectiveParams.outputScale;
+   // Once per launch, so the epilogue's per-element divide becomes an fma.
+   if (effectiveParams.outputScaleReciprocal == 0.0 && effectiveParams.outputScale > 0.0) {
+      const auto reciprocal = INTERNAL::QuantizedMakeScaleReciprocal(effectiveParams.outputScale);
+      effectiveParams.outputScaleReciprocal = reciprocal.value;
+      effectiveParams.outputScaleReciprocalError = reciprocal.error;
+   }
 
    // The staging and epilogue kernels are elementwise passes over the whole buffer, so
    // their extents are per-batch counts times the batch, indexed [batch][m][n].
@@ -1908,7 +2054,12 @@ inline void QuantizedGemmCudaLt_Call(QuantizedGemmCudaLtState &state, QuantizedG
       // Fake-quant float output: the epilogue writes the LOGICAL output directly
       // (slicing the padded accumulator), so padded execution needs no scratch.
       const int logicalOutputBlocks = static_cast<int>((logicalOutputElements + threads - 1) / threads);
-      if (effectiveParams.fuseOutputRequantize) {
+      if (effectiveParams.deferOutputEpilogue) {
+         // No epilogue launch and no write to `output`: the accumulator stays where the GEMM
+         // left it for the consumer.
+         // effectiveParams, not params: this is the struct the epilogue kernel would receive.
+         state.RecordDeferredEpilogue(bias, weightScaleVector, inputZpColumnSums, effectiveParams);
+      } else if (effectiveParams.fuseOutputRequantize) {
          // Writes the logical output compactly, so a padded GEMM needs no scratch or unpad.
          INTERNAL::QuantizedGemmCudaFusedRequantizeEpilogueKernel<<<logicalOutputBlocks, threads, 0, stream>>>(
             static_cast<std::int8_t *>(output), state.AccumulatorBuffer(), bias, weightScaleVector,

@@ -112,6 +112,9 @@ struct QuantizedCudaLtMatMulCall {
    // Effective [qmin, qmax] from an absorbed Clip, when it narrows the grid below the
    // carrier's bit-width range. Empty means clamp to the carrier range.
    std::optional<std::pair<std::int64_t, std::int64_t>> outputClamp;
+   // The sole consumer applies this region's float epilogue itself; emit none and leave the
+   // accumulator in place. Mutually exclusive with outputRequantize.
+   bool deferOutputEpilogue = false;
    float alpha = 1.0f;
    float beta = 1.0f;
 };
@@ -237,6 +240,14 @@ inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMul
    // a quantized epilogue keeps the int8/uint8 carrier.
    const bool fusedRequantize =
       plan.outputMode != EQuantizedOutputMode::Quantized && call.outputRequantize.has_value();
+   // Mirrors CanDeferOutputEpilogue: only a fake-quant float epilogue leaves an accumulator.
+   const bool deferEpilogue =
+      call.deferOutputEpilogue && plan.outputMode != EQuantizedOutputMode::Quantized && !fusedRequantize;
+   if (call.deferOutputEpilogue && !deferEpilogue) {
+      throw std::runtime_error("SOFIE " + call.boundaryName +
+                               " planned a deferred output epilogue that its lowering plan cannot express;"
+                               " the consumer would read an accumulator this region never leaves behind");
+   }
    out << "      " << call.paramsName << ".outputCarrier = SOFIE::EQuantizedOutputCarrier::"
        << (plan.outputMode == EQuantizedOutputMode::Quantized
               ? QuantizedCudaOutputCarrierName(call.outputQuant, call.boundaryName)
@@ -252,6 +263,8 @@ inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMul
       out << "      " << call.paramsName << ".requantizeQMax = static_cast<std::int32_t>(" << requantRange.second
           << ");\n";
    }
+   if (deferEpilogue)
+      out << "      " << call.paramsName << ".deferOutputEpilogue = true;\n";
    out << "      " << call.paramsName << ".weightType = SOFIE::EQuantizedWeightCarrier::"
        << (call.weightIsSigned ? "Int8" : "UInt8") << ";\n";
    out << "      " << call.paramsName << ".weightScaleMode = SOFIE::EQuantizedScaleMode::"
