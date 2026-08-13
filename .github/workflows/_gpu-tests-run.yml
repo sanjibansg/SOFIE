@@ -1,0 +1,76 @@
+name: _gpu-tests-run
+on:
+  workflow_call:
+    inputs:
+      runner_label:
+        description: "Self-hosted runner label to target for this attempt"
+        required: true
+        type: string
+      checkout_ref:
+        description: "Git ref to check out (branch ref, or refs/pull/<N>/head for comment-triggered runs)"
+        required: true
+        type: string
+      cuda_arch:
+        description: "Value for CMAKE_CUDA_ARCHITECTURES"
+        required: false
+        type: string
+        default: "native"
+
+jobs:
+  run:
+    name: GPU Unit Tests (${{ inputs.runner_label }})
+    runs-on: ${{ inputs.runner_label }}
+    container:
+      image: registry.cern.ch/ngt/lxplus-like:9
+      options: --user 0:0
+    timeout-minutes: 60
+    env:
+      DEPS_CACHE: /tmp/sofie-cmake-deps
+    steps:
+      - name: GPU check
+        run: nvidia-smi
+      - name: Setup build environment
+        run: |
+          set -euo pipefail
+          # GTest
+          dnf install -y gtest-devel 2>/dev/null || \
+          dnf install -y googletest-devel 2>/dev/null || (
+            cd /tmp
+            git clone --depth 1 -b v1.14.0 https://github.com/google/googletest.git
+            cmake -B gtest-build -S googletest \
+                  -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON
+            cmake --build gtest-build -j15
+            cmake --install gtest-build
+          )
+          echo "PATH=$PATH"                               >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"    >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH:-}" >> "$GITHUB_ENV"
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref }}
+      - name: Cache FetchContent dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DEPS_CACHE }}
+          key: cmake-deps-tests-${{ hashFiles('test/CMakeLists.txt') }}
+          restore-keys: cmake-deps-tests-
+      - name: Configure
+        run: |
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSOFIE_WITH_ROOT=OFF \
+            -Dtesting=ON \
+            -DENABLE_ALPAKA_TESTS=ON \
+            -DALPAKA_BACKEND=cuda \
+            "-DCMAKE_CUDA_ARCHITECTURES=${{ inputs.cuda_arch }}" \
+            "-DFETCHCONTENT_BASE_DIR=${{ env.DEPS_CACHE }}"
+      - name: Build and run tests
+        working-directory: build
+        run: ctest --output-on-failure -j15
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ github.run_id }}-${{ inputs.runner_label }}
+          path: build/Testing/Temporary/LastTest.log
