@@ -184,11 +184,16 @@ if (ENABLE_ALPAKA_TESTS)
       ${CMAKE_CURRENT_SOURCE_DIR}
     )
 
+    # No CUDA_ARCHITECTURES override here: let the target inherit whatever
+    # CMAKE_CUDA_ARCHITECTURES was set globally (e.g. "native" from CI, so it
+    # matches whatever GPU the runner actually has). A hardcoded list here
+    # previously included sm_70 (Volta), which some CUDA toolkit installs no
+    # longer support codegen for, breaking the build with "Unsupported gpu
+    # architecture 'compute_70'" regardless of the actual runner's GPU.
     set_target_properties(
       TestCustomModelsFromONNXForAlpakaCuda
       PROPERTIES
         CUDA_SEPARABLE_COMPILATION OFF
-        CUDA_ARCHITECTURES 70 80 86
         CUDA_STANDARD 20
         CUDA_STANDARD_REQUIRED ON
     )
