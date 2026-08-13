@@ -98,7 +98,7 @@ jobs:
             "-DFETCHCONTENT_BASE_DIR=${{ env.DEPS_CACHE }}"
 
       - name: Build PR benchmark
-        run: cmake --build sofie-pr/build --target sofie_benchmark -j$(nproc)
+        run: cmake --build sofie-pr/build --target sofie_benchmark -j10
 
       - name: Run PR benchmark
         working-directory: sofie-pr/build/benchmark
@@ -122,7 +122,7 @@ jobs:
 
       - name: Build main benchmark
         if: github.event_name == 'pull_request'
-        run: cmake --build sofie-main/build --target sofie_benchmark -j$(nproc)
+        run: cmake --build sofie-main/build --target sofie_benchmark -j10
 
       - name: Run main benchmark
         if: github.event_name == 'pull_request'
