@@ -1,6 +1,7 @@
 name: Benchmark
 
 on:
+  pull_request:
   issue_comment:
     types: [created]
   workflow_dispatch:
@@ -13,7 +14,7 @@ on:
         default: "100"
 
 concurrency:
-  group: benchmark-${{ github.event.issue.number || github.ref }}
+  group: benchmark-${{ github.event.issue.number || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -22,6 +23,7 @@ permissions:
   issues: write
 
 env:
+  CUDA_ARCH:    "native"
   BUILD_TYPE:   Release
   BENCH_WARMUP: ${{ github.event.inputs.warmup || '5' }}
   BENCH_ITERS:  ${{ github.event.inputs.iterations || '100' }}
@@ -35,12 +37,15 @@ jobs:
     timeout-minutes: 120
     if: |
       github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'pull_request' ||
       (
         github.event_name == 'issue_comment' &&
         github.event.issue.pull_request != null &&
-        github.event.comment.user.login == 'sanjibansg' &&
+        contains(fromJSON('["sanjibansg","lmoneta"]'), github.event.comment.user.login) &&
         startsWith(github.event.comment.body, '/runbenchmark')
       )
+
+    environment: ${{ github.event_name == 'pull_request' && 'ci-benchmark-approval' || 'ci-open' }}
 
     steps:
       - name: React to trigger comment
@@ -60,14 +65,17 @@ jobs:
 
       - name: Resolve PR info
         id: pr
-        if: github.event_name == 'issue_comment'
+        if: github.event_name == 'issue_comment' || github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
+            const prNumber = context.eventName === 'issue_comment'
+              ? context.payload.issue.number
+              : context.payload.pull_request.number;
             const pr = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              pull_number: context.payload.issue.number
+              pull_number: prNumber
             });
             core.setOutput('number', pr.data.number);
             core.setOutput('head_ref', `refs/pull/${pr.data.number}/head`);
@@ -77,10 +85,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: sofie-pr
-          ref: ${{ github.event_name == 'issue_comment' && steps.pr.outputs.head_ref || github.ref }}
+          ref: ${{ (github.event_name == 'issue_comment' || github.event_name == 'pull_request') && steps.pr.outputs.head_ref || github.ref }}
 
       - name: Checkout base branch
-        if: github.event_name == 'issue_comment'
+        if: github.event_name == 'issue_comment' || github.event_name == 'pull_request'
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.pr.outputs.base_ref }}
@@ -115,10 +123,9 @@ jobs:
             -n ${{ env.BENCH_ITERS }} \
             | tee benchmark_pr.txt
 
-
       - name: Check whether base branch supports the benchmark harness
         id: base_support
-        if: github.event_name == 'issue_comment'
+        if: github.event_name == 'issue_comment' || github.event_name == 'pull_request'
         run: |
           if grep -q "option(SOFIE_BENCHMARK " sofie-main/CMakeLists.txt 2>/dev/null; then
             echo "supported=true" >> "$GITHUB_OUTPUT"
@@ -128,7 +135,7 @@ jobs:
           fi
 
       - name: Configure base build
-        if: github.event_name == 'issue_comment' && steps.base_support.outputs.supported == 'true'
+        if: (github.event_name == 'issue_comment' || github.event_name == 'pull_request') && steps.base_support.outputs.supported == 'true'
         run: |
           cmake -B sofie-main/build -S sofie-main \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
@@ -140,11 +147,11 @@ jobs:
             "-DFETCHCONTENT_BASE_DIR=${{ env.DEPS_CACHE }}"
 
       - name: Build base benchmark
-        if: github.event_name == 'issue_comment' && steps.base_support.outputs.supported == 'true'
+        if: (github.event_name == 'issue_comment' || github.event_name == 'pull_request') && steps.base_support.outputs.supported == 'true'
         run: cmake --build sofie-main/build --target sofie_benchmark -j10
 
       - name: Run base benchmark
-        if: github.event_name == 'issue_comment' && steps.base_support.outputs.supported == 'true'
+        if: (github.event_name == 'issue_comment' || github.event_name == 'pull_request') && steps.base_support.outputs.supported == 'true'
         working-directory: sofie-main/build/benchmark
         run: |
           ./sofie_benchmark \
@@ -160,9 +167,9 @@ jobs:
             echo "summary<<BENCH_EOF"
             echo "### Benchmark results"
             echo ""
-            if [ "${{ github.event_name }}" = "issue_comment" ] && [ "${{ steps.base_support.outputs.supported }}" = "true" ]; then
+            if [ "${{ github.event_name == 'issue_comment' || github.event_name == 'pull_request' }}" = "true" ] && [ "${{ steps.base_support.outputs.supported }}" = "true" ]; then
               echo "Comparing against \`${{ steps.pr.outputs.base_ref }}\`"
-            elif [ "${{ github.event_name }}" = "issue_comment" ]; then
+            elif [ "${{ github.event_name == 'issue_comment' || github.event_name == 'pull_request' }}" = "true" ]; then
               echo "_\`${{ steps.pr.outputs.base_ref }}\` does not yet support the SOFIE_BENCHMARK harness — showing PR results only._"
             fi
             echo ""
@@ -179,7 +186,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Post results as PR comment
-        if: always() && github.event_name == 'issue_comment'
+        if: always() && (github.event_name == 'issue_comment' || github.event_name == 'pull_request')
         uses: marocchino/sticky-pull-request-comment@v2
         with:
           number: ${{ steps.pr.outputs.number }}

@@ -3,7 +3,6 @@ on:
   push:
     branches: [main, gpu/alpaka]
   pull_request:
-    branches: [main, gpu/alpaka]
   issue_comment:
     types: [created]
   workflow_dispatch:
@@ -25,12 +24,21 @@ jobs:
     name: GPU Unit Tests (NVIDIA/L40S)
     runs-on: ml4ep-l40s
     if: |
-      github.event_name != 'issue_comment' ||
+      github.event_name == 'push' ||
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
       (
+        github.event_name == 'issue_comment' &&
         github.event.issue.pull_request != null &&
-        github.event.comment.user.login == 'sanjibansg' &&
-        startsWith(github.event.comment.body, '/runci')
+        contains(fromJSON('["sanjibansg","lmoneta"]'), github.event.comment.user.login) &&
+        startsWith(github.event.comment.body, '/runtest')
       )
+    environment: >-
+      ${{
+        (github.event_name == 'pull_request' && !contains(fromJSON('["main","gpu/alpaka"]'), github.base_ref))
+        && 'ci-tests-approval'
+        || 'ci-open'
+      }}
     container:
       image: registry.cern.ch/ngt/lxplus-like:9
       options: --user 0:0
@@ -105,5 +113,5 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.issue.number,
-              body: `/runci: GPU Unit Tests ${status} — [view run](${runUrl})`
+              body: `/runtest: GPU Unit Tests ${status} — [view run](${runUrl})`
             });
