@@ -13,11 +13,16 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
-
+env:
+  LCG_VIEW:   /cvmfs/sft.cern.ch/lcg/views/LCG_106a/x86_64-el9-gcc13-opt
+  CUDA_CVMFS: /cvmfs/sft.cern.ch/lcg/contrib/cuda/12.4/x86_64-el9
+  CUDA_ARCH:  "native"
+  BUILD_TYPE: Release
+  DEPS_CACHE: /tmp/sofie-cmake-deps
 jobs:
-  gate:
-    name: Authorize
-    runs-on: ubuntu-latest
+  gpu-tests:
+    name: GPU Unit Tests (NVIDIA/L40S)
+    runs-on: ml4ep-l40s
     if: |
       github.event_name == 'push' ||
       github.event_name == 'pull_request' ||
@@ -34,6 +39,10 @@ jobs:
         && 'ci-tests-approval'
         || 'ci-open'
       }}
+    container:
+      image: registry.cern.ch/ngt/lxplus-like:9
+      options: --user 0:0
+    timeout-minutes: 60
     steps:
       - name: React to trigger comment
         if: github.event_name == 'issue_comment'
@@ -46,54 +55,59 @@ jobs:
               comment_id: context.payload.comment.id,
               content: 'eyes'
             });
-      - name: Authorized
-        run: echo "Authorized to run GPU tests"
-  tests-h100:
-    name: Attempt on h100
-    needs: gate
-    uses: ./.github/workflows/_gpu-tests-run.yml
-    continue-on-error: true
-    with:
-      runner_label: ml4ep-h100
-      checkout_ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/merge', github.event.issue.number) || github.ref }}
-
-  tests-h100-47gb:
-    name: Attempt on h100-47gb
-    needs: [gate, tests-h100]
-    if: always() && needs.gate.result == 'success' && needs.tests-h100.result == 'failure'
-    uses: ./.github/workflows/_gpu-tests-run.yml
-    continue-on-error: true
-    with:
-      runner_label: ml4ep-h100-47gb
-      checkout_ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/merge', github.event.issue.number) || github.ref }}
-
-  tests-l40s:
-    name: Attempt on l40s
-    needs: [gate, tests-h100, tests-h100-47gb]
-    if: >-
-      always() && needs.gate.result == 'success' &&
-      needs.tests-h100.result == 'failure' &&
-      needs.tests-h100-47gb.result == 'failure'
-    uses: ./.github/workflows/_gpu-tests-run.yml
-    with:
-      runner_label: ml4ep-l40s
-      checkout_ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/merge', github.event.issue.number) || github.ref }}
-
-  report:
-    name: Report result on PR
-    runs-on: ubuntu-latest
-    needs: [gate, tests-h100, tests-h100-47gb, tests-l40s]
-    if: always() && github.event_name == 'issue_comment'
-    steps:
-      - uses: actions/github-script@v7
+      - name: GPU check
+        run: nvidia-smi
+      - name: Setup build environment
+        run: |
+          set -euo pipefail
+          # GTest
+          dnf install -y gtest-devel 2>/dev/null || \
+          dnf install -y googletest-devel 2>/dev/null || (
+            cd /tmp
+            git clone --depth 1 -b v1.14.0 https://github.com/google/googletest.git
+            cmake -B gtest-build -S googletest \
+                  -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON
+            cmake --build gtest-build -j15
+            cmake --install gtest-build
+          )
+          echo "PATH=$PATH"                               >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"    >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH:-}" >> "$GITHUB_ENV"
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/merge', github.event.issue.number) || github.ref }}
+      - name: Cache FetchContent dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DEPS_CACHE }}
+          key: cmake-deps-tests-${{ hashFiles('test/CMakeLists.txt') }}
+          restore-keys: cmake-deps-tests-
+      - name: Configure
+        run: |
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DSOFIE_WITH_ROOT=OFF \
+            -Dtesting=ON \
+            -DENABLE_ALPAKA_TESTS=ON \
+            -DALPAKA_BACKEND=cuda \
+            "-DCMAKE_CUDA_ARCHITECTURES=${{ env.CUDA_ARCH }}" \
+            "-DFETCHCONTENT_BASE_DIR=${{ env.DEPS_CACHE }}"
+      - name: Build and run tests
+        working-directory: build
+        run: ctest --output-on-failure -j15
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ github.run_id }}
+          path: build/Testing/Temporary/LastTest.log
+      - name: Report result on PR
+        if: always() && github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
         with:
           script: |
-            const results = [
-              '${{ needs.tests-h100.result }}',
-              '${{ needs.tests-h100-47gb.result }}',
-              '${{ needs.tests-l40s.result }}',
-            ];
-            const status = results.includes('success') ? '✅ passed' : '❌ failed';
+            const status = '${{ job.status }}' === 'success' ? '✅ passed' : '❌ failed';
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
