@@ -1,28 +1,50 @@
 name: Unit Tests
 on:
   push:
-    branches: [main]
+    branches: [main, gpu/alpaka]
   pull_request:
-    branches: [main]
+    branches: [main, gpu/alpaka]
+  issue_comment:
+    types: [created]
   workflow_dispatch:
 concurrency:
-  group: tests-${{ github.ref }}
+  group: tests-${{ github.event.issue.number || github.ref }}
   cancel-in-progress: true
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
 env:
   LCG_VIEW:   /cvmfs/sft.cern.ch/lcg/views/LCG_106a/x86_64-el9-gcc13-opt
-  CUDA_CVMFS: /cvmfs/sft.cern.ch/lcg/contrib/cuda/12.4/x86_64-el9
-  CUDA_ARCH:  "90"
   BUILD_TYPE: Release
   DEPS_CACHE: /tmp/sofie-cmake-deps
 jobs:
   gpu-tests:
     name: GPU Unit Tests (NVIDIA/H100)
     runs-on: ml4ep-h100
+    if: |
+      github.event_name != 'issue_comment' ||
+      (
+        github.event.issue.pull_request != null &&
+        github.event.comment.user.login == 'sanjibansg' &&
+        startsWith(github.event.comment.body, '/runci')
+      )
     container:
       image: registry.cern.ch/ngt/lxplus-like:9
       options: --user 0:0
     timeout-minutes: 60
     steps:
+      - name: React to trigger comment
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes'
+            });
       - name: GPU check
         run: nvidia-smi
       - name: Setup build environment
@@ -67,6 +89,8 @@ jobs:
           echo "CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH:-}" >> "$GITHUB_ENV"
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/head', github.event.issue.number) || github.ref }}
       - name: Cache FetchContent dependencies
         uses: actions/cache@v4
         with:
@@ -97,3 +121,16 @@ jobs:
         with:
           name: test-log-${{ github.run_id }}
           path: build/Testing/Temporary/LastTest.log
+      - name: Report result on PR
+        if: always() && github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ job.status }}' === 'success' ? '✅ passed' : '❌ failed';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `/runci: GPU Unit Tests ${status} — [view run](${runUrl})`
+            });
