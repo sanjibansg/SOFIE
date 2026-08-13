@@ -137,6 +137,7 @@ public:
 
       size_t inputLength = SOFIE::ConvertShapeToLength(fShapeX);
       size_t outputLength = SOFIE::ConvertShapeToLength(fShapeY);
+      const std::string typeName = ConvertTypeToString(GetTemplatedType(T{}));
 
       auto inputStrides = SOFIE::UTILITY::ComputeStrideFromShape(fShapeX);
       // output stride (or not pruned vector)
@@ -187,7 +188,7 @@ public:
          if (fReduceOpMode == ReduceProd)
             out << SP << SP << "tensor_" << fNY << "[i] = 1;\n";
          else if (fReduceOpMode == ReduceMax)
-            out << SP << SP << "tensor_" << fNY << "[i] = std::numeric_limits<float>::lowest();\n";
+            out << SP << SP << "tensor_" << fNY << "[i] = std::numeric_limits<" << typeName << ">::lowest();\n";
          else
             out << SP << SP << "tensor_" << fNY << "[i] = 0;\n";
          out << SP << SP << "for (size_t j = 0; j < " << reducedLength << "; j++) {\n";
@@ -204,7 +205,7 @@ public:
                 << SP << SP << SP << SP << "tensor_" << fNY << "[i] = tensor_" << fNX << "[i * " << reducedLength << " + j];\n";
          out << SP << SP << "}\n"; // end j loop
          if(fReduceOpMode == ReduceMean)
-            out << SP << SP << "tensor_" << fNY << "[i] /= static_cast<float>(" << reducedLength << ");\n";
+            out << SP << SP << "tensor_" << fNY << "[i] /= static_cast<" << typeName << ">(" << reducedLength << ");\n";
          else if (fReduceOpMode == ReduceL2)
             out << SP << SP << "tensor_" << fNY << "[i] = std::sqrt(tensor_" << fNY << "[i]);\n";
 
@@ -216,8 +217,8 @@ public:
          if (fReduceOpMode == ReduceProd)
             out << SP << "std::fill(tensor_" << fNY <<", tensor_"<< fNY <<" + "<< outputLength << ", 1);\n";
          else if (fReduceOpMode == ReduceMax)
-            out << SP << "std::fill(tensor_" << fNY <<", tensor_"<< fNY <<" + "<< outputLength
-                      << ", std::numeric_limits<float>::lowest());\n";
+            out << SP << "std::fill(tensor_" << fNY << ", tensor_" << fNY << " + " << outputLength
+                      << ", std::numeric_limits<" << typeName << ">::lowest());\n";
          else
             out << SP << "std::fill(tensor_" << fNY <<", tensor_"<< fNY <<" + "<< outputLength << ", 0);\n";
 
@@ -238,7 +239,7 @@ public:
          out << SP  << "}\n"; // end i loop
          if(fReduceOpMode == ReduceMean) {
             out << SP  << "for (size_t j = 0; j < " << outputLength << "; j++) {\n";
-            out << SP << SP << "tensor_" << fNY << "[j] /= static_cast<float>(" << reducedLength << ");\n";
+            out << SP << SP << "tensor_" << fNY << "[j] /= static_cast<" << typeName << ">(" << reducedLength << ");\n";
             out << SP << "}\n"; // end j loop
          } else if (fReduceOpMode == ReduceL2) {
             out << SP  << "for (size_t j = 0; j < " << outputLength << "; j++) {\n";
@@ -253,8 +254,8 @@ public:
          if (fReduceOpMode == ReduceProd)
             out << SP << "std::fill(tensor_" << fNY <<", tensor_"<< fNY <<" + "<< outputLength << ", 1);\n";
          else if (fReduceOpMode == ReduceMax)
-            out << SP << "std::fill(tensor_" << fNY <<", tensor_"<< fNY <<" + "<< outputLength
-                      << ", std::numeric_limits<float>::lowest());\n";
+            out << SP << "std::fill(tensor_" << fNY << ", tensor_" << fNY << " + " << outputLength
+                      << ", std::numeric_limits<" << typeName << ">::lowest());\n";
          else
             out << SP << "std::fill(tensor_" << fNY <<", tensor_"<< fNY <<" + "<< outputLength << ",0);\n";
 
@@ -288,7 +289,7 @@ public:
          // post-processing passes
          if (fReduceOpMode == ReduceMean) {
             out << SP << "for (size_t i = 0; i < " << outputLength << "; i++) {\n";
-            out << SP << SP << "tensor_" << fNY << "[i] /= static_cast<float>(" << reducedLength << ");\n";
+            out << SP << SP << "tensor_" << fNY << "[i] /= static_cast<" << typeName << ">(" << reducedLength << ");\n";
             out << SP << "}\n";
          } else if (fReduceOpMode == ReduceL2) {
             out << SP << "for (size_t i = 0; i < " << outputLength << "; i++) {\n";
