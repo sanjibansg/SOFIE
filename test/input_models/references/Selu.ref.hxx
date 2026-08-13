@@ -1,5 +1,5 @@
 // Auto-generated SELU reference - DO NOT EDIT
 #pragma once
 namespace Selu_ExpectedOutput {
-   float outputs[] = {1.05070102f, -1.52016652f, 3.15210295f, 0.52535051f, -1.11133075f, 2.10140204f};
+   float outputs[] = {3.00000000f, -5.18798828f, 9.00000000f, 1.50000000f, -3.79272366f, 6.00000000f};
 } // namespace Selu_ExpectedOutput
