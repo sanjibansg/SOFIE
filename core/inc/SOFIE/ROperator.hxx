@@ -39,7 +39,10 @@ enum class OperatorKind {
    UNARY_ABS=23,
    CLIP=24,
    NOT=25,
-   POOL=26
+   POOL=26,
+   HARDSIGMOID=27,
+   HARDSWISH=28,
+   SOFTPLUS=29
 };
 
 inline const char* toString(OperatorKind kind) {
@@ -52,6 +55,9 @@ inline const char* toString(OperatorKind kind) {
        case OperatorKind::BATCHNORM:       return "BATCHNORM";  
        case OperatorKind::CONV:       return "CONV";
        case OperatorKind::UNDEFINED:  return "UNDEFINED";
+       case OperatorKind::HARDSIGMOID:return "HARDSIGMOID";
+       case OperatorKind::HARDSWISH:  return "HARDSWISH";
+       case OperatorKind::SOFTPLUS:   return "SOFTPLUS";
        default:                       return "UNKNOWN";
    }
 }

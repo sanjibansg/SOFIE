@@ -21,6 +21,8 @@ set(sources_headers
    SOFIE/RModelProfilerGPU.hxx
    SOFIE/ROperator.hxx
    SOFIE/ROperator_BasicUnary.hxx
+    ROperator_HardSigmoid.hxx
+    ROperator_HardSwish.hxx
    SOFIE/ROperator_BasicBinary.hxx
    SOFIE/ROperator_BasicNary.hxx
    SOFIE/ROperator_BatchNormalization.hxx
