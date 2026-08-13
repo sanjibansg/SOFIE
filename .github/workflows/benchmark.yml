@@ -22,7 +22,6 @@ permissions:
   issues: write
 
 env:
-  LCG_VIEW:     /cvmfs/sft.cern.ch/lcg/views/LCG_106a/x86_64-el9-gcc13-opt
   BUILD_TYPE:   Release
   BENCH_WARMUP: ${{ github.event.inputs.warmup || '5' }}
   BENCH_ITERS:  ${{ github.event.inputs.iterations || '100' }}
