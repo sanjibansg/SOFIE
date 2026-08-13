@@ -15,6 +15,12 @@ permissions:
   pull-requests: write
   issues: write
 env:
+  LCG_VIEW:   /cvmfs/sft.cern.ch/lcg/views/LCG_106a/x86_64-el9-gcc13-opt
+  CUDA_CVMFS: /cvmfs/sft.cern.ch/lcg/contrib/cuda/12.4/x86_64-el9
+  # "native" detects whatever GPU is actually on the runner at build time,
+  # instead of hardcoding a compute capability that breaks silently if the
+  # runner pool changes (this job moved from H100 to L40S).
+  CUDA_ARCH:  "native"
   BUILD_TYPE: Release
   DEPS_CACHE: /tmp/sofie-cmake-deps
 jobs:
@@ -46,6 +52,46 @@ jobs:
             });
       - name: GPU check
         run: nvidia-smi
+      - name: Setup build environment
+        run: |
+          set -euo pipefail
+          # LCG view (cmake, gcc-13, protobuf, openblas)
+          if [ -f "${{ env.LCG_VIEW }}/setup.sh" ]; then
+            set +u; source "${{ env.LCG_VIEW }}/setup.sh"; set -u
+          else
+            echo "LCG view not found — installing from dnf"
+            dnf install -y epel-release
+            dnf install -y cmake ninja-build gcc-c++ python3 git \
+                           protobuf-devel openblas-devel
+          fi
+          # CUDA toolkit (nvcc + headers)
+          if [ -x "${{ env.CUDA_CVMFS }}/bin/nvcc" ]; then
+            echo "${{ env.CUDA_CVMFS }}/bin" >> "$GITHUB_PATH"
+            echo "CUDA_HOME=${{ env.CUDA_CVMFS }}" >> "$GITHUB_ENV"
+          elif [ -x /usr/local/cuda/bin/nvcc ]; then
+            echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+            echo "CUDA_HOME=/usr/local/cuda" >> "$GITHUB_ENV"
+          else
+            echo "nvcc not found — installing CUDA toolkit from NVIDIA repo"
+            dnf config-manager --add-repo \
+              https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
+            dnf install -y cuda-compiler-12-4 cuda-cudart-devel-12-4 cuda-libraries-devel-12-4
+            echo "/usr/local/cuda-12.4/bin" >> "$GITHUB_PATH"
+            echo "CUDA_HOME=/usr/local/cuda-12.4" >> "$GITHUB_ENV"
+          fi
+          # GTest
+          dnf install -y gtest-devel 2>/dev/null || \
+          dnf install -y googletest-devel 2>/dev/null || (
+            cd /tmp
+            git clone --depth 1 -b v1.14.0 https://github.com/google/googletest.git
+            cmake -B gtest-build -S googletest \
+                  -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON
+            cmake --build gtest-build -j$(nproc)
+            cmake --install gtest-build
+          )
+          echo "PATH=$PATH"                               >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"    >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH:-}" >> "$GITHUB_ENV"
       - name: Checkout
         uses: actions/checkout@v4
         with:
