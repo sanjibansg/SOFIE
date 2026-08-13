@@ -20,9 +20,9 @@ env:
   BUILD_TYPE: Release
   DEPS_CACHE: /tmp/sofie-cmake-deps
 jobs:
-  gpu-tests:
-    name: GPU Unit Tests (NVIDIA/L40S)
-    runs-on: ml4ep-l40s
+  parse-command:
+    name: Parse trigger
+    runs-on: ubuntu-latest
     if: |
       github.event_name == 'push' ||
       github.event_name == 'pull_request' ||
@@ -33,16 +33,11 @@ jobs:
         contains(fromJSON('["sanjibansg","lmoneta"]'), github.event.comment.user.login) &&
         startsWith(github.event.comment.body, '/runtest')
       )
-    environment: >-
-      ${{
-        (github.event_name == 'pull_request' && !contains(fromJSON('["main","gpu/alpaka"]'), github.base_ref))
-        && 'ci-tests-approval'
-        || 'ci-open'
-      }}
-    container:
-      image: registry.cern.ch/ngt/lxplus-like:9
-      options: --user 0:0
-    timeout-minutes: 60
+    outputs:
+      runner_label: ${{ steps.parse.outputs.runner_label }}
+      valid: ${{ steps.parse.outputs.valid }}
+      flavor: ${{ steps.parse.outputs.flavor }}
+      valid_flavors: ${{ steps.parse.outputs.valid_flavors }}
     steps:
       - name: React to trigger comment
         if: github.event_name == 'issue_comment'
@@ -55,6 +50,47 @@ jobs:
               comment_id: context.payload.comment.id,
               content: 'eyes'
             });
+      - name: Parse runner flavor
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // default flavor keyed by name -> actual self-hosted runner label
+            const flavors = {
+              l40s: 'ml4ep-l40s',
+              h100: 'ml4ep-h100',
+              'h100-47gb': 'ml4ep-h100-47gb',
+            };
+            let flavor = 'l40s';
+            let valid = true;
+            if (context.eventName === 'issue_comment') {
+              const m = context.payload.comment.body.trim().match(/^\/runtest(?:\s+(\S+))?/i);
+              if (m && m[1]) {
+                flavor = m[1].toLowerCase();
+                valid = Object.prototype.hasOwnProperty.call(flavors, flavor);
+              }
+            }
+            core.setOutput('flavor', flavor);
+            core.setOutput('valid', String(valid));
+            core.setOutput('runner_label', valid ? flavors[flavor] : '');
+            core.setOutput('valid_flavors', Object.keys(flavors).join(', '));
+
+  gpu-tests:
+    name: GPU Unit Tests
+    needs: parse-command
+    if: needs.parse-command.outputs.valid == 'true'
+    runs-on: ${{ needs.parse-command.outputs.runner_label }}
+    environment: >-
+      ${{
+        (github.event_name == 'pull_request' && !contains(fromJSON('["main","gpu/alpaka"]'), github.base_ref))
+        && 'ci-tests-approval'
+        || 'ci-open'
+      }}
+    container:
+      image: registry.cern.ch/ngt/lxplus-like:9
+      options: --user 0:0
+    timeout-minutes: 60
+    steps:
       - name: GPU check
         run: nvidia-smi
       - name: Setup build environment
@@ -113,5 +149,25 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.issue.number,
-              body: `/runtest: GPU Unit Tests ${status} — [view run](${runUrl})`
+              body: `/runtest (${{ needs.parse-command.outputs.flavor }}): GPU Unit Tests ${status} — [view run](${runUrl})`
+            });
+
+  report-invalid-flavor:
+    name: Report invalid runner flavor
+    needs: parse-command
+    runs-on: ubuntu-latest
+    if: >-
+      always() && github.event_name == 'issue_comment' &&
+      needs.parse-command.result == 'success' &&
+      needs.parse-command.outputs.valid == 'false'
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `/runtest: unknown runner flavor \`${{ needs.parse-command.outputs.flavor }}\`. ` +
+                    `Valid options: ${{ needs.parse-command.outputs.valid_flavors }} (or omit for the default, l40s).`
             });
