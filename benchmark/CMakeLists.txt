@@ -27,6 +27,17 @@ Mutually exclusive with throughput benchmarking — rebuild without this flag \
 to measure throughput."
     OFF)
 
+option(SOFIE_BENCHMARK_LOWRANK
+    "Emit all benchmark models with low rank factorization enabled \
+(Options::kLowRankFactorize), so the same benchmark suite can be compared \
+dense vs low-rank across two builds. Only affects the GPU codegen emitted \
+for each model, not the sofie_benchmark runner itself."
+    OFF)
+
+set(SOFIE_BENCHMARK_LOWRANK_RATIO "0.5" CACHE STRING
+    "Rank ratio used when SOFIE_BENCHMARK_LOWRANK is ON: rank = ratio * min(rows, cols) \
+for each eligible Gemm weight matrix.")
+
 ################################################################################
 # Backend / architecture selection
 #
@@ -57,6 +68,12 @@ if(SOFIE_BENCHMARK_PROFILE)
                    "(backend = ${SOFIE_BENCHMARK_BACKEND}, throughput benchmarking disabled)")
 else()
     message(STATUS "SOFIE Benchmark: backend = ${SOFIE_BENCHMARK_BACKEND}")
+endif()
+
+if(SOFIE_BENCHMARK_LOWRANK)
+    message(STATUS "SOFIE Benchmark: low rank factorization ENABLED for all emitted models "
+                   "(ratio = ${SOFIE_BENCHMARK_LOWRANK_RATIO}). Rebuild with -DSOFIE_BENCHMARK_LOWRANK=OFF "
+                   "and re-run to compare against the dense baseline.")
 endif()
 
 include_directories(
@@ -328,6 +345,8 @@ target_compile_options(sofie_benchmark_emitter PRIVATE
 
 target_compile_definitions(sofie_benchmark_emitter PRIVATE
     $<$<BOOL:${SOFIE_BENCHMARK_PROFILE}>:SOFIE_BENCHMARK_PROFILE>
+    $<$<BOOL:${SOFIE_BENCHMARK_LOWRANK}>:SOFIE_BENCHMARK_LOWRANK>
+    $<$<BOOL:${SOFIE_BENCHMARK_LOWRANK}>:SOFIE_BENCHMARK_LOWRANK_RATIO=${SOFIE_BENCHMARK_LOWRANK_RATIO}>
 )
 
 
@@ -597,6 +616,8 @@ if(SOFIE_BENCHMARK_LARGE)
         )
         target_compile_definitions(sofie_benchmark_large_emitter PRIVATE
             $<$<BOOL:${SOFIE_BENCHMARK_PROFILE}>:SOFIE_BENCHMARK_PROFILE>
+            $<$<BOOL:${SOFIE_BENCHMARK_LOWRANK}>:SOFIE_BENCHMARK_LOWRANK>
+            $<$<BOOL:${SOFIE_BENCHMARK_LOWRANK}>:SOFIE_BENCHMARK_LOWRANK_RATIO=${SOFIE_BENCHMARK_LOWRANK_RATIO}>
         )
 
         add_custom_command(

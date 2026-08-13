@@ -5,6 +5,7 @@
 #include "SOFIE/SOFIE_common.hxx"
 #include "SOFIE/ROperator.hxx"
 #include "SOFIE/RModel.hxx"
+#include "SOFIE/SOFIEHelpers.hxx"
 
 #include <sstream>
 #include <algorithm>
@@ -25,6 +26,12 @@ namespace SOFIE{
       bool fIsDynamic = false;
       bool fBroadcastBias = false;
       bool fCheckBiasShapeAtRuntime = false; // flag to identify the need to do a run time check of bias shape compatibility in case of dynamic shapes and uni-directional broadcasting
+
+      // low rank factorization of weight matrix B: B (rows x cols) ~= Bin (rows x rank) * Bout (rank x cols)
+      bool fLowRank = false;
+      std::size_t fLowRankRank = 0;
+      std::string fLowRankInName;
+      std::string fLowRankOutName;
 
       float fAttrAlpha = 1.0;
       float fAttrBeta = 1.0;
@@ -208,6 +215,59 @@ namespace SOFIE{
                fShapeA.insert(fShapeA.begin(), fShapeB.size()-fShapeA.size(), Dim(1));
             } else if (fShapeB.size() < fShapeA.size()) {
                fShapeB.insert(fShapeB.begin(), fShapeA.size()-fShapeB.size(), Dim(1));
+            }
+         }
+
+         // try low rank factorization of weight matrix B, if enabled on the model.
+         // restrict to the plain 2D case (no MatMul batch stacking); both transB == 0
+         // and transB == 1 (the latter is how e.g. torch.nn.Linear layers are
+         // universally exported to ONNX Gemm) are supported: the generated low-rank
+         // Bin/Bout tensors are always stored logically untransposed (k x rank) and
+         // (rank x n) regardless of how the original B was stored, so Generate() /
+         // Generate_GPU_ALPAKA() never need to special-case transB for the chained
+         // low-rank calls -- when transB == 1 we just transpose the weight data once
+         // here, before factorizing, to get it into that same logical orientation.
+         if (model.LowRankFactorize() && !fIsDynamic && !appendOne &&
+             fShapeA.size() == 2 && fShapeB.size() == 2 &&
+             model.IsInitializedTensor(fNB) && model.IsWeightTensor(fNB) &&
+             model.GetTensorType(fNB) == ETensorType::FLOAT) {
+            // logical (untransposed) orientation: k x n, i.e. rows = contraction dim
+            std::size_t rows = fAttrTransB ? fShapeB[1].dim : fShapeB[0].dim; // k
+            std::size_t cols = fAttrTransB ? fShapeB[0].dim : fShapeB[1].dim; // n
+            std::size_t minDim = std::min(rows, cols);
+            std::size_t rank = static_cast<std::size_t>(model.LowRankRatio() * minDim);
+            if (rank < 1) rank = 1;
+            if (rank < minDim) {
+               auto sharedData = model.GetInitializedTensorData(fNB);
+               const float *storedData = static_cast<const float *>(sharedData.get());
+               std::vector<float> transposed;
+               const float *wdata = storedData;
+               if (fAttrTransB) {
+                  // stored B is (n x k); transpose into logical (k x n) = (rows x cols)
+                  transposed.resize(rows * cols);
+                  for (std::size_t i = 0; i < cols; i++)    // i over n
+                     for (std::size_t j = 0; j < rows; j++) // j over k
+                        transposed[j * cols + i] = storedData[i * rows + j];
+                  wdata = transposed.data();
+               }
+               std::vector<float> Ain, Bout;
+               if (SOFIE::ComputeLowRankFactors(wdata, rows, cols, rank, Ain, Bout)) {
+                  fLowRankRank = rank;
+                  fLowRankInName = fNB + "_lrin";
+                  fLowRankOutName = fNB + "_lrout";
+                  model.AddInitializedTensor<float>(fLowRankInName, {rows, rank}, Ain.data());
+                  model.AddInitializedTensor<float>(fLowRankOutName, {rank, cols}, Bout.data());
+                  model.RemoveInitializedTensor(fNB);
+                  fLowRank = true;
+                  // update the operator's bookkeeping of input tensors: replace fNB with the two factors
+                  for (auto &n : fInputTensorNames) {
+                     if (n == fNB) { n = fLowRankInName; break; }
+                  }
+                  fInputTensorNames.push_back(fLowRankOutName);
+                  if (model.Verbose())
+                     std::cout << "Gemm " << fNB << ": low rank factorized (" << rows << "x" << cols
+                                << ") -> rank " << rank << std::endl;
+               }
             }
          }
 
@@ -477,7 +537,32 @@ namespace SOFIE{
             out << SP2 << "}\n";
          }
 
-         if (fType == "float"){
+         if (fType == "float" && fLowRank){
+            // low rank factorized weight: B (k x n) ~= Bin (k x rank) * Bout (rank x n)
+            // Y = alpha * op(A) * Bin * Bout (+ bias)  computed as two chained Gemm calls:
+            //   tmp (m x rank) = alpha * op(A) * Bin
+            //   Y   (m x n)    = 1 * tmp * Bout + beta * bias
+            std::string tmpName = opName + "_lr_tmp";
+            out << SP2 << "std::vector<float> " << tmpName << "(" << m << " * " << fLowRankRank << ");\n";
+            out << SP2 << "SOFIE::Gemm_Call(" << tmpName << ".data(), false, "
+                << (fAttrTransA ? "true, " : "false, ")
+                << fLowRankRank << ", " << m << ", " << k << ", "
+                << std::setprecision(std::numeric_limits<float>::max_digits10) << fAttrAlpha
+                << ", tensor_" << fLowRankInName << ", tensor_" << fNA << ", 0.f, nullptr);\n";
+
+            out << SP2 << "SOFIE::Gemm_Call(" << "tensor_" << fNY << ", false, false, "
+                << n << ", " << m << ", " << fLowRankRank << ", "
+                << std::setprecision(std::numeric_limits<float>::max_digits10) << 1.f
+                << ", tensor_" << fLowRankOutName << ", " << tmpName << ".data(), "
+                << std::setprecision(std::numeric_limits<float>::max_digits10) << fAttrBeta << ",";
+            if (!fNC.empty() && !fBroadcastBias) {
+               out << "tensor_" << fNC;
+            } else {
+               out << "nullptr";
+            }
+            out << ");\n";
+
+         } else if (fType == "float"){
 
             out << SP2 << "SOFIE::Gemm_Call(" << "tensor_" << fNY;
              if (doStackMul) out << " + " << opName << "_y_offset";
@@ -662,7 +747,48 @@ namespace SOFIE{
             pY += " + i * " + std::to_string(strideY);
          }
 
-         if (useSBatched) {
+         if (fLowRank) {
+            // ----------------------------------------------------------------
+            // low rank factorized GEMM: B (k x n) ~= Bin (k x rank) * Bout (rank x n).
+            // Restricted (in Initialize()) to the plain 2D case (no MatMul batch
+            // stacking, untransposed B), so doStackMul/batchCollapseB/useSBatched
+            // are always false here and the two chained calls below use the
+            // plain (non-batched) blas entry points, exactly like the m/n/k
+            // (no-stacking) branches above.
+            //   tmp (m x rank) = alpha * op(A) * Bin
+            //   Y   (m x n)    = 1 * tmp * Bout (+ bias, via epilogue as usual)
+            // ----------------------------------------------------------------
+            size_t tmpSize = static_cast<size_t>(std::stoi(m)) * fLowRankRank;
+            out << SP << "auto buf_" << opName << "_lrtmp = alpaka::allocBuf<float, Idx>(devAcc, Ext1D::all(Idx{"
+                << tmpSize << "}));\n";
+            out << SP << "auto tensor_" << opName << "_lrtmp = alpaka::getPtrNative(buf_" << opName << "_lrtmp);\n";
+
+            // step 1: tmp = alpha * op(A) * Bin. Bin is always stored logically
+            // untransposed (see Initialize(): when the original B was transB==1,
+            // its data was transposed once before factorizing), regardless of the
+            // original op's transB attribute, so transB is hardcoded 'n' here.
+            out << SP << "blas.matmul("
+                << "'n', " << opName << "_transA, "
+                << fLowRankRank << ", " << opName << "_m, " << opName << "_k, "
+                << opName << "_alpha, alpaka::getPtrNative(deviceBuf_" << fLowRankInName << "), " << pA
+                << ", 0.f, tensor_" << opName << "_lrtmp);\n";
+
+            // step 2: Y = 1 * tmp * Bout (+ bias). tmp and Bout are both untransposed
+            // by construction, so transA/transB are hardcoded to 'n' here.
+            if (!fNC.empty()) {
+               std::string pC = "alpaka::getPtrNative(deviceBuf_" + fNC + ")";
+               const char *callFn = (fActivation == EActivationType::RELU) ? "blas.gemmrelu(" : "blas.gemm(";
+               out << SP << callFn << "'n', 'n', "
+                   << opName << "_n, " << opName << "_m, " << fLowRankRank << ", "
+                   << "1.f, alpaka::getPtrNative(deviceBuf_" << fLowRankOutName << "), tensor_" << opName << "_lrtmp, "
+                   << opName << "_beta, " << pC << ", " << pY << ");\n";
+            } else {
+               out << SP << "blas.matmul('n', 'n', "
+                   << opName << "_n, " << opName << "_m, " << fLowRankRank << ", "
+                   << "1.f, alpaka::getPtrNative(deviceBuf_" << fLowRankOutName << "), tensor_" << opName << "_lrtmp, "
+                   << opName << "_beta, " << pY << ");\n";
+            }
+         } else if (useSBatched) {
             // ----------------------------------------------------------------
             // gemmStridedBatched: both A and B vary per batch (e.g. per attention
             // head), and there is no bias.  Uses cublasSgemmStridedBatched via
@@ -851,6 +977,33 @@ namespace SOFIE{
          }
 
          return n+", "+m+", "+k+", "+ldb+", "+lda+", "+ldc+", "+transFlags;
+      }
+
+      // low rank factorized Gemm issues two chained GEMM calls (see Generate_GPU_ALPAKA)
+      // of different shapes, so two cuBLASLt layouts need to be pre-registered instead
+      // of the single one GetBlasConfig() computes for the dense case.
+      std::vector<std::string> GetBlasConfigs() override {
+         if (!fLowRank)
+            return ROperator::GetBlasConfigs();
+
+         int64_t dimA = fShapeA.size();
+         auto m = (fAttrTransA ? fShapeA[dimA-1].GetVal() : fShapeA[dimA-2].GetVal());
+         auto k = (fAttrTransA ? fShapeA[dimA-2].GetVal() : fShapeA[dimA-1].GetVal());
+         int64_t dimB = fShapeB.size();
+         auto n = (fAttrTransB ? fShapeB[dimB-2].GetVal() : fShapeB[dimB-1].GetVal());
+         std::string rankStr = std::to_string(fLowRankRank);
+         // Bin is always stored logically untransposed (see Initialize()), regardless
+         // of the original op's transB attribute, so the B-side flag here is always 'n'.
+         std::string transFlags1 = std::string("'n', ") + (fAttrTransA ? "'t'" : "'n'");
+         auto lda1 = (fAttrTransA ? m : k);
+
+         // step 1: tmp (m x rank) = op(A) * Bin
+         std::string cfg1 = rankStr+", "+m+", "+k+", "+rankStr+", "+lda1+", "+rankStr+", "+transFlags1;
+
+         // step 2: Y (m x n) = tmp * Bout (+ bias) -- both operands untransposed
+         std::string cfg2 = n+", "+m+", "+rankStr+", "+n+", "+rankStr+", "+n+", 'n', 'n'";
+
+         return {cfg1, cfg2};
       }
    };
 

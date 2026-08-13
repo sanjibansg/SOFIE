@@ -28,7 +28,8 @@ env:
 jobs:
   benchmark:
     name: Benchmark Comparison (H100)
-    runs-on: ml4ep-h100
+    runs-on: ml4ep-l40s
+    container: registry.cern.ch/ngt/lxplus-like:9 
     timeout-minutes: 120
 
     steps:

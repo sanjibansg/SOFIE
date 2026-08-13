@@ -28,6 +28,7 @@ enum class Options {
    kGNN = 0x8,
    kGNNComponent = 0x10,
    kProfile = 0x20,
+   kLowRankFactorize = 0x40,
 };
 
 // Optimization levels inspired by ONNXRuntime.
