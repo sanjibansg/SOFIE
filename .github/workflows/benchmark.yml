@@ -117,9 +117,6 @@ jobs:
               pull_number: context.payload.issue.number
             });
             core.setOutput('number', pr.data.number);
-            // refs/pull/<N>/merge (not /head): the GitHub-maintained commit that
-            // merges the PR head onto the current tip of the base branch, so a
-            // /runbenchmark comment benchmarks the PR as if freshly rebased.
             core.setOutput('merge_ref', `refs/pull/${pr.data.number}/merge`);
             core.setOutput('base_ref', pr.data.base.ref);
 
@@ -234,6 +231,10 @@ jobs:
           header: benchmark
           message: ${{ steps.summary.outputs.summary }}
 
+      - name: Write job summary
+        if: always()
+        run: echo "${{ steps.summary.outputs.summary }}" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Notify benchmark completion
         if: always() && github.event_name == 'issue_comment'
         uses: actions/github-script@v7
@@ -245,12 +246,8 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.issue.number,
-              body: `\`/runbenchmark\` (${{ needs.parse-command.outputs.flavor }}): Benchmark ${status} - results updated above. [view run](${runUrl})`
+              body: `\`/runbenchmark\` (${{ needs.parse-command.outputs.flavor }}): Benchmark ${status} - [view results](${runUrl})`
             });
-
-      - name: Write job summary
-        if: always()
-        run: echo "${{ steps.summary.outputs.summary }}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload benchmark results
         if: always()
