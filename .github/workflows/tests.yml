@@ -1,13 +1,10 @@
 name: Unit Tests
 on:
-  push:
-    branches: [main, gpu/alpaka]
-  pull_request:
   issue_comment:
     types: [created]
   workflow_dispatch:
 concurrency:
-  group: tests-${{ github.event.issue.number || github.event.pull_request.head.sha || github.sha }}
+  group: tests-${{ github.event.issue.number || github.ref }}
   cancel-in-progress: true
 permissions:
   contents: read
@@ -24,8 +21,6 @@ jobs:
     name: Parse trigger
     runs-on: ubuntu-latest
     if: |
-      github.event_name == 'push' ||
-      github.event_name == 'pull_request' ||
       github.event_name == 'workflow_dispatch' ||
       (
         github.event_name == 'issue_comment' &&
@@ -60,7 +55,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.issue.number,
-              body: `/runtest: triggered — [view run](${runUrl})`
+              body: `\`/runtest\` (${{ needs.parse-command.outputs.flavor }}): triggered - [view run](${runUrl})`
             });
       - name: Parse runner flavor
         id: parse
@@ -92,12 +87,6 @@ jobs:
     needs: parse-command
     if: needs.parse-command.outputs.valid == 'true'
     runs-on: ${{ needs.parse-command.outputs.runner_label }}
-    environment: >-
-      ${{
-        (github.event_name == 'pull_request' && !contains(fromJSON('["main","gpu/alpaka"]'), github.base_ref))
-        && 'ci-tests-approval'
-        || 'ci-open'
-      }}
     container:
       image: registry.cern.ch/ngt/lxplus-like:9
       options: --user 0:0
@@ -161,7 +150,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.issue.number,
-              body: `/runtest (${{ needs.parse-command.outputs.flavor }}): GPU Unit Tests ${status} — [view run](${runUrl})`
+              body: `\`/runtest\` (${{ needs.parse-command.outputs.flavor }}): GPU Unit Tests ${status} - [view run](${runUrl})`
             });
 
   report-invalid-flavor:
@@ -180,6 +169,6 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.issue.number,
-              body: `/runtest: unknown runner flavor \`${{ needs.parse-command.outputs.flavor }}\`. ` +
+              body: `\`/runtest\`: unknown runner flavor \`${{ needs.parse-command.outputs.flavor }}\`. ` +
                     `Valid options: ${{ needs.parse-command.outputs.valid_flavors }} (or omit for the default, l40s).`
             });

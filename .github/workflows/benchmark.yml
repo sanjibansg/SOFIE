@@ -67,7 +67,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.issue.number,
-              body: `/runbenchmark: triggered — [view run](${runUrl})`
+              body: `\`/runbenchmark\` (${{ needs.parse-command.outputs.flavor }}): triggered - [view run](${runUrl})`
             });
       - name: Parse runner flavor
         id: parse
@@ -172,7 +172,7 @@ jobs:
             echo "supported=true" >> "$GITHUB_OUTPUT"
           else
             echo "supported=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::${{ steps.pr.outputs.base_ref }} does not define the SOFIE_BENCHMARK option yet — skipping the base-branch comparison."
+            echo "::warning::${{ steps.pr.outputs.base_ref }} does not define the SOFIE_BENCHMARK option yet - skipping the base-branch comparison."
           fi
 
       - name: Configure base build
@@ -211,7 +211,7 @@ jobs:
             if [ "${{ github.event_name }}" = "issue_comment" ] && [ "${{ steps.base_support.outputs.supported }}" = "true" ]; then
               echo "Comparing against \`${{ steps.pr.outputs.base_ref }}\`"
             elif [ "${{ github.event_name }}" = "issue_comment" ]; then
-              echo "_\`${{ steps.pr.outputs.base_ref }}\` does not yet support the SOFIE_BENCHMARK harness — showing PR results only._"
+              echo "_\`${{ steps.pr.outputs.base_ref }}\` does not yet support the SOFIE_BENCHMARK harness - showing PR results only._"
             fi
             echo ""
             echo '```'
@@ -245,7 +245,7 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.issue.number,
-              body: `/runbenchmark (${{ needs.parse-command.outputs.flavor }}): Benchmark ${status} — results updated above. [view run](${runUrl})`
+              body: `\`/runbenchmark\` (${{ needs.parse-command.outputs.flavor }}): Benchmark ${status} - results updated above. [view run](${runUrl})`
             });
 
       - name: Write job summary
@@ -278,6 +278,6 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.payload.issue.number,
-              body: `/runbenchmark: unknown runner flavor \`${{ needs.parse-command.outputs.flavor }}\`. ` +
+              body: `\`/runbenchmark\`: unknown runner flavor \`${{ needs.parse-command.outputs.flavor }}\`. ` +
                     `Valid options: ${{ needs.parse-command.outputs.valid_flavors }} (or omit for the default, l40s).`
             });
