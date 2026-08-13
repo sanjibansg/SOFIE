@@ -57,12 +57,6 @@ set(EMIT_CAPTURES "${ALL_CAPTURES}")
 configure_file(EmitFromONNX.cxx.in EmitFromONNX_all.cxx @ONLY)
 configure_file(EmitFromONNX_GPU_ALPAKA.cxx.in EmitFromONNX_GPU_ALPAKA_all.cxx @ONLY)
 
-############################################################################
-# Low rank factorization tests (CPU) — builds an RModel programmatically
-# (no ROOT interpreter, no ONNX needed) and validates Options::kLowRankFactorize.
-# The GPU counterpart (alpaka/TestAlpakaLowRank.cxx) reuses the same emitted
-# fixture; see the ENABLE_ALPAKA_TESTS block below.
-############################################################################
 ROOTTEST_GENERATE_EXECUTABLE(
   emitLowRankModels
   LowRankModelGenerator.cxx
@@ -90,7 +84,7 @@ target_include_directories(TestLowRankFactorization PRIVATE ${CMAKE_CURRENT_BINA
 ROOTTEST_ADD_TEST(
   TestLowRankFactorization
   EXEC ./TestLowRankFactorization
-  FIXTURES_REQUIRED sofie-lowrank-emit
+  FIXTURES_REQUIRED sofie-lowrank-emit;sofie-test-lowrank-build
 )
 
 ############################################################################
@@ -184,12 +178,6 @@ if (ENABLE_ALPAKA_TESTS)
       ${CMAKE_CURRENT_SOURCE_DIR}
     )
 
-    # No CUDA_ARCHITECTURES override here: let the target inherit whatever
-    # CMAKE_CUDA_ARCHITECTURES was set globally (e.g. "native" from CI, so it
-    # matches whatever GPU the runner actually has). A hardcoded list here
-    # previously included sm_70 (Volta), which some CUDA toolkit installs no
-    # longer support codegen for, breaking the build with "Unsupported gpu
-    # architecture 'compute_70'" regardless of the actual runner's GPU.
     set_target_properties(
       TestCustomModelsFromONNXForAlpakaCuda
       PROPERTIES
@@ -238,7 +226,7 @@ if (ENABLE_ALPAKA_TESTS)
     ROOTTEST_ADD_TEST(
       TestCustomModelsFromONNXForAlpakaCuda
       EXEC ./TestCustomModelsFromONNXForAlpakaCuda
-      FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka;sofie-lowrank-emit
+      FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka;sofie-lowrank-emit;sofie-test-models-onnx-alpaka-build
     )
 
   elseif (_alpaka_backend STREQUAL "hip")
