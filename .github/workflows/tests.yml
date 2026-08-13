@@ -59,7 +59,7 @@ jobs:
             git clone --depth 1 -b v1.14.0 https://github.com/google/googletest.git
             cmake -B gtest-build -S googletest \
                   -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON
-            cmake --build gtest-build -j$(nproc)
+            cmake --build gtest-build -j15
             cmake --install gtest-build
           )
           echo "PATH=$PATH"                               >> "$GITHUB_ENV"
@@ -85,14 +85,9 @@ jobs:
             -DALPAKA_BACKEND=cuda \
             "-DCMAKE_CUDA_ARCHITECTURES=${{ env.CUDA_ARCH }}" \
             "-DFETCHCONTENT_BASE_DIR=${{ env.DEPS_CACHE }}"
-      - name: Build tests
-        run: |
-          cmake --build build \
-            --target TestCustomModelsFromONNXForAlpakaCuda \
-            -j$(nproc)
-      - name: Run tests
+      - name: Build and run tests
         working-directory: build
-        run: ctest --output-on-failure -j1
+        run: ctest --output-on-failure -j15
       - name: Upload test log
         if: always()
         uses: actions/upload-artifact@v4
