@@ -20,8 +20,8 @@ env:
   DEPS_CACHE: /tmp/sofie-cmake-deps
 jobs:
   gpu-tests:
-    name: GPU Unit Tests (NVIDIA/H100)
-    runs-on: ml4ep-h100
+    name: GPU Unit Tests (NVIDIA/L40S)
+    runs-on: ml4ep-l40s
     if: |
       github.event_name != 'issue_comment' ||
       (
