@@ -16,8 +16,8 @@
 #include "Softplus_FromONNX_GPU_ALPAKA.hxx"
 #include "Elu_FromONNX_GPU_ALPAKA.hxx"
 #include "input_models/references/Elu.ref.hxx"
-#include "Selu_FromONNX_GPU_ALPAKA.hxx"
-#include "input_models/references/Selu.ref.hxx"
+#include "SeluNonDefaultCoeffs_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/SeluNonDefaultCoeffs.ref.hxx"
 
 TEST_F(SofieAlpakaTest, Sin)
 {
@@ -359,7 +359,7 @@ TEST_F(SofieAlpakaTest, Elu)
     }
 }
 
-TEST_F(SofieAlpakaTest, Selu)
+TEST_F(SofieAlpakaTest, SeluNonDefaultCoeffs)
 {
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;
 
@@ -373,11 +373,11 @@ TEST_F(SofieAlpakaTest, Selu)
     alpaka::memcpy(queue, input_d, input_h);
     alpaka::wait(queue);
 
-    constexpr size_t nOut = sizeof(Selu_ExpectedOutput::outputs) / sizeof(float);
+    constexpr size_t nOut = sizeof(SeluNonDefaultCoeffs_ExpectedOutput::outputs) / sizeof(float);
     auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{nOut}));
 
     {
-        SOFIE_Selu::Session<alpaka::TagGpuCudaRt> session;
+        SOFIE_SeluNonDefaultCoeffs::Session<alpaka::TagGpuCudaRt> session;
         auto result = session.infer(input_d);
         alpaka::wait(queue);
         cudaDeviceSynchronize();
@@ -386,7 +386,7 @@ TEST_F(SofieAlpakaTest, Selu)
     }
 
     float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
-    float* correct = Selu_ExpectedOutput::outputs;
+    float* correct = SeluNonDefaultCoeffs_ExpectedOutput::outputs;
     for (size_t i = 0; i < nOut; ++i) {
         EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
     }

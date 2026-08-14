@@ -13,8 +13,8 @@ class ROperator_Selu final : public ROperator
 
 private:
 
-   float falpha = 1.67326319217681884765625f;   //ONNX spec default
-   float fgamma = 1.05070102214813232421875f;   //ONNX spec default
+   float falpha = 1.67326319217681884765625f;
+   float fgamma = 1.05070102214813232421875f;
    std::string fNX;
    std::string fNY;
    std::vector<Dim> fShape;
