@@ -75,6 +75,7 @@
 
 #include "Concat_0D_FromONNX_GPU_ALPAKA.hxx"
 #include "ScatterElements_FromONNX_GPU_ALPAKA.hxx"
+#include "ScatterND_FromONNX_GPU_ALPAKA.hxx"
 #include "NonZero_FromONNX_GPU_ALPAKA.hxx"
 
 #include "Split_0_FromONNX_GPU_ALPAKA.hxx"
@@ -3610,3 +3611,84 @@ TEST_F(SofieAlpakaTest, NonZero)
         EXPECT_EQ(res_ptr[i], correct[i]) << "i=" << i;
 }
 
+
+
+TEST_F(SofieAlpakaTest, ScatterND)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+   std::vector<float> data = {
+       0.f,  1.f,
+       2.f,  3.f,
+       4.f,  5.f,
+
+       6.f,  7.f,
+       8.f,  9.f,
+      10.f, 11.f
+   };
+
+   // Replace data[0,1,:] and data[-1,2,:].
+   std::vector<int64_t> indices = {
+       0, 1,
+      -1, 2
+   };
+
+   std::vector<float> updates = {
+      20.f, 21.f,
+      30.f, 31.f
+   };
+
+   std::vector<float> correct = {
+       0.f,  1.f,
+      20.f, 21.f,
+       4.f,  5.f,
+
+       6.f,  7.f,
+       8.f,  9.f,
+      30.f, 31.f
+   };
+
+   auto data_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{data.size()}));
+   auto indices_h = alpaka::allocBuf<int64_t, Idx>(host, Ext1D::all(Idx{indices.size()}));
+   auto updates_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{updates.size()}));
+
+   float* data_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(data_h));
+   int64_t* indices_ptr = reinterpret_cast<int64_t*>(alpaka::getPtrNative(indices_h));
+   float* updates_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(updates_h));
+
+   for (Idx i = 0; i < data.size(); ++i)
+      data_ptr[i] = data[i];
+
+   for (Idx i = 0; i < indices.size(); ++i)
+      indices_ptr[i] = indices[i];
+
+   for (Idx i = 0; i < updates.size(); ++i)
+      updates_ptr[i] = updates[i];
+
+   auto data_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{data.size()}));
+   auto indices_d = alpaka::allocBuf<int64_t, Idx>(device, Ext1D::all(Idx{indices.size()}));
+   auto updates_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{updates.size()}));
+
+   alpaka::memcpy(queue, data_d, data_h);
+   alpaka::memcpy(queue, indices_d, indices_h);
+   alpaka::memcpy(queue, updates_d, updates_h);
+   alpaka::wait(queue);
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{correct.size()}));
+
+   {
+      SOFIE_ScatterND::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(data_d, indices_d, updates_d);
+
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+
+   for (size_t i = 0; i < correct.size(); ++i)
+      EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
+}
