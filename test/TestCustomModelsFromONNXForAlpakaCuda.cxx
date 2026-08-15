@@ -75,6 +75,7 @@
 
 #include "Concat_0D_FromONNX_GPU_ALPAKA.hxx"
 #include "ScatterElements_FromONNX_GPU_ALPAKA.hxx"
+#include "NonZero_FromONNX_GPU_ALPAKA.hxx"
 
 #include "Split_0_FromONNX_GPU_ALPAKA.hxx"
 #include "Split_1_FromONNX_GPU_ALPAKA.hxx"
@@ -3561,3 +3562,51 @@ TEST_F(SofieAlpakaTest, Logic_BitwiseNot)
    for (std::size_t i = 0; i < N; ++i)
       EXPECT_EQ(res[i], ref[i]) << "  index=" << i;
 }
+
+
+
+TEST_F(SofieAlpakaTest, NonZero)
+{
+    std::vector<float> input = {
+        0.f, 2.f, 0.f,
+        3.f, 4.f, 0.f
+     };
+
+    // Non-zero coordinates are (0,1), (1,0), and (1,1).
+    // ONNX NonZero stores one coordinate dimension per output row.
+    std::vector<int64_t> correct = {
+        0, 1, 1,
+        1, 0, 1
+     };
+
+    auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+    float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+
+    for (Idx i = 0; i < input.size(); ++i)
+        input_ptr[i] = input[i];
+
+    auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+    alpaka::memcpy(queue, input_d, input_h);
+    alpaka::wait(queue);
+
+    // NonZero reserves rank * input_length elements.
+    constexpr std::size_t outputCapacity = 2 * 6;
+    auto result_h = alpaka::allocBuf<int64_t, Idx>(host, Ext1D::all(Idx{outputCapacity}));
+
+    {
+        SOFIE_NonZero::Session<alpaka::TagGpuCudaRt> session;
+        auto result = session.infer(input_d);
+
+        alpaka::wait(queue);
+        cudaDeviceSynchronize();
+
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    int64_t* res_ptr = reinterpret_cast<int64_t*>(alpaka::getPtrNative(result_h));
+
+    for (size_t i = 0; i < correct.size(); ++i)
+        EXPECT_EQ(res_ptr[i], correct[i]) << "i=" << i;
+}
+

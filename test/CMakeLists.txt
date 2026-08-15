@@ -46,15 +46,31 @@ file(GLOB ONNX_FILES "${ONNX_MODELS_DIR}/*.onnx")
 
 set(ALL_CAPTURES "")
 foreach(onnx_file ${ONNX_FILES})
-  get_filename_component(fname ${onnx_file} NAME_WE)
-  string(REPLACE "@1" "${onnx_file}" cap "${CAPTURE_STR}")
-  string(REPLACE "@2" "${fname}" cap "${cap}")
-  string(APPEND ALL_CAPTURES "${cap}")
+    get_filename_component(fname ${onnx_file} NAME_WE)
+    string(REPLACE "@1" "${onnx_file}" cap "${CAPTURE_STR}")
+    string(REPLACE "@2" "${fname}" cap "${cap}")
+    string(APPEND ALL_CAPTURES "${cap}")
 endforeach()
 
+# Normal ONNX tests: preserve the existing behaviour exactly.
 set(EMIT_CAPTURES "${ALL_CAPTURES}")
-
 configure_file(EmitFromONNX.cxx.in EmitFromONNX_all.cxx @ONLY)
+
+# Alpaka tests: use all regular models plus Alpaka-only operator test models.
+set(ALPAKA_CAPTURES "${ALL_CAPTURES}")
+
+file(GLOB ALPAKA_ONLY_ONNX_FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/alpaka_input_models/*.onnx"
+)
+
+foreach(onnx_file ${ALPAKA_ONLY_ONNX_FILES})
+    get_filename_component(fname ${onnx_file} NAME_WE)
+    string(REPLACE "@1" "${onnx_file}" cap "${CAPTURE_STR}")
+    string(REPLACE "@2" "${fname}" cap "${cap}")
+    string(APPEND ALPAKA_CAPTURES "${cap}")
+endforeach()
+
+set(EMIT_CAPTURES "${ALPAKA_CAPTURES}")
 configure_file(EmitFromONNX_GPU_ALPAKA.cxx.in EmitFromONNX_GPU_ALPAKA_all.cxx @ONLY)
 
 ############################################################################
@@ -84,12 +100,12 @@ if (ENABLE_ALPAKA_TESTS)
   ##########################################################################
   # Alpaka emitter
   ##########################################################################
-  ROOTTEST_GENERATE_EXECUTABLE(
-    emitFromONNXAlpaka
-    EmitFromONNX_GPU_ALPAKA_all.cxx
-    LIBRARIES protobuf::libprotobuf SOFIE_core SOFIE_parsers
-    FIXTURES_SETUP sofie-compile-models-onnx-alpaka-build
-  )
+ROOTTEST_GENERATE_EXECUTABLE(
+      emitFromONNXAlpaka
+      ${CMAKE_CURRENT_BINARY_DIR}/EmitFromONNX_GPU_ALPAKA_all.cxx
+      LIBRARIES protobuf::libprotobuf SOFIE_core SOFIE_parsers
+      FIXTURES_SETUP sofie-compile-models-onnx-alpaka-build
+)
 
   target_compile_options(emitFromONNXAlpaka PRIVATE
     -Wno-unused-parameter
