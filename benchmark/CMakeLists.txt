@@ -29,12 +29,22 @@ Mutually exclusive with throughput benchmarking — rebuild without this flag \
 to measure throughput."
     OFF)
 
+option(SOFIE_BENCHMARK_LOWRANK
+    "Emit all benchmark models with low rank factorization enabled \
+(Options::kLowRankFactorize), so the same benchmark suite can be compared \
+dense vs low-rank across two builds. Only affects the GPU codegen emitted \
+for each model, not the sofie_benchmark runner itself."
+    OFF)
+
+set(SOFIE_BENCHMARK_LOWRANK_RATIO "0.5" CACHE STRING
+    "Rank ratio used when SOFIE_BENCHMARK_LOWRANK is ON: rank = ratio * min(rows, cols) \
+for each eligible Gemm weight matrix.")
+
 ################################################################################
 # Backend / architecture selection
 #
 # SOFIE_BENCHMARK_BACKEND applies to both throughput benchmarking and profiling.
 # Currently only CUDA is supported; setting any other value is a hard error.
-# When AMD GPU (HIP/ROCm) support is added, this option will accept "HIP".
 ################################################################################
 
 set(SOFIE_BENCHMARK_BACKEND "CUDA" CACHE STRING
@@ -62,6 +72,12 @@ else()
     message(STATUS "SOFIE Benchmark: backend = ${SOFIE_BENCHMARK_BACKEND}")
 endif()
 
+if(SOFIE_BENCHMARK_LOWRANK)
+    message(STATUS "SOFIE Benchmark: low rank factorization ENABLED for all emitted models "
+                   "(ratio = ${SOFIE_BENCHMARK_LOWRANK_RATIO}). Rebuild with -DSOFIE_BENCHMARK_LOWRANK=OFF "
+                   "and re-run to compare against the dense baseline.")
+endif()
+
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/../core/inc
     ${CMAKE_CURRENT_SOURCE_DIR}/../parsers/inc
@@ -77,23 +93,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 file(GLOB BENCHMARK_ONNX_MODELS
     "${CMAKE_CURRENT_SOURCE_DIR}/models/*.onnx")
 
-# Exclude the base/template models used by specialize_models.py to generate
-# fixed-size variants (e.g. gnn_h32_k2_n100_e500.onnx).  The base models
-# have symbolic dim_param input dimensions that SOFIE cannot resolve during
-# code generation:
-#   • GetTensorShape() throws "unspecified dimension parameter" for input
-#     tensors whose shapes were not concretised by ONNX shape inference.
-#   • GetTensorShape() throws "is a dynamic tensor" when an operator tries
-#     to read a concrete size from an intermediate tensor that remained
-#     dynamic because its input shapes were unknown.
-# The concrete specialised variants produced by specialize_models.py are
-# benchmarked instead.
 list(FILTER BENCHMARK_ONNX_MODELS EXCLUDE REGEX
     "/(gnn_h32_k2|gnn_h64_k4|punet_h32_k2_heads4_layers2|punet_h64_k4_heads4_layers2|transformer_d32_h2_L6_ff32)\\.onnx$")
 
 # Exclude models that exceed GPU memory (cudaErrorMemoryAllocation) or trigger
-# a cuBLAS EXECUTION_FAILED error (status 13) on the available hardware
-# (RTX 2070 SUPER, 8 GB VRAM).  They stay on disk for reference and are
+# a cuBLAS EXECUTION_FAILED error (status 13) on architectures that are not very powerful. 
+# They stay on disk for reference and are
 # compiled into sofie_benchmark_large (cluster target) instead.
 list(FILTER BENCHMARK_ONNX_MODELS EXCLUDE REGEX
     "/(punet_h32_k2_heads4_layers2_n10000_e50000\
@@ -126,9 +131,6 @@ endif()
 list(LENGTH BENCHMARK_ONNX_MODELS N_MODELS)
 message(STATUS "SOFIE Benchmark: Found ${N_MODELS} model(s) in benchmark/models/")
 
-################################################################################
-# Fetch Alpaka and sofieBLAS (same pinned revisions as the test suite)
-################################################################################
 
 FetchContent_Declare(
     sofieBLAS
@@ -155,8 +157,26 @@ find_package(CUDAToolkit REQUIRED)
 message(STATUS "SOFIE Benchmark: CUDA toolkit ${CUDAToolkit_VERSION}")
 
 ################################################################################
-# Optional: ONNX Runtime GPU backend
+# NVML — background GPU SM/memory occupancy sampling during the timed
+# inference loop (see src/GpuOccupancy.hxx). Ships as a stub library
+# alongside libcuda.so in the CUDA toolkit; the real libnvidia-ml.so.1 is
+# resolved at runtime from the NVIDIA driver install, same pattern as the
+# CUDA driver stub.
 ################################################################################
+
+find_library(SOFIE_NVML_LIBRARY
+    NAMES nvidia-ml
+    PATHS "${CUDAToolkit_LIBRARY_DIR}/stubs" "${CUDAToolkit_LIBRARY_DIR}"
+)
+
+if(SOFIE_NVML_LIBRARY)
+    message(STATUS "SOFIE Benchmark: NVML found — ${SOFIE_NVML_LIBRARY} (GPU occupancy sampling enabled)")
+else()
+    message(WARNING
+        "SOFIE Benchmark: NVML (libnvidia-ml) not found — GPU occupancy "
+        "sampling will be disabled; SM%/MemBw% columns will print N/A.")
+endif()
+
 
 set(SOFIE_ORT_FOUND FALSE)
 
@@ -174,7 +194,6 @@ if(SOFIE_BENCHMARK_ORT)
     list(APPEND _ort_search_roots
         /usr/local/onnxruntime /usr/local /usr /opt)
 
-    # Manual header + library search (reliable, no broken cmake-config risk)
     find_path(ONNXRUNTIME_INCLUDE_DIR
         NAMES onnxruntime_cxx_api.h
         PATHS ${_ort_search_roots}
@@ -394,11 +413,10 @@ target_compile_options(sofie_benchmark_emitter PRIVATE
 
 target_compile_definitions(sofie_benchmark_emitter PRIVATE
     $<$<BOOL:${SOFIE_BENCHMARK_PROFILE}>:SOFIE_BENCHMARK_PROFILE>
+    $<$<BOOL:${SOFIE_BENCHMARK_LOWRANK}>:SOFIE_BENCHMARK_LOWRANK>
+    $<$<BOOL:${SOFIE_BENCHMARK_LOWRANK}>:SOFIE_BENCHMARK_LOWRANK_RATIO=${SOFIE_BENCHMARK_LOWRANK_RATIO}>
 )
 
-################################################################################
-# Custom command: run emitter → generate inference + benchmark headers
-################################################################################
 
 add_custom_command(
     OUTPUT  ${GENERATED_HEADERS}
@@ -414,14 +432,8 @@ add_custom_target(sofie_benchmark_headers
     DEPENDS ${GENERATED_HEADERS}
 )
 
-################################################################################
-# Benchmark runner (compiled as .cu, same as the test suite)
-################################################################################
-
-# Mark every per-model bench.cu as CUDA so nvcc processes the device kernels.
 set_source_files_properties(${BENCHMARK_MODEL_CU_SRCS} PROPERTIES LANGUAGE CUDA)
 
-# The main runner is plain C++ (no CUDA kernels, just calls forward-declared fns).
 set_source_files_properties("${RUNNER_SRC}" PROPERTIES LANGUAGE CXX)
 
 add_executable(sofie_benchmark "${RUNNER_SRC}" ${BENCHMARK_MODEL_CU_SRCS})
@@ -429,17 +441,14 @@ add_executable(sofie_benchmark "${RUNNER_SRC}" ${BENCHMARK_MODEL_CU_SRCS})
 add_dependencies(sofie_benchmark sofie_benchmark_headers)
 
 target_include_directories(sofie_benchmark PRIVATE
-    "${CMAKE_CURRENT_BINARY_DIR}"                 # generated headers live here
-    "${CMAKE_CURRENT_SOURCE_DIR}/src"             # ONNXRuntimeBenchmark.hxx
+    "${CMAKE_CURRENT_BINARY_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${alpaka_SOURCE_DIR}/include"
     "${sofieblas_SOURCE_DIR}/include"
     "${CUDAToolkit_INCLUDE_DIRS}"
 )
 
-# Default to the native GPU architecture so we compile only one arch (saves
-# memory and time).  The previous "70;75;80;86;89;90" multi-arch list caused
-# nvcc to OOM-kill when processing all models.  Override via
-#   cmake -DSOFIE_BENCHMARK_CUDA_ARCH="75;86" .
+
 if(NOT DEFINED SOFIE_BENCHMARK_CUDA_ARCH OR SOFIE_BENCHMARK_CUDA_ARCH STREQUAL "")
     if(CMAKE_CUDA_ARCHITECTURES AND NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "")
         set(SOFIE_BENCHMARK_CUDA_ARCH "${CMAKE_CUDA_ARCHITECTURES}")
@@ -464,6 +473,7 @@ target_compile_definitions(sofie_benchmark PRIVATE
     $<$<BOOL:${SOFIE_ORT_FOUND}>:SOFIE_BENCHMARK_ORT>
     $<$<BOOL:${SOFIE_BENCHMARK_TRT}>:SOFIE_BENCHMARK_TRT>
     $<$<BOOL:${SOFIE_BENCHMARK_PROFILE}>:SOFIE_BENCHMARK_PROFILE>
+    $<$<BOOL:${SOFIE_NVML_LIBRARY}>:SOFIE_BENCH_HAVE_NVML>
 )
 
 target_compile_options(sofie_benchmark PRIVATE
@@ -473,14 +483,7 @@ target_compile_options(sofie_benchmark PRIVATE
         --use_fast_math
         -O1
         -Wno-deprecated-gpu-targets
-        # Suppress "variable was declared but never referenced" (#177-D).
-        # Generated Expand/Where kernels compute per-dimension indices for
-        # broadcast dimensions; when a dimension has size 1 the index variable
-        # is always 0 and goes unused.  Without this suppress the CUDA device
-        # compiler counts them against its error-budget and stops compilation.
         -diag-suppress 177
-        # Limit device register usage to reduce per-kernel memory footprint
-        # during compilation of the large all-models TU.
         --maxrregcount=64
     >
     $<$<COMPILE_LANGUAGE:CXX>:
@@ -489,11 +492,14 @@ target_compile_options(sofie_benchmark PRIVATE
     >
 )
 
+find_package(Threads REQUIRED)
+
 target_link_libraries(sofie_benchmark PRIVATE
     SOFIE_core
     CUDA::cudart
     CUDA::cublas
     CUDA::cublasLt
+    Threads::Threads
     ${NVML_LIBRARY}
     $<$<BOOL:${SOFIE_ORT_FOUND}>:${SOFIE_ORT_TARGET}>
     $<$<BOOL:${SOFIE_BENCHMARK_TRT}>:${NVINFER_LIBRARY}>
@@ -509,7 +515,6 @@ else()
                    "re-configure with -DSOFIE_BENCHMARK_ORT=ON for ORT comparison)")
 endif()
 
-# Convenience CTest entry
 if(testing)
     add_test(
         NAME    SofieBenchmark
@@ -523,7 +528,6 @@ endif()
 #
 # Enables:
 #  • All models excluded from sofie_benchmark due to OOM on ≤8 GB GPUs
-#    (punet large, transformer_L1000_B100, transformer_L8000_B1, ...)
 #  • New very-large GNN / PUNet variants: n=30 000 / n=100 000 nodes
 #  • transformer_d32_h2_L6_ff32_n60_s60  (max sequence length for this arch)
 #
@@ -539,15 +543,9 @@ option(SOFIE_BENCHMARK_LARGE
 
 if(SOFIE_BENCHMARK_LARGE)
 
-    # CUDA architecture for the cluster.  Override on the command line:
-    #   cmake ... -DSOFIE_BENCHMARK_LARGE_CUDA_ARCH=90   # H100
     set(SOFIE_BENCHMARK_LARGE_CUDA_ARCH "80" CACHE STRING
         "CUDA SM architecture(s) for sofie_benchmark_large (e.g. 80=A100, 90=H100)")
 
-    # -------------------------------------------------------------------------
-    # Exact list of large-input models to include.
-    # These are either previously OOM-excluded or brand-new (n=30k / n=100k).
-    # -------------------------------------------------------------------------
     set(LARGE_MODEL_NAMES
         # ── PUNet h32/k2  (OOM + new) ──────────────────────────────────────
         "punet_h32_k2_heads4_layers2_n1000_e5000"
@@ -577,7 +575,6 @@ if(SOFIE_BENCHMARK_LARGE)
         "transformer_d32_h2_L6_ff32_n60_s60"
     )
 
-    # Build a regex that matches any of the large model names.
     set(_large_regex "")
     foreach(_m ${LARGE_MODEL_NAMES})
         if(_large_regex)
@@ -602,9 +599,6 @@ if(SOFIE_BENCHMARK_LARGE)
             "SOFIE Benchmark Large: ${N_LARGE} large-input model(s), "
             "CUDA arch = ${SOFIE_BENCHMARK_LARGE_CUDA_ARCH}")
 
-        # ------------------------------------------------------------------
-        # Build per-model strings (same pattern as the small benchmark above)
-        # ------------------------------------------------------------------
         set(LARGE_EMIT_CAPTURES      "")
         set(LARGE_FWD_DECLS          "")
         set(LARGE_SINGLE_MODEL_CASES "")
@@ -660,9 +654,6 @@ if(SOFIE_BENCHMARK_LARGE)
             list(APPEND LARGE_MODEL_CU_SRCS "${_model_cu}")
         endforeach()
 
-        # ------------------------------------------------------------------
-        # Configure emitter + runner sources for the large benchmark
-        # ------------------------------------------------------------------
         set(BENCHMARK_EMIT_CAPTURES      "${LARGE_EMIT_CAPTURES}")
         configure_file(
             "${CMAKE_CURRENT_SOURCE_DIR}/src/BenchmarkEmitter.cxx.in"
@@ -679,9 +670,6 @@ if(SOFIE_BENCHMARK_LARGE)
             @ONLY
         )
 
-        # ------------------------------------------------------------------
-        # sofie_benchmark_large_emitter — generates hxx + dat at build time
-        # ------------------------------------------------------------------
         add_executable(sofie_benchmark_large_emitter
             "${CMAKE_CURRENT_BINARY_DIR}/BenchmarkEmitter_large.cxx"
         )
@@ -700,11 +688,10 @@ if(SOFIE_BENCHMARK_LARGE)
         )
         target_compile_definitions(sofie_benchmark_large_emitter PRIVATE
             $<$<BOOL:${SOFIE_BENCHMARK_PROFILE}>:SOFIE_BENCHMARK_PROFILE>
+            $<$<BOOL:${SOFIE_BENCHMARK_LOWRANK}>:SOFIE_BENCHMARK_LOWRANK>
+            $<$<BOOL:${SOFIE_BENCHMARK_LOWRANK}>:SOFIE_BENCHMARK_LOWRANK_RATIO=${SOFIE_BENCHMARK_LOWRANK_RATIO}>
         )
 
-        # ------------------------------------------------------------------
-        # Custom command: run large emitter → large hxx / dat files
-        # ------------------------------------------------------------------
         add_custom_command(
             OUTPUT  ${LARGE_GENERATED_HEADERS}
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}"
@@ -719,9 +706,6 @@ if(SOFIE_BENCHMARK_LARGE)
             DEPENDS ${LARGE_GENERATED_HEADERS}
         )
 
-        # ------------------------------------------------------------------
-        # sofie_benchmark_large — the cluster benchmark binary
-        # ------------------------------------------------------------------
         set_source_files_properties(${LARGE_MODEL_CU_SRCS} PROPERTIES LANGUAGE CUDA)
         set_source_files_properties(
             "${CMAKE_CURRENT_BINARY_DIR}/BenchmarkRunner_large.cpp"
@@ -754,8 +738,7 @@ if(SOFIE_BENCHMARK_LARGE)
             ${_SOFIE_BENCH_BACKEND_DEFINE}
             ALPAKA_HAS_STD_ATOMIC_REF
             $<$<BOOL:${SOFIE_BENCHMARK_PROFILE}>:SOFIE_BENCHMARK_PROFILE>
-            # ORT intentionally excluded: libonnxruntime has no static lib,
-            # so the binary would fail on pods that lack the CUDA toolkit.
+            $<$<BOOL:${SOFIE_NVML_LIBRARY}>:SOFIE_BENCH_HAVE_NVML>
         )
 
         target_compile_options(sofie_benchmark_large PRIVATE
@@ -782,6 +765,8 @@ if(SOFIE_BENCHMARK_LARGE)
             CUDA::culibos            # required companion for static cublas
             ${NVML_LIBRARY}
             # ORT intentionally excluded — no static libonnxruntime available
+            Threads::Threads
+
         )
 
         message(STATUS

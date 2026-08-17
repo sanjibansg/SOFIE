@@ -220,19 +220,19 @@ void RModel::GenerateGPU_ALPAKA_Buffers() {
 
    // add also the dynamic tensors (only declarations, allocation will be done later)
    if (!fDynamicTensorInfos.empty()) {
-      fGC += "//--- declare the dynamic tensors\n";
-      fGC += "using bufDev_float = alpaka::Buf<devAcc, float, alpaka::DimInt<1u>, size_t>;\n";
-      fGC += "using bufDev_double = alpaka::Buf<devAcc, double, alpaka::DimInt<1u>, size_t>;\n";
-      fGC += "using bufDev_int64  = alpaka::Buf<devAcc, int64_t, alpaka::DimInt<1u>, size_t>;\n";
+      fGC += "\n//--- declare the dynamic tensors\n";
 
       for (auto &i : fDynamicTensorInfos) {
-         if (i.second.type == ETensorType::FLOAT) {
-            fGC += "bufDev_float bufDev_" + i.first + ";\n";
-         } else if (i.second.type == ETensorType::DOUBLE) {
-            fGC += "bufDev_double bufDev_" + i.first + ";\n";
-         } else if (i.second.type == ETensorType::INT64) {
-            fGC += "bufDev_int64 bufDev_" + i.first + ";\n";
-         }
+         if (i.second.type == ETensorType::FLOAT)
+            fGC += "BufF1D bufDev_" + i.first + " = alpaka::allocBuf<float, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
+         else if (i.second.type == ETensorType::DOUBLE)
+            fGC += "BufD1D bufDev_" + i.first + " = alpaka::allocBuf<double, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
+         else if (i.second.type == ETensorType::INT32)
+            fGC += "BufI321D bufDev_" + i.first + " = alpaka::allocBuf<int32_t, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
+         else if (i.second.type == ETensorType::INT64)
+            fGC += "BufI641D bufDev_" + i.first + " = alpaka::allocBuf<int64_t, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
+         else if (i.second.type == ETensorType::BOOL)
+            fGC += "BufUI81D bufDev_" + i.first + " = alpaka::allocBuf<uint8_t, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
       }
    }
 }
@@ -242,12 +242,25 @@ void RModel::GenerateDynamicTensorInfo_GPU_ALPAKA() {
    std::stringstream out;
 
    for (auto &i : fDynamicTensorInfos) {
+      bool runtimeShape = false;
+      for (const auto &dim : i.second.shape) {
+         if (dim.isParam && fShapeParams.count(dim.param) == 0) {
+            runtimeShape = true;
+            break;
+         }
+      }
+
+      if (runtimeShape)
+         continue;
+
       auto length = ConvertDimShapeToLength(i.second.shape);
+      std::string type = ConvertTypeToString(i.second.type);
+
       out << SP << "if (" << length << " > 0) {\n";
-      out << "auto bufDev_" + i.first +
-                 " = alpaka::allocBuf<float, size_t>(devAcc, Ext1D::all(Idx{" << length << "}));\n";
+      out << SP << SP << "bufDev_" << i.first << " = alpaka::allocBuf<" << type << ", size_t>(devAcc, Ext1D::all(Idx{" << length << "}));\n";
       out << SP << "}\n";
    }
+
    fGC += out.str();
 }
 
@@ -423,6 +436,13 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
       throw std::runtime_error("Unsupported output tensor type: " + name);
    };
 
+   auto GetOutputBufferName = [this](const std::string &name) -> std::string {
+      if (fDynamicTensorInfos.count(name) > 0)
+         return "bufDev_" + name;
+
+      return "deviceBuf_" + name;
+   };
+
    // Collect deduplicated dynamic dimension parameter names in declaration order
    std::vector<std::string> dynParamNames;
    {
@@ -513,7 +533,7 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    // Copy member output buffers into caller-provided output views
    for (size_t i = 0; i < outputSize; i++) {
       std::string tensorName = *(fOutputTensorNames.begin() + i);
-      fGC += SP + "alpaka::memcpy(queue, outputs[" + std::to_string(i) + "], deviceBuf_" + tensorName + ");\n";
+      fGC += SP + "alpaka::memcpy(queue, outputs[" + std::to_string(i) + "], " + GetOutputBufferName(tensorName) + ");\n";
    }
    fGC += SP + "alpaka::wait(queue);\n";
    fGC += "}\n\n";
@@ -561,7 +581,7 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    if (outputSize > 1) fGC += "{";
    for (size_t i = 0; i < outputSize; i++) {
       std::string tensorName = *(fOutputTensorNames.begin() + i);
-      fGC += "deviceBuf_" + tensorName;
+      fGC += GetOutputBufferName(tensorName);
       if (i < outputSize - 1) fGC += ",";
    }
    if (outputSize > 1) fGC += "}";
@@ -1161,7 +1181,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       SOFIE::OperatorKind::UNARY_SOFTPLUS,
       SOFIE::OperatorKind::UNARY_ATAN,
       SOFIE::OperatorKind::UNARY_FLOOR,
-      SOFIE::OperatorKind::NOT
+      SOFIE::OperatorKind::NOT,
+      SOFIE::OperatorKind::SELU
    };
 
    bool OpNeedsBlas = false;
@@ -1213,6 +1234,9 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    fGC += "        alpaka::Vec<TDim, TIdx>::all(blockSz),\n";
    fGC += "        alpaka::Vec<TDim, TIdx>::all(TIdx{1}));\n";
    fGC += "}\n\n";
+
+   if (fKernelOnly)
+      return;
 
    // define the Session struct (for GNN this is generated in RModel_GNN)
   fGC += "\n\ntemplate <typename tagAcc>\n";
@@ -1293,6 +1317,25 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
    GenerateIntermediateMemoryPool_GPU_ALPAKA();
 
+   // Dynamic tensors are not part of the static intermediate memory pool.
+   // Declare owning buffers here; their actual size is assigned later when known.
+   if (!fDynamicTensorInfos.empty()) {
+      fGC += "\n//--- declare the dynamic tensors\n";
+
+      for (auto &i : fDynamicTensorInfos) {
+         if (i.second.type == ETensorType::FLOAT)
+            fGC += "BufF1D bufDev_" + i.first + " = alpaka::allocBuf<float, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
+         else if (i.second.type == ETensorType::DOUBLE)
+            fGC += "BufD1D bufDev_" + i.first + " = alpaka::allocBuf<double, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
+         else if (i.second.type == ETensorType::INT32)
+            fGC += "BufI321D bufDev_" + i.first + " = alpaka::allocBuf<int32_t, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
+         else if (i.second.type == ETensorType::INT64)
+            fGC += "BufI641D bufDev_" + i.first + " = alpaka::allocBuf<int64_t, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
+         else if (i.second.type == ETensorType::BOOL)
+            fGC += "BufUI81D bufDev_" + i.first + " = alpaka::allocBuf<uint8_t, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
+      }
+   }
+   
    fGC += intermediate_memory_alloc_string;
 
    GenerateOperatorDeclarations();
@@ -1342,11 +1385,15 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          if (fSkipOperators.count(id)) continue;
          fGC += fOperators[id]->GenerateInitCode_GPU_ALPAKA();
          if (fOperators[id]->GetKind() == OperatorKind::GEMM || fOperators[id]->GetKind() == OperatorKind::CONV) {
-            // GetBlasConfig() returns "" for ops that use gemmStridedBatched
-            // (legacy cuBLAS path, no cuBLASLt layout registration needed).
-            auto blasCfg = fOperators[id]->GetBlasConfig();
-            if (!blasCfg.empty())
-               fGC += "\nblas.addLayoutConfig("+blasCfg+");\n";
+            // GetBlasConfigs() returns one entry per distinct GEMM call shape the
+            // operator's Generate_GPU_ALPAKA() will issue (usually one; a low-rank
+            // factorized Gemm issues two chained calls of different shapes and so
+            // needs two configs registered). Empty entries (e.g. gemmStridedBatched,
+            // legacy cuBLAS path) need no cuBLASLt layout registration.
+            for (auto &blasCfg : fOperators[id]->GetBlasConfigs()) {
+               if (!blasCfg.empty())
+                  fGC += "\nblas.addLayoutConfig("+blasCfg+");\n";
+            }
          }
       }
 
@@ -1410,6 +1457,12 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
    if (fProfile)
       RModelProfilerGPU::AddNeededStdLibs(*this);
 
+   if (static_cast<std::underlying_type_t<Options>>(Options::kKernelOnly) & options) {
+      fKernelOnly = true;
+      fUseSession = false;
+      fUseWeightFile = false;
+      fWeightFile = WeightFileType::None;
+   }
    if (static_cast<std::underlying_type_t<Options>>(Options::kNoSession) & options) {
       fUseSession = false;
       fWeightFile = WeightFileType::None;
@@ -1430,6 +1483,9 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
    if (static_cast<std::underlying_type_t<Options>>(Options::kGNN) & options ||
        static_cast<std::underlying_type_t<Options>>(Options::kGNNComponent) & options)
       throw std::runtime_error("SOFIE GPU does not yet supports GNN Inference.");
+
+   if (static_cast<std::underlying_type_t<Options>>(Options::kLowRankFactorize) & options)
+      fLowRankFactorize = true;
 
    Initialize(batchSize, verbose);
 

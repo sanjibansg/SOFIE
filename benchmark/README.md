@@ -11,11 +11,11 @@ same models through **ONNX Runtime GPU** for a side-by-side comparison.
 | Backend | CMake value | Status |
 |---------|-------------|--------|
 | NVIDIA CUDA | `CUDA` (default) | Supported |
-| AMD HIP/ROCm | `HIP` | Planned — not yet implemented |
+| AMD HIP/ROCm | `HIP` | Planned |  
+
 
 The target architecture is selected with `-DSOFIE_BENCHMARK_BACKEND=<value>` at
-configure time.  Specifying any value other than `CUDA` is a **hard CMake error** until
-the corresponding backend is implemented.
+configure time.
 
 The generated inference code and timing harness are backend-agnostic: they use
 `sofie_bench::AccTag`, `sofie_bench::Platform`, `sofie_bench::Queue`, and the
@@ -44,7 +44,7 @@ Re-run CMake after adding or removing files (it globs `models/*.onnx`).
 # SOFIE inference only — CUDA backend (default)
 cmake -B build -DSOFIE_BENCHMARK=ON /path/to/SOFIE
 
-# Explicitly name the backend (useful for CI or future HIP support)
+# Explicitly name the backend 
 cmake -B build -DSOFIE_BENCHMARK=ON -DSOFIE_BENCHMARK_BACKEND=CUDA /path/to/SOFIE
 
 # With ONNX Runtime GPU comparison
@@ -99,6 +99,58 @@ cd build/benchmark
 LD_LIBRARY_PATH=/path/to/onnxruntime/lib:$LD_LIBRARY_PATH \
 ./sofie_benchmark --onnxruntime
 ```
+
+---
+
+## GPU Occupancy (Currently supported in NVIDIA GPUs only)
+
+Alongside latency/throughput, the default (non-profiling) benchmark table reports how
+busy the GPU actually was **during the timed inference loop**, via a background thread
+sampling NVML while the loop runs.
+
+| Column | Meaning |
+|---|---|
+| `SM%(avg)` | Average SM (compute) activity duty-cycle across all samples taken during the timed inference loop |
+| `SM%(pk)`  | Peak single-sample SM activity observed during the loop |
+| `MemBw%(avg)` | Average memory-controller activity duty-cycle |
+
+Low `SM%(avg)` with a low `infer(ms)` usually means the current inference approach is
+**launch-overhead or transfer bound** rather than compute bound — the GPU sits mostly
+idle between kernel launches. Consistently high `SM%` values mean the model is actually
+saturating the device's compute; in that regime, further speedups need algorithmic or
+kernel-level work, not just reducing launch count.
+
+### How it's measured (NVIDIA/NVML only)
+
+This is **NVIDIA-specific driver-side polling, not GPU-side instrumentation** — no
+counters are read from inside the generated kernels.
+`GpuOccupancySampler` (`src/GpuOccupancy.hxx`) does, per model:
+
+1. `occSampler.start()` is called immediately before the timed inference loop begins
+   (after warmup, right at `t0_infer`) and spawns one `std::thread`.
+2. That thread polls NVML's `nvmlDeviceGetUtilizationRates()` every **2 ms** for as long
+   as the loop is running. Each call returns the NVIDIA driver's own counters:
+   - `u.gpu` — % of the last NVML sampling window during which **any** kernel was
+     executing on an SM (compute activity)
+   - `u.memory` — % of that window during which the memory controller was active
+3. Every poll accumulates into running sums and a running max; `occSampler.stop()` (called
+   right after `t1_infer`) joins the thread.
+4. `SM%(avg)` / `MemBw%(avg)` = (sum of samples) / (sample count); `SM%(pk)` = the single
+   highest `u.gpu` sample seen. These are computed in the benchmark process itself — no
+   external tool (`nvidia-smi`, Nsight, …) is invoked.
+
+Because the sampling and the CUDA calls being measured run concurrently on the host,
+this measures **whole-loop duty-cycle over wall-clock time**, sampled at ~500 Hz — it is
+not synchronized to individual kernel launches and cannot tell you per-kernel occupancy
+(warps/registers active per SM). It answers "was the GPU busy while this ran", not "how
+efficiently was each kernel using the SM".
+
+> **Caveat:** for models whose `infer(ms)` is much shorter than NVML's own sampling
+> window, increase `--iterations` so the background thread collects enough samples for a
+> representative average. Columns print `N/A` when occupancy sampling isn't available at
+> all — either `libnvidia-ml` wasn't found at configure time (see the CMake message when
+> configuring), or (on a non-CUDA backend) NVML was never wired up in the first place —
+> rather than a misleading `0.0`.
 
 ---
 
@@ -157,38 +209,11 @@ kernel.  Results are sorted by average time descending, with ± stderr over all
 timed iterations.  Warmup iterations are excluded (the session is reset before the
 timed runs start).
 
-```
-============================================================
-           GPU PROFILING RESULTS
-   (wall-clock with alpaka::wait synchronization)
-============================================================
-  MatMul_3                      : 142.718 +/- 0.412 us  (100 runs)
-  MatMul_1                      : 138.005 +/- 0.389 us  (100 runs)
-  LayerNorm_5                   :  23.441 +/- 0.201 us  (100 runs)
-  ...
-  Overall_Time                  : 847.332 +/- 1.104 us  (100 runs)
-============================================================
-```
 
 **Memory Usage Breakdown** — sizes computed at code-generation time from tensor
 shapes and types.  No runtime measurement is needed; the values are embedded
 as constants in the generated session code.
 
-```
-============================================================
-              MEMORY USAGE BREAKDOWN
-============================================================
-  CPU Memory:
-    Constant/embedded tensors : 0 bytes  (0.0000 MB)
-    Weight tensors            : 12582912 bytes  (12.000 MB)
-    Intermediate memory pool  : 0 bytes  (0.0000 MB)
-    Total CPU                 : 12582912 bytes  (12.000 MB)
-  GPU Memory (device buffers):
-    Weight device buffers     : 12582912 bytes  (12.000 MB)
-    Intermediate device bufs  : 4194304 bytes  (4.000 MB)
-    Total GPU                 : 16777216 bytes  (16.000 MB)
-============================================================
-```
 
 > **Note:** Profiling and benchmarking are mutually exclusive.  In a profiling
 > build the throughput table is not printed; in a benchmark build
@@ -399,19 +424,3 @@ cmake --build build --target sofie_benchmark -j$(nproc)
 ```
 
 ---
-
-## Adding a New Backend (HIP/ROCm)
-
-The benchmark infrastructure is designed so adding a new backend requires changes
-in only a few places:
-
-1. **`CMakeLists.txt`** — add `"HIP"` to the `SOFIE_BENCHMARK_BACKEND` allowed
-   values, call `enable_language(HIP)`, find `hip::host`, and set
-   `_SOFIE_BENCH_ALPAKA_DEFINE = ALPAKA_ACC_GPU_HIP_ENABLED` /
-   `_SOFIE_BENCH_BACKEND_DEFINE = SOFIE_BACKEND_HIP`.
-2. **`src/BenchmarkBackend.hxx`** — already contains the `SOFIE_BACKEND_HIP` branch
-   with `alpaka::TagGpuHipRt` aliases and `hipDeviceSynchronize()` sync macro.
-3. **`src/ModelBench.cu.in`** — rename to `.hip.in` (or use a common extension) and
-   configure the source file language property to `HIP`.
-4. **`src/ONNXRuntimeBenchmark.hxx`** — swap `OrtCUDAProviderOptions` for the ROCm
-   execution provider options if ORT comparison is desired on AMD hardware.

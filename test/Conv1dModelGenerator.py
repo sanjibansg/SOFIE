@@ -2,11 +2,16 @@
 
 ### generate COnv2d model using Pytorch
 
+import sys
+import os
+import logging
 import numpy as np
 import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
 result = []
@@ -132,12 +137,21 @@ def main():
       torch.save({'model_state_dict':model.state_dict()}, name + ".pt")
 
    if saveOnnx:
-        torch.onnx.export(
+      onnx_file = name + ".onnx"
+      try:
+         torch.onnx.export(
                 model,
                 xinput,
-                name + ".onnx",
+                onnx_file,
                 export_params=True
-        )
+         )
+      except Exception as e:
+         logging.error("Failed to export ONNX model %s: %s", onnx_file, e)
+         sys.exit(1)
+      if not os.path.isfile(onnx_file) or os.path.getsize(onnx_file) == 0:
+         logging.error("ONNX file %s was not created or is empty", onnx_file)
+         sys.exit(1)
+      logging.info("Exported %s", onnx_file)
 
    if loadModel :
         print('Loading model from file....')
@@ -156,12 +170,11 @@ def main():
    # for i in range(0,outSize):
    #      print(float(yvec[i]))
 
-   f = open(name + ".out", "w")
-   for i in range(0,outSize):
-        f.write(str(float(yvec[i]))+" ")
-        
-        
-    
+   with open(name + ".out", "w") as f:
+      for i in range(0,outSize):
+         f.write(str(float(yvec[i]))+" ")
+   logging.info("Wrote %s.out", name)
+
 
 if __name__ == '__main__':
     main()
