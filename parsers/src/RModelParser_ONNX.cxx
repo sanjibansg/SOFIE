@@ -102,7 +102,6 @@ extern ParserFuncSignature ParseWhere;
 extern ParserFuncSignature ParseEinsum;
 extern ParserFuncSignature ParseRandom;
 extern ParserFuncSignature ParseScatterElements;
-extern ParserFuncSignature ParseScatterND;
 extern ParserFuncSignature ParseTrilu;
 extern ParserFuncSignature ParseAnd;
 extern ParserFuncSignature ParseOr;
@@ -287,7 +286,6 @@ RModelParser_ONNX::RModelParser_ONNX() noexcept : fOperatorsMapImpl(std::make_un
    RegisterOperator("RandomUniform", ParseRandom);
    RegisterOperator("RandomUniformLike", ParseRandom);
    RegisterOperator("ScatterElements", ParseScatterElements);
-   RegisterOperator("ScatterND", ParseScatterND);
    RegisterOperator("Trilu", ParseTrilu);
    RegisterOperator("NonZero", ParseNonZero);
    RegisterOperator("ScatterND", ParseScatterND);
@@ -1102,8 +1100,27 @@ RModelParser_ONNX::ParseOperator(const size_t i, const onnx::GraphProto &graphpr
          }
       } else if (op_type == "MatMul") {
          if (childNode.op_type() == "Add") {
-            fFusedOperators[idx2] = true;
-            return ParseFuseMatMulAdd(*this, nodeproto, childNode);
+            std::string biasName;
+            if (nodeproto.output(0) == childNode.input(0))
+               biasName = childNode.input(1);
+            else if (nodeproto.output(0) == childNode.input(1))
+               biasName = childNode.input(0);
+
+            bool biasAvailable = !biasName.empty();
+            for (int j = 0; j < graphproto.node_size() && biasAvailable; ++j) {
+               const auto &candidate = graphproto.node(j);
+               for (const auto &output : candidate.output()) {
+                  if (output == biasName) {
+                     biasAvailable = static_cast<size_t>(j) < i;
+                     break;
+                  }
+               }
+            }
+
+            if (biasAvailable) {
+               fFusedOperators[idx2] = true;
+               return ParseFuseMatMulAdd(*this, nodeproto, childNode);
+            }
          }
 
          return ParseMatMul(*this, nodeproto);

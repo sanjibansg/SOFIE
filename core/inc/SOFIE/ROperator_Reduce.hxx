@@ -31,6 +31,7 @@ private:
     std::vector<size_t> fShapeX;
     std::vector<size_t> fShapeY;
     std::vector<size_t> fShapeYNotPruned; // needed for fKeepdims=0
+    bool fInitialized = false;
 
 
 public:
@@ -88,12 +89,9 @@ public:
          auto ax = fAttrAxes;
          std::sort(ax.begin(), ax.end());
          for (size_t j = 0; j < ax.size(); j++) {
-            // erase reduced dimensions, but keep last one
-            if (outputShape.size() > 1) {
-               outputShape.erase(outputShape.begin() + ax[j]);
-               for (size_t k = j+1; k < ax.size(); k++)
-                  ax[k] -= 1;  // decrease by one since we have removed a value
-            }
+            outputShape.erase(outputShape.begin() + ax[j]);
+            for (size_t k = j + 1; k < ax.size(); k++)
+               ax[k] -= 1;  // decrease by one since we have removed a value
          }
       }
       return ret;
@@ -127,11 +125,12 @@ public:
          std::cout << Name() << " : " << fNX << " -> " << fNY << " shape " << ConvertShapeToString(fShapeY) << std::endl;
       }
       model.AddNeededStdLib("algorithm");
+      fInitialized = true;
    }
 
    std::string Generate(std::string opName) override {
       opName = "op_" + opName;
-      if (fShapeX.empty() || fShapeY.empty()) {
+      if (!fInitialized) {
          throw std::runtime_error("SOFIE Reduce Op called to Generate without being initialized first");
       }
 
@@ -308,7 +307,7 @@ public:
    // which serialised the entire reduction loop inside a single thread.
    // ---------------------------------------------------------------------------
    std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) override {
-      if (fShapeX.empty() || fShapeY.empty())
+      if (!fInitialized)
          throw std::runtime_error("SOFIE Reduce Op called to Generate without being initialized first");
 
       const std::size_t Dx        = fShapeX.size();
@@ -441,7 +440,7 @@ public:
    }
 
    std::string Generate_GPU_ALPAKA(std::string /*opName*/) override {
-      if (fShapeX.empty() || fShapeY.empty())
+      if (!fInitialized)
          throw std::runtime_error("SOFIE Reduce Op called to Generate without being initialized first");
 
       std::size_t inputLength   = ConvertShapeToLength(fShapeX);

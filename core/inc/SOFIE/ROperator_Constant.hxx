@@ -22,6 +22,8 @@ private:
    std::vector<T> fValues;
    std::string fAttrType;
    bool fIsConstantOfShape = false;
+   bool fRuntimeShape = false;
+   std::vector<std::string> fRuntimeDims;
 
 public:
    ROperator_Constant(){}
@@ -33,8 +35,8 @@ public:
       fValues(values),
       fAttrType(type)
       {
-         fInputTensorNames = { };
-         fOutputTensorNames = { };
+         fInputTensorNames = fNX.empty() ? std::vector<std::string>{} : std::vector<std::string>{fNX};
+         fOutputTensorNames = {fNY};
       }
 
    std::vector<ETensorType> TypeInference(std::vector<ETensorType> input) override {
@@ -75,6 +77,30 @@ public:
             fIsOutputConstant = false;  // cannot be constant since shape is dynamic
             return;
          }
+
+         if (!model.IsInitializedTensor(fNX)) {
+            auto inputShape = model.GetTensorShape(fNX);
+            if (inputShape.size() != 1)
+               throw std::runtime_error("SOFIE ConstantOfShape Op Input Tensor must have rank 1");
+
+            size_t rank = ConvertShapeToLength(inputShape);
+            fRuntimeShape = true;
+            fRuntimeDims.resize(rank);
+            fDimShape.resize(rank);
+
+            for (size_t i = 0; i < rank; ++i) {
+               fRuntimeDims[i] = fNY + "_dim_" + std::to_string(i);
+               fDimShape[i] = Dim{fRuntimeDims[i], size_t(-1)};
+            }
+
+            if (fValues.size() != 1)
+               throw std::runtime_error("SOFIE ConstantOfShape Op value Tensor has invalid size " + std::to_string(fValues.size()));
+
+            model.AddDynamicTensor(fNY, GetTemplatedType(T{}), fDimShape);
+            fIsOutputConstant = false;
+            return;
+         }
+
          // get output shape from input values:
          // can work only if input is a constant or initialized tensor
          auto dptr = model.GetInitializedTensorData(fNX);
@@ -118,14 +144,46 @@ public:
       }
    }
 
-   std::string Generate(std::string /* OpName */) override {
-      // no code to generate here. Tensor are defined in Session constructor
-      return "//---------------------------------------\n";
+   std::string Generate(std::string /*opName*/) override {
+      if (!fRuntimeShape)
+         return "//---------------------------------------\n";
+
+      std::stringstream out;
+      out << "\n//------ ConstantOfShape\n";
+
+      for (size_t i = 0; i < fRuntimeDims.size(); ++i)
+         out << SP << "size_t " << fRuntimeDims[i] << " = static_cast<size_t>(tensor_" << fNX << "[" << i << "]);\n";
+
+      std::string length = ConvertDimShapeToLength(fDimShape);
+      out << SP << "if (" << length << " > fTensor_" << fNY << ".size()) {\n";
+      out << SP << SP << "fTensor_" << fNY << ".resize(" << length << ");\n";
+      out << SP << SP << "tensor_" << fNY << " = fTensor_" << fNY << ".data();\n";
+      out << SP << "}\n";
+      out << SP << "std::fill(tensor_" << fNY << ", tensor_" << fNY << " + " << length << ", static_cast<" << fAttrType << ">(" << fValues[0] << "));\n";
+
+      return out.str();
    }
 
-   std::string Generate_GPU_ALPAKA(std::string /* OpName */) override {
-      // no code to generate here. Tensor are defined in Session constructor
-      return "//---------------------------------------\n";
+   std::string Generate_GPU_ALPAKA(std::string /*opName*/) override {
+      if (!fRuntimeShape)
+         return "//---------------------------------------\n";
+
+      std::stringstream out;
+      out << "\n//------ ConstantOfShape_GPU_ALPAKA\n";
+      out << SP << "auto constantOfShapeHost_" << fNY << " = alpaka::allocBuf<int64_t, Idx>(hostAcc, Ext1D::all(Idx{" << fRuntimeDims.size() << "}));\n";
+      out << SP << "alpaka::memcpy(queue, constantOfShapeHost_" << fNY << ", deviceBuf_" << fNX << ");\n";
+      out << SP << "alpaka::wait(queue);\n";
+
+      for (size_t i = 0; i < fRuntimeDims.size(); ++i)
+         out << SP << "size_t " << fRuntimeDims[i] << " = static_cast<size_t>(alpaka::getPtrNative(constantOfShapeHost_" << fNY << ")[" << i << "]);\n";
+
+      std::string length = ConvertDimShapeToLength(fDimShape);
+      out << SP << "if (" << length << " > 0) {\n";
+      out << SP << SP << "bufDev_" << fNY << " = alpaka::allocBuf<" << fAttrType << ", Idx>(devAcc, Ext1D::all(Idx{" << length << "}));\n";
+      out << SP << SP << "alpaka::memset(queue, bufDev_" << fNY << ", static_cast<uint8_t>(0));\n";
+      out << SP << "}\n";
+
+      return out.str();
    }
 };
 

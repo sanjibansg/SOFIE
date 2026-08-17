@@ -44,6 +44,10 @@ private:
 
    std::vector<std::vector<IType>> fAttributes; // attributes for the version <=10 case
 
+   ETensorType fDataType = ETensorType::UNDEFINED;
+   bool fInputIsDynamic = false;
+   bool fInputIsAlias = false;
+   bool fOutputIsDynamic = false;
 
 public:
 
@@ -82,6 +86,9 @@ public:
 
       std::vector<std::vector<Dim>> shapes;
       fShapeInput = model.GetDimTensorShape(fNData);
+      fDataType = model.GetTensorType(fNData);
+      fInputIsDynamic = model.IsDynamicTensor(fNData);
+      fInputIsAlias = model.IsAliasTensor(fNData);
       shapes.push_back(fShapeInput);
 
       std::vector<std::vector<IType>> itensors(4);
@@ -367,6 +374,7 @@ public:
          }
 
          model.AddIntermediateTensor(fNOutput, model.GetTensorType(fNData), fShapeOutput);
+         fOutputIsDynamic = model.IsDynamicTensor(fNOutput);
          //if (fIdentitySlice)  model.AddAliasTensor(fNOutput, fNData);
 
          if (model.Verbose()) {
@@ -516,6 +524,9 @@ public:
       op += SP + SP + SP + "TAcc const& acc,\n";
       op += SP + SP + SP + "T const* __restrict__ input,\n";
       op += SP + SP + SP + "T* __restrict__ output,\n";
+      op += SP + SP + SP + "std::array<std::size_t, " + std::to_string(D) + "> const inputStrides,\n";
+      op += SP + SP + SP + "std::array<std::size_t, " + std::to_string(D) + "> const outputStrides,\n";
+      op += SP + SP + SP + "std::array<std::size_t, " + std::to_string(D) + "> const outputShape,\n";
       op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
 
       op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
@@ -526,8 +537,8 @@ public:
 
       for (std::size_t d = 0; d < D; ++d) {
          op += SP + SP + SP + SP + "std::size_t const out_" + std::to_string(d)
-               + " = (elem_idx / " + outputStrides[d].GetVal() + "u) % "
-               + fShapeOutput[d].GetVal() + "u;\n";
+               + " = (elem_idx / outputStrides[" + std::to_string(d) + "]) % outputShape["
+               + std::to_string(d) + "];\n";
       }
       op += "\n";
 
@@ -542,8 +553,8 @@ public:
                + " + out_" + std::to_string(d)
                + " * " + fSteps[d].GetVal() + ")";
          op += SP + SP + SP + SP + SP
-               + "static_cast<std::size_t>(" + input_coord + ")"
-               + " * " + inputStrides[d].GetVal() + "u";
+            + "static_cast<std::size_t>(" + input_coord + ")"
+            + " * inputStrides[" + std::to_string(d) + "]";
          op += (d + 1 < D) ? " +\n" : ";\n\n";
       }
 
@@ -567,25 +578,61 @@ public:
       if (fShapeInput.empty() || fShapeOutput.empty())
          throw std::runtime_error("SOFIE Slice Op called to Generate without being initialized first");
 
-      std::size_t totalElements = ConvertShapeToLength(fShapeOutput);
+      auto inputStrides = UTILITY::ComputeStrideFromShape(fShapeInput);
+      auto outputStrides = UTILITY::ComputeStrideFromShape(fShapeOutput);
+      std::string totalElements = ConvertDimShapeToLength(fShapeOutput);
       std::string kname = "sliceKernel_" + opName;
+
+      const std::string inputBuffer =
+         ((fInputIsDynamic && !fInputIsAlias) ? "bufDev_" : "deviceBuf_") + fNData;
+      const std::string outputBuffer =
+         (fOutputIsDynamic ? "bufDev_" : "deviceBuf_") + fNOutput;
 
       std::stringstream out;
       out << "\n//------ SLICE_GPU_ALPAKA\n";
+
+      if (fOutputIsDynamic) {
+         out << SP << "bufDev_" << fNOutput
+             << " = alpaka::allocBuf<" << ConvertTypeToString(fDataType)
+             << ", Idx>(devAcc, Ext1D::all(Idx{" << totalElements << "}));\n";
+      }
+
+      out << SP << "std::array<std::size_t, " << fShapeInput.size() << "> inputStrides_" << opName << " = {";
+      for (size_t i = 0; i < inputStrides.size(); ++i) {
+         if (i > 0) out << ", ";
+         out << inputStrides[i].GetVal();
+      }
+      out << "};\n";
+
+      out << SP << "std::array<std::size_t, " << fShapeOutput.size() << "> outputStrides_" << opName << " = {";
+      for (size_t i = 0; i < outputStrides.size(); ++i) {
+         if (i > 0) out << ", ";
+         out << outputStrides[i].GetVal();
+      }
+      out << "};\n";
+
+      out << SP << "std::array<std::size_t, " << fShapeOutput.size() << "> outputShape_" << opName << " = {";
+      for (size_t i = 0; i < fShapeOutput.size(); ++i) {
+         if (i > 0) out << ", ";
+         out << fShapeOutput[i].GetVal();
+      }
+      out << "};\n";
       out << SP << "auto const elementsPerThread_" << opName << " = Vec::all(static_cast<Idx>(1));\n";
       out << SP << "auto const elementsPerGrid_"   << opName << " = Vec::all(Idx{" << totalElements << "});\n";
       out << SP << "auto const workDiv_" << opName << " = sofie_workdiv(elementsPerGrid_" << opName << ");\n";
       out << SP << "alpaka::exec<Acc>(queue, workDiv_" << opName
          << ", " << kname
-         << ", alpaka::getPtrNative(deviceBuf_" << fNData << ")"
-         << ", alpaka::getPtrNative(deviceBuf_" << fNOutput << ")"
+         << ", alpaka::getPtrNative(" << inputBuffer << ")"
+         << ", alpaka::getPtrNative(" << outputBuffer << ")"
+         << ", inputStrides_" << opName
+         << ", outputStrides_" << opName
+         << ", outputShape_" << opName
          << ", static_cast<Idx>(" << totalElements << "));\n";
 
       return out.str();
    }
 
 };
-
 }//SOFIE
 
 

@@ -224,7 +224,7 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
 
     auto outBufExpr = [&](size_t i) -> std::string {
         if (outputs.size() == 1) return "out_d";
-        return "out_d[" + std::to_string(i) + "]";
+        return "std::get<" + std::to_string(i) + ">(out_d)";
     };
 
     bench << "    // ---- Warmup (not timed) ----\n"

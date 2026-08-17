@@ -23,6 +23,7 @@ private:
 
    bool fVerbose = false;
    bool fDimInput = false;
+   bool fInputIsAlias = false;
    bool fDynamicShape = false;
    ReshapeOpMode fOpMode = Reshape;   // type of Reshape operator
 
@@ -262,6 +263,7 @@ public:
       }
       fShapeInput = model.GetDimTensorShape(fNData);
       fDimInput = model.IsDynamicTensor(fNData);
+      fInputIsAlias = model.IsAliasTensor(fNData);
       // check if optional tensor exists defining shape or axes
       if (!fNInput2.empty()) {
          if (model.CheckIfTensorAlreadyExist(fNInput2)) {
@@ -403,14 +405,8 @@ std::string Generate_GPU_ALPAKA(std::string opName) override {
 
     opName = "op_" + opName;
 
-    if (fIsOutputParamShape) {
-        // shape tensor output: fill host-side tensor values, no device copy needed
-        std::stringstream out;
-        for (int i = 0; i < static_cast<int>(fShapeOutput[0].dim); i++) {
-            out << SP << "tensor_" << fNOutput << "[" << i << "] = " << fOutputShapeData[i].GetVal() << ";\n";
-        }
-        return out.str();
-    }
+    if (fIsOutputParamShape)
+       return "";
 
     std::string opType = "Reshape";
     if (fOpMode == Flatten)   opType = "Flatten";
@@ -434,10 +430,13 @@ std::string Generate_GPU_ALPAKA(std::string opName) override {
     // Instead of a GPU memcpy + CPU synchronisation barrier, create a local non-owning
     // view that aliases the source buffer.  All downstream getPtrNative() calls on the
     // local view return the same device pointer as the source — no data movement at all.
-    auto outputLength = ConvertDimShapeToLength(fShapeOutput);
-    out << SP << "auto deviceBuf_" << fNOutput
-        << " = alpaka::createView(devAcc, alpaka::getPtrNative(deviceBuf_" << fNData
-        << "), static_cast<Idx>(" << outputLength << "));\n";
+      auto outputLength = ConvertDimShapeToLength(fShapeOutput);
+      const std::string inputBuffer =
+         ((fDimInput && !fInputIsAlias) ? "bufDev_" : "deviceBuf_") + fNData;
+
+      out << SP << "auto deviceBuf_" << fNOutput
+          << " = alpaka::createView(devAcc, alpaka::getPtrNative(" << inputBuffer
+          << "), static_cast<Idx>(" << outputLength << "));\n";
 
     return out.str();
 }

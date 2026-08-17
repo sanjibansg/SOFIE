@@ -27,6 +27,8 @@ private:
    std::vector<size_t> fShapeOutput;  // used for initialized (constant) tensor case
    std::vector<Dim> fDimShapeData;    // used for dynamic/runtime tensor case
    std::vector<Dim> fDimShapeOutput;  // used for dynamic/runtime tensor case
+   bool fDynamicInput = false;
+   bool fDynamicOutput = false;
 
 public:
 
@@ -108,6 +110,7 @@ public:
          }
       } else {
          // Non-initialized (runtime/dynamic) tensor: use Dim-aware shapes
+         fDynamicInput = model.IsDynamicTensor(fNData);
          fDimShapeData = model.GetDimTensorShape(fNData);
          size_t rank = fDimShapeData.size();
          if (fAttrPerm.empty()){
@@ -131,6 +134,7 @@ public:
             fShapeOutput.clear();
          }
          model.AddIntermediateTensor(fNOutput, model.GetTensorType(fNData), fDimShapeOutput);
+         fDynamicOutput = model.IsDynamicTensor(fNOutput);
          if (model.Verbose()) {
             std::cout << "Transpose ---> " << fNOutput << " " << ConvertDimShapeToString(fDimShapeOutput) << std::endl;
          }
@@ -186,34 +190,32 @@ public:
    std::string Generate_GPU_Kernel_ALPAKA(std::string OpName) {
       std::string op;
       OpName = "op_" + OpName;
+
+      auto dimShapeData = fDimShapeData.empty() ? ConvertShapeToDim(fShapeData) : fDimShapeData;
+      const size_t rank = dimShapeData.size();
+
       op = "\n//------ TRANSPOSE_KERNEL_ALPAKA\n";
       op += SP + "struct TransposeKernel_" + OpName + " {\n";
       op += SP + SP + "template<typename TAcc, typename T>\n";
-      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc, T const* input, T* output,";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc, T const* input, T* output, ";
+      op += "std::array<std::size_t, " + std::to_string(rank) + "> const inputStrides, ";
+      op += "std::array<std::size_t, " + std::to_string(rank) + "> const outputStrides, ";
       op += "const std::size_t totalElements) const {\n";
-      op += SP + SP + SP + SP + "auto const idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
-      op += SP + SP + SP + SP + "if(idx >= totalElements) return;\n";
-      op += SP + SP + SP + SP + "std::size_t input_idx = 0;\n";
-      op += SP + SP + SP + SP + "std::size_t remaining = idx;\n";
-      op += SP + SP + SP + SP + "std::size_t coord;\n";
+      op += SP + SP + SP + "auto const idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+      op += SP + SP + SP + "if (idx >= totalElements) return;\n";
+      op += SP + SP + SP + "std::size_t input_idx = 0;\n";
+      op += SP + SP + SP + "std::size_t remaining = idx;\n";
+      op += SP + SP + SP + "std::size_t coord;\n";
 
-      auto dimShapeData   = fDimShapeData.empty()   ? ConvertShapeToDim(fShapeData)   : fDimShapeData;
-      auto dimShapeOutput = fDimShapeOutput.empty() ? ConvertShapeToDim(fShapeOutput) : fDimShapeOutput;
-      auto inputStrides  = UTILITY::ComputeStrideFromShape(dimShapeData);
-      auto outputStrides = UTILITY::ComputeStrideFromShape(dimShapeOutput);
-
-      for (size_t k = 0; k < dimShapeData.size(); k++) {
-         op += SP + SP + SP + SP + "coord = remaining / "
-               + outputStrides[k].GetVal() + "u;\n";
-         op += SP + SP + SP + SP + "remaining = remaining - coord * "
-               + outputStrides[k].GetVal() + "u;\n";
-         op += SP + SP + SP + SP + "input_idx += coord * "
-               + inputStrides[fAttrPerm[k]].GetVal() + "u;\n";
+      for (size_t k = 0; k < rank; ++k) {
+         op += SP + SP + SP + "coord = remaining / outputStrides[" + std::to_string(k) + "];\n";
+         op += SP + SP + SP + "remaining -= coord * outputStrides[" + std::to_string(k) + "];\n";
+         op += SP + SP + SP + "input_idx += coord * inputStrides[" + std::to_string(fAttrPerm[k]) + "];\n";
       }
 
-      op += SP + SP + SP + SP + "output[idx] = input[input_idx];\n";
-      op += SP + SP + SP + "}\n";
-      op += SP + SP + SP + "};\n";
+      op += SP + SP + SP + "output[idx] = input[input_idx];\n";
+      op += SP + SP + "}\n";
+      op += SP + "};\n";
 
       return op;
    }
@@ -223,21 +225,42 @@ public:
    }
 
    std::string Generate_GPU_ALPAKA(std::string OpName) override {
+      auto dimShapeData = fDimShapeData.empty() ? ConvertShapeToDim(fShapeData) : fDimShapeData;
       auto dimShapeOutput = fDimShapeOutput.empty() ? ConvertShapeToDim(fShapeOutput) : fDimShapeOutput;
-      if (dimShapeOutput.empty()) {
+      if (dimShapeOutput.empty())
          throw std::runtime_error("SOFIE Operator Transpose called to Generate without being initialized first");
-      }
-      std::stringstream out;
-      std::string length = ConvertDimShapeToLength(dimShapeOutput);
 
+      auto inputStrides = UTILITY::ComputeStrideFromShape(dimShapeData);
+      auto outputStrides = UTILITY::ComputeStrideFromShape(dimShapeOutput);
+      std::string length = ConvertDimShapeToLength(dimShapeOutput);
+      std::string inputBuffer = (fDynamicInput ? "bufDev_" : "deviceBuf_") + fNData;
+      std::string outputBuffer = (fDynamicOutput ? "bufDev_" : "deviceBuf_") + fNOutput;
+
+      std::stringstream out;
       out << "\n//------ TRANSPOSE_GPU_ALPAKA\n";
-      out << SP << "auto const elementsPerThread_"<<fNOutput<<" = Vec::all(static_cast<Idx>(1));\n";
-      out << SP << "auto const elementsPerGrid_"<<fNOutput<<" = Vec::all(Idx{"<< length << "});\n";
+
+      out << SP << "std::array<std::size_t, " << dimShapeData.size() << "> inputStrides_" << fNOutput << " = {";
+      for (size_t i = 0; i < inputStrides.size(); ++i) {
+         if (i > 0) out << ", ";
+         out << inputStrides[i].GetVal();
+      }
+      out << "};\n";
+
+      out << SP << "std::array<std::size_t, " << dimShapeOutput.size() << "> outputStrides_" << fNOutput << " = {";
+      for (size_t i = 0; i < outputStrides.size(); ++i) {
+         if (i > 0) out << ", ";
+         out << outputStrides[i].GetVal();
+      }
+      out << "};\n";
+
+      out << SP << "auto const elementsPerThread_" << fNOutput << " = Vec::all(static_cast<Idx>(1));\n";
+      out << SP << "auto const elementsPerGrid_" << fNOutput << " = Vec::all(Idx{" << length << "});\n";
       out << SP << "auto const workDiv_" << fNOutput << " = sofie_workdiv(elementsPerGrid_" << fNOutput << ");\n";
       out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNOutput
-         << ", transposeKernel_" << OpName << ", alpaka::getPtrNative(deviceBuf_" << fNData
-         << "), alpaka::getPtrNative(deviceBuf_" << fNOutput << "), static_cast<Idx>(" << length << "));\n";
-      out << SP <<"alpaka::enqueue(queue, task_" << OpName << ");\n";
+          << ", transposeKernel_" << OpName << ", alpaka::getPtrNative(" << inputBuffer << "), alpaka::getPtrNative(" << outputBuffer
+          << "), inputStrides_" << fNOutput << ", outputStrides_" << fNOutput << ", static_cast<Idx>(" << length << "));\n";
+      out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";
+
       return out.str();
    }
 

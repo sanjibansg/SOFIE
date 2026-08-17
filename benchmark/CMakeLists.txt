@@ -90,47 +90,33 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Discover models
 ################################################################################
 
-file(GLOB BENCHMARK_ONNX_MODELS
-    "${CMAKE_CURRENT_SOURCE_DIR}/models/*.onnx")
+set(SOFIE_BENCHMARK_MODEL_DIR "models" CACHE STRING "Directory under benchmark/ containing ONNX benchmark models")
+set(BENCHMARK_MODEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/${SOFIE_BENCHMARK_MODEL_DIR}")
 
-list(FILTER BENCHMARK_ONNX_MODELS EXCLUDE REGEX
-    "/(gnn_h32_k2|gnn_h64_k4|punet_h32_k2_heads4_layers2|punet_h64_k4_heads4_layers2|transformer_d32_h2_L6_ff32)\\.onnx$")
+file(GLOB BENCHMARK_ONNX_MODELS "${BENCHMARK_MODEL_DIR}/*.onnx")
 
-# Exclude models that exceed GPU memory (cudaErrorMemoryAllocation) or trigger
-# a cuBLAS EXECUTION_FAILED error (status 13) on architectures that are not very powerful. 
-# They stay on disk for reference and are
-# compiled into sofie_benchmark_large (cluster target) instead.
+# Exclude base/template models with symbolic dimensions.
+# Their fixed-size specialised variants are benchmarked instead.
 list(FILTER BENCHMARK_ONNX_MODELS EXCLUDE REGEX
-    "/(punet_h32_k2_heads4_layers2_n10000_e50000\
-|punet_h32_k2_heads4_layers2_n1000_e5000\
-|punet_h32_k2_heads4_layers2_n3000_e15000\
-|punet_h32_k2_heads4_layers2_n30000_e150000\
-|punet_h32_k2_heads4_layers2_n100000_e500000\
-|punet_h64_k4_heads4_layers2_n10000_e50000\
-|punet_h64_k4_heads4_layers2_n100_e500\
-|punet_h64_k4_heads4_layers2_n300_e1500\
-|punet_h64_k4_heads4_layers2_n3000_e15000\
-|punet_h64_k4_heads4_layers2_n30000_e150000\
-|punet_h64_k4_heads4_layers2_n100000_e500000\
-|gnn_h32_k2_n30000_e150000\
-|gnn_h32_k2_n100000_e500000\
-|gnn_h64_k4_n30000_e150000\
-|gnn_h64_k4_n100000_e500000\
-|transformer_L1000_B100\
-|transformer_L100_B100\
-|transformer_L8000_B1\
-|transformer_d32_h2_L6_ff32_n60_s60)\\.onnx$")
+        "/(gnn_h32_k2|gnn_h64_k4|punet_h32_k2_heads4_layers2|punet_h64_k4_heads4_layers2|transformer_d32_h2_L6_ff32|transformer_d64_h4_L6_ff128|gnn_large|mlpf_fp32_fused|mlpf_fp32_unfused)\\.onnx$")
+
+# Fused MLPF variants are currently unsupported.
+list(FILTER BENCHMARK_ONNX_MODELS EXCLUDE REGEX
+        "/mlpf_fp32_fused_b1_n[0-9]+\\.onnx$")
+
+# Models that exceed GPU memory on all backends.
+list(FILTER BENCHMARK_ONNX_MODELS EXCLUDE REGEX
+        "/(punet_h32_k2_heads4_layers2_n30000_e150000|punet_h32_k2_heads4_layers2_n100000_e500000|punet_h64_k4_heads4_layers2_n30000_e150000|punet_h64_k4_heads4_layers2_n100000_e500000)\\.onnx$")
 
 if(NOT BENCHMARK_ONNX_MODELS)
     message(STATUS
-        "SOFIE Benchmark: No .onnx models found in benchmark/models/. "
+        "SOFIE Benchmark: No .onnx models found in ${BENCHMARK_MODEL_DIR}. "
         "Add ONNX models there and re-run cmake to enable benchmarking.")
     return()
 endif()
 
 list(LENGTH BENCHMARK_ONNX_MODELS N_MODELS)
-message(STATUS "SOFIE Benchmark: Found ${N_MODELS} model(s) in benchmark/models/")
-
+message(STATUS "SOFIE Benchmark: Found ${N_MODELS} model(s) in ${BENCHMARK_MODEL_DIR}")
 
 FetchContent_Declare(
     sofieBLAS
