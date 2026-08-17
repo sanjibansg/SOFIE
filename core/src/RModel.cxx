@@ -272,6 +272,13 @@ bool RModel::IsConstantTensor(const std::string& tensorName) const {
     if (itr == fInitializedTensors.end()) return false;
     return itr->second.IsConstantTensor();
 }
+bool RModel::IsWeightTensor(const std::string& tensorName) const {
+   // a weight tensor is an initialized tensor that is neither constant nor flagged as not-writable
+    std::string name = UTILITY::Clean_name(tensorName);
+    auto itr = fInitializedTensors.find(name);
+    if (itr == fInitializedTensors.end()) return false;
+    return itr->second.IsWeightTensor();
+}
 
 // dynamic tensors include also Dim input tensors
 bool RModel::IsDynamicTensor(const std::string& tensorName) const {
@@ -1491,6 +1498,9 @@ void RModel::Generate(std::underlying_type_t<Options> options, int batchSize, lo
    fBatchSize = batchSize;
    fReadPos = pos;
 
+   if (static_cast<std::underlying_type_t<Options>>(Options::kKernelOnly) & options)
+      throw std::runtime_error("sofie: RModel::Generate: Options::kKernelOnly is only supported for generation with alpaka");
+
    // session flag is used in operator initialize
    if (static_cast<std::underlying_type_t<Options>>(Options::kNoSession) & options) {
       fUseSession = false;
@@ -1513,6 +1523,8 @@ void RModel::Generate(std::underlying_type_t<Options> options, int batchSize, lo
       fIsGNN = true;
    if (static_cast<std::underlying_type_t<Options>>(Options::kGNNComponent) & options)
       fIsGNNComponent = true;
+   if (static_cast<std::underlying_type_t<Options>>(Options::kLowRankFactorize) & options)
+      fLowRankFactorize = true;
 
    if (fProfile)
       RModelProfiler::AddNeededStdLibs(*this);

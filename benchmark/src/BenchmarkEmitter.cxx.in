@@ -78,8 +78,15 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
     // which runs shape inference on all operators.  Output tensor shapes are only
     // available *after* Initialize(), so we must call GenerateGPU_ALPAKA() before
     // querying output metadata.
-#ifdef SOFIE_BENCHMARK_PROFILE
+#ifdef SOFIE_BENCHMARK_LOWRANK
+    model.SetLowRankRatio(SOFIE_BENCHMARK_LOWRANK_RATIO);
+#endif
+#if defined(SOFIE_BENCHMARK_PROFILE) && defined(SOFIE_BENCHMARK_LOWRANK)
+    model.GenerateGPU_ALPAKA(Options::kProfile | Options::kLowRankFactorize);
+#elif defined(SOFIE_BENCHMARK_PROFILE)
     model.GenerateGPU_ALPAKA(Options::kProfile);
+#elif defined(SOFIE_BENCHMARK_LOWRANK)
+    model.GenerateGPU_ALPAKA(Options::kLowRankFactorize);
 #else
     model.GenerateGPU_ALPAKA();
 #endif
