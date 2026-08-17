@@ -88,6 +88,8 @@ set(sources_cxx
     src/ParseScatterND.cxx
     src/ParseTrilu.cxx
     src/ParseLogic.cxx
+    src/ParseNonZero.cxx
+    src/ParseScatterND.cxx
     ${PROTO_SRCS}
   ${DEPENDENCIES}
     ${SOFIE_core}

@@ -111,6 +111,8 @@ extern ParserFuncSignature ParseBitwiseAnd;
 extern ParserFuncSignature ParseBitwiseOr;
 extern ParserFuncSignature ParseBitwiseXor;
 extern ParserFuncSignature ParseBitwiseNot;
+extern ParserFuncSignature ParseNonZero;
+extern ParserFuncSignature ParseScatterND;
 // Declaration of fused operators
 extern ParserFuseFuncSignature ParseFuseConvAdd;
 extern ParserFuseFuncSignature ParseFuseGemmRelu;
@@ -285,6 +287,8 @@ RModelParser_ONNX::RModelParser_ONNX() noexcept : fOperatorsMapImpl(std::make_un
    RegisterOperator("ScatterElements", ParseScatterElements);
    RegisterOperator("ScatterND", ParseScatterND);
    RegisterOperator("Trilu", ParseTrilu);
+   RegisterOperator("NonZero", ParseNonZero);
+   RegisterOperator("ScatterND", ParseScatterND);
    // Logical operators
    RegisterOperator("And", ParseAnd);
    RegisterOperator("Or", ParseOr);
