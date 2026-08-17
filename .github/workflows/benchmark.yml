@@ -1,8 +1,8 @@
 name: Benchmark
 
 on:
-  pull_request:
-    branches: [main]
+  issue_comment:
+    types: [created]
   workflow_dispatch:
     inputs:
       warmup:
@@ -13,70 +13,124 @@ on:
         default: "100"
 
 concurrency:
-  group: benchmark-${{ github.ref }}
+  group: benchmark-${{ github.event.issue.number || github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
 env:
-  LCG_VIEW:     /cvmfs/sft.cern.ch/lcg/views/LCG_106a/x86_64-el9-gcc13-opt
-  CUDA_CVMFS:   /cvmfs/sft.cern.ch/lcg/contrib/cuda/12.4/x86_64-el9
-  CUDA_ARCH:    "90"
+  CUDA_ARCH:    "native"
   BUILD_TYPE:   Release
   BENCH_WARMUP: ${{ github.event.inputs.warmup || '5' }}
   BENCH_ITERS:  ${{ github.event.inputs.iterations || '100' }}
   DEPS_CACHE:   /tmp/sofie-cmake-deps
 
 jobs:
+  parse-command:
+    name: Parse trigger
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        contains(fromJSON('["sanjibansg","lmoneta"]'), github.event.comment.user.login) &&
+        startsWith(github.event.comment.body, '/runbenchmark')
+      )
+    outputs:
+      runner_label: ${{ steps.parse.outputs.runner_label }}
+      valid: ${{ steps.parse.outputs.valid }}
+      flavor: ${{ steps.parse.outputs.flavor }}
+      valid_flavors: ${{ steps.parse.outputs.valid_flavors }}
+    steps:
+      - name: React to trigger comment
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes'
+            });
+      - name: Parse runner flavor
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // default flavor keyed by name -> actual self-hosted runner label
+            const flavors = {
+              l40s: 'ml4ep-l40s',
+              h100: 'ml4ep-h100',
+              'h100-47gb': 'ml4ep-h100-47gb',
+            };
+            let flavor = 'l40s';
+            let valid = true;
+            if (context.eventName === 'issue_comment') {
+              const m = context.payload.comment.body.trim().match(/^\/runbenchmark(?:\s+(\S+))?/i);
+              if (m && m[1]) {
+                flavor = m[1].toLowerCase();
+                valid = Object.prototype.hasOwnProperty.call(flavors, flavor);
+              }
+            }
+            core.setOutput('flavor', flavor);
+            core.setOutput('valid', String(valid));
+            core.setOutput('runner_label', valid ? flavors[flavor] : '');
+            core.setOutput('valid_flavors', Object.keys(flavors).join(', '));
+      - name: Post run link
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `\`/runbenchmark\` (${{ steps.parse.outputs.flavor }}): triggered - [view run](${runUrl})`
+            });
+
   benchmark:
-    name: Benchmark Comparison (H100)
-    runs-on: ml4ep-h100
+    name: Benchmark Comparison
+    needs: parse-command
+    if: needs.parse-command.outputs.valid == 'true'
+    runs-on: ${{ needs.parse-command.outputs.runner_label }}
     container: registry.cern.ch/ngt/lxplus-like:9
     timeout-minutes: 120
 
     steps:
       - name: GPU check
         run: nvidia-smi
-
-      - name: Setup build environment
-        run: |
-          set -euo pipefail
-
-          if [ -f "${{ env.LCG_VIEW }}/setup.sh" ]; then
-            set +u; source "${{ env.LCG_VIEW }}/setup.sh"; set -u
-          else
-            echo "LCG view not found — installing from dnf"
-            dnf install -y epel-release
-            dnf install -y cmake ninja-build gcc-c++ python3 git \
-                           protobuf-devel openblas-devel
-          fi
-
-          if [ -x "${{ env.CUDA_CVMFS }}/bin/nvcc" ]; then
-            echo "${{ env.CUDA_CVMFS }}/bin" >> "$GITHUB_PATH"
-            echo "CUDA_HOME=${{ env.CUDA_CVMFS }}" >> "$GITHUB_ENV"
-          elif [ -x /usr/local/cuda/bin/nvcc ]; then
-            echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
-            echo "CUDA_HOME=/usr/local/cuda" >> "$GITHUB_ENV"
-          else
-            dnf config-manager --add-repo \
-              https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
-            dnf install -y cuda-compiler-12-4 cuda-cudart-devel-12-4 cuda-libraries-devel-12-4
-            echo "/usr/local/cuda-12.4/bin" >> "$GITHUB_PATH"
-            echo "CUDA_HOME=/usr/local/cuda-12.4" >> "$GITHUB_ENV"
-          fi
-
-          echo "PATH=$PATH"                               >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"    >> "$GITHUB_ENV"
-          echo "CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH:-}" >> "$GITHUB_ENV"
+      - name: Resolve PR info
+        id: pr
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.issue.number
+            });
+            core.setOutput('number', pr.data.number);
+            core.setOutput('merge_ref', `refs/pull/${pr.data.number}/merge`);
+            core.setOutput('base_ref', pr.data.base.ref);
 
       - name: Checkout PR branch
         uses: actions/checkout@v4
         with:
           path: sofie-pr
+          ref: ${{ github.event_name == 'issue_comment' && steps.pr.outputs.merge_ref || github.ref }}
 
-      - name: Checkout main branch
-        if: github.event_name == 'pull_request'
+      - name: Checkout base branch
+        if: github.event_name == 'issue_comment'
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ steps.pr.outputs.base_ref }}
           path: sofie-main
 
       - name: Cache FetchContent dependencies
@@ -98,7 +152,7 @@ jobs:
             "-DFETCHCONTENT_BASE_DIR=${{ env.DEPS_CACHE }}"
 
       - name: Build PR benchmark
-        run: cmake --build sofie-pr/build --target sofie_benchmark -j$(nproc)
+        run: cmake --build sofie-pr/build --target sofie_benchmark -j10
 
       - name: Run PR benchmark
         working-directory: sofie-pr/build/benchmark
@@ -107,9 +161,19 @@ jobs:
             -w ${{ env.BENCH_WARMUP }} \
             -n ${{ env.BENCH_ITERS }} \
             | tee benchmark_pr.txt
+      - name: Check whether base branch supports the benchmark harness
+        id: base_support
+        if: github.event_name == 'issue_comment'
+        run: |
+          if grep -q "option(SOFIE_BENCHMARK " sofie-main/CMakeLists.txt 2>/dev/null; then
+            echo "supported=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "supported=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::${{ steps.pr.outputs.base_ref }} does not define the SOFIE_BENCHMARK option yet - skipping the base-branch comparison."
+          fi
 
-      - name: Configure main build
-        if: github.event_name == 'pull_request'
+      - name: Configure base build
+        if: github.event_name == 'issue_comment' && steps.base_support.outputs.supported == 'true'
         run: |
           cmake -B sofie-main/build -S sofie-main \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
@@ -120,12 +184,12 @@ jobs:
             "-DCMAKE_CUDA_ARCHITECTURES=${{ env.CUDA_ARCH }}" \
             "-DFETCHCONTENT_BASE_DIR=${{ env.DEPS_CACHE }}"
 
-      - name: Build main benchmark
-        if: github.event_name == 'pull_request'
-        run: cmake --build sofie-main/build --target sofie_benchmark -j$(nproc)
+      - name: Build base benchmark
+        if: github.event_name == 'issue_comment' && steps.base_support.outputs.supported == 'true'
+        run: cmake --build sofie-main/build --target sofie_benchmark -j10
 
-      - name: Run main benchmark
-        if: github.event_name == 'pull_request'
+      - name: Run base benchmark
+        if: github.event_name == 'issue_comment' && steps.base_support.outputs.supported == 'true'
         working-directory: sofie-main/build/benchmark
         run: |
           ./sofie_benchmark \
@@ -133,20 +197,57 @@ jobs:
             -n ${{ env.BENCH_ITERS }} \
             | tee benchmark_main.txt
 
-      - name: Summarise PR vs main
-        if: github.event_name == 'pull_request'
+      - name: Build comparison summary
+        id: summary
+        if: always()
         run: |
-          echo "### Benchmark comparison: PR vs main" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "── PR ──────────────────────────────────────────────────────────────" \
-            >> "$GITHUB_STEP_SUMMARY"
-          cat sofie-pr/build/benchmark/benchmark_pr.txt   >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "── main ────────────────────────────────────────────────────────────" \
-            >> "$GITHUB_STEP_SUMMARY"
-          cat sofie-main/build/benchmark/benchmark_main.txt >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "summary<<BENCH_EOF"
+            echo "### Benchmark results (${{ needs.parse-command.outputs.flavor }})"
+            echo ""
+            if [ "${{ github.event_name }}" = "issue_comment" ] && [ "${{ steps.base_support.outputs.supported }}" = "true" ]; then
+              echo "Comparing against \`${{ steps.pr.outputs.base_ref }}\`"
+            elif [ "${{ github.event_name }}" = "issue_comment" ]; then
+              echo "_\`${{ steps.pr.outputs.base_ref }}\` does not yet support the SOFIE_BENCHMARK harness - showing PR results only._"
+            fi
+            echo ""
+            echo '```'
+            echo "── PR ──────────────────────────────────────────────────────────────"
+            cat sofie-pr/build/benchmark/benchmark_pr.txt 2>/dev/null || echo "(no results)"
+            if [ -f sofie-main/build/benchmark/benchmark_main.txt ]; then
+              echo ""
+              echo "── ${{ steps.pr.outputs.base_ref }} ──────────────────────────────────────────────"
+              cat sofie-main/build/benchmark/benchmark_main.txt
+            fi
+            echo '```'
+            echo "BENCH_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post results as PR comment
+        if: always() && github.event_name == 'issue_comment'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          number: ${{ steps.pr.outputs.number }}
+          header: benchmark
+          message: ${{ steps.summary.outputs.summary }}
+
+      - name: Write job summary
+        if: always()
+        run: echo "${{ steps.summary.outputs.summary }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify benchmark completion
+        if: always() && github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ job.status }}' === 'success' ? '✅ completed' : '❌ failed';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `\`/runbenchmark\` (${{ needs.parse-command.outputs.flavor }}): Benchmark ${status} - [view results](${runUrl})`
+            });
 
       - name: Upload benchmark results
         if: always()
@@ -156,3 +257,24 @@ jobs:
           path: |
             sofie-pr/build/benchmark/benchmark_pr.txt
             sofie-main/build/benchmark/benchmark_main.txt
+          if-no-files-found: ignore
+
+  report-invalid-flavor:
+    name: Report invalid runner flavor
+    needs: parse-command
+    runs-on: ubuntu-latest
+    if: >-
+      always() && github.event_name == 'issue_comment' &&
+      needs.parse-command.result == 'success' &&
+      needs.parse-command.outputs.valid == 'false'
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `\`/runbenchmark\`: unknown runner flavor \`${{ needs.parse-command.outputs.flavor }}\`. ` +
+                    `Valid options: ${{ needs.parse-command.outputs.valid_flavors }} (or omit for the default, l40s).`
+            });

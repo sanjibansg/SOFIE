@@ -78,8 +78,15 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
     // which runs shape inference on all operators.  Output tensor shapes are only
     // available *after* Initialize(), so we must call GenerateGPU_ALPAKA() before
     // querying output metadata.
-#ifdef SOFIE_BENCHMARK_PROFILE
+#ifdef SOFIE_BENCHMARK_LOWRANK
+    model.SetLowRankRatio(SOFIE_BENCHMARK_LOWRANK_RATIO);
+#endif
+#if defined(SOFIE_BENCHMARK_PROFILE) && defined(SOFIE_BENCHMARK_LOWRANK)
+    model.GenerateGPU_ALPAKA(Options::kProfile | Options::kLowRankFactorize);
+#elif defined(SOFIE_BENCHMARK_PROFILE)
     model.GenerateGPU_ALPAKA(Options::kProfile);
+#elif defined(SOFIE_BENCHMARK_LOWRANK)
+    model.GenerateGPU_ALPAKA(Options::kLowRankFactorize);
 #else
     model.GenerateGPU_ALPAKA();
 #endif
@@ -132,6 +139,7 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         << "#pragma once\n\n"
         << "#include \"" << modelName << "_GPU_ALPAKA.hxx\"\n"
         << "#include \"BenchmarkBackend.hxx\"\n"
+        << "#include \"GpuOccupancy.hxx\"\n"
         << "#include <chrono>\n"
         << "#include <iostream>\n"
         << "#include <random>\n"
@@ -253,13 +261,16 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
           << "    auto t1_in = std::chrono::high_resolution_clock::now();\n\n";
 
     bench
-        << "    // ---- Timed inference ----\n"
+        << "    // ---- Timed inference (with GPU occupancy sampling) ----\n"
+        << "    GpuOccupancySampler occSampler(0);\n"
+        << "    occSampler.start();\n"
         << "    auto t0_infer = std::chrono::high_resolution_clock::now();\n"
         << "    for (int _i = 0; _i < iterations; ++_i)\n"
         << "        " << inferCall.str() << ";\n"
         << "    alpaka::wait(session.queue);\n"
         << "    SOFIE_BENCH_DEVICE_SYNC();\n"
-        << "    auto t1_infer = std::chrono::high_resolution_clock::now();\n\n";
+        << "    auto t1_infer = std::chrono::high_resolution_clock::now();\n"
+        << "    occSampler.stop();\n\n";
 
     bench
         << "    // ---- Timed output transfer (D2H: device -> host) ----\n"
@@ -281,9 +292,20 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         << "    double avg_out_ms    = std::chrono::duration<double, std::milli>"
            "(t1_out   - t0_out  ).count() / iterations;\n"
         << "    double throughput    = (avg_infer_ms > 0.0) ? 1000.0 / avg_infer_ms : 0.0;\n\n"
-        << "    std::printf(\"%-40s  %12.4f  %14.4f  %15.4f  %16.1f\\n\",\n"
+        << "    char smAvgStr[16], smPeakStr[16], memAvgStr[16];\n"
+        << "    if (occSampler.available() && occSampler.sampleCount() > 0) {\n"
+        << "        std::snprintf(smAvgStr,  sizeof(smAvgStr),  \"%.1f\", occSampler.avgSmUtilPct());\n"
+        << "        std::snprintf(smPeakStr, sizeof(smPeakStr), \"%u\",   occSampler.peakSmUtilPct());\n"
+        << "        std::snprintf(memAvgStr, sizeof(memAvgStr), \"%.1f\", occSampler.avgMemUtilPct());\n"
+        << "    } else {\n"
+        << "        std::snprintf(smAvgStr,  sizeof(smAvgStr),  \"N/A\");\n"
+        << "        std::snprintf(smPeakStr, sizeof(smPeakStr), \"N/A\");\n"
+        << "        std::snprintf(memAvgStr, sizeof(memAvgStr), \"N/A\");\n"
+        << "    }\n"
+        << "    std::printf(\"%-40s  %12.4f  %14.4f  %15.4f  %16.1f  %10s  %9s  %11s\\n\",\n"
         << "                \"" << modelName << "\",\n"
-        << "                avg_infer_ms, avg_in_ms, avg_out_ms, throughput);\n"
+        << "                avg_infer_ms, avg_in_ms, avg_out_ms, throughput,\n"
+        << "                smAvgStr, smPeakStr, memAvgStr);\n"
         << "#endif  // SOFIE_BENCHMARK_PROFILE\n"
         << "}\n";
 
