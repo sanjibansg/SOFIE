@@ -99,29 +99,17 @@ std::vector<std::uint8_t> QuantizeTensorToUInt8(const float *data, std::size_t l
    return quantized;
 }
 
-std::vector<std::int8_t> QuantizeGemmWeightTensorToInt8(const float *data, std::size_t n, std::size_t k,
+namespace {
+
+// One loop behind the four public spellings: output is [n, physicalK] row-major zero-padded,
+// the transposed variants change only the source index, and per-channel scales override per column.
+std::vector<std::int8_t> QuantizeWeightTensorToInt8Core(const float *data, std::size_t n, std::size_t k,
+                                                        std::size_t physicalN, std::size_t physicalK,
+                                                        bool transposedSource,
                                                         const QuantizationInfo &info,
                                                         const std::vector<float> &perChannelScale)
 {
-   std::vector<std::int8_t> quantized(n * k);
-   for (std::size_t col = 0; col < n; ++col) {
-      QuantizationInfo channelInfo = info;
-      channelInfo.granularity = EQuantizationGranularity::PerTensor;
-      channelInfo.axis = -1;
-      channelInfo.scale = static_cast<double>(perChannelScale[col]);
-      channelInfo.zeroPoint = 0;
-      for (std::size_t kk = 0; kk < k; ++kk) {
-         quantized[col * k + kk] = static_cast<std::int8_t>(QuantizeScalarToIntegerGrid(data[col * k + kk], channelInfo));
-      }
-   }
-   return quantized;
-}
-
-std::vector<std::int8_t> QuantizeMatMulWeightTensorToInt8Transposed(const float *data, std::size_t k, std::size_t n,
-                                                                  const QuantizationInfo &info,
-                                                                  const std::vector<float> &perChannelScale)
-{
-   std::vector<std::int8_t> quantized(n * k);
+   std::vector<std::int8_t> quantized(physicalN * physicalK, 0);
    for (std::size_t col = 0; col < n; ++col) {
       QuantizationInfo channelInfo = info;
       if (!perChannelScale.empty()) {
@@ -131,10 +119,28 @@ std::vector<std::int8_t> QuantizeMatMulWeightTensorToInt8Transposed(const float 
          channelInfo.zeroPoint = 0;
       }
       for (std::size_t kk = 0; kk < k; ++kk) {
-         quantized[col * k + kk] = static_cast<std::int8_t>(QuantizeScalarToIntegerGrid(data[kk * n + col], channelInfo));
+         const float value = transposedSource ? data[kk * n + col] : data[col * k + kk];
+         quantized[col * physicalK + kk] =
+            static_cast<std::int8_t>(QuantizeScalarToIntegerGrid(value, channelInfo));
       }
    }
    return quantized;
+}
+
+} // namespace
+
+std::vector<std::int8_t> QuantizeGemmWeightTensorToInt8(const float *data, std::size_t n, std::size_t k,
+                                                        const QuantizationInfo &info,
+                                                        const std::vector<float> &perChannelScale)
+{
+   return QuantizeWeightTensorToInt8Core(data, n, k, n, k, false, info, perChannelScale);
+}
+
+std::vector<std::int8_t> QuantizeMatMulWeightTensorToInt8Transposed(const float *data, std::size_t k, std::size_t n,
+                                                                  const QuantizationInfo &info,
+                                                                  const std::vector<float> &perChannelScale)
+{
+   return QuantizeWeightTensorToInt8Core(data, n, k, n, k, true, info, perChannelScale);
 }
 
 std::vector<std::int8_t> QuantizeGemmWeightTensorToInt8Padded(const float *data, std::size_t n, std::size_t k,
@@ -142,20 +148,7 @@ std::vector<std::int8_t> QuantizeGemmWeightTensorToInt8Padded(const float *data,
                                                               const QuantizationInfo &info,
                                                               const std::vector<float> &perChannelScale)
 {
-   std::vector<std::int8_t> quantized(physicalN * physicalK, 0);
-   for (std::size_t col = 0; col < n; ++col) {
-      QuantizationInfo channelInfo = info;
-      if (!perChannelScale.empty()) {
-         channelInfo.granularity = EQuantizationGranularity::PerTensor;
-         channelInfo.axis = -1;
-         channelInfo.scale = static_cast<double>(perChannelScale[col]);
-         channelInfo.zeroPoint = 0;
-      }
-      for (std::size_t kk = 0; kk < k; ++kk) {
-         quantized[col * physicalK + kk] = static_cast<std::int8_t>(QuantizeScalarToIntegerGrid(data[col * k + kk], channelInfo));
-      }
-   }
-   return quantized;
+   return QuantizeWeightTensorToInt8Core(data, n, k, physicalN, physicalK, false, info, perChannelScale);
 }
 
 std::vector<std::int8_t> QuantizeMatMulWeightTensorToInt8TransposedPadded(const float *data, std::size_t k, std::size_t n,
@@ -163,20 +156,7 @@ std::vector<std::int8_t> QuantizeMatMulWeightTensorToInt8TransposedPadded(const 
                                                                           const QuantizationInfo &info,
                                                                           const std::vector<float> &perChannelScale)
 {
-   std::vector<std::int8_t> quantized(physicalN * physicalK, 0);
-   for (std::size_t col = 0; col < n; ++col) {
-      QuantizationInfo channelInfo = info;
-      if (!perChannelScale.empty()) {
-         channelInfo.granularity = EQuantizationGranularity::PerTensor;
-         channelInfo.axis = -1;
-         channelInfo.scale = static_cast<double>(perChannelScale[col]);
-         channelInfo.zeroPoint = 0;
-      }
-      for (std::size_t kk = 0; kk < k; ++kk) {
-         quantized[col * physicalK + kk] = static_cast<std::int8_t>(QuantizeScalarToIntegerGrid(data[kk * n + col], channelInfo));
-      }
-   }
-   return quantized;
+   return QuantizeWeightTensorToInt8Core(data, n, k, physicalN, physicalK, true, info, perChannelScale);
 }
 
 bool IsScalarPerTensor(const QuantizationInfo &info)
@@ -691,46 +671,48 @@ void PopulateDenseLinearResourceRequirements(QuantizedLoweringPlan &plan, bool h
       return QuantizedStorageElementSize(storage) * elements;
    };
 
-   AddQuantizedResourceRequirement(
-      plan.resources, EQuantizedResourceCategory::TensorStorage, EQuantizedResourceRole::InputCarrier,
+   AddQuantizedTensorStorage(plan.resources,
+      EQuantizedResourceRole::InputCarrier,
       plan.inputStorage,
       bytes(plan.inputStorage, batchCount * shape.logicalM * shape.logicalK),
-      std::max<std::size_t>(QuantizedStorageElementSize(plan.inputStorage), 1), false,
+      QuantizedStorageElementSize(plan.inputStorage),
       "logical dense-linear input carrier");
-   AddQuantizedResourceRequirement(
-      plan.resources, EQuantizedResourceCategory::TensorStorage, EQuantizedResourceRole::WeightCarrier,
+   AddQuantizedTensorStorage(plan.resources,
+      EQuantizedResourceRole::WeightCarrier,
       plan.weightStorage,
       bytes(plan.weightStorage, plan.backend == EQuantizedBackend::CPU
                                       ? ((shape.logicalN + 3) / 4) * 4 * shape.logicalK
                                       : batchCount * physicalN * physicalK),
-      std::max<std::size_t>(QuantizedStorageElementSize(plan.weightStorage), 1), false,
+      QuantizedStorageElementSize(plan.weightStorage),
       "physical pre-lowered dense-linear weight carrier");
    if (hasBias) {
-      AddQuantizedResourceRequirement(
-         plan.resources, EQuantizedResourceCategory::TensorStorage, EQuantizedResourceRole::BiasCarrier,
+      AddQuantizedTensorStorage(plan.resources,
+         EQuantizedResourceRole::BiasCarrier,
          plan.biasStorage,
          bytes(plan.biasStorage, shape.logicalN),
-         std::max<std::size_t>(QuantizedStorageElementSize(plan.biasStorage), 1), false,
+         QuantizedStorageElementSize(plan.biasStorage),
          "dense-linear bias carrier");
    }
-   AddQuantizedResourceRequirement(
-      plan.resources, EQuantizedResourceCategory::TensorStorage, EQuantizedResourceRole::OutputCarrier,
+   AddQuantizedTensorStorage(plan.resources,
+      EQuantizedResourceRole::OutputCarrier,
       plan.outputStorage,
       bytes(plan.outputStorage, batchCount * shape.logicalM * shape.logicalN),
-      std::max<std::size_t>(QuantizedStorageElementSize(plan.outputStorage), 1), false,
+      QuantizedStorageElementSize(plan.outputStorage),
       "logical dense-linear output carrier");
 
    if (plan.backend == EQuantizedBackend::CPU) {
-      AddQuantizedResourceRequirement(
-         plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::InputStaging,
+      AddQuantizedBackendScratch(plan.resources,
+         EQuantizedResourceRole::InputStaging,
          EQuantizedStorageType::Int32Accumulator,
-         bytes(EQuantizedStorageType::Int32Accumulator, shape.logicalK), alignof(std::int32_t), true,
+         bytes(EQuantizedStorageType::Int32Accumulator, shape.logicalK),
+         alignof(std::int32_t),
          "thread-local CPU input quantization row");
-      AddQuantizedResourceRequirement(
-         plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::Accumulator,
+      AddQuantizedBackendScratch(plan.resources,
+         EQuantizedResourceRole::Accumulator,
          EQuantizedStorageType::Int32Accumulator,
          bytes(EQuantizedStorageType::Int32Accumulator, std::min<std::size_t>(shape.logicalN, 4)),
-         alignof(std::int32_t), true, "portable CPU output-channel tile accumulator");
+         alignof(std::int32_t),
+         "portable CPU output-channel tile accumulator");
       return;
    }
 
@@ -738,45 +720,51 @@ void PopulateDenseLinearResourceRequirements(QuantizedLoweringPlan &plan, bool h
       return;
 
    constexpr std::size_t cudaAlignment = 256;
-   AddQuantizedResourceRequirement(
-      plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::BackendWorkspace,
+   AddQuantizedBackendScratch(plan.resources,
+      EQuantizedResourceRole::BackendWorkspace,
       EQuantizedStorageType::UNDEFINED,
-      kQuantizedCudaLtMaxWorkspaceBytes, cudaAlignment, true,
+      kQuantizedCudaLtMaxWorkspaceBytes,
+      cudaAlignment,
       "maximum cuBLASLt heuristic workspace capacity");
 
    if (QuantizedPlanUsesFP8DenseLinear(plan)) {
       if (QuantizedShapePolicyUsesPadding(shape.policy)) {
-         AddQuantizedResourceRequirement(
-            plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::OutputStaging,
+         AddQuantizedBackendScratch(plan.resources,
+            EQuantizedResourceRole::OutputStaging,
             plan.outputStorage,
-            bytes(plan.outputStorage, batchCount * shape.logicalM * physicalN), cudaAlignment, true,
+            bytes(plan.outputStorage, batchCount * shape.logicalM * physicalN),
+            cudaAlignment,
             "padded FP8 output staging buffer");
       }
       return;
    }
 
-   AddQuantizedResourceRequirement(
-      plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::InputStaging,
+   AddQuantizedBackendScratch(plan.resources,
+      EQuantizedResourceRole::InputStaging,
       EQuantizedStorageType::Int8,
-      bytes(EQuantizedStorageType::Int8, batchCount * physicalM * physicalK), cudaAlignment, true,
+      bytes(EQuantizedStorageType::Int8, batchCount * physicalM * physicalK),
+      cudaAlignment,
       "cuBLASLt int8 input staging or padding buffer");
-   AddQuantizedResourceRequirement(
-      plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::Accumulator,
+   AddQuantizedBackendScratch(plan.resources,
+      EQuantizedResourceRole::Accumulator,
       EQuantizedStorageType::Int32Accumulator,
-      bytes(EQuantizedStorageType::Int32Accumulator, batchCount * physicalM * physicalN), cudaAlignment, true,
+      bytes(EQuantizedStorageType::Int32Accumulator, batchCount * physicalM * physicalN),
+      cudaAlignment,
       "cuBLASLt int32 accumulator and epilogue source");
    if (QuantizedShapePolicyUsesPadding(shape.policy)) {
-      AddQuantizedResourceRequirement(
-         plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::OutputStaging,
+      AddQuantizedBackendScratch(plan.resources,
+         EQuantizedResourceRole::OutputStaging,
          plan.outputStorage,
-         bytes(plan.outputStorage, batchCount * physicalM * physicalN), cudaAlignment, true,
+         bytes(plan.outputStorage, batchCount * physicalM * physicalN),
+         cudaAlignment,
          "padded quantized output staging buffer");
    }
    if (hasBias) {
-      AddQuantizedResourceRequirement(
-         plan.resources, EQuantizedResourceCategory::BackendScratch, EQuantizedResourceRole::BiasStaging,
+      AddQuantizedBackendScratch(plan.resources,
+         EQuantizedResourceRole::BiasStaging,
          EQuantizedStorageType::FloatCarrier,
-         bytes(EQuantizedStorageType::FloatCarrier, physicalN), cudaAlignment, true,
+         bytes(EQuantizedStorageType::FloatCarrier, physicalN),
+         cudaAlignment,
          "transient bias-to-output offset for the quantized epilogue");
    }
 }

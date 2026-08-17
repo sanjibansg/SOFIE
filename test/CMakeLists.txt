@@ -71,6 +71,11 @@ configure_file(EmitFromONNX_GPU_ALPAKA.cxx.in EmitFromONNX_GPU_ALPAKA_all.cxx @O
 ############################################################################
 if (ENABLE_ALPAKA_TESTS)
 
+  # sm_90 gives the FP8 paths native E4M3 instructions; below sm_89 nvcc falls back to software
+  # emulation. Each listed architecture is a full compile pass.
+  set(SOFIE_TEST_CUDA_ARCHITECTURES "70;80;86;90" CACHE STRING
+      "CUDA architectures for the Alpaka/CUDA test targets")
+
   string(TOLOWER "${ALPAKA_BACKEND}" _alpaka_backend)
   if (NOT _alpaka_backend IN_LIST ALPAKA_BACKEND)
     message(FATAL_ERROR "Unsupported ALPAKA_BACKEND=${ALPAKA_BACKEND}")
@@ -183,7 +188,7 @@ if (ENABLE_ALPAKA_TESTS)
         ${_alpaka_cuda_test_target}
         PROPERTIES
           CUDA_SEPARABLE_COMPILATION OFF
-          CUDA_ARCHITECTURES 70 80 86
+          CUDA_ARCHITECTURES "${SOFIE_TEST_CUDA_ARCHITECTURES}"
           CUDA_STANDARD 20
           CUDA_STANDARD_REQUIRED ON
       )

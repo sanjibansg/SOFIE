@@ -97,14 +97,13 @@ public:
       }
       out << std::setprecision(std::numeric_limits<double>::max_digits10);
       if (fp8) {
-         // Both grids are required: an FP8 carrier is a code on a grid as an int8 one is, and
-         // a call emitted without them adds raw E4M3 codes and overshoots by 1/scale.
-         if (!fRegion.inputLowPrecision || !fRegion.inputLowPrecision->affineQuantization ||
-             !fRegion.operandBLowPrecision || !fRegion.operandBLowPrecision->affineQuantization)
-            throw std::runtime_error("SOFIE quantized elementwise FP8 lowering requires a per-tensor "
-                                     "scale on both operand carriers");
-         const double inputScale = fRegion.inputLowPrecision->affineQuantization->scale;
-         const double operandBScale = fRegion.operandBLowPrecision->affineQuantization->scale;
+         // A carrier off a Q/DQ boundary is a code on a grid and needs its scale applied; one
+         // declared directly as FLOAT8E4M3FN is a value on no grid, and its scale is one.
+         const auto carrierScale = [](const std::optional<LowPrecisionTensorInfo> &carrier) {
+            return carrier && carrier->affineQuantization ? carrier->affineQuantization->scale : 1.0;
+         };
+         const double inputScale = carrierScale(fRegion.inputLowPrecision);
+         const double operandBScale = carrierScale(fRegion.operandBLowPrecision);
          out << "      " << params << ".lowPrecisionFP8 = true;\n";
          out << "      " << params << ".inputScale = " << INTERNAL::QuantizedDoubleLiteral(inputScale) << ";\n";
          out << "      " << params << ".operandBScale = " << INTERNAL::QuantizedDoubleLiteral(operandBScale)

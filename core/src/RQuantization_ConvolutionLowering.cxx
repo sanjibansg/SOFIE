@@ -104,6 +104,273 @@ bool HasUniformZeroPoints(const std::vector<std::int64_t> &zeroPoints)
                       [&](std::int64_t value) { return value == zeroPoints.front(); });
 }
 
+// The four logical carriers a direct Conv kernel reads and writes; bytes and alignment derive
+// from the storage element size. The weight description differs per arm and reaches diagnostics.
+void AddConvDirectCarriers(QuantizedLoweringPlan &plan, const QuantizedConvRegion &region,
+   const std::vector<std::size_t> &inputShape,
+   const std::vector<std::size_t> &weightShape,
+   const std::vector<std::size_t> &outputShape,
+   const char *kind, const char *weightDescription)
+{
+   const auto add = [&plan](EQuantizedResourceRole role, EQuantizedStorageType storage,
+                            std::size_t elements, const std::string &description) {
+      AddQuantizedTensorStorage(plan.resources, role, storage,
+                                elements * QuantizedStorageElementSize(storage),
+                                QuantizedStorageElementSize(storage), description);
+   };
+   const std::string label(kind);
+   add(EQuantizedResourceRole::InputCarrier, plan.inputStorage,
+       QuantizedStorageElementCount(inputShape), "logical " + label + " Conv input carrier");
+   add(EQuantizedResourceRole::WeightCarrier, plan.weightStorage,
+       QuantizedStorageElementCount(weightShape), weightDescription);
+   if (!region.biasSourceTensor.empty())
+      add(EQuantizedResourceRole::BiasCarrier, plan.biasStorage, weightShape.front(),
+          label + " Conv output-channel bias carrier");
+   add(EQuantizedResourceRole::OutputCarrier, plan.outputStorage,
+       QuantizedStorageElementCount(outputShape), "logical " + label + " Conv output carrier");
+}
+
+// An asymmetric or int32-bias Conv, lowered to the direct centered-integer CUDA kernel rather
+// than the im2col/cuBLASLt matrix path.
+void PlanDirectAffineConv(QuantizedLoweringPlan &plan, const QuantizedConvRegion &region,
+   const std::vector<std::size_t> &inputShape,
+   const std::vector<std::size_t> &weightShape,
+   const std::vector<std::size_t> &outputShape)
+{
+   plan.computeProfile = EQuantizedComputeProfile::AffineInt8AsymmetricConv;
+   plan.status = EQuantizedLoweringStatus::Optimized;
+   plan.capabilityTag = "alpaka_affine_conv_direct";
+   plan.reason = region.reason +
+                 "; affine INT8/UINT8 Conv lowered to a direct centered-integer CUDA kernel";
+   plan.weightStorageTensor = region.weightSourceTensor + "_quantized_conv_direct_storage";
+   plan.suppressesGraphOperators = true;
+
+   plan.resources.entries.clear();
+   AddConvDirectCarriers(plan, region, inputShape, weightShape, outputShape, "affine",
+                         "plain affine Conv weight carrier");
+}
+
+// A symmetric depthwise Conv, which has no matrix form worth building: one direct CUDA kernel.
+void PlanDepthwiseConv(QuantizedLoweringPlan &plan, const QuantizedConvRegion &region,
+   const std::vector<std::size_t> &inputShape,
+   const std::vector<std::size_t> &weightShape,
+   const std::vector<std::size_t> &outputShape)
+{
+   plan.status = EQuantizedLoweringStatus::Optimized;
+   plan.capabilityTag = "alpaka_int8_depthwise_conv_direct";
+   plan.reason = region.reason +
+                 "; symmetric INT8 depthwise Conv lowered to a direct CUDA kernel";
+   plan.weightStorageTensor = region.weightSourceTensor + "_quantized_depthwise_conv_storage";
+   plan.suppressesGraphOperators = true;
+
+   plan.resources.entries.clear();
+   AddConvDirectCarriers(plan, region, inputShape, weightShape, outputShape, "depthwise",
+                         "plain pre-quantized depthwise Conv weights");
+}
+
+// A symmetric standard or grouped Conv, lowered as im2col plus cuBLASLt. Picks the shape policy,
+// declares the carriers and the scratch arena, and retiles an exact plan that overruns its budget.
+void PlanMatrixConv(QuantizedLoweringPlan &plan, const QuantizedConvRegion &region,
+   const std::vector<std::size_t> &inputShape,
+   const std::vector<std::size_t> &weightShape,
+   const std::vector<std::size_t> &outputShape)
+{
+   const std::size_t outputSpatial =
+      std::accumulate(outputShape.begin() + 2, outputShape.end(), std::size_t{1},
+                      std::multiplies<std::size_t>{});
+   const std::size_t kernelSpatial =
+      std::accumulate(weightShape.begin() + 2, weightShape.end(), std::size_t{1},
+                      std::multiplies<std::size_t>{});
+   const std::size_t m = inputShape.front() * outputSpatial;
+   const std::size_t k = weightShape[1] * kernelSpatial;
+   const std::size_t n = weightShape.front() / region.attributes.group;
+   plan.matrixShapePolicy = MakeCublasLtShapePolicy(m, k, n);
+   if (plan.matrixShapePolicy->policy == EQuantizedShapePolicy::PaddedCandidate) {
+      if (IsProfitableCublasLtPaddedDenseLinearPolicy(*plan.matrixShapePolicy) &&
+          plan.outputMode == EQuantizedOutputMode::Quantized) {
+         plan.matrixShapePolicy->policy = EQuantizedShapePolicy::Padded;
+         plan.matrixShapePolicy->reason =
+            "padded cuBLASLt INT8 Conv execution selected; " + plan.matrixShapePolicy->reason;
+      } else {
+         plan.matrixShapePolicy->policy = EQuantizedShapePolicy::Fallback;
+         plan.matrixShapePolicy->reason =
+            "padded cuBLASLt Conv requires profitable work and an integer output carrier; " +
+            plan.matrixShapePolicy->reason;
+      }
+   }
+
+   if (QuantizedShapePolicyIsExecutable(plan.matrixShapePolicy->policy)) {
+      plan.status = EQuantizedLoweringStatus::Optimized;
+      plan.capabilityTag = plan.matrixShapePolicy->policy == EQuantizedShapePolicy::Padded
+                              ? "alpaka_int8_conv_matrix_padded"
+                              : "alpaka_int8_conv_matrix_exact";
+      plan.reason = region.reason + "; symmetric INT8 standard/grouped Conv lowered as "
+                    "im2col plus cuBLASLt; " + plan.matrixShapePolicy->reason;
+      if (plan.matrixShapePolicy->policy == EQuantizedShapePolicy::Exact &&
+          plan.inputStorage == EQuantizedStorageType::Int8 &&
+          QuantizedConvUnitKernelDirectInputGeometry(region.attributes,
+                                                     inputShape.front(), outputSpatial)) {
+         plan.reason += "; unit-kernel Conv is a direct NCHW GEMM-operand candidate "
+                        "(im2col elided when the provider supports the direct layout)";
+      }
+      plan.weightStorageTensor =
+         region.weightSourceTensor + "_quantized_conv_matrix_storage";
+      plan.weightLayout = EQuantizedLayout::PlainDevice;
+      plan.suppressesGraphOperators = true;
+
+      plan.resources.entries.clear();
+      constexpr std::size_t cudaAlignment = 256;
+      const auto physicalM = plan.matrixShapePolicy->physicalM;
+      const auto physicalK = plan.matrixShapePolicy->physicalK;
+      const auto physicalN = plan.matrixShapePolicy->physicalN;
+      const auto outputElementBytes = QuantizedStorageElementSize(plan.outputStorage);
+      const auto stagedGroups = QuantizedShapePolicyUsesPadding(plan.matrixShapePolicy->policy)
+                                   ? std::size_t{1}
+                                   : region.attributes.group;
+      AddQuantizedTensorStorage(plan.resources,
+         EQuantizedResourceRole::InputCarrier,
+         plan.inputStorage,
+         SaturatingResourceProduct({QuantizedStorageElementCount(inputShape),
+                                    QuantizedStorageElementSize(plan.inputStorage)}),
+         QuantizedStorageElementSize(plan.inputStorage),
+         "logical Conv input carrier");
+      AddQuantizedTensorStorage(plan.resources,
+         EQuantizedResourceRole::WeightCarrier,
+         plan.weightStorage,
+         SaturatingResourceProduct({region.attributes.group, physicalN, physicalK}),
+         alignof(std::int8_t),
+         "group-major pre-quantized Conv matrix weights");
+      if (!region.biasSourceTensor.empty()) {
+         AddQuantizedTensorStorage(plan.resources,
+            EQuantizedResourceRole::BiasCarrier,
+            plan.biasStorage,
+            SaturatingResourceProduct({weightShape.front(),
+                                       QuantizedStorageElementSize(plan.biasStorage)}),
+            QuantizedStorageElementSize(plan.biasStorage),
+            "Conv output-channel bias carrier");
+      }
+      AddQuantizedTensorStorage(plan.resources,
+         EQuantizedResourceRole::OutputCarrier,
+         plan.outputStorage,
+         SaturatingResourceProduct({QuantizedStorageElementCount(outputShape),
+                                    outputElementBytes}),
+         outputElementBytes,
+         "logical Conv output carrier");
+      AddQuantizedBackendScratch(plan.resources,
+         EQuantizedResourceRole::InputStaging,
+         EQuantizedStorageType::Int8,
+         SaturatingResourceProduct({stagedGroups, m, k}),
+         cudaAlignment,
+         stagedGroups == 1 ? "logical per-group INT8 im2col matrix"
+                           : "contiguous all-group INT8 im2col matrices");
+      if (QuantizedShapePolicyUsesPadding(plan.matrixShapePolicy->policy)) {
+         AddQuantizedBackendScratch(plan.resources,
+            EQuantizedResourceRole::OutputStaging,
+            plan.outputStorage,
+            SaturatingResourceProduct({m, n, outputElementBytes}),
+            cudaAlignment,
+            "logical per-group matrix output before NCHW scatter");
+      }
+      AddQuantizedBackendScratch(plan.resources,
+         EQuantizedResourceRole::BackendWorkspace,
+         EQuantizedStorageType::UNDEFINED,
+         kQuantizedCudaLtMaxWorkspaceBytes,
+         cudaAlignment,
+         "maximum cuBLASLt heuristic workspace capacity");
+      AddQuantizedBackendScratch(plan.resources,
+         EQuantizedResourceRole::InputStaging,
+         EQuantizedStorageType::Int8,
+         SaturatingResourceProduct({stagedGroups, physicalM, physicalK}),
+         cudaAlignment,
+         stagedGroups == 1 ? "cuBLASLt INT8 input padding buffer"
+                           : "contiguous all-group cuBLASLt INT8 input padding buffers");
+      AddQuantizedBackendScratch(plan.resources,
+         EQuantizedResourceRole::Accumulator,
+         EQuantizedStorageType::Int32Accumulator,
+         SaturatingResourceProduct({stagedGroups, physicalM, physicalN, sizeof(std::int32_t)}),
+         cudaAlignment,
+         stagedGroups == 1 ? "cuBLASLt INT32 accumulator and epilogue source"
+                           : "contiguous all-group cuBLASLt INT32 accumulators");
+      if (QuantizedShapePolicyUsesPadding(plan.matrixShapePolicy->policy)) {
+         AddQuantizedBackendScratch(plan.resources,
+            EQuantizedResourceRole::OutputStaging,
+            plan.outputStorage,
+            SaturatingResourceProduct({physicalM, physicalN, outputElementBytes}),
+            cudaAlignment,
+            "padded quantized matrix output");
+      }
+      if (!region.biasSourceTensor.empty() &&
+          QuantizedShapePolicyUsesPadding(plan.matrixShapePolicy->policy)) {
+         AddQuantizedBackendScratch(plan.resources,
+            EQuantizedResourceRole::BiasStaging,
+            EQuantizedStorageType::FloatCarrier,
+            SaturatingResourceProduct({physicalN, sizeof(float)}),
+            cudaAlignment,
+            "per-group bias-to-output offset for padded execution");
+      }
+      // An exact-shape plan whose untiled arena exceeds the budget switches to tiled
+      // execution; padded plans keep their per-group path and the budget enforcement.
+      if (plan.matrixShapePolicy->policy == EQuantizedShapePolicy::Exact) {
+         std::string budgetReason;
+         if (!QuantizedConvResourcesWithinBudget(plan, budgetReason)) {
+            const auto groups = region.attributes.group;
+            // Per-row tile cost: two staging buffers, the tile input buffer, the INT32
+            // accumulator; the tiled arena fits half the budget, staging respects the tile cap.
+            const std::size_t perRowBytes =
+               SaturatingResourceProduct({2, groups, k}) + k +
+               SaturatingResourceProduct({groups, n, sizeof(std::int32_t)});
+            const std::size_t tileArenaBudget =
+               kQuantizedConvMaxReusableScratchBytes / 2 > kQuantizedCudaLtMaxWorkspaceBytes
+                  ? kQuantizedConvMaxReusableScratchBytes / 2 - kQuantizedCudaLtMaxWorkspaceBytes
+                  : 0;
+            const std::size_t rowStagingBytes =
+               std::max<std::size_t>(SaturatingResourceProduct({groups, k}), 1);
+            std::size_t tileRows = perRowBytes == 0 ? 0 : tileArenaBudget / perRowBytes;
+            tileRows = std::min(tileRows, kQuantizedConvIm2ColTileBytes / rowStagingBytes);
+            tileRows -= tileRows % kQuantizedConvIm2ColTileRowQuantum;
+            if (tileRows >= kQuantizedConvIm2ColTileRowQuantum && tileRows < m) {
+               auto &entries = plan.resources.entries;
+               entries.erase(
+                  std::remove_if(entries.begin(), entries.end(),
+                                 [](const QuantizedResourceRequirement &entry) {
+                                    return entry.category ==
+                                              EQuantizedResourceCategory::BackendScratch &&
+                                           entry.reusable &&
+                                           (entry.role == EQuantizedResourceRole::InputStaging ||
+                                            entry.role == EQuantizedResourceRole::Accumulator);
+                                 }),
+                  entries.end());
+               AddQuantizedBackendScratch(plan.resources,
+                  EQuantizedResourceRole::InputStaging,
+                  EQuantizedStorageType::Int8,
+                  SaturatingResourceProduct({2, groups, tileRows, k}),
+                  cudaAlignment,
+                  "double-buffered INT8 im2col staging tiles");
+               AddQuantizedBackendScratch(plan.resources,
+                  EQuantizedResourceRole::InputStaging,
+                  EQuantizedStorageType::Int8,
+                  SaturatingResourceProduct({groups, tileRows, k}),
+                  cudaAlignment, "cuBLASLt INT8 tile input buffers, one per group");
+               AddQuantizedBackendScratch(plan.resources,
+                  EQuantizedResourceRole::Accumulator,
+                  EQuantizedStorageType::Int32Accumulator,
+                  SaturatingResourceProduct({groups, tileRows, n, sizeof(std::int32_t)}),
+                  cudaAlignment,
+                  "tiled cuBLASLt INT32 accumulator");
+               plan.matrixShapePolicy->im2colTileRows = tileRows;
+               plan.reason += "; untiled reusable scratch exceeds the arena budget, "
+                              "so exact execution is tiled to " +
+                              std::to_string(tileRows) + " rows per tile";
+            }
+         }
+      }
+   } else {
+      plan.capabilityTag = "alpaka_int8_conv_matrix_shape_unsupported";
+      plan.reason = region.reason + "; symmetric INT8 standard/grouped Conv matrix "
+                    "lowering is not selected: " + plan.matrixShapePolicy->reason;
+   }
+}
+
 QuantizedLoweringPlan MakeAlpakaConvCandidatePlan(
    const QuantizedConvRegion &region, const QuantizedLoweringPlan &cpuPlan,
    const std::vector<std::int64_t> &weightZeroPoints,
@@ -140,284 +407,15 @@ QuantizedLoweringPlan MakeAlpakaConvCandidatePlan(
    const bool directAffine = !signedOperands || !symmetric ||
                              cpuPlan.biasStorage == EQuantizedStorageType::Int32Accumulator;
    if (directAffine) {
-      plan.computeProfile = EQuantizedComputeProfile::AffineInt8AsymmetricConv;
-      plan.status = EQuantizedLoweringStatus::Optimized;
-      plan.capabilityTag = "alpaka_affine_conv_direct";
-      plan.reason = region.reason +
-                    "; affine INT8/UINT8 Conv lowered to a direct centered-integer CUDA kernel";
-      plan.weightStorageTensor = region.weightSourceTensor + "_quantized_conv_direct_storage";
-      plan.suppressesGraphOperators = true;
-
-      plan.resources.entries.clear();
-      const auto addTensor = [&](EQuantizedResourceRole role,
-                                 EQuantizedStorageType storage, std::size_t elements,
-                                 const std::string &description) {
-         AddQuantizedResourceRequirement(
-            plan.resources, EQuantizedResourceCategory::TensorStorage, role,
-            storage, elements * QuantizedStorageElementSize(storage),
-            std::max<std::size_t>(QuantizedStorageElementSize(storage), 1), false,
-            description);
-      };
-      addTensor(EQuantizedResourceRole::InputCarrier,
-                plan.inputStorage,
-                QuantizedStorageElementCount(inputShape), "logical affine Conv input carrier");
-      addTensor(EQuantizedResourceRole::WeightCarrier,
-                plan.weightStorage,
-                QuantizedStorageElementCount(weightShape), "plain affine Conv weight carrier");
-      if (!region.biasSourceTensor.empty())
-         addTensor(EQuantizedResourceRole::BiasCarrier,
-                   plan.biasStorage,
-                   weightShape.front(), "affine Conv output-channel bias carrier");
-      addTensor(EQuantizedResourceRole::OutputCarrier,
-                plan.outputStorage,
-                QuantizedStorageElementCount(outputShape), "logical affine Conv output carrier");
+      PlanDirectAffineConv(plan, region, inputShape, weightShape, outputShape);
       return plan;
    }
 
    plan.computeProfile = EQuantizedComputeProfile::AffineInt8Conv;
-   if (region.attributes.kind == EQuantizedConvolutionKind::Depthwise) {
-      plan.status = EQuantizedLoweringStatus::Optimized;
-      plan.capabilityTag = "alpaka_int8_depthwise_conv_direct";
-      plan.reason = region.reason +
-                    "; symmetric INT8 depthwise Conv lowered to a direct CUDA kernel";
-      plan.weightStorageTensor =
-         region.weightSourceTensor + "_quantized_depthwise_conv_storage";
-      plan.suppressesGraphOperators = true;
-
-      plan.resources.entries.clear();
-      const auto inputBytes = QuantizedStorageElementCount(inputShape) *
-                              QuantizedStorageElementSize(plan.inputStorage);
-      const auto weightBytes = QuantizedStorageElementCount(weightShape) *
-                               QuantizedStorageElementSize(plan.weightStorage);
-      const auto outputBytes = QuantizedStorageElementCount(outputShape) *
-                               QuantizedStorageElementSize(plan.outputStorage);
-      AddQuantizedResourceRequirement(
-         plan.resources, EQuantizedResourceCategory::TensorStorage,
-         EQuantizedResourceRole::InputCarrier,
-         plan.inputStorage, inputBytes,
-         std::max<std::size_t>(QuantizedStorageElementSize(plan.inputStorage), 1), false,
-         "logical depthwise Conv input carrier");
-      AddQuantizedResourceRequirement(
-         plan.resources, EQuantizedResourceCategory::TensorStorage,
-         EQuantizedResourceRole::WeightCarrier,
-         plan.weightStorage, weightBytes, alignof(std::int8_t), false,
-         "plain pre-quantized depthwise Conv weights");
-      if (!region.biasSourceTensor.empty()) {
-         AddQuantizedResourceRequirement(
-            plan.resources, EQuantizedResourceCategory::TensorStorage,
-            EQuantizedResourceRole::BiasCarrier,
-            plan.biasStorage,
-            weightShape.front() * QuantizedStorageElementSize(plan.biasStorage),
-            std::max<std::size_t>(QuantizedStorageElementSize(plan.biasStorage), 1), false,
-            "depthwise Conv output-channel bias carrier");
-      }
-      AddQuantizedResourceRequirement(
-         plan.resources, EQuantizedResourceCategory::TensorStorage,
-         EQuantizedResourceRole::OutputCarrier,
-         plan.outputStorage, outputBytes,
-         std::max<std::size_t>(QuantizedStorageElementSize(plan.outputStorage), 1), false,
-         "logical depthwise Conv output carrier");
-   } else {
-      const std::size_t outputSpatial =
-         std::accumulate(outputShape.begin() + 2, outputShape.end(), std::size_t{1},
-                         std::multiplies<std::size_t>{});
-      const std::size_t kernelSpatial =
-         std::accumulate(weightShape.begin() + 2, weightShape.end(), std::size_t{1},
-                         std::multiplies<std::size_t>{});
-      const std::size_t m = inputShape.front() * outputSpatial;
-      const std::size_t k = weightShape[1] * kernelSpatial;
-      const std::size_t n = weightShape.front() / region.attributes.group;
-      plan.matrixShapePolicy = MakeCublasLtShapePolicy(m, k, n);
-      if (plan.matrixShapePolicy->policy == EQuantizedShapePolicy::PaddedCandidate) {
-         if (IsProfitableCublasLtPaddedDenseLinearPolicy(*plan.matrixShapePolicy) &&
-             plan.outputMode == EQuantizedOutputMode::Quantized) {
-            plan.matrixShapePolicy->policy = EQuantizedShapePolicy::Padded;
-            plan.matrixShapePolicy->reason =
-               "padded cuBLASLt INT8 Conv execution selected; " + plan.matrixShapePolicy->reason;
-         } else {
-            plan.matrixShapePolicy->policy = EQuantizedShapePolicy::Fallback;
-            plan.matrixShapePolicy->reason =
-               "padded cuBLASLt Conv requires profitable work and an integer output carrier; " +
-               plan.matrixShapePolicy->reason;
-         }
-      }
-
-      if (QuantizedShapePolicyIsExecutable(plan.matrixShapePolicy->policy)) {
-         plan.status = EQuantizedLoweringStatus::Optimized;
-         plan.capabilityTag = plan.matrixShapePolicy->policy == EQuantizedShapePolicy::Padded
-                                 ? "alpaka_int8_conv_matrix_padded"
-                                 : "alpaka_int8_conv_matrix_exact";
-         plan.reason = region.reason + "; symmetric INT8 standard/grouped Conv lowered as "
-                       "im2col plus cuBLASLt; " + plan.matrixShapePolicy->reason;
-         if (plan.matrixShapePolicy->policy == EQuantizedShapePolicy::Exact &&
-             plan.inputStorage == EQuantizedStorageType::Int8 &&
-             QuantizedConvUnitKernelDirectInputGeometry(region.attributes,
-                                                        inputShape.front(), outputSpatial)) {
-            plan.reason += "; unit-kernel Conv is a direct NCHW GEMM-operand candidate "
-                           "(im2col elided when the provider supports the direct layout)";
-         }
-         plan.weightStorageTensor =
-            region.weightSourceTensor + "_quantized_conv_matrix_storage";
-         plan.weightLayout = EQuantizedLayout::PlainDevice;
-         plan.suppressesGraphOperators = true;
-
-         plan.resources.entries.clear();
-         constexpr std::size_t cudaAlignment = 256;
-         const auto physicalM = plan.matrixShapePolicy->physicalM;
-         const auto physicalK = plan.matrixShapePolicy->physicalK;
-         const auto physicalN = plan.matrixShapePolicy->physicalN;
-         const auto outputElementBytes = QuantizedStorageElementSize(plan.outputStorage);
-         const auto stagedGroups = QuantizedShapePolicyUsesPadding(plan.matrixShapePolicy->policy)
-                                      ? std::size_t{1}
-                                      : region.attributes.group;
-         AddQuantizedResourceRequirement(
-            plan.resources, EQuantizedResourceCategory::TensorStorage,
-            EQuantizedResourceRole::InputCarrier,
-            plan.inputStorage,
-            SaturatingResourceProduct({QuantizedStorageElementCount(inputShape),
-                                       QuantizedStorageElementSize(plan.inputStorage)}),
-            std::max<std::size_t>(QuantizedStorageElementSize(plan.inputStorage), 1), false,
-            "logical Conv input carrier");
-         AddQuantizedResourceRequirement(
-            plan.resources, EQuantizedResourceCategory::TensorStorage,
-            EQuantizedResourceRole::WeightCarrier,
-            plan.weightStorage,
-            SaturatingResourceProduct({region.attributes.group, physicalN, physicalK}),
-            alignof(std::int8_t), false, "group-major pre-quantized Conv matrix weights");
-         if (!region.biasSourceTensor.empty()) {
-            AddQuantizedResourceRequirement(
-               plan.resources, EQuantizedResourceCategory::TensorStorage,
-               EQuantizedResourceRole::BiasCarrier,
-               plan.biasStorage,
-               SaturatingResourceProduct({weightShape.front(),
-                                          QuantizedStorageElementSize(plan.biasStorage)}),
-               std::max<std::size_t>(QuantizedStorageElementSize(plan.biasStorage), 1), false,
-               "Conv output-channel bias carrier");
-         }
-         AddQuantizedResourceRequirement(
-            plan.resources, EQuantizedResourceCategory::TensorStorage,
-            EQuantizedResourceRole::OutputCarrier,
-            plan.outputStorage,
-            SaturatingResourceProduct({QuantizedStorageElementCount(outputShape),
-                                       outputElementBytes}),
-            std::max<std::size_t>(outputElementBytes, 1), false,
-            "logical Conv output carrier");
-         AddQuantizedResourceRequirement(
-            plan.resources, EQuantizedResourceCategory::BackendScratch,
-            EQuantizedResourceRole::InputStaging,
-            EQuantizedStorageType::Int8,
-            SaturatingResourceProduct({stagedGroups, m, k}), cudaAlignment, true,
-            stagedGroups == 1 ? "logical per-group INT8 im2col matrix"
-                              : "contiguous all-group INT8 im2col matrices");
-         if (QuantizedShapePolicyUsesPadding(plan.matrixShapePolicy->policy)) {
-            AddQuantizedResourceRequirement(
-               plan.resources, EQuantizedResourceCategory::BackendScratch,
-               EQuantizedResourceRole::OutputStaging,
-               plan.outputStorage,
-               SaturatingResourceProduct({m, n, outputElementBytes}), cudaAlignment, true,
-               "logical per-group matrix output before NCHW scatter");
-         }
-         AddQuantizedResourceRequirement(
-            plan.resources, EQuantizedResourceCategory::BackendScratch,
-            EQuantizedResourceRole::BackendWorkspace,
-            EQuantizedStorageType::UNDEFINED, kQuantizedCudaLtMaxWorkspaceBytes,
-            cudaAlignment, true, "maximum cuBLASLt heuristic workspace capacity");
-         AddQuantizedResourceRequirement(
-            plan.resources, EQuantizedResourceCategory::BackendScratch,
-            EQuantizedResourceRole::InputStaging,
-            EQuantizedStorageType::Int8,
-            SaturatingResourceProduct({stagedGroups, physicalM, physicalK}),
-            cudaAlignment, true,
-            stagedGroups == 1 ? "cuBLASLt INT8 input padding buffer"
-                              : "contiguous all-group cuBLASLt INT8 input padding buffers");
-         AddQuantizedResourceRequirement(
-            plan.resources, EQuantizedResourceCategory::BackendScratch,
-            EQuantizedResourceRole::Accumulator,
-            EQuantizedStorageType::Int32Accumulator,
-            SaturatingResourceProduct({stagedGroups, physicalM, physicalN, sizeof(std::int32_t)}),
-            cudaAlignment, true,
-            stagedGroups == 1 ? "cuBLASLt INT32 accumulator and epilogue source"
-                              : "contiguous all-group cuBLASLt INT32 accumulators");
-         if (QuantizedShapePolicyUsesPadding(plan.matrixShapePolicy->policy)) {
-            AddQuantizedResourceRequirement(
-               plan.resources, EQuantizedResourceCategory::BackendScratch,
-               EQuantizedResourceRole::OutputStaging,
-               plan.outputStorage,
-               SaturatingResourceProduct({physicalM, physicalN, outputElementBytes}),
-               cudaAlignment, true, "padded quantized matrix output");
-         }
-         if (!region.biasSourceTensor.empty() &&
-             QuantizedShapePolicyUsesPadding(plan.matrixShapePolicy->policy)) {
-            AddQuantizedResourceRequirement(
-               plan.resources, EQuantizedResourceCategory::BackendScratch,
-               EQuantizedResourceRole::BiasStaging,
-               EQuantizedStorageType::FloatCarrier,
-               SaturatingResourceProduct({physicalN, sizeof(float)}),
-               cudaAlignment, true, "per-group bias-to-output offset for padded execution");
-         }
-         // An exact-shape plan whose untiled arena exceeds the budget switches to tiled
-         // execution; padded plans keep their per-group path and the budget enforcement.
-         if (plan.matrixShapePolicy->policy == EQuantizedShapePolicy::Exact) {
-            std::string budgetReason;
-            if (!QuantizedConvResourcesWithinBudget(plan, budgetReason)) {
-               const auto groups = region.attributes.group;
-               // Per-row tile cost: two staging buffers, the tile input buffer, the INT32
-               // accumulator; the tiled arena fits half the budget, staging respects the tile cap.
-               const std::size_t perRowBytes =
-                  SaturatingResourceProduct({2, groups, k}) + k +
-                  SaturatingResourceProduct({groups, n, sizeof(std::int32_t)});
-               const std::size_t tileArenaBudget =
-                  kQuantizedConvMaxReusableScratchBytes / 2 > kQuantizedCudaLtMaxWorkspaceBytes
-                     ? kQuantizedConvMaxReusableScratchBytes / 2 - kQuantizedCudaLtMaxWorkspaceBytes
-                     : 0;
-               const std::size_t rowStagingBytes =
-                  std::max<std::size_t>(SaturatingResourceProduct({groups, k}), 1);
-               std::size_t tileRows = perRowBytes == 0 ? 0 : tileArenaBudget / perRowBytes;
-               tileRows = std::min(tileRows, kQuantizedConvIm2ColTileBytes / rowStagingBytes);
-               tileRows -= tileRows % kQuantizedConvIm2ColTileRowQuantum;
-               if (tileRows >= kQuantizedConvIm2ColTileRowQuantum && tileRows < m) {
-                  auto &entries = plan.resources.entries;
-                  entries.erase(
-                     std::remove_if(entries.begin(), entries.end(),
-                                    [](const QuantizedResourceRequirement &entry) {
-                                       return entry.category ==
-                                                 EQuantizedResourceCategory::BackendScratch &&
-                                              entry.reusable &&
-                                              (entry.role == EQuantizedResourceRole::InputStaging ||
-                                               entry.role == EQuantizedResourceRole::Accumulator);
-                                    }),
-                     entries.end());
-                  AddQuantizedResourceRequirement(
-                     plan.resources, EQuantizedResourceCategory::BackendScratch,
-                     EQuantizedResourceRole::InputStaging,
-                     EQuantizedStorageType::Int8,
-                     SaturatingResourceProduct({2, groups, tileRows, k}),
-                     cudaAlignment, true, "double-buffered INT8 im2col staging tiles");
-                  AddQuantizedResourceRequirement(
-                     plan.resources, EQuantizedResourceCategory::BackendScratch,
-                     EQuantizedResourceRole::InputStaging,
-                     EQuantizedStorageType::Int8,
-                     SaturatingResourceProduct({groups, tileRows, k}),
-                     cudaAlignment, true, "cuBLASLt INT8 tile input buffers, one per group");
-                  AddQuantizedResourceRequirement(
-                     plan.resources, EQuantizedResourceCategory::BackendScratch,
-                     EQuantizedResourceRole::Accumulator,
-                     EQuantizedStorageType::Int32Accumulator,
-                     SaturatingResourceProduct({groups, tileRows, n, sizeof(std::int32_t)}),
-                     cudaAlignment, true, "tiled cuBLASLt INT32 accumulator");
-                  plan.matrixShapePolicy->im2colTileRows = tileRows;
-                  plan.reason += "; untiled reusable scratch exceeds the arena budget, "
-                                 "so exact execution is tiled to " +
-                                 std::to_string(tileRows) + " rows per tile";
-               }
-            }
-         }
-      } else {
-         plan.capabilityTag = "alpaka_int8_conv_matrix_shape_unsupported";
-         plan.reason = region.reason + "; symmetric INT8 standard/grouped Conv matrix "
-                       "lowering is not selected: " + plan.matrixShapePolicy->reason;
-      }
-   }
+   if (region.attributes.kind == EQuantizedConvolutionKind::Depthwise)
+      PlanDepthwiseConv(plan, region, inputShape, weightShape, outputShape);
+   else
+      PlanMatrixConv(plan, region, inputShape, weightShape, outputShape);
    return plan;
 }
 
@@ -474,24 +472,24 @@ QuantizedLoweringPlan MakeAlpakaFP8ConvCandidatePlan(
       plan.weightStorageTensor = region.weightSourceTensor + "_fp8_conv_depthwise_storage";
       plan.suppressesGraphOperators = true;
 
-      AddQuantizedResourceRequirement(
-         plan.resources, EQuantizedResourceCategory::TensorStorage,
+      AddQuantizedTensorStorage(plan.resources,
          EQuantizedResourceRole::InputCarrier,
          EQuantizedStorageType::FP8E4M3,
          QuantizedStorageByteSize(EQuantizedStorageType::FP8E4M3, inputShape),
-         1, false, "native E4M3 depthwise Conv input");
-      AddQuantizedResourceRequirement(
-         plan.resources, EQuantizedResourceCategory::TensorStorage,
+         1,
+         "native E4M3 depthwise Conv input");
+      AddQuantizedTensorStorage(plan.resources,
          EQuantizedResourceRole::WeightCarrier,
          EQuantizedStorageType::FP8E4M3,
          SaturatingResourceProduct({groups, kernelSpatial, channelMultiplier}),
-         1, false, "group-major E4M3 depthwise Conv weights");
-      AddQuantizedResourceRequirement(
-         plan.resources, EQuantizedResourceCategory::TensorStorage,
+         1,
+         "group-major E4M3 depthwise Conv weights");
+      AddQuantizedTensorStorage(plan.resources,
          EQuantizedResourceRole::OutputCarrier,
          EQuantizedStorageType::FloatCarrier,
          QuantizedStorageByteSize(EQuantizedStorageType::FloatCarrier, outputShape),
-         alignof(float), false, "native FP8 depthwise Conv FP32 output");
+         alignof(float),
+         "native FP8 depthwise Conv FP32 output");
       return plan;
    }
 
@@ -520,41 +518,42 @@ QuantizedLoweringPlan MakeAlpakaFP8ConvCandidatePlan(
    plan.weightStorageTensor = region.weightSourceTensor + "_fp8_conv_matrix_storage";
    plan.suppressesGraphOperators = true;
 
-   AddQuantizedResourceRequirement(
-      plan.resources, EQuantizedResourceCategory::TensorStorage,
+   AddQuantizedTensorStorage(plan.resources,
       EQuantizedResourceRole::InputCarrier,
       EQuantizedStorageType::FP8E4M3,
       QuantizedStorageByteSize(EQuantizedStorageType::FP8E4M3, inputShape),
-      1, false, "native E4M3 Conv input");
-   AddQuantizedResourceRequirement(
-      plan.resources, EQuantizedResourceCategory::TensorStorage,
+      1,
+      "native E4M3 Conv input");
+   AddQuantizedTensorStorage(plan.resources,
       EQuantizedResourceRole::WeightCarrier,
       EQuantizedStorageType::FP8E4M3,
       SaturatingResourceProduct({groups, k, n}),
-      1, false, "group-major transposed E4M3 Conv weights");
-   AddQuantizedResourceRequirement(
-      plan.resources, EQuantizedResourceCategory::TensorStorage,
+      1,
+      "group-major transposed E4M3 Conv weights");
+   AddQuantizedTensorStorage(plan.resources,
       EQuantizedResourceRole::OutputCarrier,
       EQuantizedStorageType::FloatCarrier,
       QuantizedStorageByteSize(EQuantizedStorageType::FloatCarrier, outputShape),
-      alignof(float), false, "native FP8 Conv FP32 output");
-   AddQuantizedResourceRequirement(
-      plan.resources, EQuantizedResourceCategory::BackendScratch,
+      alignof(float),
+      "native FP8 Conv FP32 output");
+   AddQuantizedBackendScratch(plan.resources,
       EQuantizedResourceRole::InputStaging,
       EQuantizedStorageType::FP8E4M3,
       SaturatingResourceProduct({groups, m, k}),
-      256, true, "contiguous all-group E4M3 im2col matrices");
-   AddQuantizedResourceRequirement(
-      plan.resources, EQuantizedResourceCategory::BackendScratch,
+      256,
+      "contiguous all-group E4M3 im2col matrices");
+   AddQuantizedBackendScratch(plan.resources,
       EQuantizedResourceRole::OutputStaging,
       EQuantizedStorageType::FloatCarrier,
       SaturatingResourceProduct({groups, m, n, sizeof(float)}),
-      256, true, "contiguous all-group FP32 matrix outputs");
-   AddQuantizedResourceRequirement(
-      plan.resources, EQuantizedResourceCategory::BackendScratch,
+      256,
+      "contiguous all-group FP32 matrix outputs");
+   AddQuantizedBackendScratch(plan.resources,
       EQuantizedResourceRole::BackendWorkspace,
-      EQuantizedStorageType::UNDEFINED, kQuantizedCudaLtMaxWorkspaceBytes,
-      256, true, "cuBLASLt FP8 workspace");
+      EQuantizedStorageType::UNDEFINED,
+      kQuantizedCudaLtMaxWorkspaceBytes,
+      256,
+      "cuBLASLt FP8 workspace");
    return plan;
 }
 
@@ -575,43 +574,44 @@ void PopulatePortableConvResources(QuantizedLoweringPlan &plan,
    for (std::size_t axis = 2; axis < weightShape.size(); ++axis)
       patchElements *= weightShape[axis];
 
-   AddQuantizedResourceRequirement(
-      plan.resources, EQuantizedResourceCategory::TensorStorage,
+   AddQuantizedTensorStorage(plan.resources,
       EQuantizedResourceRole::InputCarrier,
-      plan.inputStorage, bytes(plan.inputStorage, inputElements),
-      std::max<std::size_t>(QuantizedStorageElementSize(plan.inputStorage), 1),
-      false, "logical Conv input carrier");
-   AddQuantizedResourceRequirement(
-      plan.resources, EQuantizedResourceCategory::TensorStorage,
+      plan.inputStorage,
+      bytes(plan.inputStorage, inputElements),
+      QuantizedStorageElementSize(plan.inputStorage),
+      "logical Conv input carrier");
+   AddQuantizedTensorStorage(plan.resources,
       EQuantizedResourceRole::WeightCarrier,
-      plan.weightStorage, bytes(plan.weightStorage, weightElements),
-      std::max<std::size_t>(QuantizedStorageElementSize(plan.weightStorage), 1),
-      false, "plain pre-quantized Conv weight carrier");
+      plan.weightStorage,
+      bytes(plan.weightStorage, weightElements),
+      QuantizedStorageElementSize(plan.weightStorage),
+      "plain pre-quantized Conv weight carrier");
    if (!region.biasSourceTensor.empty()) {
-      AddQuantizedResourceRequirement(
-         plan.resources, EQuantizedResourceCategory::TensorStorage,
+      AddQuantizedTensorStorage(plan.resources,
          EQuantizedResourceRole::BiasCarrier,
-         plan.biasStorage, bytes(plan.biasStorage, outputChannels),
-         std::max<std::size_t>(QuantizedStorageElementSize(plan.biasStorage), 1),
-         false, "Conv output-channel bias carrier");
+         plan.biasStorage,
+         bytes(plan.biasStorage, outputChannels),
+         QuantizedStorageElementSize(plan.biasStorage),
+         "Conv output-channel bias carrier");
    }
-   AddQuantizedResourceRequirement(
-      plan.resources, EQuantizedResourceCategory::TensorStorage,
+   AddQuantizedTensorStorage(plan.resources,
       EQuantizedResourceRole::OutputCarrier,
-      plan.outputStorage, bytes(plan.outputStorage, outputElements),
-      std::max<std::size_t>(QuantizedStorageElementSize(plan.outputStorage), 1),
-      false, "logical Conv output carrier");
-   AddQuantizedResourceRequirement(
-      plan.resources, EQuantizedResourceCategory::BackendScratch,
+      plan.outputStorage,
+      bytes(plan.outputStorage, outputElements),
+      QuantizedStorageElementSize(plan.outputStorage),
+      "logical Conv output carrier");
+   AddQuantizedBackendScratch(plan.resources,
       EQuantizedResourceRole::InputStaging,
       EQuantizedStorageType::Int32Accumulator,
       bytes(EQuantizedStorageType::Int32Accumulator, patchElements),
-      alignof(std::int32_t), true, "reusable centered integer Conv receptive field");
-   AddQuantizedResourceRequirement(
-      plan.resources, EQuantizedResourceCategory::BackendScratch,
+      alignof(std::int32_t),
+      "reusable centered integer Conv receptive field");
+   AddQuantizedBackendScratch(plan.resources,
       EQuantizedResourceRole::Accumulator,
-      EQuantizedStorageType::Int32Accumulator, sizeof(std::int32_t),
-      alignof(std::int32_t), true, "portable Conv output accumulator");
+      EQuantizedStorageType::Int32Accumulator,
+      sizeof(std::int32_t),
+      alignof(std::int32_t),
+      "portable Conv output accumulator");
 }
 
 } // namespace

@@ -88,6 +88,24 @@ inline void AddQuantizedResourceRequirement(QuantizedResourceRequirements &requi
                                    std::max<std::size_t>(alignment, 1), reusable, std::move(reason)});
 }
 
+// Tensor storage lives as long as the model and backend scratch is the arena reused between
+// calls, so the category fixes reusability; alignment varies and stays a parameter.
+inline void AddQuantizedTensorStorage(QuantizedResourceRequirements &requirements,
+                                      EQuantizedResourceRole role, EQuantizedStorageType storageType,
+                                      std::size_t bytes, std::size_t alignment, std::string reason)
+{
+   AddQuantizedResourceRequirement(requirements, EQuantizedResourceCategory::TensorStorage, role,
+                                   storageType, bytes, alignment, false, std::move(reason));
+}
+
+inline void AddQuantizedBackendScratch(QuantizedResourceRequirements &requirements,
+                                       EQuantizedResourceRole role, EQuantizedStorageType storageType,
+                                       std::size_t bytes, std::size_t alignment, std::string reason)
+{
+   AddQuantizedResourceRequirement(requirements, EQuantizedResourceCategory::BackendScratch, role,
+                                   storageType, bytes, alignment, true, std::move(reason));
+}
+
 inline std::size_t SaturatingQuantizedResourceAdd(std::size_t lhs, std::size_t rhs)
 {
    if (lhs > std::numeric_limits<std::size_t>::max() - rhs)

@@ -1049,6 +1049,130 @@ void QuantizationPipeline::PropagateLowPrecisionThroughMovement(RModel &model, E
    }
 }
 
+namespace {
+
+using EmittedConsumers = std::unordered_map<std::string, std::vector<std::size_t>>;
+
+// Fused round-trip boundaries eligible for folding into their producer.
+struct RoundTripFold {
+   std::string source;             // the producing operator's output tensor
+   std::string boundaryOutput;     // the tensor the boundary writes, adopted by the producer
+   std::size_t quantizeIndex;
+   QuantizationGrid grid;
+};
+
+// An optional Clip directly behind a Quantize, with constant scalar bounds and this Q as its
+// float's sole reader. The Clip stays absorbable however the carrier leaving the Q is consumed.
+struct AbsorbableClip {
+   std::string input;
+   double low = 0.0;
+   double high = 0.0;
+   std::size_t opIndex = 0;
+   bool present = false;
+};
+
+AbsorbableClip FindAbsorbableClipBeforeQuantize(RModel &model,
+                                                std::vector<std::unique_ptr<ROperator>> &emittedOperators,
+                                                const EmittedConsumers &consumers,
+                                                const std::unordered_map<std::string, std::size_t> &producer,
+                                                const std::set<std::string> &graphOutputs,
+                                                const std::string &quantizeSource)
+{
+   AbsorbableClip clip;
+   auto clipProducer = producer.find(quantizeSource);
+   if (clipProducer == producer.end() || graphOutputs.count(quantizeSource) != 0)
+      return clip;
+   const auto candidate = clipProducer->second;
+   auto *op = emittedOperators[candidate].get();
+   auto clipConsumers = consumers.find(quantizeSource);
+   if (!QuantizationPipeline::OriginalOperatorEmitted(model, candidate) ||
+       op->GetKind() != OperatorKind::CLIP || clipConsumers == consumers.end() ||
+       clipConsumers->second.size() != 1)
+      return clip;
+   const auto clipInputs = op->GetOpInputTensors();
+   if (clipInputs.size() != 3 || !ReadScalarInitializer(model, std::string(clipInputs[1]), clip.low) ||
+       !ReadScalarInitializer(model, std::string(clipInputs[2]), clip.high))
+      return clip;
+   clip.input = std::string(clipInputs[0]);
+   clip.opIndex = candidate;
+   clip.present = true;
+   return clip;
+}
+
+// A round trip whose float comes straight from a decode reads the decode's carrier, applying
+// its scale in the same kernel; exact only for zero point 0 and a power-of-two scale.
+bool AbsorbUpstreamDecode(RModel &model, std::set<std::size_t> &consumedOperatorIndices,
+                          const EmittedConsumers &consumers,
+                          const std::set<std::string> &graphOutputs,
+                          ROperator_ONNXQuantizeLinear &quantize,
+                          ROperator_ONNXDequantizeLinear &source, std::size_t sourceIndex)
+{
+   if (quantize.HasFusedUpstreamDecode() ||
+       !QuantizationPipeline::OriginalOperatorEmitted(model, sourceIndex) || source.IsDuplicateDecode())
+      return false;
+   const auto &sourceGrid = source.GetGrid();
+   if (sourceGrid.kind != EQuantizationGridKind::Integer ||
+       sourceGrid.granularity != EQuantizationGranularity::PerTensor || sourceGrid.zeroPoint != 0 ||
+       !(sourceGrid.scale > 0.0))
+      return false;
+   int exponent = 0;
+   if (std::frexp(sourceGrid.scale, &exponent) != 0.5)
+      return false;
+   // The decode stops being emitted, so nothing else may be reading its float.
+   const std::string decoded = source.GetOutputTensor();
+   if (model.GetTensorType(decoded) != ETensorType::FLOAT || graphOutputs.count(decoded) != 0)
+      return false;
+   auto readers = consumers.find(decoded);
+   if (readers == consumers.end() || readers->second.size() != 1)
+      return false;
+   quantize.FuseUpstreamDecode(source.GetInputTensor(), sourceGrid.scale);
+   consumedOperatorIndices.insert(sourceIndex);
+   return true;
+}
+
+// Round-trip fold: a producer applying the fake-quant snap in its own epilogue absorbs the
+// boundary outright. Returns the fold count; unfoldable producers are tallied when tracing.
+std::size_t ApplyRoundTripFolds(RModel &model,
+                                std::vector<std::unique_ptr<ROperator>> &emittedOperators,
+                                std::set<std::size_t> &consumedOperatorIndices,
+                                const EmittedConsumers &consumers,
+                                const std::unordered_map<std::string, std::size_t> &producer,
+                                const std::set<std::string> &graphOutputs,
+                                const std::vector<RoundTripFold> &roundTripFolds,
+                                bool traceGuards, std::map<std::string, int> &unfoldableProducers)
+{
+   std::size_t foldedRoundTrips = 0;
+   for (const auto &fold : roundTripFolds) {
+      auto upstream = producer.find(fold.source);
+      if (upstream == producer.end())
+         continue;
+      if (!QuantizationPipeline::OriginalOperatorEmitted(model, upstream->second))
+         continue;
+      auto *producerOp = emittedOperators[upstream->second].get();
+      if (!producerOp->CanFuseOutputOnGrid(EQuantizedOutputEmit::Snap)) {
+         // Producers declining the fold, by name.
+         if (traceGuards)
+            ++unfoldableProducers[producerOp->Name()];
+         continue;
+      }
+      // After the fold the producer's own output tensor is gone, so any other reader, an
+      // operator or a graph output, would lose its value; both guards are correctness.
+      auto readers = consumers.find(fold.source);
+      if (readers == consumers.end() || readers->second.size() != 1)
+         continue;
+      if (graphOutputs.count(fold.source) != 0)
+         continue;
+
+      producerOp->FuseOutputOnGrid(fold.boundaryOutput, fold.grid, EQuantizedOutputEmit::Snap);
+      consumedOperatorIndices.insert(fold.quantizeIndex);
+      ++foldedRoundTrips;
+      ++QuantizationExtension::Of(model).report.fakeQuantFolds;
+   }
+   return foldedRoundTrips;
+}
+
+} // namespace
+
 void QuantizationPipeline::FuseUnabsorbedFakeQuantBoundaries(RModel &model)
 {
    auto alive = [&model](std::size_t index) { return OriginalOperatorEmitted(model, index); };
@@ -1067,13 +1191,6 @@ void QuantizationPipeline::FuseUnabsorbedFakeQuantBoundaries(RModel &model)
    }
    const std::set<std::string> graphOutputs(model.fOutputTensorNames.begin(), model.fOutputTensorNames.end());
 
-   // Fused round-trip boundaries eligible for folding into their producer.
-   struct RoundTripFold {
-      std::string source;             // the producing operator's output tensor
-      std::string boundaryOutput;     // the tensor the boundary writes, adopted by the producer
-      std::size_t quantizeIndex;
-      QuantizationGrid grid;
-   };
    std::vector<RoundTripFold> roundTripFolds;
    std::size_t clippedRoundTrips = 0;   // excluded from folding by the Clip guard
 
@@ -1087,38 +1204,6 @@ void QuantizationPipeline::FuseUnabsorbedFakeQuantBoundaries(RModel &model)
    };
    int fusedRoundTrips = 0;
    std::size_t absorbedUpstreamDecodes = 0;
-
-   // A round trip whose float comes straight from a decode reads that decode's carrier
-   // instead, applying its scale in the same kernel. The decode's kernel then has no reader.
-   //
-   // Exact rather than near: the decode stores `(code - zeroPoint) * scale` into a float
-   // tensor, so absorbing it is only value-preserving when that product is representable
-   // there. A zero point of 0 and a power-of-two scale make it an int8 times a power of two,
-   // which every float32 holds exactly, and the quantize's own arithmetic is untouched.
-   auto absorbUpstreamDecode = [&model, &consumers, &graphOutputs, &alive](
-                                  ROperator_ONNXQuantizeLinear &quantize,
-                                  ROperator_ONNXDequantizeLinear &source, std::size_t sourceIndex) {
-      if (quantize.HasFusedUpstreamDecode() || !alive(sourceIndex) || source.IsDuplicateDecode())
-         return false;
-      const auto &sourceGrid = source.GetGrid();
-      if (sourceGrid.kind != EQuantizationGridKind::Integer ||
-          sourceGrid.granularity != EQuantizationGranularity::PerTensor || sourceGrid.zeroPoint != 0 ||
-          !(sourceGrid.scale > 0.0))
-         return false;
-      int exponent = 0;
-      if (std::frexp(sourceGrid.scale, &exponent) != 0.5)
-         return false;
-      // The decode stops being emitted, so nothing else may be reading its float.
-      const std::string decoded = source.GetOutputTensor();
-      if (model.GetTensorType(decoded) != ETensorType::FLOAT || graphOutputs.count(decoded) != 0)
-         return false;
-      auto readers = consumers.find(decoded);
-      if (readers == consumers.end() || readers->second.size() != 1)
-         return false;
-      quantize.FuseUpstreamDecode(source.GetInputTensor(), sourceGrid.scale);
-      model.fLoweredConsumedOperatorIndices.insert(sourceIndex);
-      return true;
-   };
 
    // Keyed off the operators' own tensor fields rather than fOutputTensorNames, which
    // fusion rewrites, so the pass stays idempotent across repeated calls.
@@ -1143,30 +1228,14 @@ void QuantizationPipeline::FuseUnabsorbedFakeQuantBoundaries(RModel &model)
       if (QuantizationExtension::Of(model).state.producerEncodeHandoffs.count(carrier) != 0)
          { decline("carrier_is_planned_handoff"); continue; }
 
-      // Optional preceding Clip, likewise only when this Q is its sole reader; the Clip
-      // stays absorbable however the carrier leaving the Q is consumed.
-      std::string clipInput;
-      double clipLow = 0.0;
-      double clipHigh = 0.0;
-      bool hasClip = false;
-      std::size_t clipIndex = 0;
       const auto &quantizeSource = quantize->GetInputTensor();
-      if (auto clipProducer = producer.find(quantizeSource);
-          clipProducer != producer.end() && graphOutputs.count(quantizeSource) == 0) {
-         const auto candidate = clipProducer->second;
-         auto *clip = model.fOperators[candidate].get();
-         auto clipConsumers = consumers.find(quantizeSource);
-         if (alive(candidate) && clip->GetKind() == OperatorKind::CLIP &&
-             clipConsumers != consumers.end() && clipConsumers->second.size() == 1) {
-            const auto clipInputs = clip->GetOpInputTensors();
-            if (clipInputs.size() == 3 && readScalar(std::string(clipInputs[1]), clipLow) &&
-                readScalar(std::string(clipInputs[2]), clipHigh)) {
-               clipInput = std::string(clipInputs[0]);
-               hasClip = true;
-               clipIndex = candidate;
-            }
-         }
-      }
+      const auto clip = FindAbsorbableClipBeforeQuantize(model, model.fOperators, consumers,
+                                                         producer, graphOutputs, quantizeSource);
+      const std::string &clipInput = clip.input;
+      const double clipLow = clip.low;
+      const double clipHigh = clip.high;
+      const bool hasClip = clip.present;
+      const std::size_t clipIndex = clip.opIndex;
 
       // Declining the round trip is not declining the Clip: wherever this Q goes on
       // emitting, the clamp still belongs in its kernel. Only paths keeping the Q alive use this.
@@ -1252,7 +1321,8 @@ void QuantizationPipeline::FuseUnabsorbedFakeQuantBoundaries(RModel &model)
                if (SameQuantizationGrid(source->GetQuantizationInfo(), quantize->GetQuantizationInfo()) &&
                    model.GetTensorType(source->GetOutputTensor()) == ETensorType::FLOAT)
                   quantize->MarkFakeQuantIdentity();
-               else if (hop == 0 && absorbUpstreamDecode(*quantize, *source, upstream->second))
+               else if (hop == 0 && AbsorbUpstreamDecode(model, model.fLoweredConsumedOperatorIndices, consumers,
+                                                          graphOutputs, *quantize, *source, upstream->second))
                   ++absorbedUpstreamDecodes;
                break;
             }
@@ -1276,34 +1346,10 @@ void QuantizationPipeline::FuseUnabsorbedFakeQuantBoundaries(RModel &model)
 
    // Round-trip fold: a producer applying the fake-quant snap in its own epilogue absorbs
    // the boundary outright, adopting its output tensor with no carrier and no type change.
-   std::size_t foldedRoundTrips = 0;
    std::map<std::string, int> unfoldableProducers;
-   for (const auto &fold : roundTripFolds) {
-      auto upstream = producer.find(fold.source);
-      if (upstream == producer.end())
-         continue;
-      if (!alive(upstream->second))
-         continue;
-      auto *producerOp = model.fOperators[upstream->second].get();
-      if (!producerOp->CanFuseOutputOnGrid(EQuantizedOutputEmit::Snap)) {
-         // Producers declining the fold, by name.
-         if (traceGuards)
-            ++unfoldableProducers[producerOp->Name()];
-         continue;
-      }
-      // After the fold the producer's own output tensor is gone, so any other reader, an
-      // operator or a graph output, would lose its value; both guards are correctness.
-      auto readers = consumers.find(fold.source);
-      if (readers == consumers.end() || readers->second.size() != 1)
-         continue;
-      if (graphOutputs.count(fold.source) != 0)
-         continue;
-
-      producerOp->FuseOutputOnGrid(fold.boundaryOutput, fold.grid, EQuantizedOutputEmit::Snap);
-      model.fLoweredConsumedOperatorIndices.insert(fold.quantizeIndex);
-      ++foldedRoundTrips;
-      ++QuantizationExtension::Of(model).report.fakeQuantFolds;
-   }
+   const std::size_t foldedRoundTrips = ApplyRoundTripFolds(
+      model, model.fOperators, model.fLoweredConsumedOperatorIndices, consumers, producer,
+      graphOutputs, roundTripFolds, traceGuards, unfoldableProducers);
 
    if (traceGuards) {
       int declined = 0;
