@@ -247,19 +247,19 @@ void RModel::GenerateGPU_ALPAKA_Buffers() {
 
    // add also the dynamic tensors (only declarations, allocation will be done later)
    if (!fDynamicTensorInfos.empty()) {
-      fGC += "//--- declare the dynamic tensors\n";
-      fGC += "using bufDev_float = alpaka::Buf<devAcc, float, alpaka::DimInt<1u>, size_t>;\n";
-      fGC += "using bufDev_double = alpaka::Buf<devAcc, double, alpaka::DimInt<1u>, size_t>;\n";
-      fGC += "using bufDev_int64  = alpaka::Buf<devAcc, int64_t, alpaka::DimInt<1u>, size_t>;\n";
+      fGC += "\n//--- declare the dynamic tensors\n";
 
       for (auto &i : fDynamicTensorInfos) {
-         if (i.second.type == ETensorType::FLOAT) {
-            fGC += "bufDev_float bufDev_" + i.first + ";\n";
-         } else if (i.second.type == ETensorType::DOUBLE) {
-            fGC += "bufDev_double bufDev_" + i.first + ";\n";
-         } else if (i.second.type == ETensorType::INT64) {
-            fGC += "bufDev_int64 bufDev_" + i.first + ";\n";
-         }
+         if (i.second.type == ETensorType::FLOAT)
+            fGC += "BufF1D bufDev_" + i.first + " = alpaka::allocBuf<float, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
+         else if (i.second.type == ETensorType::DOUBLE)
+            fGC += "BufD1D bufDev_" + i.first + " = alpaka::allocBuf<double, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
+         else if (i.second.type == ETensorType::INT32)
+            fGC += "BufI321D bufDev_" + i.first + " = alpaka::allocBuf<int32_t, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
+         else if (i.second.type == ETensorType::INT64)
+            fGC += "BufI641D bufDev_" + i.first + " = alpaka::allocBuf<int64_t, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
+         else if (i.second.type == ETensorType::BOOL)
+            fGC += "BufUI81D bufDev_" + i.first + " = alpaka::allocBuf<uint8_t, Idx>(devAcc, Ext1D::all(Idx{1}));\n";
       }
    }
 }
@@ -269,12 +269,25 @@ void RModel::GenerateDynamicTensorInfo_GPU_ALPAKA() {
    std::stringstream out;
 
    for (auto &i : fDynamicTensorInfos) {
+      bool runtimeShape = false;
+      for (const auto &dim : i.second.shape) {
+         if (dim.isParam && fShapeParams.count(dim.param) == 0) {
+            runtimeShape = true;
+            break;
+         }
+      }
+
+      if (runtimeShape)
+         continue;
+
       auto length = ConvertDimShapeToLength(i.second.shape);
+      std::string type = ConvertTypeToString(i.second.type);
+
       out << SP << "if (" << length << " > 0) {\n";
-      out << "auto bufDev_" + i.first +
-                 " = alpaka::allocBuf<float, size_t>(devAcc, Ext1D::all(Idx{" << length << "}));\n";
+      out << SP << SP << "bufDev_" << i.first << " = alpaka::allocBuf<" << type << ", size_t>(devAcc, Ext1D::all(Idx{" << length << "}));\n";
       out << SP << "}\n";
    }
+
    fGC += out.str();
 }
 
@@ -380,6 +393,13 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
       if (type == ETensorType::INT64)  return "ViewConstI641D";
       if (type == ETensorType::BOOL)   return "ViewConstUI81D";
       throw std::runtime_error("sofie: input tensor " + name + " is of an unsupported data type.");
+   };
+
+   auto GetOutputBufferName = [this](const std::string &name) -> std::string {
+      if (fDynamicTensorInfos.count(name) > 0)
+         return "bufDev_" + name;
+
+      return "deviceBuf_" + name;
    };
 
    // Collect deduplicated dynamic dimension parameter names in declaration order
@@ -498,7 +518,7 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    // Copy member output buffers into caller-provided output views
    for (size_t i = 0; i < outputSize; i++) {
       std::string tensorName = *(fOutputTensorNames.begin() + i);
-      fGC += SP + "alpaka::memcpy(queue, outputs[" + std::to_string(i) + "], deviceBuf_" + tensorName + ");\n";
+      fGC += SP + "alpaka::memcpy(queue, outputs[" + std::to_string(i) + "], " + GetOutputBufferName(tensorName) + ");\n";
    }
    fGC += SP + "alpaka::wait(queue);\n";
    fGC += "}\n\n";
@@ -547,7 +567,7 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    if (outputSize > 1) fGC += "{";
    for (size_t i = 0; i < outputSize; i++) {
       std::string tensorName = *(fOutputTensorNames.begin() + i);
-      fGC += "deviceBuf_" + tensorName;
+      fGC += GetOutputBufferName(tensorName);
       if (i < outputSize - 1) fGC += ",";
    }
    if (outputSize > 1) fGC += "}";
