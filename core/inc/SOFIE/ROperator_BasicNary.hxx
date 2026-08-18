@@ -193,10 +193,54 @@ public:
       return acc_v + " = " + acc_v + " + " + val + ";"; // Sum and Mean both accumulate
    }
 
+   // per-input broadcast layout, computed once and shared by the kernel gen and the launch
+   struct GPUNaryBroadcastInfo {
+      std::vector<std::vector<Dim>> dims;
+      std::vector<std::vector<bool>> bcast;
+      std::vector<bool> isScalar;
+      std::vector<bool> isContiguous;
+      bool needCoords = false;
+      std::vector<std::string> dynParams;
+   };
+
+   GPUNaryBroadcastInfo GetGPUNaryBroadcastInfo() const {
+      GPUNaryBroadcastInfo info;
+      const std::size_t nIn = fShapeInputs.size();
+      const std::size_t D = fShapeY.size();
+      info.dims.resize(nIn);
+      info.bcast.resize(nIn);
+      info.isScalar.assign(nIn, true);
+      info.isContiguous.assign(nIn, true);
+      bool anyGeneral = false;
+      for (std::size_t i = 0; i < nIn; i++) {
+         info.dims[i].assign(D, Dim{1});
+         for (std::size_t k = 0; k < fShapeInputs[i].size(); k++)
+            info.dims[i][D - fShapeInputs[i].size() + k] = fShapeInputs[i][k];
+         info.bcast[i].resize(D);
+         for (std::size_t d = 0; d < D; d++) {
+            info.bcast[i][d] = !info.dims[i][d].isParam && info.dims[i][d].dim == 1;
+            if (!info.bcast[i][d]) info.isScalar[i] = false;
+            if (info.dims[i][d].GetVal() != fShapeY[d].GetVal()) info.isContiguous[i] = false;
+         }
+         if (!info.isScalar[i] && !info.isContiguous[i]) anyGeneral = true;
+      }
+      info.needCoords = anyGeneral;
+      if (!info.needCoords)
+         return info;
+
+      UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fShapeY), info.dynParams);
+      for (std::size_t i = 0; i < nIn; i++)
+         if (!info.isScalar[i] && !info.isContiguous[i])
+            UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(info.dims[i]), info.dynParams);
+      return info;
+   }
+
    std::string Generate_GPU_Kernel_ALPAKA(std::string OpName) override {
-      if (fBroadcast) return "";
       OpName = "op_" + OpName;
       size_t nIn = fNInputs.size();
+      auto info = GetGPUNaryBroadcastInfo();
+      const std::size_t D = fShapeY.size();
+      auto stridesY = UTILITY::ComputeStrideFromShape(fShapeY);
       std::string op;
       op += "\n//------ BASICNARY_KERNEL_ALPAKA\n";
       op += SP + "struct BasicNaryKernel_" + OpName + " {\n";
@@ -207,12 +251,40 @@ public:
       op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc";
       for (size_t i = 0; i < nIn; i++)
          op += ", Tin" + std::to_string(i) + " const* in" + std::to_string(i);
-      op += ", TOut* out, std::size_t n) const {\n";
+      op += ", TOut* out";
+      for (auto &p : info.dynParams)
+         op += ", std::size_t const " + p;
+      op += ", std::size_t n) const {\n";
       op += SP + SP + SP + "auto const idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
       op += SP + SP + SP + "if (idx >= n) return;\n";
-      op += SP + SP + SP + "TOut v = static_cast<TOut>(in0[idx]);\n";
+
+      // decompose idx into output coords, skipping broadcast dims (stride 0)
+      if (info.needCoords) {
+         op += SP + SP + SP + "std::size_t remaining = idx;\n";
+         op += SP + SP + SP + "std::size_t coord;\n";
+         for (size_t i = 0; i < nIn; i++)
+            if (!info.isScalar[i] && !info.isContiguous[i])
+               op += SP + SP + SP + "std::size_t idx" + std::to_string(i) + " = 0;\n";
+         for (std::size_t d = 0; d < D; d++) {
+            std::string sY = "(" + stridesY[d].GetVal() + ")";
+            op += SP + SP + SP + "coord = remaining / " + sY + ";\n";
+            if (d + 1 < D)
+               op += SP + SP + SP + "remaining -= coord * " + sY + ";\n";
+            for (size_t i = 0; i < nIn; i++) {
+               if (info.isScalar[i] || info.isContiguous[i] || info.bcast[i][d]) continue;
+               auto strides = UTILITY::ComputeStrideFromShape(info.dims[i]);
+               op += SP + SP + SP + "idx" + std::to_string(i) + " += coord * (" + strides[d].GetVal() + ");\n";
+            }
+         }
+      }
+      auto index = [&info](size_t i) -> std::string {
+         if (info.isContiguous[i]) return "idx";
+         if (info.isScalar[i]) return "0";
+         return "idx" + std::to_string(i);
+      };
+      op += SP + SP + SP + "TOut v = static_cast<TOut>(in0[" + index(0) + "]);\n";
       for (size_t i = 1; i < nIn; i++)
-         op += SP + SP + SP + "{ TOut w = static_cast<TOut>(in" + std::to_string(i) + "[idx]); " + GetGPUCombine("v", "w") + " }\n";
+         op += SP + SP + SP + "{ TOut w = static_cast<TOut>(in" + std::to_string(i) + "[" + index(i) + "]); " + GetGPUCombine("v", "w") + " }\n";
       if (Op == EBasicNaryOperator::Mean)
          op += SP + SP + SP + "v = v / static_cast<TOut>(" + std::to_string(nIn) + ");\n";
       op += SP + SP + SP + "out[idx] = v;\n";
@@ -222,16 +294,15 @@ public:
    }
 
    std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string OpName) override {
-      if (fBroadcast) return "";
       OpName = "op_" + OpName;
       return SP + "BasicNaryKernel_" + OpName + " basicNaryKernel_" + OpName + ";\n";
    }
 
    std::string Generate_GPU_ALPAKA(std::string OpName) override {
-      if (fBroadcast) return SP + "// BasicNary broadcast not yet supported on the alpaka backend (op skipped)\n";
       if (fShapeY.empty())
          throw std::runtime_error("SOFIE BasicNary Op called to Generate without being initialized first");
       OpName = "op_" + OpName;
+      auto info = GetGPUNaryBroadcastInfo();
       std::stringstream out;
       std::string length = ConvertDimShapeToLength(fShapeY);
       out << "\n//------ BASICNARY_GPU_ALPAKA\n";
@@ -242,6 +313,8 @@ public:
       for (auto &in : fNInputs)
          out << ", alpaka::getPtrNative(deviceBuf_" << in << ")";
       out << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")";
+      for (auto &p : info.dynParams)
+         out << ", static_cast<std::size_t>(" << p << ")";
       out << ", static_cast<std::size_t>(" << length << "));\n";
       out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";
       return out.str();
