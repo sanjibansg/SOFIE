@@ -21,6 +21,7 @@
 #include "DynamicReduceMaxFirst_FromONNX_GPU_ALPAKA.hxx"
 #include "DynamicReduceSumMulti_FromONNX_GPU_ALPAKA.hxx"
 #include "TopK_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/TopK.ref.hxx"
 
 TEST_F(SofieAlpakaTest, ReduceMean)
 {

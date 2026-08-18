@@ -13,6 +13,10 @@
 #include "Softmax2d_FromONNX_GPU_ALPAKA.hxx"
 #include "Softmax3d_FromONNX_GPU_ALPAKA.hxx"
 #include "Softmax4d_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/Softmax1d.ref.hxx"
+#include "input_models/references/Softmax2d.ref.hxx"
+#include "input_models/references/Softmax3d.ref.hxx"
+#include "input_models/references/Softmax4d.ref.hxx"
 
 TEST_F(SofieAlpakaTest, BatchNormalization)
 {
