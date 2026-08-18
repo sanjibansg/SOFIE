@@ -122,7 +122,6 @@ TEST_F(SofieAlpakaTest, LinearWithSigmoid)
 
 TEST_F(SofieAlpakaTest, DynamicLinear)
 {
-    // X[N,4] -> Gemm(W[4,3],B[3]) -> Relu -> Y[N,3], N dynamic. Gemm+Relu fuses to gemmrelu. Run at two sizes.
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;
     const std::size_t In = 4, Out = 3;
     const float W[4][3] = {{0.5f, -1.0f, 0.25f},

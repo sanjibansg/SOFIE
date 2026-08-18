@@ -96,7 +96,6 @@ TEST_F(SofieAlpakaTest, AddBroadcast1)
 
 TEST_F(SofieAlpakaTest, DynamicAddBroadcast)
 {
-    // X[N,4,n_pf] + bias[4,1] -> Y[N,4,n_pf], N and n_pf dynamic. Run at two sizes.
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;
     const std::size_t C = 4;
     const float bias[4] = {0.5f, -1.0f, 0.25f, 2.0f};
@@ -173,7 +172,6 @@ TEST_F(SofieAlpakaTest, Equal)
 
 TEST_F(SofieAlpakaTest, DynamicEqual)
 {
-    // X1[N,3] == X2[N,3] -> Y[N,3] (bool/uint8), N dynamic. Run at two batch sizes.
     const std::size_t cols = 3;
     for (std::size_t N : {std::size_t(1), std::size_t(8)}) {
         const std::size_t sz = N * cols;

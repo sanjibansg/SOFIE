@@ -173,8 +173,8 @@ public:
       return out.str();
    }
 
-   // symbolic names used by the kernel stride expressions, shared by the kernel signature and the launch call
 
+   // symbolic names in the kernel stride expressions, shared by the signature and the launch
    std::vector<std::string> GetGPUDynParams() const {
       auto dimShapeData   = fDimShapeData.empty()   ? ConvertShapeToDim(fShapeData)   : fDimShapeData;
       auto dimShapeOutput = fDimShapeOutput.empty() ? ConvertShapeToDim(fShapeOutput) : fDimShapeOutput;

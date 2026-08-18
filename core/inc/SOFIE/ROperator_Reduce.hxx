@@ -98,7 +98,6 @@ public:
       return ret;
    }
 
-   // dynamic (Dim) shape inference, mirrors the size_t version above
    std::vector<Dim> DoShapeInference(const std::vector<Dim> & input) {
       auto ret = input;
       auto & outputShape = ret;
@@ -331,9 +330,7 @@ public:
    // This replaces the previous naive "one thread per output element" approach
    // which serialised the entire reduction loop inside a single thread.
    // ---------------------------------------------------------------------------
-   // base dynamic identifiers (e.g. n_pf, n_sv) inside the baked index math,
-   // passed to the kernel as size_t args. CollectDimParams extracts identifiers,
-   // so this stays valid even when a dim is a compound expression like std::max(...)
+   // dynamic identifiers in the index math, passed to the kernel as size_t args
    std::vector<std::string> GetGPUDynParams() const {
       std::vector<std::string> params;
       UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fShapeX), params);
@@ -360,8 +357,7 @@ public:
             keepAxes.push_back(d);
       }
 
-      // Row-major strides (as runtime expressions) for decomposing the flat
-      // reduction index r into per-axis coordinates.
+      // row-major strides for decomposing the flat reduction index into coordinates
       // redStrides[i] = product of fShapeX[redAxes[j]] for j > i
       std::vector<std::string> redStrides(redAxes.size(), "1");
       for (int ri = (int)redAxes.size() - 2; ri >= 0; --ri)

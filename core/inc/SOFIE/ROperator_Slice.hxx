@@ -494,8 +494,7 @@ public:
       return out.str();
    }
 
-   // symbolic names used by the kernel index expressions, shared by the
-   // kernel signature and the launch call
+   // symbolic names in the kernel index expressions, shared by the signature and the launch
    std::vector<std::string> GetGPUDynParams() const {
       std::vector<std::string> params;
       UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fShapeOutput), params);

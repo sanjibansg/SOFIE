@@ -129,8 +129,7 @@ TEST_F(SofieAlpakaTest, DynamicBatchNorm4D)
     }
 }
 
-// X[N,4,n_pf] + relu: dynamic batch and spatial. rebuilt per size so Y matches its length;
-// Y length is a symmetric product so the ctor arg order doesn't matter, infer is (N, n_pf).
+// X[N,4,n_pf] + relu: dynamic batch and spatial, rebuilt per size so Y matches its length
 TEST_F(SofieAlpakaTest, DynamicBatchNormDynSpatialRelu)
 {
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;

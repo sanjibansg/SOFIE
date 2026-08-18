@@ -137,7 +137,6 @@ TEST_F(SofieAlpakaTest, Transpose)
 
 TEST_F(SofieAlpakaTest, DynamicTranspose)
 {
-    // X[N,3,n_pf] perm(0,2,1) -> Y[N,n_pf,3], N and n_pf dynamic. Run at two sizes.
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;
     const std::size_t C = 3;
 
@@ -220,7 +219,6 @@ TEST_F(SofieAlpakaTest, Concat0D)
 
 TEST_F(SofieAlpakaTest, DynamicConcat)
 {
-    // A[N,2,n_pf] + B[N,3,n_pf] axis 1 -> Y[N,5,n_pf], N and n_pf dynamic. Run at two sizes.
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;
     const std::size_t Ca = 2, Cb = 3, Cy = 5;
 
@@ -617,9 +615,9 @@ TEST_F(SofieAlpakaTest, Tile5D)
         EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE);
 }
 
+// X[N,2] -> Tile([2,3]) -> Y[2N,6], N dynamic
 TEST_F(SofieAlpakaTest, DynamicTile)
 {
-    // X[N,2] -> Tile([2,3]) -> Y[2N,6], with N dynamic. Run at two batch sizes.
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;
     const std::size_t inCols = 2, outCols = 6;
 
@@ -860,7 +858,6 @@ TEST_F(SofieAlpakaTest, GatherNegativeIndices)
 
 TEST_F(SofieAlpakaTest, DynamicGather)
 {
-    // X[N,3,n_pf], indices [2,0], axis 1 -> Y[N,2,n_pf], N and n_pf dynamic. Run at two sizes.
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;
     const std::size_t C = 3, K = 2;
     const std::size_t idxs[2] = {2, 0};
@@ -1328,7 +1325,6 @@ TEST_F(SofieAlpakaTest, Slice_Neg)
 
 TEST_F(SofieAlpakaTest, DynamicSlice)
 {
-    // X[N,4,n_pf] axis 1 [1:3] -> Y[N,2,n_pf], N and n_pf dynamic. Run at two sizes.
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;
     const std::size_t C = 4, K = 2, start = 1;
 
@@ -1482,7 +1478,6 @@ TEST_F(SofieAlpakaTest, Trilu_3D)
 
 TEST_F(SofieAlpakaTest, DynamicRange)
 {
-    // X[N,K] dynamic -> Shape -> Gather(dim1=K) -> Range(0,K,1) -> Y[K] = arange(K)
     const std::size_t Ns[] = {1, 4};
     const std::size_t Ks[] = {3, 7};
     for (int t = 0; t < 2; ++t) {
@@ -1514,8 +1509,6 @@ TEST_F(SofieAlpakaTest, DynamicRange)
 
 TEST_F(SofieAlpakaTest, DynamicRangeMul)
 {
-    // X[N,K] dynamic -> Shape -> Gather(N),Gather(K) -> Range(0,K,1) -> Mul(arange, N) -> Y[K] = i*N
-    // N is a shape tensor read on-device by the Mul (the ParticleNet deviceBuf_168 pattern).
     const std::size_t Ns[] = {1, 5};
     const std::size_t Ks[] = {4, 6};
     for (int t = 0; t < 2; ++t) {

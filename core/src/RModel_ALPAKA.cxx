@@ -52,7 +52,6 @@ void RModel::ComputeEltwiseFusionGroups() {
       auto firstInputs = fOperators[i]->GetOpInputTensors();
       group.inputTensor = firstInputs.empty() ? "" : std::string(firstInputs[0]);
 
-      // Extend chain: only if CURRENT op is elementwise with runtime (non constant) output that can be fused
       size_t current = i;
       while (fOperators[current]->IsElementwise() && !fOperators[current]->IsOutputConstant()) {
          auto curOutputs = fOperators[current]->GetOpOutputTensors();
@@ -77,7 +76,6 @@ void RModel::ComputeEltwiseFusionGroups() {
       auto lastOutputs = fOperators[current]->GetOpOutputTensors();
       group.outputTensor = lastOutputs.empty() ? "" : std::string(lastOutputs[0]);
 
-      // Element count: literal for static tensors, runtime expression for dynamic ones
       if (!group.outputTensor.empty()) {
          auto it = fIntermediateTensorInfos.find(group.outputTensor);
          if (it != fIntermediateTensorInfos.end()) {
@@ -272,8 +270,6 @@ void RModel::GenerateGPU_ALPAKA_Buffers() {
       }
    }
 
-   // shape tensors: small INT64 arrays. Host array is filled by the producing operator,
-   // device buffer is used when a shape tensor feeds a compute kernel.
    if (!fShapeTensors.empty()) {
       fGC += "//--- declare the shape tensors\n";
       for (auto &i : fShapeTensors) {
@@ -512,8 +508,7 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    fGC += "void infer(std::span<ViewConstF1D const> inputs, std::span<ViewF1D> outputs" + spanDynDecl + "){\n";
 
    {
-      // Interleave dynamic params with inputs in the exact order _infer_impl declares them
-      // (each symbol emitted just before the first input whose shape introduces it).
+      // each symbol goes just before the first input whose shape introduces it
       fGC += SP + "_infer_impl(";
       std::unordered_map<std::string, int> seen;
       bool first = true;
@@ -565,8 +560,6 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    fGC += GenerateInferSignature_GPU_ALPAKA();
    fGC += "){\n";
 
-   // Wrap each typed input buffer in a ViewConstXX, then call _infer_impl. Interleave the
-   // dynamic params with the views in the same order _infer_impl declares them.
    std::vector<std::string> typedImplArgs;
    {
       std::unordered_map<std::string, int> seen;
@@ -769,8 +762,6 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       }
 
       if (!fShapeParams.empty()) {
-         // emit params in declaration order (like the infer signature), not unordered_map order,
-         // so ctor and infer agree on arg order for multi-symbol models
          std::unordered_map<std::string, int> seenParam;
          for (auto &name : fInputTensorNames) {
             if (IsDimInputTensor(name)) {

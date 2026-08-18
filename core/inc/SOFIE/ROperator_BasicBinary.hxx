@@ -451,11 +451,7 @@ public:
       return out.str();
    }
 
-   // Broadcast layout shared by the GPU kernel generation and the launch call,
-   // computed once so the kernel signature and the call site cannot drift apart.
-   // Shapes are the Dim members, which are filled in every non-constant path of
-   // Initialize (for static inputs via ConvertShapeToDim), so one code path
-   // covers static and dynamic models.
+   // Computed once so the kernel signature and the call site cannot drift apart.
    struct GPUBroadcastInfo {
       std::vector<Dim> dimA;
       std::vector<Dim> dimB;
@@ -472,8 +468,6 @@ public:
    GPUBroadcastInfo GetGPUBroadcastInfo() const {
       GPUBroadcastInfo info;
       const std::size_t D = fDimShapeY.size();
-      // right-aligned rank padding (ONNX broadcast); no-op when Initialize
-      // already padded the shapes in place
       info.dimA.assign(D, Dim{1});
       info.dimB.assign(D, Dim{1});
       for (std::size_t i = 0; i < fDimShapeA.size(); i++)
@@ -484,7 +478,6 @@ public:
       info.bcastA.resize(D);
       info.bcastB.resize(D);
       for (std::size_t d = 0; d < D; d++) {
-         // only a static 1 marks a broadcast dimension, a parametric dim is never 1
          info.bcastA[d] = !info.dimA[d].isParam && info.dimA[d].dim == 1;
          info.bcastB[d] = !info.dimB[d].isParam && info.dimB[d].dim == 1;
          if (!info.bcastA[d]) info.isAScalar = false;
@@ -498,7 +491,6 @@ public:
       if (!info.needCoords)
          return info;
 
-      // symbolic names in the emitted stride expressions become size_t kernel args
       UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fDimShapeY), info.dynParams);
       if (generalA) UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(info.dimA), info.dynParams);
       if (generalB) UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(info.dimB), info.dynParams);
@@ -530,8 +522,7 @@ public:
       op += SP + SP + SP + "auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
       op += SP + SP + SP + "if (idx < totalElements) {\n";
 
-      // general broadcast case: decompose idx into per-dim output coords and
-      // accumulate the input index, skipping broadcast dims (stride 0)
+      // decompose idx into output coords, skipping broadcast dims (stride 0)
       if (info.needCoords) {
          op += SP + SP + SP + SP + "std::size_t remaining = idx;\n";
          op += SP + SP + SP + SP + "std::size_t coord;\n";
@@ -581,7 +572,6 @@ public:
       out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNY
          << ", binary" << OpName << "Kernel, alpaka::getPtrNative(deviceBuf_" << fNA
          << "), alpaka::getPtrNative(deviceBuf_" << fNB << "), alpaka::getPtrNative(deviceBuf_" << fNY << ")";
-      // dynamic shape params, same order as the kernel signature
       for (auto &p : info.dynParams)
          out << ", static_cast<std::size_t>(" << p << ")";
       out << ", static_cast<Idx>(" << length << "));\n";

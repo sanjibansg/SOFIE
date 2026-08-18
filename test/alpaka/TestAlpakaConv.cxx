@@ -732,7 +732,6 @@ TEST_F(SofieAlpakaTest, DynamicConv1D)
 
 TEST_F(SofieAlpakaTest, DynamicConv1DNoBias)
 {
-    // X[N,2,n_pf] k=1 no-bias conv -> Y[N,3,n_pf], N and n_pf dynamic. Run at two sizes.
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;
     const std::size_t Cin = 2, Cout = 3;
     const float W[3][2] = {{0.5f, -1.0f}, {0.25f, 0.75f}, {-0.5f, 1.5f}};
@@ -775,7 +774,6 @@ TEST_F(SofieAlpakaTest, DynamicConv1DNoBias)
 
 TEST_F(SofieAlpakaTest, DynamicConv2DNoBias)
 {
-    // X[N,2,n_pf,4] 1x1 no-bias conv -> Y[N,3,n_pf,4], N and n_pf dynamic. Run at two sizes.
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;
     const std::size_t Cin = 2, Cout = 3, Q = 4;
     const float W[3][2] = {{0.5f, -1.0f}, {0.25f, 0.75f}, {-0.5f, 1.5f}};

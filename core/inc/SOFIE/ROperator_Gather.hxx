@@ -161,7 +161,6 @@ public:
          return out.str();
       }
       if (fIsOutputParamShape) {
-         // output is a shape tensor with symbolic values
          out << "//--------------------(shape)----------\n";
          for (int i = 0; i < static_cast<int>(fOutputShapeData.size()); i++) {
             out << SP << "tensor_" << fNY << "[" << i << " ] = " << fOutputShapeData[i].GetVal() << ";\n";
@@ -286,8 +285,7 @@ public:
       return out.str();
    }
 
-// symbolic names used by the kernel index expressions, shared by the kernel
-// signature and the launch call
+// symbolic names in the kernel index expressions, shared by the signature and the launch
 std::vector<std::string> GetGPUDynParams() const {
     std::vector<std::string> params;
     UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fShapeY), params);
@@ -396,7 +394,6 @@ std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override 
 std::string Generate_GPU_ALPAKA(std::string opName) override {
     if (fIsOutputConstant) return "";
     if (fIsOutputParamShape) {
-        // shape tensor output: fill the host-side values and copy them to the device buffer
         std::stringstream out;
         out << "\n//------ GATHER (shape) GPU\n";
         for (int i = 0; i < static_cast<int>(fOutputShapeData.size()); i++) {

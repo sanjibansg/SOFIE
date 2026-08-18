@@ -64,8 +64,6 @@ public:
          throw std::runtime_error("TMVA::SOFIE ONNX TopK op axis = " + std::to_string(fAttrAxis) +
             " value exceeds size of tensor " + fNX + " of size " + std::to_string(fShapeX.size()) + " .");
       }
-      // k stays a static constant so bestV[K] is a fixed register buffer; on a
-      // dynamic axis we keep the declared k (kNN guarantees k <= axis length)
       fK = fShapeX[fAttrAxis].isParam ? kval : std::min(kval, fShapeX[fAttrAxis].dim);
 
       fShapeY = fShapeX;
@@ -138,8 +136,8 @@ public:
       return out.str();
    }
 
-   // one thread per slice, K-sized insertion-sorted register buffer; the sorted
-   // axis length is a runtime arg (nElAxis) so the kernel handles a dynamic axis
+   // one thread per slice with a K-sized insertion-sorted register buffer; the axis
+   // length is a runtime arg so the kernel handles a dynamic axis
    std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) override {
       if (fShapeX.empty())
          throw std::runtime_error("SOFIE Operator TopK called to Generate without being initialized first");

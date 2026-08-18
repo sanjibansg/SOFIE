@@ -375,8 +375,7 @@
             return out.str();
          }
 
-   // symbolic names used by the kernel index expressions, shared by the
-   // kernel signature and the launch call
+   // symbolic names in the kernel index expressions, shared by the signature and the launch
    std::vector<std::string> GetGPUDynParams() const {
       std::vector<std::string> params;
       UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fOutputShape), params);
@@ -398,8 +397,7 @@
 
       auto outStrides = UTILITY::ComputeStrideFromShape(fOutputShape);
 
-      // cumulative offsets along the concat axis, kept as expression strings
-      // since an axis dim can be symbolic
+      // cumulative offsets along the concat axis, as strings since a dim can be symbolic
       std::vector<std::string> prefix(Nin);
       prefix[0] = "0";
       for (std::size_t k = 1; k < Nin; ++k)

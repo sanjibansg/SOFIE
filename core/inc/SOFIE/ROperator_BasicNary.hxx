@@ -185,7 +185,6 @@ public:
       return out.str();
    }
 
-   // device-side accumulation expression for the current op
    std::string GetGPUCombine(const std::string& acc_v, const std::string& val) const {
       if (Op == EBasicNaryOperator::Max)
          return acc_v + " = (" + acc_v + " > " + val + ") ? " + acc_v + " : " + val + ";";

@@ -297,7 +297,6 @@ TEST_F(SofieAlpakaTest, Neg)
 
 TEST_F(SofieAlpakaTest, DynamicNegRelu)
 {
-    // X[N,3,n_pf] -> Neg -> Relu -> Y, fused eltwise chain, N and n_pf dynamic. Run at two sizes.
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;
     const std::size_t C = 3;
 

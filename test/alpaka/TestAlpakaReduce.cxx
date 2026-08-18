@@ -344,8 +344,7 @@ TEST_F(SofieAlpakaTest, ReduceMax_mid)
         EXPECT_NEAR(res_ptr[i], correct[i], TOLERANCE) << "  i=" << i;
 }
 
-// DynamicReduceSumLast: X[N,4] -> ReduceSum(axis=-1, keepdims=0) -> Y[N]
-//   last-axis (kLast), pruned output, negative axis, static reduced-length.
+// X[N,4] -> ReduceSum(axis=-1, keepdims=0) -> Y[N]: kLast, pruned output, negative axis
 TEST_F(SofieAlpakaTest, DynamicReduceSumLast)
 {
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;
@@ -379,11 +378,7 @@ TEST_F(SofieAlpakaTest, DynamicReduceSumLast)
     }
 }
 
-// DynamicReduceMeanMid: X[N,4,M] -> ReduceMean(axis=1, keepdims=1) -> Y[N,1,M]
-//   middle-axis (kMiddle) with TWO symbolic dims. Reconstruct the session per size so
-//   the returned Y buffer matches outSize; the output length N*M is a symmetric product
-//   so the unordered_map ctor-arg order is immaterial, and infer args stay in
-//   declaration order (N, M).
+// X[N,4,M] -> ReduceMean(axis=1, keepdims=1) -> Y[N,1,M]: kMiddle with two symbolic dims
 TEST_F(SofieAlpakaTest, DynamicReduceMeanMid)
 {
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;
@@ -424,8 +419,6 @@ TEST_F(SofieAlpakaTest, DynamicReduceMeanMid)
     }
 }
 
-// DynamicReduceMaxFirst: X[N,4] -> ReduceMax(axis=0, keepdims=0) -> Y[4]
-//   reduces the DYNAMIC axis, so reducedLength is symbolic (=N); kFirst path, Max op.
 TEST_F(SofieAlpakaTest, DynamicReduceMaxFirst)
 {
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;
@@ -460,8 +453,6 @@ TEST_F(SofieAlpakaTest, DynamicReduceMaxFirst)
     }
 }
 
-// DynamicReduceSumMulti: X[N,3,2] -> ReduceSum(axes=[1,2], keepdims=0) -> Y[N]
-//   multi-axis reduce -> exercises the redStrides product string in the kernel.
 TEST_F(SofieAlpakaTest, DynamicReduceSumMulti)
 {
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;
@@ -499,7 +490,7 @@ TEST_F(SofieAlpakaTest, TopK)
 {
    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
 
-   // axis=-1, largest=1, sorted=1, k=5 (baked); input is a single 9-element row
+   // axis=-1, largest=1, sorted=1, k=5 fixed at codegen; input is a single 9-element row
    std::vector<float> input {9.0, 8.0, 4.5, 1.7, 2.9, 3.2, 4.0, 2.6, 7.4};
    constexpr std::size_t K = 5;
 

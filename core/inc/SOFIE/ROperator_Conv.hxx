@@ -1003,9 +1003,6 @@ public:
 
 
    std::string GetBlasConfig(){
-      // gemm_m (output spatial) can be dynamic, so build the layout dims as runtime expressions.
-      // addLayoutConfig is emitted in the ctor where the shape params are in scope, so the layout
-      // registers for the actual runtime size and matmul finds it. Static dims resolve to numbers.
       std::string oDepth_  = (fDim > 2) ? fShapeY[2].GetVal()    : "1";
       std::string oHeight_ = (fDim > 1) ? fShapeY[fDim].GetVal() : "1";
       std::string oWidth_  = fShapeY[fDim + 1].GetVal();
@@ -1013,7 +1010,6 @@ public:
       std::string gemm_n_  = std::to_string(fShapeW[0] / fAttrGroup);
       std::string gemm_k_  = std::to_string(fShapeW[1] * kSize_);
       std::string gemm_m_  = "(" + oDepth_ + " * " + oHeight_ + " * " + oWidth_ + ")";
-      // lda = gemm_m, ldb = gemm_k, ldc = gemm_m (all col-major)
       return gemm_m_ + ", " + gemm_n_ + ", " + gemm_k_ + ", " + gemm_m_ + ", " + gemm_k_ + ", " + gemm_m_ + ", 'n', 'n'";
    }
 

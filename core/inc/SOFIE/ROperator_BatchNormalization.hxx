@@ -51,7 +51,6 @@ public:
       fInputTensorNames = { fNX };
       fOutputTensorNames = { fNY };
 
-      // fused per-channel scale tensor (created in Initialize)
       fNFusedScale = fNScale + "_fused_inv_std_dev";
 
       if(std::is_same<T, float>::value){
@@ -96,7 +95,6 @@ public:
       }
 
       fShapeX = model.GetDimTensorShape(fNX);
-      // Rank is kept at 2-4, matching ROOT SOFIE's BatchNorm constraint
       if (fShapeX.size() < 2 || fShapeX.size() > 4) {
          throw std::runtime_error("SOFIE BatchNormalization Op input tensor " + fNX
                                   + " has wrong shape : " + ConvertDimShapeToString(fShapeX));
@@ -105,10 +103,6 @@ public:
       fShapeY = fShapeX;
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShapeY);
 
-      // Fuse scale with the variance over channels only -> a [C] array, instead of materializing
-      // the weights to the full [N,C,...] tensor (which would bake the batch size and block any dynamic shape).
-      //The batch and spatial dims are handled by the runtime index math in the
-      // kernel / Generate.
       auto original_S = model.GetInitializedTensorData(fNScale);
       auto original_V = model.GetInitializedTensorData(fNVar);
       auto shape_S = model.GetTensorShape(fNScale);
@@ -117,13 +111,11 @@ public:
       }
       size_t channels = shape_S[0];
 
-      //TODO: only float is fused here (mirrors ROOT); add a double branch if needed
       if (fType == "float") {
          float *original_scale_ptr = static_cast<float *>(original_S.get());
          float *original_var_ptr   = static_cast<float *>(original_V.get());
          float *fused_scale_data   = new float[channels];
          for (size_t i = 0; i < channels; i++) {
-            // scale * (1 / sqrt(variance + epsilon))
             fused_scale_data[i] = original_scale_ptr[i] / std::sqrt(original_var_ptr[i] + fepsilon);
          }
          std::shared_ptr<void> fused_scale_ptr(fused_scale_data, std::default_delete<float[]>());
@@ -147,8 +139,6 @@ public:
          spatial_dim = ConvertDimShapeToLength(spatialShape);
       }
 
-      // Per-channel affine over a [N, C, spatial] tensor. Weights stay [C] and are indexed by the
-      // channel c, so batch and spatial can be any (runtime) size.
       out << "\n\n//---- BatchNorm" << (fActivation == EActivationType::RELU ? " + ReLU " : " ") << opName << "\n";
       out << SP << "{\n";
       out << SP << "   size_t i = 0;\n";
@@ -173,8 +163,7 @@ public:
       return out.str();
    }
 
-   // base dynamic identifiers in the spatial dims (e.g. n_pf, n_sv), passed as
-   // size_t kernel args; CollectDimParams handles compound dims like std::max(...)
+   // symbolic names in the kernel index expressions, shared by the signature and the launch
    std::vector<std::string> GetGPUDynParams() const {
       std::vector<std::string> params;
       if (fShapeX.size() > 2) {
@@ -190,9 +179,8 @@ public:
          throw std::runtime_error("SOFIE BatchNormalization called to Generate without being initialized first");
 
       std::string totalElements = ConvertDimShapeToLength(fShapeY);
-      std::string channels      = fShapeX[1].GetVal();   // per-channel weight count (static)
+      std::string channels      = fShapeX[1].GetVal();
 
-      // spatial_dim = product of dims after [N, C]; "1" for a rank-2 input.
       std::string spatial_dim = "1";
       std::vector<Dim> spatialShape;
       if (fShapeX.size() > 2) {
@@ -220,7 +208,6 @@ public:
       op += SP + SP + SP + "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
 
       op += SP + SP + SP + "for (std::size_t i = global_thread_idx; i < totalElements; i += grid_thread_extent) {\n";
-      // weights are per-channel [C]; derive the channel from the flat index (layout [N, C, spatial]).
       op += SP + SP + SP + SP + "std::size_t const c = (i / (" + spatial_dim + ")) % (" + channels + ");\n";
       op += SP + SP + SP + SP + "T val = (X[i] - mean[c]) * fused_scale[c] + bias[c];\n";
       if (fActivation == EActivationType::RELU)

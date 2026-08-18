@@ -64,7 +64,6 @@ public:
       }
       ETensorType type = ConvertStringToType(fType);
 
-      // classify each input: 0 = intermediate (runtime), 1 = constant/initialized, 2 = shape tensor (symbolic)
       auto analyzeInput = [&](const std::string & tName, T & value, Dim & dim) {
          int ftype = 0;
          if (model.IsInitializedTensor(tName)) {
@@ -95,11 +94,9 @@ public:
       int res2 = analyzeInput(fNLimit, limit_value, limit_dim);
       int res3 = analyzeInput(fNDelta, delta_value, delta_dim);
       if (res1 == 0 || res2 == 0 || res3 == 0) {
-         // cannot know size at compile time - need to compute fully at run time
          fShape = {Dim{"range_size_" + fNStart + "_" + fNLimit}};
          model.AddDynamicTensor(fNOutput, type, fShape);
       } else if (res1 == 1 && res2 == 1 && res3 == 1) {
-         // all inputs known: output is a constant tensor
          size_t number_of_elements = std::max(static_cast<int>(std::ceil((limit_value - start_value) / delta_value )) , 0 );
          fIsOutputConstant = true;
          std::vector<T> output(number_of_elements);
@@ -110,7 +107,6 @@ public:
          model.AddConstantTensor(fNOutput,shape, output.data());
          fShape = ConvertShapeToDim(shape);
       } else {
-         // mix of constant and shape-tensor inputs: derive the output length symbolically
          std::string start = (res1 == 1) ? std::to_string(start_value) : start_dim.GetVal();
          std::string limit = (res2 == 1) ? std::to_string(limit_value) : limit_dim.GetVal();
          std::string delta = (res3 == 1) ? std::to_string(delta_value) : delta_dim.GetVal();
@@ -147,12 +143,9 @@ public:
       }
    }
 
-   // Resolve the output-length variable name and its defining expression, shared by the
-   // CPU and GPU code generators.
    void GetRangeSize(std::string & outputSizeVar, std::string & outputSize) const {
       outputSize = fShape[0].param;
       if (outputSize.find("range_size") != std::string::npos) {
-         // fully run-time: read the scalar input tensors at run time
          outputSizeVar = outputSize;
          outputSize = "static_cast<size_t>(std::max(std::ceil((static_cast<float>(*tensor_" + fNLimit +
                 ") - static_cast<float>(*tensor_" + fNStart + ")) / static_cast<float>(*tensor_" + fNDelta + ")), 0.0f))";
@@ -214,9 +207,8 @@ public:
 
       std::string outputSize = fShape[0].param;
       if (outputSize.find("range_size") != std::string::npos) {
-         // fully run-time size (all-runtime scalar limits) needs a device->host scalar read;
-         // not yet supported on the alpaka backend. Skip GPU codegen for this case - the
-         // symbolic/shape-tensor case below (what ParticleNet needs) is fully handled.
+         // the size expression dereferences the scalar inputs on the host, which on GPU
+         // would need a device->host read; not supported yet, so skip GPU codegen here
          out << SP << "// Range: fully run-time size not supported on alpaka backend (op skipped)\n";
          return out.str();
       }
