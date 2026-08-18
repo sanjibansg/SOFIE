@@ -325,6 +325,10 @@
 #include "Split_2_FromONNX.hxx"
 
 #include "ScatterElements_FromONNX.hxx"
+#include "ScatterND_Ex1_FromONNX.hxx"
+#include "ScatterND_Ex2_FromONNX.hxx"
+#include "ScatterND_NegativeIndices_FromONNX.hxx"
+#include "ScatterND_2D_FromONNX.hxx"
 
 #include "gtest/gtest.h"
 
@@ -3239,4 +3243,76 @@ TEST(ONNX, ScatterElements)
    for (size_t i = 0; i < output.size(); ++i) {
       EXPECT_LE(std::abs(output[i] - correct_output[i]), DEFAULT_TOLERANCE);
    }
+}
+
+// ── ScatterND tests ────────────────────────────────────────────────────────
+
+TEST(ONNX, ScatterND_Ex1)
+{
+   // 1-D data, element-wise scatter (from ONNX spec)
+   std::vector<float>   data    = {1, 2, 3, 4, 5, 6, 7, 8};
+   std::vector<int64_t> indices = {4, 3, 1, 7};   // shape [4,1]
+   std::vector<float>   updates = {9, 10, 11, 12};
+   std::vector<float>   correct = {1, 11, 3, 10, 9, 6, 7, 12};
+
+   SOFIE_ScatterND_Ex1::Session s("ScatterND_Ex1_FromONNX.dat");
+   auto output = s.infer(data.data(), indices.data(), updates.data());
+
+   EXPECT_EQ(output.size(), correct.size());
+   for (size_t i = 0; i < correct.size(); ++i)
+      EXPECT_LE(std::abs(output[i] - correct[i]), DEFAULT_TOLERANCE);
+}
+
+TEST(ONNX, ScatterND_Ex2)
+{
+   // 3-D data, scatter 2-D slices (k=1, sliceSize=16)
+   std::vector<float>   data(64, 0.f);   // zeros [4,4,4]
+   std::vector<int64_t> indices = {0, 2};   // shape [2,1]
+   std::vector<float>   updates = {
+      1, 2, 3, 4, 5, 6, 7, 8, 8, 7, 6, 5, 4, 3, 2, 1,
+      1, 2, 3, 4, 5, 6, 7, 8, 8, 7, 6, 5, 4, 3, 2, 1
+   };  // shape [2,4,4]
+
+   std::vector<float> correct(64, 0.f);
+   for (int j = 0; j < 16; ++j) correct[j]      = updates[j];       // data[0,:,:]
+   for (int j = 0; j < 16; ++j) correct[32 + j] = updates[16 + j];  // data[2,:,:]
+
+   SOFIE_ScatterND_Ex2::Session s("ScatterND_Ex2_FromONNX.dat");
+   auto output = s.infer(data.data(), indices.data(), updates.data());
+
+   EXPECT_EQ(output.size(), correct.size());
+   for (size_t i = 0; i < correct.size(); ++i)
+      EXPECT_LE(std::abs(output[i] - correct[i]), DEFAULT_TOLERANCE);
+}
+
+TEST(ONNX, ScatterND_NegativeIndices)
+{
+   // Negative indices: -1 maps to last element (index 4), -3 maps to index 2
+   std::vector<float>   data    = {0, 0, 0, 0, 0};   // zeros [5]
+   std::vector<int64_t> indices = {-1, -3};           // shape [2,1]
+   std::vector<float>   updates = {99, 88};
+   std::vector<float>   correct = {0, 0, 88, 0, 99};
+
+   SOFIE_ScatterND_NegativeIndices::Session s("ScatterND_NegativeIndices_FromONNX.dat");
+   auto output = s.infer(data.data(), indices.data(), updates.data());
+
+   EXPECT_EQ(output.size(), correct.size());
+   for (size_t i = 0; i < correct.size(); ++i)
+      EXPECT_LE(std::abs(output[i] - correct[i]), DEFAULT_TOLERANCE);
+}
+
+TEST(ONNX, ScatterND_2D)
+{
+   // 2-D data, element-wise scatter (k == r == 2)
+   std::vector<float>   data    = {0, 0, 0, 0, 0, 0, 0, 0, 0};   // zeros [3,3]
+   std::vector<int64_t> indices = {0, 2, 1, 0, 2, 1};   // shape [3,2]
+   std::vector<float>   updates = {5, 6, 7};
+   std::vector<float>   correct = {0, 0, 5,  6, 0, 0,  0, 7, 0};
+
+   SOFIE_ScatterND_2D::Session s("ScatterND_2D_FromONNX.dat");
+   auto output = s.infer(data.data(), indices.data(), updates.data());
+
+   EXPECT_EQ(output.size(), correct.size());
+   for (size_t i = 0; i < correct.size(); ++i)
+      EXPECT_LE(std::abs(output[i] - correct[i]), DEFAULT_TOLERANCE);
 }

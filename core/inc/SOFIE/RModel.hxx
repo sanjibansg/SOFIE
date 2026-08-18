@@ -28,6 +28,8 @@ private:
    bool fIsSubGraph = false;
    bool fUseVDT = false;
    bool fProfile = false;
+   bool fLowRankFactorize = false;     // enable low rank factorization of eligible weight matrices (disabled by default)
+   float fLowRankRatio = 0.5f;         // rank of the factorization = ratio * min(rows, cols) of the weight matrix
    int fVerbose = 0;
    int fBatchSize = -1;
    long fReadPos = 0;  // reading file position
@@ -241,6 +243,8 @@ public:
    bool IsInitializedTensor(const std::string &name) const;
    // Check if a tensor is Constant (note a Constant tensor is also initialized)
    bool IsConstantTensor(const std::string &name) const;
+   // Check if a tensor is a weight tensor (initialized, not constant, and writable)
+   bool IsWeightTensor(const std::string &name) const;
    bool IsDynamicTensor(const std::string &name) const;
    // Check if tensor is a input dynamic tensor (without a specified shape, based on Sim structure
    bool IsDimInputTensor(const std::string &name) const;
@@ -372,7 +376,14 @@ public:
       fUseVDT = on;
    }
    bool UseVDT() const { return fUseVDT;}
-   
+
+   // Low rank factorization of eligible weight matrices (Gemm/MatMul). Disabled by default;
+   // enable by passing Options::kLowRankFactorize to Generate(). The rank used for each
+   // eligible weight matrix is fLowRankRatio * min(rows, cols), rounded down (min 1).
+   bool LowRankFactorize() const { return fLowRankFactorize; }
+   void SetLowRankRatio(float ratio) { fLowRankRatio = ratio; }
+   float LowRankRatio() const { return fLowRankRatio; }
+
 #ifdef SOFIE_SUPPORT_ROOT_BINARY
    // Use the ClassDef macro to allow definition of custom streaming
    ClassDefNV(RModel, 3);

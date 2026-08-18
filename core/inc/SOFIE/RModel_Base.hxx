@@ -30,6 +30,8 @@ enum class Options {
    kProfile = 0x20,
    kBinaryWeightFile = 0x40,
    kTextWeightFile = 0x80,
+   kLowRankFactorize = 0x100,
+   kKernelOnly = 0x200,
 };
 
 // Optimization levels inspired by ONNXRuntime.
@@ -71,6 +73,7 @@ protected:
    std::string fGC; // generated code
    bool fUseWeightFile = true;
    bool fUseSession = true;
+   bool fKernelOnly = false;
    bool fIsGNN = false;
    bool fIsGNNComponent = false;
 

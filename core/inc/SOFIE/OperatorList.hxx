@@ -30,6 +30,7 @@
 #include "SOFIE/ROperator_LayerNormalization.hxx"
 #include "SOFIE/ROperator_Expand.hxx"
 #include "SOFIE/ROperator_Gather.hxx"
+#include "SOFIE/ROperator_ScatterND.hxx"
 #include "SOFIE/ROperator_Swish.hxx"
 #include "SOFIE/ROperator_Erf.hxx"
 #include "SOFIE/ROperator_Elu.hxx"

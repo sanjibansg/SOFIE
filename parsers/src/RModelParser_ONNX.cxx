@@ -108,6 +108,7 @@ extern ParserFuncSignature ParseWhere;
 extern ParserFuncSignature ParseEinsum;
 extern ParserFuncSignature ParseRandom;
 extern ParserFuncSignature ParseScatterElements;
+extern ParserFuncSignature ParseScatterND;
 extern ParserFuncSignature ParseTrilu;
 extern ParserFuncSignature ParseAnd;
 extern ParserFuncSignature ParseOr;
@@ -408,6 +409,7 @@ RModelParser_ONNX::RModelParser_ONNX() noexcept : fOperatorsMapImpl(std::make_un
    RegisterOperator("RandomUniform", ParseRandom);
    RegisterOperator("RandomUniformLike", ParseRandom);
    RegisterOperator("ScatterElements", ParseScatterElements);
+   RegisterOperator("ScatterND", ParseScatterND);
    RegisterOperator("Trilu", ParseTrilu);
    // Logical operators
    RegisterOperator("And", ParseAnd);

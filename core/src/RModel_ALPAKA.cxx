@@ -707,7 +707,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       SOFIE::OperatorKind::UNARY_SOFTPLUS,
       SOFIE::OperatorKind::UNARY_ATAN,
       SOFIE::OperatorKind::UNARY_FLOOR,
-      SOFIE::OperatorKind::NOT
+      SOFIE::OperatorKind::NOT,
+      SOFIE::OperatorKind::SELU
    };
 
    bool OpNeedsBlas = false;
@@ -774,6 +775,9 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    fGC += "        alpaka::Vec<TDim, TIdx>::all(blockSz),\n";
    fGC += "        alpaka::Vec<TDim, TIdx>::all(TIdx{1}));\n";
    fGC += "}\n\n";
+
+   if (fKernelOnly)
+      return;
 
    // define the Session struct (for GNN this is generated in RModel_GNN)
   fGC += "\n\ntemplate <typename tagAcc>\n";
@@ -881,11 +885,15 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          ROperator *op = (loweredIt != fLoweredOperators.end()) ? loweredIt->second.get() : fOperators[id].get();
          fGC += op->GenerateInitCode_GPU_ALPAKA();
          if (op->GetKind() == OperatorKind::GEMM || op->GetKind() == OperatorKind::CONV) {
-            // GetBlasConfig() returns "" for ops that use gemmStridedBatched
-            // (legacy cuBLAS path, no cuBLASLt layout needed).
-            auto blasCfg = op->GetBlasConfig();
-            if (!blasCfg.empty())
-               fGC += "\nblas.addLayoutConfig("+blasCfg+");\n";
+            // GetBlasConfigs() returns one entry per distinct GEMM call shape the
+            // operator's Generate_GPU_ALPAKA() will issue (usually one; a low-rank
+            // factorized Gemm issues two chained calls of different shapes and so
+            // needs two configs registered). Empty entries (e.g. gemmStridedBatched,
+            // legacy cuBLAS path) need no cuBLASLt layout registration.
+            for (auto &blasCfg : op->GetBlasConfigs()) {
+               if (!blasCfg.empty())
+                  fGC += "\nblas.addLayoutConfig("+blasCfg+");\n";
+            }
          }
       }
 
@@ -954,6 +962,12 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
    if (fProfile)
       RModelProfilerGPU::AddNeededStdLibs(*this);
 
+   if (static_cast<std::underlying_type_t<Options>>(Options::kKernelOnly) & options) {
+      fKernelOnly = true;
+      fUseSession = false;
+      fUseWeightFile = false;
+      fWeightFile = WeightFileType::None;
+   }
    if (static_cast<std::underlying_type_t<Options>>(Options::kNoSession) & options) {
       fUseSession = false;
       fWeightFile = WeightFileType::None;
@@ -986,6 +1000,9 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
    if (static_cast<std::underlying_type_t<Options>>(Options::kGNN) & options ||
        static_cast<std::underlying_type_t<Options>>(Options::kGNNComponent) & options)
       throw std::runtime_error("SOFIE GPU does not yet supports GNN Inference.");
+
+   if (static_cast<std::underlying_type_t<Options>>(Options::kLowRankFactorize) & options)
+      fLowRankFactorize = true;
 
    Initialize(batchSize, verbose);
    const auto explicitFileWeightPolicy =

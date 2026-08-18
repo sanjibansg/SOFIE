@@ -66,6 +66,36 @@ set(EMIT_CAPTURES "${ALL_CAPTURES}")
 configure_file(EmitFromONNX.cxx.in EmitFromONNX_all.cxx @ONLY)
 configure_file(EmitFromONNX_GPU_ALPAKA.cxx.in EmitFromONNX_GPU_ALPAKA_all.cxx @ONLY)
 
+ROOTTEST_GENERATE_EXECUTABLE(
+  emitLowRankModels
+  LowRankModelGenerator.cxx
+  LIBRARIES SOFIE_core
+  FIXTURES_SETUP sofie-lowrank-emit-build
+)
+
+ROOTTEST_ADD_TEST(
+  EmitLowRankModels
+  COMMAND ./emitLowRankModels
+  FIXTURES_REQUIRED sofie-lowrank-emit-build
+  FIXTURES_SETUP sofie-lowrank-emit
+)
+
+ROOTTEST_GENERATE_EXECUTABLE(
+  TestLowRankFactorization
+  TestLowRankFactorization.cxx
+  LIBRARIES SOFIE_core GTest::gtest GTest::gtest_main BLAS::BLAS
+  FIXTURES_REQUIRED sofie-lowrank-emit
+  FIXTURES_SETUP sofie-test-lowrank-build
+)
+
+target_include_directories(TestLowRankFactorization PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+ROOTTEST_ADD_TEST(
+  TestLowRankFactorization
+  EXEC ./TestLowRankFactorization
+  FIXTURES_REQUIRED sofie-lowrank-emit;sofie-test-lowrank-build
+)
+
 ############################################################################
 # Alpaka tests
 ############################################################################
@@ -150,6 +180,8 @@ if (ENABLE_ALPAKA_TESTS)
       alpaka/TestAlpakaShapeIndexing.cxx
       alpaka/TestAlpakaGNN.cxx
       alpaka/TestAlpakaPool.cxx
+      alpaka/TestAlpakaLowRank.cxx
+      alpaka/TestAlpakaKernelOnly.cxx
     )
 
     set_source_files_properties(
@@ -162,7 +194,7 @@ if (ENABLE_ALPAKA_TESTS)
       TestCustomModelsFromONNXForAlpakaCuda
       ${ALPAKA_CUDA_TEST_SOURCES}
       LIBRARIES SOFIE_quantization GTest::gtest GTest::gtest_main
-      FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka
+      FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka;sofie-lowrank-emit
       FIXTURES_SETUP sofie-test-models-onnx-alpaka-build
     )
 
@@ -234,7 +266,7 @@ if (ENABLE_ALPAKA_TESTS)
     ROOTTEST_ADD_TEST(
       TestCustomModelsFromONNXForAlpakaCuda
       EXEC ./TestCustomModelsFromONNXForAlpakaCuda
-      FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka
+      FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka;sofie-lowrank-emit;sofie-test-models-onnx-alpaka-build
     )
 
     ROOTTEST_ADD_TEST(

@@ -51,7 +51,8 @@ enum class OperatorKind {
    UNARY_SOFTPLUS=28,
    UNARY_ATAN=29,
    UNARY_FLOOR=30,
-   POOL=32
+   POOL=32,
+   SELU=33
 };
 
 inline const char* toString(OperatorKind kind) {
@@ -123,6 +124,15 @@ public:
    virtual std::string Header() { return "";}
    virtual std::string GetFusableOutputTensorName() { return "";}
    virtual std::string GetBlasConfig() { return ""; }
+   // most operators issue a single cuBLASLt GEMM call and so need at most one layout
+   // config; operators that chain multiple GEMM calls of different shapes (e.g. a
+   // low-rank factorized Gemm) override this to register one config per call.
+   virtual std::vector<std::string> GetBlasConfigs() {
+      auto c = GetBlasConfig();
+      if (c.empty())
+         return {};
+      return {c};
+   }
    virtual void UpdateFusableTensorName(std::string, const std::function<void(const std::string&)>& removal_func){ return;};
 
    // Semantic graph-analysis hooks
