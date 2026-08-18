@@ -11,7 +11,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-BACKENDS = ("sofie", "ort", "tensorrt")
+BACKENDS = ("sofie", "ort", "tensorrt", "pytorch_aot")
 
 METRICS = {
     "duration_us": ("gpu__time_duration.sum", "gpu__time_duration.avg"),

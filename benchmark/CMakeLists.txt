@@ -23,6 +23,8 @@ option(SOFIE_BENCHMARK_ORT
 
 option(SOFIE_BENCHMARK_TRT "Enable TensorRT benchmark comparison" OFF)
 
+option(SOFIE_BENCHMARK_AOT "Enable PyTorch AOTInductor benchmark comparison" OFF)
+
 option(SOFIE_BENCHMARK_PROFILE
     "Enable per-operator GPU profiling (per-op timing + memory breakdown). \
 Mutually exclusive with throughput benchmarking — rebuild without this flag \
@@ -219,6 +221,11 @@ if(SOFIE_BENCHMARK_TRT)
     find_library(NVINFER_PLUGIN_LIBRARY nvinfer_plugin REQUIRED)
 endif()
 
+if(SOFIE_BENCHMARK_AOT)
+    find_package(Torch REQUIRED)
+    message(STATUS "SOFIE Benchmark: PyTorch AOTInductor comparison enabled")
+endif()
+
 ################################################################################
 # Build per-model strings for configure_file
 ################################################################################
@@ -237,6 +244,7 @@ set(_EMIT_BLOCK
 
 set(BENCHMARK_EMIT_CAPTURES        "")
 set(BENCHMARK_BENCH_HEADERS        "")
+set(BENCHMARK_AOT_META_HEADERS     "")
 set(BENCHMARK_FWD_DECLS            "")
 set(BENCHMARK_SINGLE_MODEL_CASES   "")
 set(BENCHMARK_SPAWN_CALLS          "")
@@ -248,9 +256,10 @@ foreach(ONNX_FILE ${BENCHMARK_ONNX_MODELS})
 
     string(REGEX REPLACE "[^A-Za-z0-9]" "_" MODEL_CPPNAME "${MODEL_NAME}")
 
-    set(GEN_HXX   "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_GPU_ALPAKA.hxx")
-    set(GEN_BENCH "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_bench.hxx")
-    list(APPEND GENERATED_HEADERS "${GEN_HXX}" "${GEN_BENCH}")
+    set(GEN_HXX      "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_GPU_ALPAKA.hxx")
+    set(GEN_BENCH    "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_bench.hxx")
+    set(GEN_AOT_META "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_aot_meta.hxx")
+    list(APPEND GENERATED_HEADERS "${GEN_HXX}" "${GEN_BENCH}" "${GEN_AOT_META}")
 
     string(REPLACE "@1@" "${ONNX_FILE}"  _emit_cap "${_EMIT_BLOCK}")
     string(REPLACE "@2@" "${MODEL_NAME}" _emit_cap "${_emit_cap}")
@@ -258,6 +267,9 @@ foreach(ONNX_FILE ${BENCHMARK_ONNX_MODELS})
 
     string(APPEND BENCHMARK_BENCH_HEADERS
         "#include \"${MODEL_NAME}_bench.hxx\"\n")
+
+    string(APPEND BENCHMARK_AOT_META_HEADERS
+            "#include \"${MODEL_NAME}_aot_meta.hxx\"\n")
 
     # Forward declaration for the main TU (function defined in per-model .cu)
     string(APPEND BENCHMARK_FWD_DECLS
@@ -275,6 +287,10 @@ foreach(ONNX_FILE ${BENCHMARK_ONNX_MODELS})
         "#ifdef SOFIE_BENCHMARK_TRT\n"
         "        if (run_trt)\n"
         "            BenchmarkTRT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations, profile);\n"
+        "#endif\n"
+        "#ifdef SOFIE_BENCHMARK_AOT\n"
+        "        if (run_aot)\n"
+        "            BenchmarkAOT_GPU(\"${BENCHMARK_MODEL_DIR}/aot_models/${MODEL_NAME}.pt2\", \"${MODEL_NAME}\", GetAOTInputSpecs_${MODEL_CPPNAME}(), warmup, iterations, profile);\n"
         "#endif\n"
         "        return 0;\n"
         "    }\n"
@@ -340,7 +356,10 @@ foreach(ONNX_FILE ${BENCHMARK_ONNX_MODELS})
             "        if (run_trt)\n"
             "            RunBackend(\"--trt-only\", \"tensorrt\");\n"
             "#endif\n"
-
+            "#ifdef SOFIE_BENCHMARK_AOT\n"
+            "        if (run_aot)\n"
+            "            RunBackend(\"--aot-only\", \"pytorch_aot\");\n"
+            "#endif\n"
             "    }\n"
     )
 
@@ -458,6 +477,7 @@ target_compile_definitions(sofie_benchmark PRIVATE
     ALPAKA_HAS_STD_ATOMIC_REF
     $<$<BOOL:${SOFIE_ORT_FOUND}>:SOFIE_BENCHMARK_ORT>
     $<$<BOOL:${SOFIE_BENCHMARK_TRT}>:SOFIE_BENCHMARK_TRT>
+    $<$<BOOL:${SOFIE_BENCHMARK_AOT}>:SOFIE_BENCHMARK_AOT>
     $<$<BOOL:${SOFIE_BENCHMARK_PROFILE}>:SOFIE_BENCHMARK_PROFILE>
     $<$<BOOL:${SOFIE_NVML_LIBRARY}>:SOFIE_BENCH_HAVE_NVML>
 )
@@ -491,6 +511,7 @@ target_link_libraries(sofie_benchmark PRIVATE
     $<$<BOOL:${SOFIE_BENCHMARK_TRT}>:${NVINFER_LIBRARY}>
     $<$<BOOL:${SOFIE_BENCHMARK_TRT}>:${NVONNXPARSER_LIBRARY}>
     $<$<BOOL:${SOFIE_BENCHMARK_TRT}>:${NVINFER_PLUGIN_LIBRARY}>
+    $<$<BOOL:${SOFIE_BENCHMARK_AOT}>:${TORCH_LIBRARIES}>
 )
 if(SOFIE_ORT_FOUND)
     message(STATUS "SOFIE Benchmark: target 'sofie_benchmark' configured "
@@ -596,9 +617,10 @@ if(SOFIE_BENCHMARK_LARGE)
             get_filename_component(MODEL_NAME "${ONNX_FILE}" NAME_WE)
             string(REGEX REPLACE "[^A-Za-z0-9]" "_" MODEL_CPPNAME "${MODEL_NAME}")
 
-            set(GEN_HXX   "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_GPU_ALPAKA.hxx")
-            set(GEN_BENCH "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_bench.hxx")
-            list(APPEND LARGE_GENERATED_HEADERS "${GEN_HXX}" "${GEN_BENCH}")
+            set(GEN_HXX      "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_GPU_ALPAKA.hxx")
+            set(GEN_BENCH    "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_bench.hxx")
+            set(GEN_AOT_META "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_aot_meta.hxx")
+            list(APPEND LARGE_GENERATED_HEADERS "${GEN_HXX}" "${GEN_BENCH}" "${GEN_AOT_META}")
 
             string(REPLACE "@1@" "${ONNX_FILE}"  _ec "${_EMIT_BLOCK}")
             string(REPLACE "@2@" "${MODEL_NAME}" _ec "${_ec}")
