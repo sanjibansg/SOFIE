@@ -1,5 +1,5 @@
-#include "SOFIE/RQuantization_Storage.hxx"
-#include "SOFIE/RQuantization_DenseLinear.hxx"
+#include "SOFIE/quantization/RQuantization_Storage.hxx"
+#include "SOFIE/quantization/RQuantization_DenseLinear.hxx"
 #include "SOFIE/RModel.hxx"
 
 #include <cstring>

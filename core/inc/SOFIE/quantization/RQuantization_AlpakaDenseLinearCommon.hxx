@@ -4,8 +4,8 @@
 // cuBLASLt scaffolding both dense-linear precisions sit on: owned handles, layouts, heuristic
 // selection, the autotune walk, the deferred-epilogue holder, and the precision-agnostic unpad.
 
-#include "SOFIE/RQuantization_AlpakaCommon.hxx"
-#include "SOFIE/RQuantization_AlpakaPrimitives.hxx"
+#include "SOFIE/quantization/RQuantization_AlpakaCommon.hxx"
+#include "SOFIE/quantization/RQuantization_AlpakaPrimitives.hxx"
 
 #include <algorithm>
 #include <cstddef>

@@ -4,7 +4,7 @@
 // The int8 dense-linear path: input quantization and padding kernels, the epilogue value/code
 // arithmetic and its kernels, and the cuBLASLt state and call that drive them.
 
-#include "SOFIE/RQuantization_AlpakaDenseLinearCommon.hxx"
+#include "SOFIE/quantization/RQuantization_AlpakaDenseLinearCommon.hxx"
 
 namespace SOFIE {
 

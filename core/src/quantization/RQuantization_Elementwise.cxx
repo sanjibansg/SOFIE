@@ -1,9 +1,9 @@
-#include "SOFIE/RQuantization_Elementwise.hxx"
-#include "SOFIE/RQuantization_Analysis.hxx"
-#include "SOFIE/RQuantization_Storage.hxx"
+#include "SOFIE/quantization/RQuantization_Elementwise.hxx"
+#include "SOFIE/quantization/RQuantization_Analysis.hxx"
+#include "SOFIE/quantization/RQuantization_Storage.hxx"
 #include "SOFIE/RModel.hxx"
 #include "SOFIE/ROperator_BasicBinary.hxx"
-#include "SOFIE/ROperator_QuantizedElementwise.hxx"
+#include "SOFIE/quantization/ROperator_QuantizedElementwise.hxx"
 
 #include <iostream>
 #include <optional>

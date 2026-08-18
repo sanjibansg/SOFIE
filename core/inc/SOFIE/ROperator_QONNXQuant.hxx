@@ -5,7 +5,7 @@
 #include "SOFIE/ROperator.hxx"
 #include "SOFIE/SOFIE_common.hxx"
 #include "SOFIE/RQuantization.hxx"
-#include "SOFIE/RQuantization_Parameters.hxx"
+#include "SOFIE/quantization/RQuantization_Parameters.hxx"
 
 #include <cmath>
 #include <limits>

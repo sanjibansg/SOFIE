@@ -11,7 +11,7 @@
 
 #include "SOFIE/RModel.hxx"
 #include "SOFIE/RQuantization.hxx"
-#include "SOFIE/RQuantization_Pipeline.hxx"
+#include "SOFIE/quantization/RQuantization_Pipeline.hxx"
 
 #include "gtest/gtest.h"
 

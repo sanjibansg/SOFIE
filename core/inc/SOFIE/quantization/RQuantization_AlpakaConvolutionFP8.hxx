@@ -4,7 +4,7 @@
 // The FP8 (E4M3) Conv paths: the verbatim code fetch, the FP8 scatter and depthwise kernels,
 // and the depthwise and cuBLASLt calls.
 
-#include "SOFIE/RQuantization_AlpakaConvolutionCommon.hxx"
+#include "SOFIE/quantization/RQuantization_AlpakaConvolutionCommon.hxx"
 
 namespace SOFIE {
 

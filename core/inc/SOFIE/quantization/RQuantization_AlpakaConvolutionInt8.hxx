@@ -4,7 +4,7 @@
 // The int8 Conv paths: the tiled im2col fetch, scatter, the quantized and float epilogues, and
 // the depthwise and affine kernels, with the three calls that drive them.
 
-#include "SOFIE/RQuantization_AlpakaConvolutionCommon.hxx"
+#include "SOFIE/quantization/RQuantization_AlpakaConvolutionCommon.hxx"
 
 namespace SOFIE {
 

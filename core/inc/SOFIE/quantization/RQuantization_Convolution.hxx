@@ -3,8 +3,8 @@
 
 #include "SOFIE/ROperator_Conv.hxx"
 #include "SOFIE/RQuantization.hxx"
-#include "SOFIE/RQuantization_Analysis.hxx"
-#include "SOFIE/RQuantization_Storage.hxx"
+#include "SOFIE/quantization/RQuantization_Analysis.hxx"
+#include "SOFIE/quantization/RQuantization_Storage.hxx"
 
 #include <cstddef>
 #include <functional>

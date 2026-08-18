@@ -4,8 +4,8 @@
 #include "SOFIE/ROperator.hxx"
 #include "SOFIE/SOFIE_common.hxx"
 #include "SOFIE/RQuantization.hxx"
-#include "SOFIE/ROperator_QuantizedMatrix.hxx"
-#include "SOFIE/ROperator_QuantizedGemm.hxx"
+#include "SOFIE/quantization/ROperator_QuantizedMatrix.hxx"
+#include "SOFIE/quantization/ROperator_QuantizedGemm.hxx"
 
 #include <cmath>
 #include <cstdint>

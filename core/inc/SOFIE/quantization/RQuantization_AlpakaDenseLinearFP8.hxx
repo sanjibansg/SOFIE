@@ -4,7 +4,7 @@
 // The FP8 (E4M3) dense-linear path: carrier and capability mapping, the cuBLASLt FP8 state and
 // its descriptor build, the bias epilogue and padded-output slice, and the call.
 
-#include "SOFIE/RQuantization_AlpakaDenseLinearCommon.hxx"
+#include "SOFIE/quantization/RQuantization_AlpakaDenseLinearCommon.hxx"
 
 namespace SOFIE {
 

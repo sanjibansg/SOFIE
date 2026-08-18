@@ -5,7 +5,7 @@
 #include "SOFIE/RModelExtension.hxx"
 #include "SOFIE/ROperator.hxx"
 #include "SOFIE/RQuantization.hxx"
-#include "SOFIE/RQuantization_Lowering.hxx"
+#include "SOFIE/quantization/RQuantization_Lowering.hxx"
 #include "SOFIE/SOFIE_common.hxx"
 
 #include <cstddef>

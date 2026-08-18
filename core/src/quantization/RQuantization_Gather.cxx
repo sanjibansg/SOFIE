@@ -1,10 +1,10 @@
-#include "SOFIE/RQuantization_Gather.hxx"
-#include "SOFIE/RQuantization_Analysis.hxx"
-#include "SOFIE/RQuantization_Parameters.hxx"
-#include "SOFIE/RQuantization_Storage.hxx"
+#include "SOFIE/quantization/RQuantization_Gather.hxx"
+#include "SOFIE/quantization/RQuantization_Analysis.hxx"
+#include "SOFIE/quantization/RQuantization_Parameters.hxx"
+#include "SOFIE/quantization/RQuantization_Storage.hxx"
 #include "SOFIE/RModel.hxx"
 #include "SOFIE/ROperator_Gather.hxx"
-#include "SOFIE/ROperator_QuantizedGather.hxx"
+#include "SOFIE/quantization/ROperator_QuantizedGather.hxx"
 
 #include <iostream>
 #include <numeric>

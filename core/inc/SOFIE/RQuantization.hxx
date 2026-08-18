@@ -1,7 +1,7 @@
 #ifndef SOFIE_RQUANTIZATION
 #define SOFIE_RQUANTIZATION
 
-#include "SOFIE/RQuantization_ConvolutionTypes.hxx"
+#include "SOFIE/quantization/RQuantization_ConvolutionTypes.hxx"
 
 #include <algorithm>
 #include <cmath>
@@ -307,7 +307,7 @@ inline std::int64_t QuantizeScalarToIntegerGrid(float value, const QuantizationI
    return quantized;
 }
 
-#include "SOFIE/RQuantization_Lowering.hxx"
+#include "SOFIE/quantization/RQuantization_Lowering.hxx"
 
 enum class EQuantizedEpilogueKind {
    None = 0,
@@ -333,7 +333,7 @@ struct QuantizedEpilogue {
    std::optional<std::size_t> addOpIndex;
 };
 
-#include "SOFIE/RQuantization_DenseLinearTypes.hxx"
+#include "SOFIE/quantization/RQuantization_DenseLinearTypes.hxx"
 
 // Fields every lowered region carries: the emitted tensor, the float input source
 // (Gather keys on indices and leaves it empty), and the lowering verdict with its reason.

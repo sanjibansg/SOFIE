@@ -22,8 +22,8 @@
 #include "SOFIE/ROperator_QONNXQuant.hxx"
 #include "SOFIE/ROperator_Gemm.hxx"
 #include "SOFIE/ROperator_Relu.hxx"
-#include "SOFIE/RQuantization_DenseLinear.hxx"
-#include "SOFIE/RQuantization_Storage.hxx"
+#include "SOFIE/quantization/RQuantization_DenseLinear.hxx"
+#include "SOFIE/quantization/RQuantization_Storage.hxx"
 #include "SOFIE/RWeightFile.hxx"
 #include "SOFIE/SOFIE_QuantizedAlpaka.hxx"
 

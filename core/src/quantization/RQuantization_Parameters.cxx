@@ -1,4 +1,4 @@
-#include "SOFIE/RQuantization_Parameters.hxx"
+#include "SOFIE/quantization/RQuantization_Parameters.hxx"
 #include "SOFIE/RModel.hxx"
 
 #include <cmath>

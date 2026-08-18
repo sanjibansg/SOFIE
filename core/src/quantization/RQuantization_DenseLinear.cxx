@@ -1,5 +1,5 @@
-#include "SOFIE/RQuantization_DenseLinear.hxx"
-#include "SOFIE/RQuantization_Analysis.hxx"
+#include "SOFIE/quantization/RQuantization_DenseLinear.hxx"
+#include "SOFIE/quantization/RQuantization_Analysis.hxx"
 
 #include <algorithm>
 #include <sstream>

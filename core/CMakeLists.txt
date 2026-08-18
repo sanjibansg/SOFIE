@@ -81,33 +81,39 @@ set(sources_headers
 # The quantization pipeline's headers. LinkDef names no quantization class, so keeping
 # them out of the base list leaves the base dictionary complete.
 set(sources_quantization_headers
-   SOFIE/ROperator_QuantizedConv.hxx
-   SOFIE/ROperator_QuantizedElementwise.hxx
-   SOFIE/ROperator_QuantizedGather.hxx
-   SOFIE/ROperator_QuantizedGemm.hxx
-   SOFIE/ROperator_QuantizedMatMul.hxx
-   SOFIE/ROperator_QuantizedMatrix.hxx
+   SOFIE/quantization/ROperator_QuantizedConv.hxx
+   SOFIE/quantization/ROperator_QuantizedElementwise.hxx
+   SOFIE/quantization/ROperator_QuantizedGather.hxx
+   SOFIE/quantization/ROperator_QuantizedGemm.hxx
+   SOFIE/quantization/ROperator_QuantizedMatMul.hxx
+   SOFIE/quantization/ROperator_QuantizedMatrix.hxx
    SOFIE/SOFIE_Quantized.hxx
    SOFIE/SOFIE_QuantizedAlpaka.hxx
-   SOFIE/RQuantization_AlpakaCommon.hxx
-   SOFIE/RQuantization_AlpakaPrimitives.hxx
-   SOFIE/RQuantization_AlpakaBroadcast.hxx
-   SOFIE/RQuantization_AlpakaDenseLinear.hxx
-   SOFIE/RQuantization_AlpakaConvolution.hxx
-   SOFIE/RQuantization_AlpakaElementwise.hxx
-   SOFIE/RQuantization_AlpakaGather.hxx
+   SOFIE/quantization/RQuantization_AlpakaCommon.hxx
+   SOFIE/quantization/RQuantization_AlpakaPrimitives.hxx
+   SOFIE/quantization/RQuantization_AlpakaBroadcast.hxx
+   SOFIE/quantization/RQuantization_AlpakaDenseLinear.hxx
+   SOFIE/quantization/RQuantization_AlpakaDenseLinearCommon.hxx
+   SOFIE/quantization/RQuantization_AlpakaDenseLinearInt8.hxx
+   SOFIE/quantization/RQuantization_AlpakaDenseLinearFP8.hxx
+   SOFIE/quantization/RQuantization_AlpakaConvolution.hxx
+   SOFIE/quantization/RQuantization_AlpakaConvolutionCommon.hxx
+   SOFIE/quantization/RQuantization_AlpakaConvolutionInt8.hxx
+   SOFIE/quantization/RQuantization_AlpakaConvolutionFP8.hxx
+   SOFIE/quantization/RQuantization_AlpakaElementwise.hxx
+   SOFIE/quantization/RQuantization_AlpakaGather.hxx
    SOFIE/RQuantization.hxx
-   SOFIE/RQuantization_Analysis.hxx
-   SOFIE/RQuantization_Convolution.hxx
-   SOFIE/RQuantization_ConvolutionTypes.hxx
-   SOFIE/RQuantization_DenseLinear.hxx
-   SOFIE/RQuantization_DenseLinearTypes.hxx
-   SOFIE/RQuantization_Elementwise.hxx
-   SOFIE/RQuantization_Gather.hxx
-   SOFIE/RQuantization_Lowering.hxx
-   SOFIE/RQuantization_Parameters.hxx
-   SOFIE/RQuantization_Pipeline.hxx
-   SOFIE/RQuantization_Storage.hxx
+   SOFIE/quantization/RQuantization_Analysis.hxx
+   SOFIE/quantization/RQuantization_Convolution.hxx
+   SOFIE/quantization/RQuantization_ConvolutionTypes.hxx
+   SOFIE/quantization/RQuantization_DenseLinear.hxx
+   SOFIE/quantization/RQuantization_DenseLinearTypes.hxx
+   SOFIE/quantization/RQuantization_Elementwise.hxx
+   SOFIE/quantization/RQuantization_Gather.hxx
+   SOFIE/quantization/RQuantization_Lowering.hxx
+   SOFIE/quantization/RQuantization_Parameters.hxx
+   SOFIE/quantization/RQuantization_Pipeline.hxx
+   SOFIE/quantization/RQuantization_Storage.hxx
 )
 
 list(TRANSFORM sources_headers PREPEND "inc/")
@@ -116,17 +122,17 @@ list(TRANSFORM sources_quantization_headers PREPEND "inc/")
 # The quantization pipeline's translation units. RModel_Quantization.cxx belongs here
 # despite defining RModel members, because base calls none of them.
 set(sources_quantization_cxx
-    src/RModel_Quantization.cxx
-    src/RQuantization_Analysis.cxx
-    src/RQuantization_Convolution.cxx
-    src/RQuantization_ConvolutionLowering.cxx
-    src/RQuantization_DenseLinear.cxx
-    src/RQuantization_DenseLinearPass.cxx
-    src/RQuantization_Elementwise.cxx
-    src/RQuantization_Gather.cxx
-    src/RQuantization_Parameters.cxx
-    src/RQuantization_Pipeline.cxx
-    src/RQuantization_Storage.cxx
+    src/quantization/RModel_Quantization.cxx
+    src/quantization/RQuantization_Analysis.cxx
+    src/quantization/RQuantization_Convolution.cxx
+    src/quantization/RQuantization_ConvolutionLowering.cxx
+    src/quantization/RQuantization_DenseLinear.cxx
+    src/quantization/RQuantization_DenseLinearPass.cxx
+    src/quantization/RQuantization_Elementwise.cxx
+    src/quantization/RQuantization_Gather.cxx
+    src/quantization/RQuantization_Parameters.cxx
+    src/quantization/RQuantization_Pipeline.cxx
+    src/quantization/RQuantization_Storage.cxx
 )
 
 set(sources_cxx

@@ -1,7 +1,7 @@
 #ifndef SOFIE_RQUANTIZATION_ALPAKA_BROADCAST
 #define SOFIE_RQUANTIZATION_ALPAKA_BROADCAST
 
-#include "SOFIE/RQuantization_AlpakaCommon.hxx"
+#include "SOFIE/quantization/RQuantization_AlpakaCommon.hxx"
 
 #include <cstddef>
 

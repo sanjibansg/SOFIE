@@ -3,8 +3,8 @@
 
 // Depends only on the shared utility layers: the requantize-clamp and status
 // primitives, and the row-major multidirectional broadcast primitive.
-#include "SOFIE/RQuantization_AlpakaPrimitives.hxx"
-#include "SOFIE/RQuantization_AlpakaBroadcast.hxx"
+#include "SOFIE/quantization/RQuantization_AlpakaPrimitives.hxx"
+#include "SOFIE/quantization/RQuantization_AlpakaBroadcast.hxx"
 
 #include <cstddef>
 #include <cstdint>

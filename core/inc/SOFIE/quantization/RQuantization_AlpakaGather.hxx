@@ -2,8 +2,8 @@
 #define SOFIE_RQUANTIZATION_ALPAKA_GATHER
 
 // Depends only on the shared primitive utility layer, not on a sibling family.
-#include "SOFIE/RQuantization_AlpakaCommon.hxx"
-#include "SOFIE/RQuantization_AlpakaPrimitives.hxx"
+#include "SOFIE/quantization/RQuantization_AlpakaCommon.hxx"
+#include "SOFIE/quantization/RQuantization_AlpakaPrimitives.hxx"
 
 #include <cstddef>
 #include <cstdint>

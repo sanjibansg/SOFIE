@@ -17,7 +17,7 @@
 #include "SOFIE/ROperator_Gemm.hxx"
 #include "SOFIE/ROperator_LeakyRelu.hxx"
 #include "SOFIE/ROperator_Relu.hxx"
-#include "SOFIE/RQuantization_Pipeline.hxx"
+#include "SOFIE/quantization/RQuantization_Pipeline.hxx"
 
 namespace SOFIE {
 

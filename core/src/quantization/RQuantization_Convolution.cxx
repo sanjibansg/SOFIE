@@ -1,5 +1,5 @@
-#include "SOFIE/RQuantization_Convolution.hxx"
-#include "SOFIE/RQuantization_Analysis.hxx"
+#include "SOFIE/quantization/RQuantization_Convolution.hxx"
+#include "SOFIE/quantization/RQuantization_Analysis.hxx"
 #include "SOFIE/RModel.hxx"
 
 #include <algorithm>

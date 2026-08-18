@@ -4,7 +4,7 @@
 #include "SOFIE/ROperator.hxx"
 #include "SOFIE/SOFIE_common.hxx"
 #include "SOFIE/RQuantization.hxx"
-#include "SOFIE/ROperator_QuantizedMatrix.hxx"
+#include "SOFIE/quantization/ROperator_QuantizedMatrix.hxx"
 #include "SOFIE/SOFIE_Quantized.hxx"
 
 #include <algorithm>

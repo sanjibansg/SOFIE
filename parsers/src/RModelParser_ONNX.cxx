@@ -1,7 +1,7 @@
 #include "SOFIE/RModelParser_ONNX.hxx"
 #include "SOFIE/RQuantization.hxx"
-#include "SOFIE/RQuantization_Pipeline.hxx"
-#include "SOFIE/RQuantization_Lowering.hxx"
+#include "SOFIE/quantization/RQuantization_Pipeline.hxx"
+#include "SOFIE/quantization/RQuantization_Lowering.hxx"
 #include "onnx_proto3.pb.h"
 
 #include <stdexcept>

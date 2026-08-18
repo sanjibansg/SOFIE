@@ -4,7 +4,7 @@
 // Conv pieces both precisions share: the padding-aware input index, the im2col kernel (generic
 // over its fetch policy), and the compute-capability probe.
 
-#include "SOFIE/RQuantization_AlpakaDenseLinear.hxx"
+#include "SOFIE/quantization/RQuantization_AlpakaDenseLinear.hxx"
 
 #include <algorithm>
 #include <cstddef>

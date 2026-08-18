@@ -2,8 +2,8 @@
 #define SOFIE_RQUANTIZATION_DENSELINEAR
 
 #include "SOFIE/RQuantization.hxx"
-#include "SOFIE/RQuantization_Analysis.hxx"
-#include "SOFIE/RQuantization_Storage.hxx"
+#include "SOFIE/quantization/RQuantization_Analysis.hxx"
+#include "SOFIE/quantization/RQuantization_Storage.hxx"
 
 #include <cstddef>
 #include <cstdint>
