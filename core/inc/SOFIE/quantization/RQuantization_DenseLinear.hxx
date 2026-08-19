@@ -103,6 +103,11 @@ QuantizedMatMulShapeAssessment AssessQuantizedMatMulShape(
 QuantizedDenseLinearBackendCapability AssessCublasLtDenseLinearCapability(
    const QuantizedDenseLinearOperands &operands);
 
+// The per-backend capability seam: discovery asks a backend whether it can execute the
+// operands. ALPAKA dispatches to the cuBLASLt assessor; other backends decline by name.
+QuantizedDenseLinearBackendCapability AssessQuantizedDenseLinearCapability(
+   EQuantizedBackend backend, const QuantizedDenseLinearOperands &operands);
+
 QuantizedDenseLinearBackendCapability
 SelectExecutableDenseLinearCapability(QuantizedDenseLinearBackendCapability capability);
 
@@ -118,7 +123,7 @@ QuantizedLoweringPlan MakeUnsupportedQuantizedMatMulPlan(const QuantizedDenseLin
 QuantizedLoweringPlan MakeUnsupportedLowPrecisionDenseLinearPlan(
    EQuantizedBackend backend, std::string reason, bool preservesSemantics,
    ELowPrecisionCarrier inputCarrier, ELowPrecisionCarrier weightCarrier,
-   ELowPrecisionCarrier outputCarrier, ELowPrecisionAccumulation accumulation,
+   ELowPrecisionCarrier outputCarrier,
    EQuantizedComputeProfile profile, std::string capabilityTag);
 QuantizedLoweringPlan MakeMatMulAlpakaTransposedWeightStoragePlan(
    const QuantizedDenseLinearRegion &region, const std::string &weightStorageTensor,

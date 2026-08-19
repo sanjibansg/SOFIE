@@ -221,10 +221,9 @@ void DiscoverQuantizedGatherRegions(QuantizationPassContext &context)
          alpaka.weightStorageTensor = dedicatedStorage;
          alpaka.inputStorage = EQuantizedStorageType::FP8E4M3;
          alpaka.weightStorage = EQuantizedStorageType::FP8E4M3;
-         alpaka.inputLowPrecisionCarrier = ELowPrecisionCarrier::FP8E4M3;
-         alpaka.weightLowPrecisionCarrier = ELowPrecisionCarrier::FP8E4M3;
-         alpaka.outputLowPrecisionCarrier = ELowPrecisionCarrier::Float32;
-         alpaka.lowPrecisionAccumulation = ELowPrecisionAccumulation::Float32;
+         alpaka.inputContract = CarrierOnlyOperandContract(ELowPrecisionCarrier::FP8E4M3);
+         alpaka.weightContract = CarrierOnlyOperandContract(ELowPrecisionCarrier::FP8E4M3);
+         alpaka.outputContract = CarrierOnlyOperandContract(ELowPrecisionCarrier::Float32);
          alpaka.capabilityTag = "cuda_fp8_gather_e4m3_f32";
       } else {
          const auto &tableQuant = *region.tableLowPrecision->affineQuantization;
@@ -239,11 +238,11 @@ void DiscoverQuantizedGatherRegions(QuantizationPassContext &context)
          alpaka.inputStorage = storage;
          alpaka.weightStorage = storage;
          alpaka.capabilityTag = "alpaka_int8_gather";
-         // Per-channel tables read a symmetric scale vector at runtime; protect
-         // it from pruning via the shared weight-scale contract.
+         // The table is the weight operand: its grid and affine carrier ride the contract,
+         // and a per-channel scale vector is protected from pruning through it.
+         alpaka.weightContract = AffineOperandContract(tableQuant);
          if (tableQuant.granularity == EQuantizationGranularity::PerChannel) {
-            alpaka.weightScaleMode = EQuantizedParameterMode::PerOutputChannel;
-            alpaka.weightScaleTensor = tableQuant.scaleTensor;
+            alpaka.weightContract.perChannelScaleTensor = tableQuant.scaleTensor;
          }
       }
       alpaka.reason = region.reason + "; " + alpaka.capabilityTag;

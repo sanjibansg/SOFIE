@@ -92,7 +92,6 @@ struct QuantizedCudaLtMatMulCall {
    std::string inputTensor;
    std::string weightStorageTensor;
    std::string biasTensor;
-   std::string weightScaleTensor;
    std::string m;
    std::string n;
    std::string k;
@@ -122,7 +121,7 @@ struct QuantizedCudaLtMatMulCall {
 inline QuantizedCudaLtMatMulCall MakeQuantizedCudaLtInt8DenseLinearCall(
    std::string boundaryName, std::string stateName, std::string paramsName,
    std::string outputTensor, std::string inputTensor, std::string weightStorageTensor,
-   std::string biasTensor, std::string weightScaleTensor,
+   std::string biasTensor,
    std::string m, std::string n, std::string k,
    const QuantizedLoweringPlan &plan, const QuantizationInfo &inputQuant,
    const QuantizationInfo &weightQuant, std::optional<QuantizationInfo> biasQuant,
@@ -137,7 +136,6 @@ inline QuantizedCudaLtMatMulCall MakeQuantizedCudaLtInt8DenseLinearCall(
    call.inputTensor = std::move(inputTensor);
    call.weightStorageTensor = std::move(weightStorageTensor);
    call.biasTensor = std::move(biasTensor);
-   call.weightScaleTensor = std::move(weightScaleTensor);
    call.m = std::move(m);
    call.n = std::move(n);
    call.k = std::move(k);
@@ -165,10 +163,6 @@ inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMul
    if (call.hasBias && (!call.biasQuant.has_value() || call.biasTensor.empty())) {
       throw std::runtime_error("SOFIE " + call.boundaryName + " is missing bias tensor or quantization metadata");
    }
-   if (plan.weightScaleMode == EQuantizedParameterMode::PerOutputChannel && call.weightScaleTensor.empty()) {
-      throw std::runtime_error("SOFIE " + call.boundaryName + " per-channel launch is missing a weight scale tensor");
-   }
-
    const auto inputRange = QuantizedIntegerRange(call.inputQuant);
    const auto biasRange = call.biasQuant ? QuantizedIntegerRange(*call.biasQuant) : std::pair<std::int64_t, std::int64_t>{0, 0};
    const auto outputRange = QuantizedIntegerRange(call.outputQuant);
@@ -268,7 +262,7 @@ inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMul
    out << "      " << call.paramsName << ".weightType = SOFIE::EQuantizedWeightCarrier::"
        << (call.weightIsSigned ? "Int8" : "UInt8") << ";\n";
    out << "      " << call.paramsName << ".weightScaleMode = SOFIE::EQuantizedScaleMode::"
-       << (plan.weightScaleMode == EQuantizedParameterMode::PerOutputChannel ? "PerOutputChannel" : "PerTensor") << ";\n";
+       << (!plan.weightContract.perChannelScaleTensor.empty() ? "PerOutputChannel" : "PerTensor") << ";\n";
 
    out << "      " << call.stateName << ".BindScratch(quantizedCudaScratchArena.View());\n";
    out << "      SOFIE::QuantizedGemmCudaLt_Call(" << call.stateName
@@ -281,8 +275,8 @@ inline std::string GenerateQuantizedCudaLtMatMulCall(const QuantizedCudaLtMatMul
    } else {
       out << ", static_cast<const float *>(nullptr)";
    }
-   if (plan.weightScaleMode == EQuantizedParameterMode::PerOutputChannel) {
-      out << ", alpaka::getPtrNative(deviceBuf_" << call.weightScaleTensor << ")";
+   if (!plan.weightContract.perChannelScaleTensor.empty()) {
+      out << ", alpaka::getPtrNative(deviceBuf_" << plan.weightContract.perChannelScaleTensor << ")";
    } else {
       out << ", static_cast<const float *>(nullptr)";
    }
@@ -338,19 +332,9 @@ inline QuantizedCudaLtFP8DenseLinearCall MakeQuantizedCudaLtFP8DenseLinearCall(
    return call;
 }
 
-inline const char *QuantizedCudaFP8FormatName(ELowPrecisionCarrier carrier, const std::string &pathName)
-{
-   switch (carrier) {
-   case ELowPrecisionCarrier::FP8E4M3:
-      return "E4M3";
-   case ELowPrecisionCarrier::FP8E5M2:
-      return "E5M2";
-   default:
-      throw std::runtime_error("SOFIE " + pathName + " received a non-FP8 carrier");
-   }
-}
-
-inline const char *QuantizedCudaFP8OutputCarrierName(ELowPrecisionCarrier carrier, const std::string &pathName)
+// The ELowPrecisionFormat enumerator a carrier's values are emitted under. Which carriers
+// are legal in which invocation slot is the executability checks' business, not this map's.
+inline const char *LowPrecisionFormatName(ELowPrecisionCarrier carrier, const std::string &pathName)
 {
    switch (carrier) {
    case ELowPrecisionCarrier::FP8E4M3:
@@ -362,7 +346,7 @@ inline const char *QuantizedCudaFP8OutputCarrierName(ELowPrecisionCarrier carrie
    case ELowPrecisionCarrier::Float32:
       return "Float32";
    default:
-      throw std::runtime_error("SOFIE " + pathName + " received an unsupported FP8 output carrier");
+      throw std::runtime_error("SOFIE " + pathName + " received a carrier with no format name");
    }
 }
 
@@ -430,33 +414,37 @@ inline std::string GenerateQuantizedCudaLtFP8DenseLinearCall(const QuantizedCuda
           << (call.weightIsMatrixA ? inputStride : weightStride) << ";\n";
       out << "      " << call.paramsName << ".batchStrideC = " << (shape.logicalM * shape.logicalN) << ";\n";
    }
-   out << "      " << call.paramsName << ".inputFormat = SOFIE::EQuantizedFP8Format::"
-       << QuantizedCudaFP8FormatName(plan.inputLowPrecisionCarrier, call.boundaryName) << ";\n";
-   out << "      " << call.paramsName << ".weightFormat = SOFIE::EQuantizedFP8Format::"
-       << QuantizedCudaFP8FormatName(plan.weightLowPrecisionCarrier, call.boundaryName) << ";\n";
-   out << "      " << call.paramsName << ".outputCarrier = SOFIE::EQuantizedFP8OutputCarrier::"
-       << QuantizedCudaFP8OutputCarrierName(plan.outputLowPrecisionCarrier, call.boundaryName) << ";\n";
-   out << "      " << call.paramsName << ".accumulation = SOFIE::EQuantizedFP8Accumulation::"
-       << QuantizedCudaFP8AccumulationName(plan.lowPrecisionAccumulation, call.boundaryName) << ";\n";
+   out << "      " << call.paramsName << ".inputFormat = SOFIE::ELowPrecisionFormat::"
+       << LowPrecisionFormatName(plan.inputContract.carrier, call.boundaryName) << ";\n";
+   out << "      " << call.paramsName << ".weightFormat = SOFIE::ELowPrecisionFormat::"
+       << LowPrecisionFormatName(plan.weightContract.carrier, call.boundaryName) << ";\n";
+   out << "      " << call.paramsName << ".outputCarrier = SOFIE::ELowPrecisionFormat::"
+       << LowPrecisionFormatName(plan.outputContract.carrier, call.boundaryName) << ";\n";
+   out << "      " << call.paramsName << ".accumulation = SOFIE::ELowPrecisionFormat::"
+       << QuantizedCudaFP8AccumulationName(LowPrecisionAccumulationForCarrier(plan.inputContract.carrier),
+                                           call.boundaryName) << ";\n";
    out << "      " << call.paramsName << ".alpha = static_cast<float>("
        << std::setprecision(std::numeric_limits<float>::max_digits10) << call.alpha << ");\n";
    out << "      " << call.paramsName << ".beta = static_cast<float>("
        << std::setprecision(std::numeric_limits<float>::max_digits10) << call.beta << ");\n";
    // Left at their defaults when unit, so an uncalibrated call emits no scale at all.
-   if (plan.lowPrecisionInputScale != 1.0 || plan.lowPrecisionWeightScale != 1.0) {
+   const double fp8InputScale = QuantizedFloat8OperandScale(plan.inputContract);
+   const double fp8WeightScale = QuantizedFloat8OperandScale(plan.weightContract);
+   const double fp8OutputScale = QuantizedFloat8OperandScale(plan.outputContract);
+   if (fp8InputScale != 1.0 || fp8WeightScale != 1.0) {
       out << std::setprecision(std::numeric_limits<float>::max_digits10);
-      out << "      " << call.paramsName << ".inputScale = static_cast<float>(" << plan.lowPrecisionInputScale << ");\n";
-      out << "      " << call.paramsName << ".weightScale = static_cast<float>(" << plan.lowPrecisionWeightScale << ");\n";
+      out << "      " << call.paramsName << ".inputScale = static_cast<float>(" << fp8InputScale << ");\n";
+      out << "      " << call.paramsName << ".weightScale = static_cast<float>(" << fp8WeightScale << ");\n";
    }
-   if (plan.lowPrecisionOutputScale != 1.0) {
+   if (fp8OutputScale != 1.0) {
       out << std::setprecision(std::numeric_limits<float>::max_digits10);
-      out << "      " << call.paramsName << ".outputScale = static_cast<float>(" << plan.lowPrecisionOutputScale << ");\n";
+      out << "      " << call.paramsName << ".outputScale = static_cast<float>(" << fp8OutputScale << ");\n";
    }
-   if (plan.lowPrecisionOutputClampEnabled) {
+   if (QuantizedFloat8OperandClamped(plan.outputContract)) {
       out << std::setprecision(std::numeric_limits<float>::max_digits10);
       out << "      " << call.paramsName << ".hasOutputClamp = true;\n";
-      out << "      " << call.paramsName << ".outputClampLow = static_cast<float>(" << plan.lowPrecisionOutputClampLow << ");\n";
-      out << "      " << call.paramsName << ".outputClampHigh = static_cast<float>(" << plan.lowPrecisionOutputClampHigh << ");\n";
+      out << "      " << call.paramsName << ".outputClampLow = static_cast<float>(" << plan.outputContract.grid.codeMin << ");\n";
+      out << "      " << call.paramsName << ".outputClampHigh = static_cast<float>(" << plan.outputContract.grid.codeMax << ");\n";
    }
    out << "      " << call.paramsName << ".hasBias = " << (call.hasBias ? "true" : "false") << ";\n";
    out << "      " << call.paramsName << ".hasRelu = " << (call.hasRelu ? "true" : "false") << ";\n";

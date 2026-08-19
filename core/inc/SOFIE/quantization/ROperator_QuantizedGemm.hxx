@@ -221,10 +221,6 @@ inline std::string GenerateFusedQuantizedGemmCublasLtCoreLaunch(std::string opNa
    if (region.inputSourceTensor.empty() || region.outputTensor.empty()) {
       throw std::runtime_error("SOFIE fused Quantized Gemm cuBLASLt core launch is missing input/output tensors");
    }
-   if (plan.weightScaleMode == EQuantizedParameterMode::PerOutputChannel && plan.weightScaleTensor.empty()) {
-      throw std::runtime_error("SOFIE fused Quantized Gemm cuBLASLt per-channel launch is missing a weight scale tensor");
-   }
-
    const auto dimA = context.inputShape.size();
    const auto dimB = context.weightShape.size();
 
@@ -232,12 +228,13 @@ inline std::string GenerateFusedQuantizedGemmCublasLtCoreLaunch(std::string opNa
       "ROperator_QuantizedGemm cuBLASLt int8 GEMM core boundary " + opName,
       "quantizedGemmCudaLtState_" + opName, "params_quantizedGemm_" + opName,
       region.outputTensor, region.inputSourceTensor, plan.weightStorageTensor,
-      region.biasSourceTensor, plan.weightScaleTensor,
+      region.biasSourceTensor,
       context.inputShape[dimA - 2].GetVal(), context.weightShape[dimB - 2].GetVal(),
       context.inputShape[dimA - 1].GetVal(), plan, region.inputQuant, region.weightQuant,
       region.biasQuant, region.outputQuant, INTERNAL::HasQuantizedGemmBias(region),
       context.activation == EActivationType::RELU, region.weightQuant.isSigned, context.alpha, context.beta);
    call.outputRequantize = region.outputRequantize;
+   call.outputClamp = region.outputClamp;
    call.deferOutputEpilogue = region.deferOutputEpilogue;
    return INTERNAL::GenerateQuantizedCudaLtMatMulCall(call);
 }

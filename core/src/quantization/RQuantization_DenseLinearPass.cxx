@@ -300,10 +300,12 @@ void ApplyAdoptedPlanFields(QuantizedLoweringPlan &plan, const AdoptableFP8Outpu
 {
    if (!adopt.adopted())
       return;
-   plan.lowPrecisionOutputScale = adopt.scale;
-   plan.lowPrecisionOutputClampEnabled = adopt.hasClamp;
-   plan.lowPrecisionOutputClampLow = adopt.clampLow;
-   plan.lowPrecisionOutputClampHigh = adopt.clampHigh;
+   plan.outputContract = Float8OperandContract(ELowPrecisionCarrier::FP8E4M3, adopt.scale);
+   if (adopt.hasClamp) {
+      // The absorbed Clip, already in code units: a narrowing of the format's code set.
+      plan.outputContract.grid.codeMin = adopt.clampLow;
+      plan.outputContract.grid.codeMax = adopt.clampHigh;
+   }
 }
 
 // Whether the output walk may fold a constant scalar Mul into the epilogue alpha: Gemm applies
@@ -320,10 +322,27 @@ bool FP8OutputWalkFoldsScaleMul()
    return std::getenv("SOFIE_DISABLE_FP8_ALPHA_FOLD") == nullptr;
 }
 
-// Walks forward from a region output to the boundary defining its grid; a fork or a
-// non-transparent op ends the search. `allowScaleMul` has no default: callers state their fold policy.
+// A Relu consuming the output boundary folds into the epilogue's max(code, zeroPoint) clamp
+// exactly when the zero point maps to 0.0; a pre-boundary Relu takes the clip-fold instead.
+bool BoundaryReluFoldsIntoEpilogueClamp(const QuantizationInfo &outputQuant)
+{
+   return outputQuant.zeroPoint == 0;
+}
+
+// The grids the fused output requantize supports (the int8 carrier handoff to the next
+// layer): signed 8-bit per-tensor round-to-nearest with a positive scale.
+bool FusedRequantizeGridSupported(const QuantizationInfo &grid)
+{
+   return grid.isSigned && grid.bitWidth == 8 &&
+          grid.granularity == EQuantizationGranularity::PerTensor && grid.scale > 0.0 &&
+          grid.rounding == EQuantizationRoundingMode::ROUND;
+}
+
+// Walks forward from a region output to the boundary defining its grid; a fork or opaque op
+// ends the search. Fold flags have no defaults (foldReluAsClip = Relu as Clip(0, +inf)).
 AbsorbedOutputChain FindAbsorbableOutputChain(const QuantizationPassContext &ctx,
-                                              std::string tensor, bool allowScaleMul)
+                                              std::string tensor, bool allowScaleMul,
+                                              bool foldReluAsClip)
 {
    AbsorbedOutputChain chain;
    for (int hop = 0; hop < kQuantizationWalkMaxHops; ++hop) {
@@ -338,9 +357,13 @@ AbsorbedOutputChain FindAbsorbableOutputChain(const QuantizationPassContext &ctx
          return chain;
       }
       const bool isScaleMul = allowScaleMul && IsFloatMulOperator(*ctx.operators[index]);
-      if (!isScaleMul && !IsBoundarySearchSeeThrough(ctx, index))
+      // A Relu is Clip(0, +inf): the same epilogue-clamp fold covers both spellings of the
+      // same math, and the clip-to-code conversion is zero-point-correct on every grid.
+      const bool isEpilogueRelu =
+         foldReluAsClip && ctx.operators[index]->GetKind() == OperatorKind::RELU;
+      if (!isScaleMul && !isEpilogueRelu && !IsBoundarySearchSeeThrough(ctx, index))
          return chain;
-      if (!isScaleMul && !IsBoundaryChainAbsorbable(ctx, index)) {
+      if (!isScaleMul && !isEpilogueRelu && !IsBoundaryChainAbsorbable(ctx, index)) {
          // A scale fold needs the Mul suppressed, which a non-absorbable chain cannot
          // do, so the two are mutually exclusive in either order.
          if (chain.alphaScale != 1.0)
@@ -366,6 +389,10 @@ AbsorbedOutputChain FindAbsorbableOutputChain(const QuantizationPassContext &ctx
          if (!std::isfinite(scalar) || scalar == 0.0)
             return chain;
          chain.alphaScale *= scalar;
+      }
+      if (isEpilogueRelu) {
+         chain.hasClip = true;
+         chain.clipLow = std::max(chain.clipLow, 0.0);
       }
       if (ctx.operators[index]->GetKind() == OperatorKind::CLIP) {
          // Clip carries grid information the int8 dtype cannot express (a 7-bit range,
@@ -730,7 +757,10 @@ void DeepenAbsorbedOutputChain(const QuantizationPassContext &ctx, AbsorbedOutpu
          return;
       }
 
-      const auto next = FindAbsorbableOutputChain(ctx, dequantOutput, /*allowScaleMul=*/false);
+      // No Relu fold here: the deepened re-encode run must stay value-preserving, and the
+      // boundary behind a Relu belongs to the next region.
+      const auto next =
+         FindAbsorbableOutputChain(ctx, dequantOutput, /*allowScaleMul=*/false, /*foldReluAsClip=*/false);
       if (next.boundaryIndex == static_cast<std::size_t>(-1)) {
          decline = "no further boundary behind the pair";
          return;
@@ -840,9 +870,8 @@ void SetOutputQuantFromBoundary(const QuantizationPassContext &ctx, QuantizedDen
       }
    }
 
-   // Absorb a Relu on the output boundary into the epilogue's hasRelu. Requires a symmetric
-   // grid, and the Gemm spelling, which is the only one that forwards it.
-   if (info.outputQuant.zeroPoint != 0 || isQuantizedMatMulSpelling)
+   // Absorb a Relu on the output boundary into the epilogue's hasRelu.
+   if (!BoundaryReluFoldsIntoEpilogueClamp(info.outputQuant))
       return;
    auto outputConsumers = ctx.graph.consumersByTensor.find(info.outputTensor);
    if (outputConsumers == ctx.graph.consumersByTensor.end() || outputConsumers->second.size() != 1)
@@ -869,9 +898,7 @@ void SetOutputQuantFromBoundary(const QuantizationPassContext &ctx, QuantizedDen
       return;
    auto nextQuant = ctx.model.GetQuantizationInfo(std::string(nextOutputs[0]));
    ReinterpretInt8StorableUnsigned(nextQuant);
-   if (nextQuant.isSigned && nextQuant.bitWidth == 8 &&
-       nextQuant.granularity == EQuantizationGranularity::PerTensor && nextQuant.scale > 0.0 &&
-       nextQuant.rounding == EQuantizationRoundingMode::ROUND)
+   if (FusedRequantizeGridSupported(nextQuant))
       info.outputRequantize = nextQuant;
 }
 
@@ -976,7 +1003,8 @@ void ResolveOutputQuantization(const QuantizationPassContext &ctx, QuantizedDens
       // own alpha attribute, so a Mul there ends the walk.
       const auto chain =
          FindAbsorbableOutputChain(ctx, info.gemmOutputTensor,
-                                   Int8OutputWalkFoldsScaleMul(isQuantizedMatMulSpelling));
+                                   Int8OutputWalkFoldsScaleMul(isQuantizedMatMulSpelling),
+                                   /*foldReluAsClip=*/true);
       if (chain.boundaryIndex == static_cast<std::size_t>(-1))
          reasons.push_back("Gemm output consumer is not a quantization boundary");
       else
@@ -1022,7 +1050,8 @@ void ResolveOutputQuantization(const QuantizationPassContext &ctx, QuantizedDens
    const auto chain = adjacentBoundary
                          ? AbsorbedOutputChain{}
                          : FindAbsorbableOutputChain(
-                              ctx, addOutput, Int8OutputWalkFoldsScaleMul(isQuantizedMatMulSpelling));
+                              ctx, addOutput, Int8OutputWalkFoldsScaleMul(isQuantizedMatMulSpelling),
+                              /*foldReluAsClip=*/true);
    if (!adjacentBoundary && chain.boundaryIndex == static_cast<std::size_t>(-1)) {
       reasons.push_back("MatMul Add epilogue output consumer is not a quantization boundary");
       return;
@@ -1042,7 +1071,8 @@ AdoptableFP8OutputQuant FindAdoptableFP8OutputQuant(const QuantizationPassContex
 {
    AdoptableFP8OutputQuant result;
    const auto chain =
-      FindAbsorbableOutputChain(ctx, outputTensor, FP8OutputWalkFoldsScaleMul());
+      FindAbsorbableOutputChain(ctx, outputTensor, FP8OutputWalkFoldsScaleMul(),
+                                /*foldReluAsClip=*/true);
    if (chain.boundaryIndex == static_cast<std::size_t>(-1) || chain.boundaryIndex >= ctx.operators.size()) {
       result.decline = "no sole-consumer boundary chain";
       return result;
@@ -1148,6 +1178,22 @@ AdoptableFP8OutputQuant FindAdoptableFP8OutputQuant(const QuantizationPassContex
    return result;
 }
 
+// A Relu on a float-carried FP8 output with no boundary behind it has no grid to clamp
+// against, so it rides the epilogue's hasRelu — the same float max cuBLASLt applies.
+void AbsorbFloatOutputRelu(const QuantizationPassContext &ctx, QuantizedDenseLinearRegion &region)
+{
+   const auto reluIndex = SoleConsumer(ctx, region.outputTensor);
+   if (reluIndex == static_cast<std::size_t>(-1) ||
+       ctx.operators[reluIndex]->GetKind() != OperatorKind::RELU ||
+       ctx.operators[reluIndex]->GetOpOutputTensors().size() != 1)
+      return;
+   region.outputReluOpIndex = reluIndex;
+   region.epilogue.kind = QuantizedEpilogueHasBias(region.epilogue.kind)
+                             ? EQuantizedEpilogueKind::BiasRelu
+                             : EQuantizedEpilogueKind::Relu;
+   region.outputTensor = std::string(ctx.operators[reluIndex]->GetOpOutputTensors()[0]);
+}
+
 // Forms the native-FP8 region for a Gemm/MatMul whose operands resolved to E4M3 carriers,
 // adopting a trailing E4M3 encode into the cuBLASLt D and an upstream same-grid input carrier.
 void FormNativeFP8DenseLinearRegion(const QuantizationPassContext &ctx,
@@ -1245,6 +1291,8 @@ void FormNativeFP8DenseLinearRegion(const QuantizationPassContext &ctx,
                matmul.epilogue.kind = QuantizedEpilogueHasBias(matmul.epilogue.kind)
                                          ? EQuantizedEpilogueKind::BiasRelu
                                          : EQuantizedEpilogueKind::Relu;
+         } else {
+            AbsorbFloatOutputRelu(ctx, matmul);
          }
 
          AdoptUpstreamFP8InputCarrier(ctx, fusedInt8HandoffTensors, matmul.inputSourceTensor,
@@ -1258,8 +1306,8 @@ void FormNativeFP8DenseLinearRegion(const QuantizationPassContext &ctx,
                                        : matmul.weightSourceTensor;
          auto alpakaPlan = MakeAlpakaCublasLtFP8Plan(matmul, fp8WeightStorageTensor, capability, shapePolicy);
          alpakaPlan.weightStorageIsRuntimeTensor = fp8RuntimeOperandB;
-         alpakaPlan.lowPrecisionInputScale = fp8InputScale;
-         alpakaPlan.lowPrecisionWeightScale = fp8WeightScale;
+         alpakaPlan.inputContract = Float8OperandContract(alpakaPlan.inputContract.carrier, fp8InputScale);
+         alpakaPlan.weightContract = Float8OperandContract(alpakaPlan.weightContract.carrier, fp8WeightScale);
          ApplyAdoptedPlanFields(alpakaPlan, outputAdopt);
          alpakaPlan.reason = matmul.reason + "; " + capability.reason;
          // A runtime operand is its own storage: it is written each inference as an
@@ -1268,7 +1316,7 @@ void FormNativeFP8DenseLinearRegion(const QuantizationPassContext &ctx,
             RegisterLowPrecisionSourceStorage(ctx, matmul.weightTensor, matmul.weightSourceTensor, alpakaPlan.weightLayout);
          plans[EQuantizedBackend::CPU] = MakeUnsupportedLowPrecisionDenseLinearPlan(
             EQuantizedBackend::CPU, matmul.reason + "; CPU FP8 MatMul lowering is not implemented", true,
-            capability.inputCarrier, capability.weightCarrier, capability.outputCarrier, capability.accumulation,
+            capability.inputCarrier, capability.weightCarrier, capability.outputCarrier,
             capability.profile, "fp8_dense_linear_cpu_backend_unsupported");
          plans[EQuantizedBackend::ALPAKA] = std::move(alpakaPlan);
       } else {
@@ -1277,12 +1325,12 @@ void FormNativeFP8DenseLinearRegion(const QuantizationPassContext &ctx,
          plans[EQuantizedBackend::CPU] = MakeUnsupportedLowPrecisionDenseLinearPlan(
             EQuantizedBackend::CPU, matmul.reason, false,
             inputLowPrecision.carrier, weightLowPrecision.carrier, ELowPrecisionCarrier::Float32,
-            ELowPrecisionAccumulation::Float32, EQuantizedComputeProfile::FP8E4M3DenseLinearRank2,
+            EQuantizedComputeProfile::FP8E4M3DenseLinearRank2,
             "fp8_dense_linear_semantic_unsupported");
          plans[EQuantizedBackend::ALPAKA] = MakeUnsupportedLowPrecisionDenseLinearPlan(
             EQuantizedBackend::ALPAKA, matmul.reason, false,
             inputLowPrecision.carrier, weightLowPrecision.carrier, ELowPrecisionCarrier::Float32,
-            ELowPrecisionAccumulation::Float32, EQuantizedComputeProfile::FP8E4M3DenseLinearRank2,
+            EQuantizedComputeProfile::FP8E4M3DenseLinearRank2,
             "fp8_dense_linear_semantic_unsupported");
       }
       StoreQuantizedRegion(ctx.state, std::move(matmul));
@@ -1372,8 +1420,8 @@ void FormNativeFP8DenseLinearRegion(const QuantizationPassContext &ctx,
       const std::string fp8WeightStorageTensor =
          fp8PaddedN > n ? info.weightSourceTensor + "_fp8_padded_device_storage" : info.weightSourceTensor;
       auto alpakaPlan = MakeAlpakaCublasLtFP8Plan(info, fp8WeightStorageTensor, capability, shapePolicy);
-      alpakaPlan.lowPrecisionInputScale = fp8InputScale;
-      alpakaPlan.lowPrecisionWeightScale = fp8WeightScale;
+      alpakaPlan.inputContract = Float8OperandContract(alpakaPlan.inputContract.carrier, fp8InputScale);
+      alpakaPlan.weightContract = Float8OperandContract(alpakaPlan.weightContract.carrier, fp8WeightScale);
       ApplyAdoptedPlanFields(alpakaPlan, outputAdopt);
       alpakaPlan.reason = info.reason + "; " + capability.reason;
       if (fp8PaddedN == 0)
@@ -1448,7 +1496,8 @@ void FormQuantizedMatMulRegion(const QuantizationPassContext &ctx,
          storageReasons.push_back("MatMul input zero point is nonzero with a runtime operand B; the "
                                   "zero-point correction requires constant weight column sums");
 
-      const auto capability = AssessCublasLtDenseLinearCapability(
+      const auto capability = AssessQuantizedDenseLinearCapability(
+         EQuantizedBackend::ALPAKA,
          MakeDenseLinearOperands(matmul, inputShape, weightShape, outputShape));
       const auto selectedCapability = SelectExecutableDenseLinearCapability(capability);
       if (!selectedCapability.executable) {
@@ -1495,10 +1544,12 @@ void FormQuantizedMatMulRegion(const QuantizationPassContext &ctx,
                                                 : "_quantized_transposed_device_storage");
          const bool matmulFloatConsumer = OutputHasFloatConsumer(ctx, matmul.outputTensor);
          const bool matmulAbsorbedDequant = matmul.outputDequantOpIndex.has_value();
-         TraceOutputMode(matmul.outputTensor, matmulFloatConsumer, matmulAbsorbedDequant, false);
+         const bool matmulAbsorbedRelu = matmul.outputReluOpIndex.has_value();
+         TraceOutputMode(matmul.outputTensor, matmulFloatConsumer, matmulAbsorbedDequant,
+                         matmulAbsorbedRelu);
          auto alpakaPlan = MakeMatMulAlpakaTransposedWeightStoragePlan(
             matmul, deviceStorageTensor, selectedCapability.shapePolicy,
-            matmulFloatConsumer || matmulAbsorbedDequant,
+            matmulFloatConsumer || matmulAbsorbedDequant || matmulAbsorbedRelu,
             InputSourceIsFloatOp(ctx, fusedInt8HandoffTensors, matmul.inputSourceTensor));
          alpakaPlan.weightStorageIsRuntimeTensor = runtimeOperandB;
          alpakaPlan.computeProfile = selectedCapability.profile;
@@ -1507,6 +1558,18 @@ void FormQuantizedMatMulRegion(const QuantizationPassContext &ctx,
          if (!matmul.outputMovementTargetTensor.empty() &&
              IsQuantizedLoweringOptimized(alpakaPlan.status))
             movementRunCarrierTensors.insert(matmul.outputMovementTargetTensor);
+         // Producer half of the int8 carrier handoff: the fused requantize engages only for a
+         // lowered plan, and the consumer reads the set rather than re-deriving the predicate.
+         if (matmul.outputRequantize) {
+            if (IsQuantizedLoweringOptimized(alpakaPlan.status)) {
+               fusedInt8HandoffTensors.insert(matmul.outputTensor);
+               // Carried on the consumer's requantize grid as an int8 tensor; the carrier also
+               // keeps installLoweredOperator from typing it FLOAT.
+               alpakaPlan.outputContract = AffineOperandContract(*matmul.outputRequantize);
+            } else {
+               matmul.outputRequantize.reset();
+            }
+         }
          plans[EQuantizedBackend::ALPAKA] = std::move(alpakaPlan);
          matmul.reason += runtimeOperandB
                              ? "; runtime int8 operand B read in place"
@@ -1612,7 +1675,7 @@ void FormQuantizedGemmRegion(const QuantizationPassContext &ctx,
             operands.outputFloatConsumed = OutputHasFloatConsumer(ctx, info.outputTensor) ||
                                            info.outputDequantOpIndex.has_value() ||
                                            info.outputReluOpIndex.has_value();
-            auto capability = AssessCublasLtDenseLinearCapability(operands);
+            auto capability = AssessQuantizedDenseLinearCapability(EQuantizedBackend::ALPAKA, operands);
             if (IsQuantizedLoweringAvailable(cpuPlan.status)) {
                cpuPlan.matrixShapePolicy = capability.shapePolicy;
                PopulateDenseLinearResourceRequirements(cpuPlan, !info.biasSourceTensor.empty());
@@ -1652,8 +1715,9 @@ void FormQuantizedGemmRegion(const QuantizationPassContext &ctx,
       if (info.outputRequantize) {
          if (IsQuantizedLoweringOptimized(alpakaPlan.status)) {
             fusedInt8HandoffTensors.insert(info.outputTensor);
-            // The epilogue stores int8 here, so installLoweredOperator must not type it FLOAT.
-            alpakaPlan.outputLowPrecisionCarrier = ELowPrecisionCarrier::AffineInt8;
+            // Carried on the consumer's requantize grid as an int8 tensor; the carrier also
+            // keeps installLoweredOperator from typing it FLOAT.
+            alpakaPlan.outputContract = AffineOperandContract(*info.outputRequantize);
          } else {
             // Not lowered: the tensor stays a float activation, so drop the fusion.
             info.outputRequantize.reset();

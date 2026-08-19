@@ -62,7 +62,7 @@ struct QuantizedGemmCudaLtFP8State {
    std::int64_t fBatchStrideA = 0;
    std::int64_t fBatchStrideB = 0;
    std::int64_t fBatchStrideC = 0;
-   EQuantizedFP8OutputCarrier fOutputCarrier = EQuantizedFP8OutputCarrier::FP8E4M3;
+   ELowPrecisionFormat fOutputCarrier = ELowPrecisionFormat::FP8E4M3;
    bool fInitialized = false;
 
    QuantizedGemmCudaLtFP8State() = default;
@@ -92,48 +92,18 @@ struct QuantizedGemmCudaLtFP8State {
 };
 #endif // SOFIE_USE_CUBLASLT
 
-inline ELowPrecisionCarrier LowPrecisionCarrierForCudaFP8Format(EQuantizedFP8Format format)
-{
-   return format == EQuantizedFP8Format::E5M2 ? ELowPrecisionCarrier::FP8E5M2
-                                                  : ELowPrecisionCarrier::FP8E4M3;
-}
-
-inline ELowPrecisionAccumulation LowPrecisionAccumulationForCudaFP8(
-   EQuantizedFP8Accumulation accumulation)
-{
-   return accumulation == EQuantizedFP8Accumulation::Float16 ? ELowPrecisionAccumulation::Float16
-                                                                 : ELowPrecisionAccumulation::Float32;
-}
-
-inline ELowPrecisionCarrier LowPrecisionCarrierForCudaFP8OutputCarrier(
-   EQuantizedFP8OutputCarrier carrier)
+inline const char *QuantizedGemmCudaLtFP8_OutputProfileName(ELowPrecisionFormat carrier)
 {
    switch (carrier) {
-   case EQuantizedFP8OutputCarrier::FP8E4M3:
-      return ELowPrecisionCarrier::FP8E4M3;
-   case EQuantizedFP8OutputCarrier::FP8E5M2:
-      return ELowPrecisionCarrier::FP8E5M2;
-   case EQuantizedFP8OutputCarrier::Float16:
-   case EQuantizedFP8OutputCarrier::BFloat16:
-      return ELowPrecisionCarrier::Float16;
-   case EQuantizedFP8OutputCarrier::Float32:
-      return ELowPrecisionCarrier::Float32;
-   }
-   return ELowPrecisionCarrier::UNDEFINED;
-}
-
-inline const char *QuantizedGemmCudaLtFP8_OutputProfileName(EQuantizedFP8OutputCarrier carrier)
-{
-   switch (carrier) {
-   case EQuantizedFP8OutputCarrier::Float16:
+   case ELowPrecisionFormat::Float16:
       return "f16";
-   case EQuantizedFP8OutputCarrier::BFloat16:
+   case ELowPrecisionFormat::BFloat16:
       return "bf16";
-   case EQuantizedFP8OutputCarrier::Float32:
+   case ELowPrecisionFormat::Float32:
       return "f32";
-   case EQuantizedFP8OutputCarrier::FP8E4M3:
+   case ELowPrecisionFormat::FP8E4M3:
       return "fp8e4m3";
-   case EQuantizedFP8OutputCarrier::FP8E5M2:
+   case ELowPrecisionFormat::FP8E5M2:
       return "fp8e5m2";
    }
    return "unknown";
@@ -143,15 +113,15 @@ inline bool QuantizedGemmCudaLtFP8_IsExecutableE4M3TN(const QuantizedFP8DenseLin
 {
    // E4M3 is executable as an output carrier, which is what keeps an FP8 layer chain in
    // FP8. It requires the BF16 C matrix set up below.
-   const bool supportedOutput = params.outputCarrier == EQuantizedFP8OutputCarrier::Float16 ||
-                                params.outputCarrier == EQuantizedFP8OutputCarrier::BFloat16 ||
-                                params.outputCarrier == EQuantizedFP8OutputCarrier::Float32 ||
-                                params.outputCarrier == EQuantizedFP8OutputCarrier::FP8E4M3;
+   const bool supportedOutput = params.outputCarrier == ELowPrecisionFormat::Float16 ||
+                                params.outputCarrier == ELowPrecisionFormat::BFloat16 ||
+                                params.outputCarrier == ELowPrecisionFormat::Float32 ||
+                                params.outputCarrier == ELowPrecisionFormat::FP8E4M3;
    return params.m != 0 && params.n != 0 && params.k != 0 && params.batchCount != 0 &&
-          params.inputFormat == EQuantizedFP8Format::E4M3 &&
-          params.weightFormat == EQuantizedFP8Format::E4M3 &&
+          params.inputFormat == ELowPrecisionFormat::FP8E4M3 &&
+          params.weightFormat == ELowPrecisionFormat::FP8E4M3 &&
           supportedOutput &&
-          params.accumulation == EQuantizedFP8Accumulation::Float32;
+          params.accumulation == ELowPrecisionFormat::Float32;
 }
 
 inline std::string QuantizedGemmCudaLtFP8_CapabilityTag(const QuantizedFP8DenseLinearInvocation &params)
@@ -171,8 +141,7 @@ inline QuantizedDenseLinearBackendCapability QuantizedGemmCudaLtFP8_QueryCapabil
       capability.profile = EQuantizedComputeProfile::FP8E4M3DenseLinearRank2;
       capability.inputCarrier = ELowPrecisionCarrier::FP8E4M3;
       capability.weightCarrier = ELowPrecisionCarrier::FP8E4M3;
-      capability.outputCarrier = LowPrecisionCarrierForCudaFP8OutputCarrier(params.outputCarrier);
-      capability.accumulation = ELowPrecisionAccumulation::Float32;
+      capability.outputCarrier = LowPrecisionCarrierForFormat(params.outputCarrier);
       capability.tag = QuantizedGemmCudaLtFP8_CapabilityTag(params);
       capability.reason = "SOFIE cuBLASLt FP8 E4M3 TN " + std::string(QuantizedGemmCudaLtFP8_OutputProfileName(params.outputCarrier)) +
                           " path is executable for this backend";
@@ -181,26 +150,25 @@ inline QuantizedDenseLinearBackendCapability QuantizedGemmCudaLtFP8_QueryCapabil
 #endif
    return MakeFP8DenseLinearBackendUnsupportedCapability(
       EQuantizedBackend::ALPAKA,
-      LowPrecisionCarrierForCudaFP8Format(params.inputFormat),
-      LowPrecisionCarrierForCudaFP8Format(params.weightFormat),
-      LowPrecisionCarrierForCudaFP8OutputCarrier(params.outputCarrier),
-      LowPrecisionAccumulationForCudaFP8(params.accumulation),
+      LowPrecisionCarrierForFormat(params.inputFormat),
+      LowPrecisionCarrierForFormat(params.weightFormat),
+      LowPrecisionCarrierForFormat(params.outputCarrier),
       "SOFIE FP8 cuBLASLt dense-linear boundary supports executable E4M3 x E4M3 TN E4M3/Float16/BFloat16/Float32 output only in this build/backend");
 }
 
 #ifdef SOFIE_USE_CUBLASLT
-inline cudaDataType_t QuantizedGemmCudaLtFP8_OutputDataType(EQuantizedFP8OutputCarrier carrier)
+inline cudaDataType_t QuantizedGemmCudaLtFP8_OutputDataType(ELowPrecisionFormat carrier)
 {
    switch (carrier) {
-   case EQuantizedFP8OutputCarrier::Float16:
+   case ELowPrecisionFormat::Float16:
       return CUDA_R_16F;
-   case EQuantizedFP8OutputCarrier::BFloat16:
+   case ELowPrecisionFormat::BFloat16:
       return CUDA_R_16BF;
-   case EQuantizedFP8OutputCarrier::Float32:
+   case ELowPrecisionFormat::Float32:
       return CUDA_R_32F;
-   case EQuantizedFP8OutputCarrier::FP8E4M3:
+   case ELowPrecisionFormat::FP8E4M3:
       return CUDA_R_8F_E4M3;
-   case EQuantizedFP8OutputCarrier::FP8E5M2:
+   case ELowPrecisionFormat::FP8E5M2:
       return CUDA_R_8F_E5M2;
    }
    return CUDA_R_32F;
@@ -272,7 +240,7 @@ inline void QuantizedGemmCudaLtFP8SlicePaddedOutput(QuantizedGemmCudaStream stre
    const std::size_t elements = params.n * params.logicalM;
    if (elements == 0)
       return;
-   if (params.outputCarrier != EQuantizedFP8OutputCarrier::Float32)
+   if (params.outputCarrier != ELowPrecisionFormat::Float32)
       throw std::runtime_error("SOFIE FP8 padded output staging supports only the Float32 output carrier");
    constexpr int threads = 256;
    const int blocks = static_cast<int>((elements + threads - 1) / threads);
@@ -299,16 +267,16 @@ inline void QuantizedGemmCudaLtFP8ApplyBiasEpilogue(QuantizedGemmCudaStream stre
    constexpr int threads = 256;
    const int blocks = static_cast<int>((elements + threads - 1) / threads);
    switch (params.outputCarrier) {
-   case EQuantizedFP8OutputCarrier::Float32:
+   case ELowPrecisionFormat::Float32:
       QuantizedGemmCudaLtFP8BiasEpilogueKernel<float><<<blocks, threads, 0, stream>>>(static_cast<float *>(output), bias, biasToOutputUnits, params);
       break;
-   case EQuantizedFP8OutputCarrier::Float16:
+   case ELowPrecisionFormat::Float16:
       QuantizedGemmCudaLtFP8BiasEpilogueKernel<__half><<<blocks, threads, 0, stream>>>(static_cast<__half *>(output), bias, biasToOutputUnits, params);
       break;
-   case EQuantizedFP8OutputCarrier::BFloat16:
+   case ELowPrecisionFormat::BFloat16:
       QuantizedGemmCudaLtFP8BiasEpilogueKernel<__nv_bfloat16><<<blocks, threads, 0, stream>>>(static_cast<__nv_bfloat16 *>(output), bias, biasToOutputUnits, params);
       break;
-   case EQuantizedFP8OutputCarrier::FP8E4M3:
+   case ELowPrecisionFormat::FP8E4M3:
       // E4M3 activation carrier: the GEMM already stored E4M3 codes, so bias and Relu are
       // applied in place through float, on the code grid.
       QuantizedGemmCudaLtFP8BiasEpilogueKernel<__nv_fp8_e4m3><<<blocks, threads, 0, stream>>>(static_cast<__nv_fp8_e4m3 *>(output), bias, biasToOutputUnits, params);
@@ -356,7 +324,7 @@ inline void QuantizedGemmCudaLtFP8State::Reset() noexcept
    fBatchStrideA = 0;
    fBatchStrideB = 0;
    fBatchStrideC = 0;
-   fOutputCarrier = EQuantizedFP8OutputCarrier::FP8E4M3;
+   fOutputCarrier = ELowPrecisionFormat::FP8E4M3;
    // The descriptor is gone, so nothing is programmed into it any more. fFusedBias itself
    // survives: it is keyed to the bias values, not to this shape.
    fProgrammedBias = nullptr;

@@ -27,19 +27,15 @@ inline void CheckCudaStatus(cudaError_t status, const char *where)
 }
 
 // __host__ __device__, not __device__: ALPAKA_FN_ACC is both unless CUDA-only mode is on, and
-// nvcc refuses a __device__-only callee from one. A consumer applying a deferred epilogue calls
-// this whole chain from such a functor. Nothing here touches device intrinsics.
+// nvcc refuses a __device__-only callee from one (the deferred-epilogue chain calls through it).
 __host__ __device__ inline std::int32_t QuantizedCudaClamp(std::int32_t value, std::int32_t qmin,
                                                            std::int32_t qmax)
 {
    return value < qmin ? qmin : (value > qmax ? qmax : value);
 }
 
-// Affine requantize with round-half-to-even, matching the ONNX QuantizeLinear
-// and PQuant contract used across the quantized subsystem. The zero point is added
-// after the rounding, as `saturate(round(x / scale) + zeroPoint)` specifies: it is an
-// integer shift of the code, and rounding with it folded in moves half-way ties by its
-// parity.
+// Affine requantize with round-half-to-even, the ONNX QuantizeLinear/PQuant contract:
+// saturate(round(x / scale) + zeroPoint), the zero point added after rounding so ties hold.
 __host__ __device__ inline std::int32_t QuantizedCudaQuantizeClamp(double value, double scale,
                                                                    std::int32_t zero, std::int32_t qmin,
                                                                    std::int32_t qmax)

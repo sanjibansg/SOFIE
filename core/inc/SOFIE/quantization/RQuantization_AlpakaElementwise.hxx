@@ -164,11 +164,8 @@ __global__ void QuantizedElementwiseAffineVectorKernel(
    }
 }
 
-// One FP8 elementwise result, each operand dequantized with its own per-tensor scale.
-//
-// The Add rounds A's product and contracts B's, matching ROperator_BasicBinary's FP8 arm,
-// which decodes only the sole-consumer operand inline and lets nvcc fold that multiply into
-// the add. A symmetric spelling rounds one step earlier and is not bit-exact against it.
+// One FP8 elementwise result, operands dequantized per-tensor. The Add rounds A's product and
+// contracts B's, matching ROperator_BasicBinary's FP8 arm; a symmetric spelling is not bit-exact.
 __device__ inline float QuantizedElementwiseFP8Combine(__nv_fp8_e4m3 ca, __nv_fp8_e4m3 cb,
                                                        float scaleA, float scaleB,
                                                        EQuantizedElementwiseOp op, bool hasRelu)

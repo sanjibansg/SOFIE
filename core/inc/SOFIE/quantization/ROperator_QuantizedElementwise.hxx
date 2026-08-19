@@ -75,7 +75,7 @@ public:
           fRegion.outputShape.size() > static_cast<std::size_t>(kQuantizedElementwiseMaxRank))
          throw std::runtime_error("SOFIE quantized elementwise requires a static output rank within the supported range");
 
-      const bool fp8 = fPlan.inputLowPrecisionCarrier == ELowPrecisionCarrier::FP8E4M3;
+      const bool fp8 = fPlan.inputContract.carrier == ELowPrecisionCarrier::FP8E4M3;
       const std::size_t rank = fRegion.outputShape.size();
       const auto inputExtent = AlignedExtent(fRegion.inputShape, rank);
       const auto operandBExtent = AlignedExtent(fRegion.operandBShape, rank);

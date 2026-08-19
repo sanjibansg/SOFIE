@@ -79,7 +79,7 @@ public:
          std::accumulate(fRegion.indicesShape.begin(), fRegion.indicesShape.end(),
                          std::size_t{1}, std::multiplies<std::size_t>{});
 
-      const bool fp8 = fPlan.inputLowPrecisionCarrier == ELowPrecisionCarrier::FP8E4M3;
+      const bool fp8 = fPlan.inputContract.carrier == ELowPrecisionCarrier::FP8E4M3;
       const std::string params = "quantizedGatherParams_" + opName;
 
       std::ostringstream out;
@@ -108,7 +108,7 @@ public:
          out << "      " << params << ".quantAxisStride = " << quantAxisStride << ";\n";
          out << "      " << params << ".quantAxisLength = " << fRegion.tableShape[quantAxis] << ";\n";
          out << "      " << params << ".tableCarrier = " << INTERNAL::QuantizedInputCarrierEnumName(fContext.tableSourceType) << ";\n";
-         scaleVector = "alpaka::getPtrNative(deviceBuf_" + fPlan.weightScaleTensor + ")";
+         scaleVector = "alpaka::getPtrNative(deviceBuf_" + fPlan.weightContract.perChannelScaleTensor + ")";
       } else {
          const auto &tableQuant = *fRegion.tableLowPrecision->affineQuantization;
          out << "      " << params << ".scale = " << INTERNAL::QuantizedDoubleLiteral(tableQuant.scale) << ";\n";

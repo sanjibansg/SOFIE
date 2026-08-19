@@ -273,6 +273,62 @@ enum class ELowPrecisionAccumulation {
    Float32 = 3
 };
 
+// The one numeric-format vocabulary, shared by the planning layer and the generated-code
+// ABI's format slots; per-slot legality is the executability checks' business, not the types'.
+enum class ELowPrecisionFormat {
+   Undefined = 0,
+   Int8 = 1,
+   UInt8 = 2,
+   FP8E4M3 = 3,
+   FP8E5M2 = 4,
+   Float16 = 5,
+   BFloat16 = 6,
+   Float32 = 7
+};
+
+// The one bridge from an ABI format to the planning carrier. BFloat16 rides the Float16
+// carrier: planning tracks a 16-bit float boundary, not which 16-bit encoding.
+inline ELowPrecisionCarrier LowPrecisionCarrierForFormat(ELowPrecisionFormat format)
+{
+   switch (format) {
+   case ELowPrecisionFormat::Int8:
+      return ELowPrecisionCarrier::AffineInt8;
+   case ELowPrecisionFormat::UInt8:
+      return ELowPrecisionCarrier::AffineUInt8;
+   case ELowPrecisionFormat::FP8E4M3:
+      return ELowPrecisionCarrier::FP8E4M3;
+   case ELowPrecisionFormat::FP8E5M2:
+      return ELowPrecisionCarrier::FP8E5M2;
+   case ELowPrecisionFormat::Float16:
+   case ELowPrecisionFormat::BFloat16:
+      return ELowPrecisionCarrier::Float16;
+   case ELowPrecisionFormat::Float32:
+      return ELowPrecisionCarrier::Float32;
+   case ELowPrecisionFormat::Undefined:
+      break;
+   }
+   return ELowPrecisionCarrier::UNDEFINED;
+}
+
+// Accumulation is derived, never stored: affine-integer carriers accumulate in Int32 and
+// everything else in Float32 (the rule LowPrecisionTensorInfo documents).
+inline ELowPrecisionAccumulation LowPrecisionAccumulationForCarrier(ELowPrecisionCarrier carrier)
+{
+   switch (carrier) {
+   case ELowPrecisionCarrier::AffineInt8:
+   case ELowPrecisionCarrier::AffineUInt8:
+      return ELowPrecisionAccumulation::Int32;
+   case ELowPrecisionCarrier::FP8E4M3:
+   case ELowPrecisionCarrier::FP8E5M2:
+   case ELowPrecisionCarrier::Float16:
+   case ELowPrecisionCarrier::Float32:
+      return ELowPrecisionAccumulation::Float32;
+   case ELowPrecisionCarrier::UNDEFINED:
+      break;
+   }
+   return ELowPrecisionAccumulation::UNDEFINED;
+}
+
 // The accumulation type is not stored: it is fully determined by the carrier
 // (affine-integer carriers accumulate in Int32, everything else in Float32).
 struct LowPrecisionTensorInfo {
@@ -350,11 +406,6 @@ enum class EQuantizedLayout {
 };
 
 
-enum class EQuantizedParameterMode {
-   UNDEFINED = 0,
-   Scalar = 1,
-   PerOutputChannel = 2
-};
 enum class EQuantizedShapePolicy {
    UNDEFINED = 0,
    Exact = 1,
@@ -509,6 +560,61 @@ inline EQuantizedCarrierMode QuantizedCarrierModeForStorage(EQuantizedStorageTyp
    }
 }
 
+// One operand's quantization facts in a single spelling: carrier, the grid mapping codes to
+// values (default = none known; scale 1.0 = codes are values), and per-channel tensor names.
+struct QuantizedOperandContract {
+   ELowPrecisionCarrier carrier = ELowPrecisionCarrier::UNDEFINED;
+   QuantizationGrid grid;
+   std::string perChannelScaleTensor;   // empty = per-tensor
+   std::string perChannelZeroPointTensor;
+};
+
+// The affine spelling: carrier from signedness, grid unset for widths the integer range
+// rejects. Per-channel tensor names are the call site's: each plan maker gates its own shapes.
+inline QuantizedOperandContract AffineOperandContract(const QuantizationInfo &info)
+{
+   QuantizedOperandContract contract;
+   contract.carrier = LowPrecisionTensorInfoFromAffineQuantization(info).carrier;
+   if (info.bitWidth > 0 && info.bitWidth < 63)
+      contract.grid = IntegerGridFrom(info);
+   return contract;
+}
+
+// The float-mini spelling: format-fixed code set, per-tensor scale, no zero point.
+inline QuantizedOperandContract Float8OperandContract(ELowPrecisionCarrier carrier, double scale)
+{
+   QuantizedOperandContract contract;
+   contract.carrier = carrier;
+   contract.grid = Float8GridFrom(scale, carrier == ELowPrecisionCarrier::FP8E5M2
+                                            ? EQuantizationGridKind::Float8E5M2
+                                            : EQuantizationGridKind::Float8E4M3);
+   return contract;
+}
+
+// A carrier with no grid: a float operand, or a species whose grid the plan does not carry.
+inline QuantizedOperandContract CarrierOnlyOperandContract(ELowPrecisionCarrier carrier)
+{
+   QuantizedOperandContract contract;
+   contract.carrier = carrier;
+   return contract;
+}
+
+// The per-tensor dequantization factor a float-mini operand carries; 1.0 for anything else
+// (an affine grid's scale is applied through the integer epilogue, not this factor).
+inline double QuantizedFloat8OperandScale(const QuantizedOperandContract &contract)
+{
+   return contract.grid.IsFloatingPoint() ? contract.grid.scale : 1.0;
+}
+
+// Whether the operand's code interval is narrower than its format's: an absorbed clamp.
+inline bool QuantizedFloat8OperandClamped(const QuantizedOperandContract &contract)
+{
+   if (!contract.grid.IsFloatingPoint())
+      return false;
+   const double limit = Float8CodeLimit(contract.grid.kind);
+   return contract.grid.codeMin != -limit || contract.grid.codeMax != limit;
+}
+
 struct QuantizedLoweringPlan {
    EQuantizedBackend backend = EQuantizedBackend::UNDEFINED;
    EQuantizedLoweringStatus status = EQuantizedLoweringStatus::UNDEFINED;
@@ -520,10 +626,11 @@ struct QuantizedLoweringPlan {
    EQuantizedStorageType accumulatorStorage = EQuantizedStorageType::UNDEFINED;
    EQuantizedStorageType outputStorage = EQuantizedStorageType::UNDEFINED;
 
-   ELowPrecisionCarrier inputLowPrecisionCarrier = ELowPrecisionCarrier::UNDEFINED;
-   ELowPrecisionCarrier weightLowPrecisionCarrier = ELowPrecisionCarrier::UNDEFINED;
-   ELowPrecisionCarrier outputLowPrecisionCarrier = ELowPrecisionCarrier::UNDEFINED;
-   ELowPrecisionAccumulation lowPrecisionAccumulation = ELowPrecisionAccumulation::UNDEFINED;
+   // The operand descriptions: carrier, grid (scale spelling for both species), and the
+   // per-channel tensor names. The single currency every codegen and pipeline reader uses.
+   QuantizedOperandContract inputContract;
+   QuantizedOperandContract weightContract;
+   QuantizedOperandContract outputContract;
    EQuantizedOutputMode outputMode = EQuantizedOutputMode::UNDEFINED;
    EQuantizedComputeProfile computeProfile = EQuantizedComputeProfile::UNDEFINED;
    std::string capabilityTag;
@@ -535,20 +642,6 @@ struct QuantizedLoweringPlan {
    // int8 carrier a QuantizeLinear writes each inference, read directly by codegen.
    bool weightStorageIsRuntimeTensor = false;
    EQuantizedLayout weightLayout = EQuantizedLayout::UNDEFINED;
-   EQuantizedParameterMode weightScaleMode = EQuantizedParameterMode::Scalar;
-   std::string weightScaleTensor;
-   std::string weightZeroPointTensor;
-   // Per-tensor dequantization factors for a native low-precision operand pair, carried as
-   // values because the backend applies them itself rather than reading a graph tensor.
-   double lowPrecisionInputScale = 1.0;
-   double lowPrecisionWeightScale = 1.0;
-   // Grid step the region encodes its output onto when it writes an FP8 carrier rather than
-   // a float D. 1 means the region emits float and no D scale is programmed.
-   double lowPrecisionOutputScale = 1.0;
-   // Output clamp in output units, from a Clip absorbed with the quantize boundary.
-   bool lowPrecisionOutputClampEnabled = false;
-   double lowPrecisionOutputClampLow = 0.0;
-   double lowPrecisionOutputClampHigh = 0.0;
 
    std::vector<std::size_t> consumedOperatorIndices;
    bool suppressesGraphOperators = false;

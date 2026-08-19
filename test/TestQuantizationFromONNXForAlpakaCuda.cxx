@@ -1,8 +1,5 @@
-// Per-operator-family tests: the convolution metadata/shape/validator matrix, the raw
-// Conv/Elementwise/Gather device kernels, frontend equivalence, and the elementwise and
-// gather metadata families. Also the umbrella translation unit: it #includes the section
-// files at the bottom, because the SOFIE Alpaka headers define external-linkage
-// __global__ kernels, so exactly one translation unit per binary may reach them.
+// Per-operator-family tests and the umbrella translation unit: the section files are #included
+// at the bottom because the Alpaka headers' __global__ kernels allow only one TU per binary.
 
 #include <algorithm>
 #include <cmath>
@@ -459,8 +456,8 @@ TEST(QuantizationMetadata, Convolution)
 
          EXPECT_EQ(unsignedPlan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
          EXPECT_EQ(unsignedPlan->capabilityTag, "alpaka_affine_conv_direct");
-         EXPECT_EQ(unsignedPlan->inputLowPrecisionCarrier, SOFIE::ELowPrecisionCarrier::AffineUInt8);
-         EXPECT_EQ(unsignedPlan->weightLowPrecisionCarrier, SOFIE::ELowPrecisionCarrier::AffineUInt8);
+         EXPECT_EQ(unsignedPlan->inputContract.carrier, SOFIE::ELowPrecisionCarrier::AffineUInt8);
+         EXPECT_EQ(unsignedPlan->weightContract.carrier, SOFIE::ELowPrecisionCarrier::AffineUInt8);
          EXPECT_EQ(unsignedPlan->weightStorage, SOFIE::EQuantizedStorageType::UInt8);
          const auto &unsignedRegion = *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(unsignedConv.GetQuantizationState());
          const auto unsignedContext = SOFIE::MakeQuantizedConvCodegenContext(unsignedConv, unsignedRegion);
@@ -529,7 +526,7 @@ TEST(QuantizationMetadata, Convolution)
             SOFIE::MakeQuantizedConvCodegenContext(fp8, fp8Region));
          const auto fp8Generated = fp8Lowered.Generate_GPU_ALPAKA("fp8_standard_conv");
          EXPECT_NE(fp8Generated.find("QuantizedConvCudaLtFP8_Call"), std::string::npos);
-         EXPECT_NE(fp8Generated.find("EQuantizedFP8OutputCarrier::Float32"),
+         EXPECT_NE(fp8Generated.find("ELowPrecisionFormat::Float32"),
                    std::string::npos);
          EXPECT_NE(fp8Generated.find(".matrix.hasBias = true"), std::string::npos);
          EXPECT_NE(fp8Generated.find(".matrix.beta = 1.0f"), std::string::npos);
@@ -570,7 +567,8 @@ TEST(QuantizationMetadata, Convolution)
          EXPECT_EQ(fp8Plan->capabilityTag, "cuda_fp8_conv_backend_unsupported");
       #endif
          EXPECT_EQ(fp8Plan->computeProfile, SOFIE::EQuantizedComputeProfile::FP8E4M3Conv);
-         EXPECT_EQ(fp8Plan->lowPrecisionAccumulation,
+         // Accumulation is derived from the carrier, not stored on the plan.
+         EXPECT_EQ(SOFIE::LowPrecisionAccumulationForCarrier(fp8Plan->inputContract.carrier),
                    SOFIE::ELowPrecisionAccumulation::Float32);
    }
    {
@@ -1029,8 +1027,7 @@ TEST(QuantizationMetadata, Convolution)
             SOFIE::EQuantizedBackend::ALPAKA);
          ASSERT_NE(plan, nullptr);
          EXPECT_EQ(plan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
-         EXPECT_EQ(plan->weightScaleMode,
-                   SOFIE::EQuantizedParameterMode::PerOutputChannel);
+         EXPECT_FALSE(plan->weightContract.perChannelScaleTensor.empty());
          const auto context = SOFIE::MakeQuantizedConvCodegenContext(model, region);
          EXPECT_EQ(context.weightScales.size(), 64U);
          EXPECT_EQ(context.weightZeroPoints.size(), 64U);
@@ -1709,10 +1706,10 @@ TEST_F(QuantizationAlpakaTest, ConvolutionKernels)
          params.matrix.m = width;
          params.matrix.n = channelsPerGroup;
          params.matrix.k = channelsPerGroup;
-         params.matrix.inputFormat = SOFIE::EQuantizedFP8Format::E4M3;
-         params.matrix.weightFormat = SOFIE::EQuantizedFP8Format::E4M3;
-         params.matrix.outputCarrier = SOFIE::EQuantizedFP8OutputCarrier::Float32;
-         params.matrix.accumulation = SOFIE::EQuantizedFP8Accumulation::Float32;
+         params.matrix.inputFormat = SOFIE::ELowPrecisionFormat::FP8E4M3;
+         params.matrix.weightFormat = SOFIE::ELowPrecisionFormat::FP8E4M3;
+         params.matrix.outputCarrier = SOFIE::ELowPrecisionFormat::Float32;
+         params.matrix.accumulation = SOFIE::ELowPrecisionFormat::Float32;
          params.matrix.hasBias = true;
          params.matrix.beta = 1.0f;
          params.geometry.batch = 1;
@@ -1805,10 +1802,10 @@ TEST_F(QuantizationAlpakaTest, ConvolutionKernels)
          params.matrix.m = width;
          params.matrix.n = 1;
          params.matrix.k = kernel;
-         params.matrix.inputFormat = SOFIE::EQuantizedFP8Format::E4M3;
-         params.matrix.weightFormat = SOFIE::EQuantizedFP8Format::E4M3;
-         params.matrix.outputCarrier = SOFIE::EQuantizedFP8OutputCarrier::Float32;
-         params.matrix.accumulation = SOFIE::EQuantizedFP8Accumulation::Float32;
+         params.matrix.inputFormat = SOFIE::ELowPrecisionFormat::FP8E4M3;
+         params.matrix.weightFormat = SOFIE::ELowPrecisionFormat::FP8E4M3;
+         params.matrix.outputCarrier = SOFIE::ELowPrecisionFormat::Float32;
+         params.matrix.accumulation = SOFIE::ELowPrecisionFormat::Float32;
          params.matrix.hasBias = true;
          params.geometry.batch = 1;
          params.geometry.inputChannels = channels;
@@ -3086,8 +3083,7 @@ TEST(QuantizationMetadata, Gather)
             state, region->gatherOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
          ASSERT_NE(plan, nullptr);
          EXPECT_EQ(plan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
-         EXPECT_EQ(plan->weightScaleMode, SOFIE::EQuantizedParameterMode::PerOutputChannel);
-         EXPECT_EQ(plan->weightScaleTensor, "scale");
+         EXPECT_EQ(plan->weightContract.perChannelScaleTensor, "scale");
    }
    {
       SCOPED_TRACE("asymmetric per-channel quantization is rejected");

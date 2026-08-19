@@ -75,7 +75,6 @@ QuantizedDenseLinearBackendCapability MakeNativeFP8E4M3TNF32Capability()
    capability.inputCarrier = ELowPrecisionCarrier::FP8E4M3;
    capability.weightCarrier = ELowPrecisionCarrier::FP8E4M3;
    capability.outputCarrier = ELowPrecisionCarrier::Float32;
-   capability.accumulation = ELowPrecisionAccumulation::Float32;
    capability.tag = "fp8_dense_linear_cublaslt_e4m3_tn_f32";
    capability.reason = "SOFIE cuBLASLt FP8 E4M3 TN FP32 path selected for native FP8 Gemm";
    return capability;
@@ -237,10 +236,8 @@ QuantizedDenseLinearProfileAssessment AssessDenseLinearComputeProfile(
       inputQuant, weightQuant, outputQuant, std::nullopt, expectedWeightPerChannelAxis, operatorName);
    assessment.reasons.insert(assessment.reasons.end(), parameterReasons.begin(), parameterReasons.end());
 
-   // An asymmetric input is corrected in the epilogue (the accumulator sheds
-   // inputZeroPoint times the weight column sum), and an asymmetric output rides the
-   // epilogue's output offset. An asymmetric weight would need per-element activation
-   // sums the lowering does not compute, so it still declines.
+   // An asymmetric input is corrected by weight column sums and an asymmetric output rides the
+   // epilogue offset; an asymmetric weight would need activation sums the lowering does not compute.
    const bool hasAsymmetricWeight = !IsScalarZeroPointZero(weightQuant);
    if (hasAsymmetricWeight) {
       assessment.reasons.push_back(operatorName + " weight zero point is nonzero; cuBLASLt int8 lowering requires activation-sum/weight-sum zero-point correction");
@@ -408,15 +405,14 @@ std::string DenseLinearShapeToString(const std::vector<std::size_t> &shape)
    return out.str();
 }
 
-void SetAffineLowPrecisionCarriers(QuantizedLoweringPlan &plan,
+void SetAffineOperandContracts(QuantizedLoweringPlan &plan,
                                    const QuantizationInfo &inputQuant,
                                    const QuantizationInfo &weightQuant,
                                    const QuantizationInfo &outputQuant)
 {
-   plan.inputLowPrecisionCarrier = LowPrecisionTensorInfoFromAffineQuantization(inputQuant).carrier;
-   plan.weightLowPrecisionCarrier = LowPrecisionTensorInfoFromAffineQuantization(weightQuant).carrier;
-   plan.outputLowPrecisionCarrier = LowPrecisionTensorInfoFromAffineQuantization(outputQuant).carrier;
-   plan.lowPrecisionAccumulation = ELowPrecisionAccumulation::Int32;
+   plan.inputContract = AffineOperandContract(inputQuant);
+   plan.weightContract = AffineOperandContract(weightQuant);
+   plan.outputContract = AffineOperandContract(outputQuant);
 }
 
 } // namespace
@@ -520,6 +516,23 @@ QuantizedMatMulShapeAssessment AssessQuantizedMatMulShape(
    assessment.unsupportedReasons.push_back("MatMul broadcasted shape family is not a dense projection or exact-batch MatMul");
    assessment.reason = JoinQuantizationReasons(assessment.unsupportedReasons);
    return assessment;
+}
+
+QuantizedDenseLinearBackendCapability AssessQuantizedDenseLinearCapability(
+   EQuantizedBackend backend, const QuantizedDenseLinearOperands &operands)
+{
+   switch (backend) {
+   case EQuantizedBackend::ALPAKA:
+      return AssessCublasLtDenseLinearCapability(operands);
+   default:
+      break;
+   }
+   QuantizedDenseLinearBackendCapability capability;
+   capability.backend = backend;
+   capability.executable = false;
+   capability.tag = "dense_linear_backend_assessor_unavailable";
+   capability.reason = "no dense-linear capability assessor is registered for this backend";
+   return capability;
 }
 
 QuantizedDenseLinearBackendCapability AssessCublasLtDenseLinearCapability(
@@ -780,7 +793,7 @@ QuantizedLoweringPlan MakeUnsupportedQuantizedMatMulPlan(const QuantizedDenseLin
    plan.capabilityTag = preservesSemantics ? "matmul_recognized_backend_unsupported" : "matmul_semantic_unsupported";
    plan.consumedOperatorIndices = { region.denseOpIndex };
    if (preservesSemantics) {
-      SetAffineLowPrecisionCarriers(plan, region.inputQuant, region.weightQuant, region.outputQuant);
+      SetAffineOperandContracts(plan, region.inputQuant, region.weightQuant, region.outputQuant);
    }
    return plan;
 }
@@ -788,7 +801,7 @@ QuantizedLoweringPlan MakeUnsupportedQuantizedMatMulPlan(const QuantizedDenseLin
 QuantizedLoweringPlan MakeUnsupportedLowPrecisionDenseLinearPlan(
    EQuantizedBackend backend, std::string reason, bool preservesSemantics,
    ELowPrecisionCarrier inputCarrier, ELowPrecisionCarrier weightCarrier,
-   ELowPrecisionCarrier outputCarrier, ELowPrecisionAccumulation accumulation,
+   ELowPrecisionCarrier outputCarrier,
    EQuantizedComputeProfile profile, std::string capabilityTag)
 {
    auto plan = MakeUnsupportedQuantizedPlan(backend, std::move(reason), preservesSemantics);
@@ -803,10 +816,9 @@ QuantizedLoweringPlan MakeUnsupportedLowPrecisionDenseLinearPlan(
    plan.outputMode = preservesSemantics ? EQuantizedOutputMode::ExactFakeQuantFloat : EQuantizedOutputMode::UNDEFINED;
    plan.computeProfile = preservesSemantics ? profile : EQuantizedComputeProfile::UNDEFINED;
    plan.capabilityTag = preservesSemantics ? std::move(capabilityTag) : "low_precision_dense_linear_semantic_unsupported";
-   plan.inputLowPrecisionCarrier = inputCarrier;
-   plan.weightLowPrecisionCarrier = weightCarrier;
-   plan.outputLowPrecisionCarrier = outputCarrier;
-   plan.lowPrecisionAccumulation = accumulation;
+   plan.inputContract = CarrierOnlyOperandContract(inputCarrier);
+   plan.weightContract = CarrierOnlyOperandContract(weightCarrier);
+   plan.outputContract = CarrierOnlyOperandContract(outputCarrier);
    return plan;
 }
 
@@ -848,7 +860,7 @@ static void ApplyDequantizedFloatOutput(QuantizedLoweringPlan &plan, bool dequan
       return;
    plan.outputStorage = EQuantizedStorageType::FloatCarrier;
    plan.outputMode = EQuantizedOutputMode::ExactFakeQuantFloat;
-   plan.outputLowPrecisionCarrier = ELowPrecisionCarrier::Float32;
+   plan.outputContract = CarrierOnlyOperandContract(ELowPrecisionCarrier::Float32);
 }
 
 QuantizedLoweringPlan MakeMatMulAlpakaTransposedWeightStoragePlan(const QuantizedDenseLinearRegion &region,
@@ -885,14 +897,15 @@ QuantizedLoweringPlan MakeMatMulAlpakaTransposedWeightStoragePlan(const Quantize
    plan.computeProfile = IsPerChannelAxis(region.weightQuant, 1)
                             ? EQuantizedComputeProfile::SignedInt8PerTensorActivationPerChannelWeightRank2
                             : EQuantizedComputeProfile::SignedInt8SymmetricPerTensorRank2;
-   SetAffineLowPrecisionCarriers(plan, region.inputQuant, region.weightQuant, region.outputQuant);
+   SetAffineOperandContracts(plan, region.inputQuant, region.weightQuant, region.outputQuant);
+   // An absorbed int8 Clip/Relu stays a region fact (region.outputClamp): it narrows the
+   // epilogue's rounding grid, which applies even when the output leaves as float.
    plan.matrixShapePolicy = shapePolicy;
    plan.weightStorageTensor = weightStorageTensor;
    plan.weightLayout = EQuantizedLayout::PlainDevice;
    if (IsPerChannelAxis(region.weightQuant, 1)) {
-      plan.weightScaleMode = EQuantizedParameterMode::PerOutputChannel;
-      plan.weightScaleTensor = region.weightQuant.scaleTensor;
-      plan.weightZeroPointTensor = region.weightQuant.zeroPointTensor;
+      plan.weightContract.perChannelScaleTensor = region.weightQuant.scaleTensor;
+      plan.weightContract.perChannelZeroPointTensor = region.weightQuant.zeroPointTensor;
    }
    plan.consumedOperatorIndices = QuantizedRegionConsumedOperatorIndices(region);
    ApplyDequantizedFloatOutput(plan, dequantizeFloatOutput);
@@ -934,7 +947,7 @@ QuantizedLoweringPlan MakeCPUPackedWeightBaselinePlan(const QuantizedDenseLinear
    plan.outputStorage = EQuantizedStorageType::FloatCarrier;
    plan.outputMode = EQuantizedOutputMode::ExactFakeQuantFloat;
    plan.computeProfile = EQuantizedComputeProfile::GenericRecognized;
-   SetAffineLowPrecisionCarriers(plan, region.inputQuant, region.weightQuant, region.outputQuant);
+   SetAffineOperandContracts(plan, region.inputQuant, region.weightQuant, region.outputQuant);
    plan.weightStorageTensor = weightStorageTensor;
    plan.weightLayout = EQuantizedLayout::PackedCPU;
    return plan;
@@ -996,14 +1009,13 @@ QuantizedLoweringPlan MakeAlpakaCublasLtCorePlan(const QuantizedDenseLinearRegio
    plan.outputStorage = QuantizedStorageTypeForCarrier(region.outputQuant);
    plan.outputMode = EQuantizedOutputMode::Quantized;
    plan.computeProfile = capability.profile;
-   SetAffineLowPrecisionCarriers(plan, region.inputQuant, region.weightQuant, region.outputQuant);
+   SetAffineOperandContracts(plan, region.inputQuant, region.weightQuant, region.outputQuant);
    plan.matrixShapePolicy = capability.shapePolicy;
    plan.weightStorageTensor = weightStorageTensor;
    plan.weightLayout = EQuantizedLayout::PlainDevice;
    if (IsPerChannelAxis(region.weightQuant, 0)) {
-      plan.weightScaleMode = EQuantizedParameterMode::PerOutputChannel;
-      plan.weightScaleTensor = region.weightQuant.scaleTensor;
-      plan.weightZeroPointTensor = region.weightQuant.zeroPointTensor;
+      plan.weightContract.perChannelScaleTensor = region.weightQuant.scaleTensor;
+      plan.weightContract.perChannelZeroPointTensor = region.weightQuant.zeroPointTensor;
    }
    ApplyDequantizedFloatOutput(plan, dequantizeFloatOutput);
    // An intermediate input is a float activation, so the cuBLASLt path reads it as a
@@ -1043,10 +1055,11 @@ QuantizedLoweringPlan MakeAlpakaCublasLtFP8Plan(
    plan.biasStorage = hasBias ? EQuantizedStorageType::FloatCarrier : EQuantizedStorageType::UNDEFINED;
    plan.outputStorage = QuantizedStorageTypeForLowPrecisionCarrier(capability.outputCarrier);
    plan.accumulatorStorage = QuantizedStorageTypeForLowPrecisionCarrier(ELowPrecisionCarrier::Float32);
-   plan.inputLowPrecisionCarrier = capability.inputCarrier;
-   plan.weightLowPrecisionCarrier = capability.weightCarrier;
-   plan.outputLowPrecisionCarrier = capability.outputCarrier;
-   plan.lowPrecisionAccumulation = capability.accumulation;
+   // Carriers only: the pass resolves the operand scales after capability assessment and
+   // fills the grids where it does.
+   plan.inputContract = CarrierOnlyOperandContract(capability.inputCarrier);
+   plan.weightContract = CarrierOnlyOperandContract(capability.weightCarrier);
+   plan.outputContract = CarrierOnlyOperandContract(capability.outputCarrier);
    plan.outputMode = EQuantizedOutputMode::ExactFakeQuantFloat;
    plan.computeProfile = capability.profile;
    plan.capabilityTag = capability.tag;

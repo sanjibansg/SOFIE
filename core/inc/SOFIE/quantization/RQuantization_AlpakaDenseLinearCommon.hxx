@@ -174,10 +174,8 @@ inline void SetStridedBatchLayout(cublasLtMatrixLayout_t layout, std::size_t bat
                        "cublasLtMatrixLayoutSetAttribute(batch-stride)");
 }
 
-// Shared heuristic query for both cuBLASLt states: selects candidate 0 and sizes the
-// workspace to the largest candidate; returns false, count zero, when no algorithm exists.
-// tolerateUnsupported turns the provider's "no algorithm for this combination" answer into a
-// false return instead of a throw, for a caller holding a second configuration to fall back to.
+// Shared heuristic query for both cuBLASLt states: selects candidate 0, sizes the workspace to
+// the largest; tolerateUnsupported returns false instead of throwing, for callers with a fallback.
 template <typename State>
 inline bool QuantizedGemmCudaLtSelectHeuristics(State &state, cublasLtMatrixLayout_t cLayout,
                                                 cublasLtMatrixLayout_t dLayout,

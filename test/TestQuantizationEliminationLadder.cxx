@@ -1,7 +1,5 @@
-// Assertions on the generated header text: adopted output quants, movement-carrier
-// rewires, duplicate-decode views, fused snaps, and the arena/aliasing decisions.
-// Each is asserted on the text because a numeric run cannot observe it; the paired
-// session runs live in TestQuantizationNumerics.cxx.
+// Assertions on the generated header text — the fusions a numeric run cannot observe,
+// since they are bit-exact; the paired session runs live in TestQuantizationNumerics.cxx.
 
 #include <algorithm>
 #include <cstddef>
@@ -180,7 +178,7 @@ TEST(ScaledFP8QdqCodegen, AdoptedOutputQuantNarrowsDAndDecodesSeparately)
       << "expected no FP8 quantize kernel to decode: the trailing pair is adopted by the "
          "region, so a decoding kernel means the fused round trip came back:\n"
       << bodies;
-   EXPECT_NE(code.find("outputCarrier = SOFIE::EQuantizedFP8OutputCarrier::FP8E4M3"), std::string::npos)
+   EXPECT_NE(code.find("outputCarrier = SOFIE::ELowPrecisionFormat::FP8E4M3"), std::string::npos)
       << "the region did not adopt the trailing quantize as its FP8 output carrier";
    EXPECT_NE(code.find("DequantizeLinearKernel"), std::string::npos)
       << "no standalone dequantize decodes the adopted carrier back to float";
@@ -194,7 +192,7 @@ TEST(ScaledFP8QdqCodegen, MovementRunCarriesAdoptedCodesThroughTranspose)
    ASSERT_TRUE(file.good()) << "generated header missing";
    const std::string code((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
-   EXPECT_NE(code.find("outputCarrier = SOFIE::EQuantizedFP8OutputCarrier::FP8E4M3"), std::string::npos)
+   EXPECT_NE(code.find("outputCarrier = SOFIE::ELowPrecisionFormat::FP8E4M3"), std::string::npos)
       << "the region did not adopt the encode behind the Transpose as its FP8 output carrier";
    EXPECT_EQ(SOFIE_TEST::CountOccurrences(code, "ONNX_QUANTIZELINEAR_FP8_KERNEL_ALPAKA"), 1u)
       << "expected only the input encode kernel: a second quantize kernel means the "
@@ -230,9 +228,8 @@ static std::string ReadGeneratedHeader(const char *header)
    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
-// An adopted run that reaches its boundary through movement: the region writes the codes at
-// the head, the Transpose permutes them, and every boundary the run passed is gone. Asserted
-// on the generated text because the values are identical either way.
+// An adopted run reaching its boundary through movement: the head writes the codes, the
+// Transpose permutes them, every passed boundary is gone; the values are identical either way.
 TEST(OutputAdoptionCodegen, DeepenedRunIsCarriedByTheTranspose)
 {
    const std::string code =
@@ -270,9 +267,8 @@ TEST(OutputAdoptionCodegen, DeepenedRunIsCarriedByTheTranspose)
       << "the k Transpose is not reading the adopted carrier and writing the run's target";
 }
 
-// The same walk on a run whose two boundaries name grids one octave apart. The coarse grid's
-// points lie on the fine one, so a single encode cannot reproduce the pair and the crossing
-// boundary has to survive.
+// The same walk with grids one octave apart: the coarse points lie on the fine grid, one
+// encode cannot reproduce the pair, and the crossing boundary has to survive.
 TEST(OutputAdoptionCodegen, GridCrossingKeepsItsBoundary)
 {
    const std::string code =
@@ -314,10 +310,8 @@ TEST(OutputAdoptionCodegen, RoundTripAbsorbsTheDecodeInFrontOfIt)
       << "the round trip stopped writing its own grid's snapped float";
 }
 
-// The accumulator handoff: a lowered int8 region whose sole consumer is a Softmax emits no
-// float epilogue, and the Softmax applies QuantizedGemmCudaEpilogueValueSpec at its own load.
-// Asserted on the emitted text because the handoff is bit-exact, so a build where it failed to
-// engage computes the same numbers and no numeric test can see the difference.
+// The accumulator handoff: the sole-consumer Softmax applies the epilogue at its own load and
+// the region emits none. The handoff is bit-exact, so only the emitted text can see a failure.
 TEST(DeferredEpilogueCodegen, SoftmaxConsumesTheAccumulator)
 {
    std::ifstream in("ONNX_QDQ_AttentionSoftmax_FromONNX_GPU_ALPAKA.hxx");
@@ -335,9 +329,8 @@ TEST(DeferredEpilogueCodegen, SoftmaxConsumesTheAccumulator)
       << "the Softmax launch is not reading the producing GEMM's recorded epilogue";
 }
 
-// Every specialized epilogue call is paired with its host-side guard. Without one, a call
-// compiled for the wrong invocation shape returns a plausible wrong number and nothing
-// downstream catches it.
+// Every specialized epilogue call is paired with its host-side guard: a call compiled for
+// the wrong invocation shape returns a plausible wrong number nothing downstream catches.
 TEST(DeferredEpilogueCodegen, EverySpecializedEpilogueCarriesItsGuard)
 {
    for (const char *header : {"ONNX_QDQ_AttentionSoftmax_FromONNX_GPU_ALPAKA.hxx"}) {

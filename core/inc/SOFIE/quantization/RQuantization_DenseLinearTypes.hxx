@@ -17,13 +17,12 @@ struct QuantizedDenseLinearBackendCapability {
    ELowPrecisionCarrier inputCarrier = ELowPrecisionCarrier::UNDEFINED;
    ELowPrecisionCarrier weightCarrier = ELowPrecisionCarrier::UNDEFINED;
    ELowPrecisionCarrier outputCarrier = ELowPrecisionCarrier::UNDEFINED;
-   ELowPrecisionAccumulation accumulation = ELowPrecisionAccumulation::UNDEFINED;
 };
 
 inline QuantizedDenseLinearBackendCapability MakeFP8DenseLinearBackendUnsupportedCapability(
    EQuantizedBackend backend, ELowPrecisionCarrier inputCarrier,
    ELowPrecisionCarrier weightCarrier, ELowPrecisionCarrier outputCarrier,
-   ELowPrecisionAccumulation accumulation, std::string reason)
+   std::string reason)
 {
    QuantizedDenseLinearBackendCapability capability;
    capability.backend = backend;
@@ -32,7 +31,6 @@ inline QuantizedDenseLinearBackendCapability MakeFP8DenseLinearBackendUnsupporte
    capability.inputCarrier = inputCarrier;
    capability.weightCarrier = weightCarrier;
    capability.outputCarrier = outputCarrier;
-   capability.accumulation = accumulation;
    capability.tag = "fp8_dense_linear_backend_unsupported";
    capability.reason = std::move(reason);
    return capability;

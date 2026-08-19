@@ -109,10 +109,10 @@ inline void QuantizedConvCudaDepthwiseFP8_Call(
    if (geometry.groups == 0 || geometry.groups != geometry.inputChannels ||
        geometry.outputChannels % geometry.inputChannels != 0)
       throw std::runtime_error("SOFIE FP8 depthwise Conv received inconsistent channel dimensions");
-   if (params.matrix.inputFormat != EQuantizedFP8Format::E4M3 ||
-       params.matrix.weightFormat != EQuantizedFP8Format::E4M3 ||
-       params.matrix.outputCarrier != EQuantizedFP8OutputCarrier::Float32 ||
-       params.matrix.accumulation != EQuantizedFP8Accumulation::Float32)
+   if (params.matrix.inputFormat != ELowPrecisionFormat::FP8E4M3 ||
+       params.matrix.weightFormat != ELowPrecisionFormat::FP8E4M3 ||
+       params.matrix.outputCarrier != ELowPrecisionFormat::Float32 ||
+       params.matrix.accumulation != ELowPrecisionFormat::Float32)
       throw std::runtime_error("SOFIE FP8 depthwise Conv requires E4M3 operands and FP32 accumulation/output");
    if (params.matrix.hasBias && bias == nullptr)
       throw std::runtime_error("SOFIE FP8 depthwise Conv expected a bias pointer");

@@ -1,7 +1,5 @@
-// Pipeline-report and frontier assertions: region counts and verdicts,
-// the carrier-frontier invariant, the carrier capability protocol, and the
-// plans/resources byte accounting (packed scratch, carrier-memory planning, and the
-// runtime memory diagnostics).
+// Pipeline-report and frontier assertions: region counts and verdicts, the carrier-frontier
+// invariant, the capability protocol, and the plans/resources byte accounting.
 
 #include <algorithm>
 #include <cmath>
@@ -317,9 +315,8 @@ TEST(CarrierCapabilityProtocol, OperatorsDeclareWhatTheyCanCarry)
    EXPECT_TRUE(reshape.CarrierOutputAliasesInput())
       << "a Reshape that does not declare aliasing lets the carrier arena reuse its source";
 
-   // A Transpose runs a real kernel into its own buffer, so it does not alias. Declaring
-   // otherwise would keep tensors out of the arena that belong in it, which is wasteful
-   // but not wrong.
+   // A Transpose runs a real kernel into its own buffer, so it does not alias; declaring
+   // otherwise would keep arena-eligible tensors out — wasteful but not wrong.
    SOFIE::ROperator_Transpose<float> transpose(std::vector<SOFIE::int_t>{1, 0}, "x", "y");
    EXPECT_EQ(transpose.CarrierSupport(), SOFIE::ELowPrecisionCarrierSupport::ValuePreserving);
    EXPECT_FALSE(transpose.CarrierOutputAliasesInput());

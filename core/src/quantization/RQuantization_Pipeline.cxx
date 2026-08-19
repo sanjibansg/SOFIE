@@ -359,10 +359,10 @@ void QuantizationPipeline::PrepareQuantizedTensorStorage(RModel &model, EQuantiz
       consumedOperators.insert(planIt->second.consumedOperatorIndices.begin(),
                                planIt->second.consumedOperatorIndices.end());
       protectedTensors.insert(planIt->second.weightStorageTensor);
-      if (!planIt->second.weightScaleTensor.empty())
-         protectedTensors.insert(planIt->second.weightScaleTensor);
-      if (!planIt->second.weightZeroPointTensor.empty())
-         protectedTensors.insert(planIt->second.weightZeroPointTensor);
+      if (!planIt->second.weightContract.perChannelScaleTensor.empty())
+         protectedTensors.insert(planIt->second.weightContract.perChannelScaleTensor);
+      if (!planIt->second.weightContract.perChannelZeroPointTensor.empty())
+         protectedTensors.insert(planIt->second.weightContract.perChannelZeroPointTensor);
       const auto &region = QuantizationExtension::Of(model).state.regions.at(opIndex);
       const auto &weightSource = QuantizedRegionSecondaryStorageTensor(region);
       pruneCandidates.insert(weightSource);
@@ -444,11 +444,11 @@ void QuantizationPipeline::AddLoweredQuantizedOperators(RModel &model, EQuantize
          if (!isIndexInput)
             setKnownTensorType(inputSourceTensor, TensorTypeForQuantizedStorage(plan.inputStorage));
       }
-      if (plan.outputLowPrecisionCarrier == ELowPrecisionCarrier::Float32)
+      if (plan.outputContract.carrier == ELowPrecisionCarrier::Float32)
          setKnownTensorType(outputTensor, ETensorType::FLOAT);
       // An E4M3 activation carrier (an FP8 layer handing the next FP8 layer a native
       // operand) is stored as a byte-wide FP8 tensor.
-      if (plan.outputLowPrecisionCarrier == ELowPrecisionCarrier::FP8E4M3)
+      if (plan.outputContract.carrier == ELowPrecisionCarrier::FP8E4M3)
          setKnownTensorType(outputTensor, ETensorType::FLOAT8E4M3FN);
       if (QuantizedPlanExposesQuantizedOutputCarrier(plan))
          setKnownTensorType(outputTensor, TensorTypeForQuantizedStorage(plan.outputStorage));
@@ -695,8 +695,7 @@ void QuantizationPipeline::ApplyPlannedCarrierHandoffs(RModel &model)
 }
 
 // The accumulator handoff: a lowered dense-linear region whose sole reader can apply the
-// epilogue itself stops emitting it. Both halves are asked -- see CanDeferOutputEpilogue and
-// ROperator::AcceptInt32Accumulator.
+// epilogue itself stops emitting it (CanDeferOutputEpilogue asks one half, AcceptInt32Accumulator the other).
 void QuantizationPipeline::ApplyDeferredOutputEpilogues(
    RModel &model, const std::unordered_map<std::string, std::vector<std::size_t>> &consumers)
 {
@@ -719,10 +718,8 @@ void QuantizationPipeline::ApplyDeferredOutputEpilogues(
       if (reader == consumers.end() || reader->second.size() != 1)
          continue;
       const std::size_t readerIndex = reader->second.front();
-      // The accumulator is scratch bound from a shared arena base, so it survives only until
-      // the next lowered region runs: none may sit between producer and consumer. Ordinary
-      // kernels touch no scratch. Original operator indices order the same as emission, since
-      // codegen walks fOperators forward and absorbed ops are gone from both.
+      // The accumulator is shared-arena scratch, alive only until the next lowered region: none
+      // may sit between producer and consumer. Operator indices order the same as emission.
       if (readerIndex <= opIndex)
          continue;
       bool loweredRegionInBetween = false;
@@ -897,8 +894,6 @@ void QuantizationPipeline::DeduplicateCarrierDecodes(RModel &model, EQuantizedBa
                 << "\n";
 }
 
-// Rewires a DQ -> movement -> Q chain onto the carrier so the movement moves codes and the
-// boundary pair dies; exact because both boundaries share a grid, so Q(DQ(c)) == c.
 // Rewires a movement run onto a byte-wide carrier: each hop reads and writes codes, the
 // tensors between hops are retyped in place, and the last hop takes over the target tensor.
 void QuantizationPipeline::RewireCarrierMovementRun(RModel &model, const std::vector<std::size_t> &runOpIndices,

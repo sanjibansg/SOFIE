@@ -430,10 +430,10 @@ QuantizedLoweringPlan MakeAlpakaFP8ConvCandidatePlan(
       region, EQuantizedBackend::ALPAKA, region.reason, true);
    const auto inputCarrier = region.inputLowPrecision->carrier;
    const auto weightCarrier = region.weightLowPrecision->carrier;
-   plan.inputLowPrecisionCarrier = inputCarrier;
-   plan.weightLowPrecisionCarrier = weightCarrier;
-   plan.outputLowPrecisionCarrier = ELowPrecisionCarrier::Float32;
-   plan.lowPrecisionAccumulation = ELowPrecisionAccumulation::Float32;
+   // FP8 conv operands are scale-free by contract: carriers only, no grid.
+   plan.inputContract = CarrierOnlyOperandContract(inputCarrier);
+   plan.weightContract = CarrierOnlyOperandContract(weightCarrier);
+   plan.outputContract = CarrierOnlyOperandContract(ELowPrecisionCarrier::Float32);
    plan.inputStorage = QuantizedStorageTypeForLowPrecisionCarrier(inputCarrier);
    plan.weightStorage = QuantizedStorageTypeForLowPrecisionCarrier(weightCarrier);
    plan.biasStorage = region.biasSourceTensor.empty()
@@ -656,10 +656,9 @@ void BuildQuantizedConvLoweringPlans(QuantizationPassContext &context)
             "; portable native FP8 Conv execution is unavailable; a backend-native FP8 Conv rule is required";
          auto cpu = MakeUnsupportedConvPlan(
             region, EQuantizedBackend::CPU, reason, true);
-         cpu.inputLowPrecisionCarrier = region.inputLowPrecision->carrier;
-         cpu.weightLowPrecisionCarrier = region.weightLowPrecision->carrier;
-         cpu.outputLowPrecisionCarrier = ELowPrecisionCarrier::Float32;
-         cpu.lowPrecisionAccumulation = ELowPrecisionAccumulation::Float32;
+         cpu.inputContract = CarrierOnlyOperandContract(region.inputLowPrecision->carrier);
+         cpu.weightContract = CarrierOnlyOperandContract(region.weightLowPrecision->carrier);
+         cpu.outputContract = CarrierOnlyOperandContract(ELowPrecisionCarrier::Float32);
          const auto inputShape = model.GetTensorShape(region.inputSourceTensor);
          const auto weightShape = model.GetTensorShape(region.weightSourceTensor);
          const auto outputShape = model.GetTensorShape(region.outputTensor);
@@ -667,10 +666,9 @@ void BuildQuantizedConvLoweringPlans(QuantizationPassContext &context)
             region, inputShape, weightShape, outputShape,
             model.GetTensorType(region.inputSourceTensor),
             model.GetTensorType(region.weightSourceTensor));
-         alpaka.inputLowPrecisionCarrier = cpu.inputLowPrecisionCarrier;
-         alpaka.weightLowPrecisionCarrier = cpu.weightLowPrecisionCarrier;
-         alpaka.outputLowPrecisionCarrier = cpu.outputLowPrecisionCarrier;
-         alpaka.lowPrecisionAccumulation = cpu.lowPrecisionAccumulation;
+         alpaka.inputContract = cpu.inputContract;
+         alpaka.weightContract = cpu.weightContract;
+         alpaka.outputContract = cpu.outputContract;
          EnforceAlpakaConvResourceBudget(alpaka);
          plans[EQuantizedBackend::CPU] = std::move(cpu);
          plans[EQuantizedBackend::ALPAKA] = std::move(alpaka);
@@ -760,12 +758,16 @@ void BuildQuantizedConvLoweringPlans(QuantizationPassContext &context)
                                  : EQuantizedStorageType::FloatCarrier);
       cpu.accumulatorStorage = EQuantizedStorageType::Int32Accumulator;
       cpu.outputStorage = outputStorage;
-      cpu.inputLowPrecisionCarrier = region.inputLowPrecision->carrier;
-      cpu.weightLowPrecisionCarrier = region.weightLowPrecision->carrier;
-      cpu.outputLowPrecisionCarrier = outputMode == EQuantizedOutputMode::Quantized
-         ? region.outputLowPrecision->carrier
-         : ELowPrecisionCarrier::Float32;
-      cpu.lowPrecisionAccumulation = ELowPrecisionAccumulation::Int32;
+      cpu.inputContract = AffineOperandContract(inputQuant);
+      cpu.inputContract.carrier = region.inputLowPrecision->carrier;
+      cpu.weightContract = AffineOperandContract(weightQuant);
+      cpu.weightContract.carrier = region.weightLowPrecision->carrier;
+      if (outputMode == EQuantizedOutputMode::Quantized) {
+         cpu.outputContract = AffineOperandContract(*region.outputLowPrecision->affineQuantization);
+         cpu.outputContract.carrier = region.outputLowPrecision->carrier;
+      } else {
+         cpu.outputContract = CarrierOnlyOperandContract(ELowPrecisionCarrier::Float32);
+      }
       cpu.outputMode = outputMode;
       cpu.computeProfile = EQuantizedComputeProfile::GenericRecognized;
       cpu.capabilityTag = "portable_affine_conv_cpu";
@@ -775,9 +777,8 @@ void BuildQuantizedConvLoweringPlans(QuantizationPassContext &context)
             : region.weightSourceTensor;
       cpu.weightLayout = EQuantizedLayout::Plain;
       if (weightQuant.granularity == EQuantizationGranularity::PerChannel) {
-         cpu.weightScaleMode = EQuantizedParameterMode::PerOutputChannel;
-         cpu.weightScaleTensor = weightQuant.scaleTensor;
-         cpu.weightZeroPointTensor = weightQuant.zeroPointTensor;
+         cpu.weightContract.perChannelScaleTensor = weightQuant.scaleTensor;
+         cpu.weightContract.perChannelZeroPointTensor = weightQuant.zeroPointTensor;
       }
       cpu.consumedOperatorIndices = QuantizedRegionConsumedOperatorIndices(region);
       cpu.suppressesGraphOperators = true;

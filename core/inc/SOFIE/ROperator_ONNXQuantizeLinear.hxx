@@ -229,9 +229,8 @@ inline void RequirePerTensorQDQForGpu(const QuantizationInfo &info, const std::s
 
 using SOFIE::ExactDoubleLiteral;
 
-// Registers the float result of folding a DequantizeLinear over an initialized carrier.
-// A small result stays a constant tensor, embedded where the operators that fold against it
-// look for it; a folded weight becomes an initialized tensor and travels in the weight file.
+// Registers the float result of folding a DequantizeLinear over an initialized carrier: a
+// small result stays an embedded constant, a folded weight travels in the weight file.
 inline void AddFoldedDequantizedTensor(RModel &model, const std::string &name,
                                        const std::vector<std::size_t> &shape,
                                        const std::vector<float> &values)

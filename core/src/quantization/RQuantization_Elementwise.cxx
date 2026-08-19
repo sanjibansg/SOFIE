@@ -126,10 +126,9 @@ void BuildElementwisePlans(QuantizationModelState &state, QuantizedElementwiseRe
       alpaka.inputStorage = EQuantizedStorageType::FP8E4M3;
       alpaka.weightStorage = EQuantizedStorageType::FP8E4M3;
       alpaka.outputStorage = EQuantizedStorageType::FloatCarrier;
-      alpaka.inputLowPrecisionCarrier = ELowPrecisionCarrier::FP8E4M3;
-      alpaka.weightLowPrecisionCarrier = ELowPrecisionCarrier::FP8E4M3;
-      alpaka.outputLowPrecisionCarrier = ELowPrecisionCarrier::Float32;
-      alpaka.lowPrecisionAccumulation = ELowPrecisionAccumulation::Float32;
+      alpaka.inputContract = CarrierOnlyOperandContract(ELowPrecisionCarrier::FP8E4M3);
+      alpaka.weightContract = CarrierOnlyOperandContract(ELowPrecisionCarrier::FP8E4M3);
+      alpaka.outputContract = CarrierOnlyOperandContract(ELowPrecisionCarrier::Float32);
       alpaka.capabilityTag = "cuda_fp8_elementwise_" + opName + "_e4m3_f32";
       alpaka.reason = region.reason + "; native E4M3 elementwise " + opName +
                       " lowered to a direct FP32-accumulation kernel";

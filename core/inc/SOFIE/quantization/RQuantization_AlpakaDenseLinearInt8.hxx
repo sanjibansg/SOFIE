@@ -231,10 +231,8 @@ __host__ __device__ inline std::int32_t QuantizedCudaFakeQuantOutputCodeWith(
    }
 }
 
-// Fake-quant value of one logical output element: the accumulator scaled and biased, rounded
-// onto the output grid with the Relu applied there, then dequantized back to float.
-// __host__ __device__ so a consumer's alpaka kernel applies the same function and params,
-// which is what makes the fused form bit-identical.
+// Fake-quant value of one logical output element: scale, bias, round onto the output grid with
+// Relu, dequantize. __host__ __device__ so a deferring consumer applies the identical function.
 template <typename Flags>
 __host__ __device__ inline float QuantizedGemmCudaEpilogueValueWith(
    const Flags &flags, std::size_t idx, const std::int32_t *accumulator, const float *bias,
@@ -364,10 +362,8 @@ inline void QuantizedGemmCudaUnpadUInt8Matrix(QuantizedGemmCudaStream stream, co
    QuantizedGemmCudaUnpadMatrix(stream, padded, output, logicalRows, logicalCols, physicalRows, physicalCols);
 }
 
-// Whether the integer epilogue can ride the GEMM's own narrowing store instead of a readback
-// pass over the accumulator. cuBLASLt writes an int8 D from a float scale, rounding half to
-// even and saturating, which is the epilogue's contract; what remains has to be expressible
-// as the scalar alpha and the per-column float offset the bias kernel already builds.
+// Whether the integer epilogue can ride the GEMM's own narrowing store: cuBLASLt writes an int8
+// D with round-half-to-even and saturation, leaving only alpha and the per-column bias offset.
 inline bool QuantizedGemmCudaLt_NarrowsQuantizedOutput(const QuantizedDenseLinearInvocation &params)
 {
    // Forces the readback epilogue, so one binary can run either output path.
@@ -384,9 +380,8 @@ inline bool QuantizedGemmCudaLt_NarrowsQuantizedOutput(const QuantizedDenseLinea
    // rejects on this path.
    if (params.weightScaleMode == EQuantizedScaleMode::PerOutputChannel)
       return false;
-   // The output zero point is an integer shift of the code applied after the rounding, and the
-   // store rounds the biased value, so carrying it in the offset would move half-way ties by
-   // its parity.
+   // The output zero point shifts the code after the rounding; carrying it in the offset the
+   // store rounds would move half-way ties by its parity.
    if (params.outputZeroPoint != 0)
       return false;
    // The asymmetric-input correction subtracts a per-column multiple of the weight column sums
@@ -404,9 +399,8 @@ inline bool QuantizedGemmCudaLt_NarrowsQuantizedOutput(const QuantizedDenseLinea
 }
 
 struct QuantizedGemmCudaLtState : QuantizedDeferredEpilogueHolder {
-   // Declaration order fixes the default teardown order (reverse of this list): destruction
-   // must run preference, then C/B/A layouts, then operation, then handle. The base holds only
-   // borrowed pointers and is destroyed after every member, so it does not enter that order.
+   // Declaration order fixes the teardown order (reverse): preference, then C/B/A layouts,
+   // operation, handle. The base holds borrowed pointers only and stays out of that order.
    INTERNAL::QuantizedCudaLtHandle fHandle;
    INTERNAL::QuantizedCudaLtMatmulDesc fOperation;
    INTERNAL::QuantizedCudaLtMatrixLayout fALayout;
@@ -445,16 +439,14 @@ struct QuantizedGemmCudaLtState : QuantizedDeferredEpilogueHolder {
    std::int64_t fBatchStrideC = 0;
    bool fAColumnMajorInput = false;
    bool fInitialized = false;
-   // Output configuration the descriptor and layouts were built for. The requested flag is
-   // what the caller asked for and the narrowed flag is what the provider accepted, so a shape
-   // the heuristic declined settles on the wide accumulator and stays there.
+   // Output configuration the descriptor was built for: requested is what the caller asked,
+   // narrowed what the provider accepted — a declined shape settles on the wide accumulator.
    bool fNarrowOutputRequested = false;
    bool fNarrowedOutput = false;
    bool fEpilogueHasBias = false;
    bool fEpilogueHasRelu = false;
-   // Per-output-channel weight sums for the asymmetric-input correction, built once from
-   // the constant weight storage. Survives Reset(): the weight bound to this state does
-   // not change.
+   // Per-output-channel weight sums for the asymmetric-input correction; built once and
+   // surviving Reset(), since the weight bound to this state does not change.
    INTERNAL::QuantizedCudaDeviceBuffer<std::int32_t> fInputZpColumnSums;
    bool fInputZpColumnSumsBuilt = false;
    // Remembers a provider rejection of the direct column-major input layout so an ineligible
@@ -539,9 +531,8 @@ struct QuantizedGemmCudaLtState : QuantizedDeferredEpilogueHolder {
       fEpilogueHasRelu = false;
    }
 
-   // narrowOutput asks for the GEMM to write output codes directly. The caller reads
-   // NarrowsOutput() afterwards for what the provider accepted and picks its destination
-   // buffer from that.
+   // narrowOutput asks the GEMM to write output codes directly; the caller reads
+   // NarrowsOutput() for what the provider accepted and picks its destination from that.
    void Initialize(const QuantizedDenseLinearInvocation &params, bool narrowOutput = false)
    {
       InitializeInternal(params, narrowOutput, true);
@@ -563,9 +554,8 @@ struct QuantizedGemmCudaLtState : QuantizedDeferredEpilogueHolder {
    bool NarrowsOutput() const { return fNarrowedOutput; }
 
 private:
-   // Builds the descriptor, layouts and heuristics for one output configuration: a narrowed D
-   // holding output codes, or the wide int32 accumulator the readback epilogue consumes.
-   // Returns false with the state reset when the provider offers no algorithm for it.
+   // Builds descriptor, layouts, and heuristics for one output configuration (narrowed D or
+   // wide accumulator); returns false with the state reset when no algorithm exists for it.
    bool TryConfigure(const QuantizedDenseLinearInvocation &params, bool narrow)
    {
       Reset();
@@ -578,10 +568,8 @@ private:
                                      narrow ? CUDA_R_32F : CUDA_R_32I),
             "cublasLtMatmulDescCreate");
 
-         // A narrowed store runs the transposed problem: a row-major [m, n] D with leading
-         // dimension n is the same memory as a column-major [n, m] D, and that transpose is
-         // what feeding the weight first computes. The provider offers no bias epilogue on an
-         // int8 D in the row-major form, and this reinterpretation costs no data movement.
+         // A narrowed store runs the transposed problem (row-major [m, n] D is column-major
+         // [n, m] memory): no bias epilogue exists on a row-major int8 D, and this moves no data.
          const cublasOperation_t transA = narrow ? CUBLAS_OP_T
                                                  : (params.aColumnMajorInput ? CUBLAS_OP_T : CUBLAS_OP_N);
          const cublasOperation_t transB = narrow ? CUBLAS_OP_N : CUBLAS_OP_T;
@@ -848,9 +836,8 @@ public:
          });
    }
 
-   // target is the int32 accumulator, or the output code buffer when the caller asked for a
-   // narrowed store and NarrowsOutput() confirmed it. biasOutputOffset is the per-column offset
-   // in output units, required by a narrowed store that carries a bias.
+   // target is the accumulator, or the output code buffer when a narrowed store was confirmed;
+   // biasOutputOffset is the per-column offset in output units a narrowed biased store needs.
    void Execute(void *target, const std::int8_t *inputQuantized, const std::int8_t *weightQuantized,
                 const QuantizedDenseLinearInvocation &params, QuantizedGemmCudaStream stream,
                 bool narrowOutput = false, const float *biasOutputOffset = nullptr)

@@ -1,7 +1,5 @@
-// Bit-exact numerics of the quantized fixture sessions on the Alpaka CUDA
-// backend: the int8 and FP8 dense-linear families, the MLPs, the residual Add,
-// movement-carrier propagation, and the batched MatMul family. The generated-text
-// assertions on the same fixtures live in TestQuantizationEliminationLadder.cxx.
+// Bit-exact numerics of the quantized fixture sessions on the Alpaka CUDA backend; the
+// generated-text assertions on the same fixtures live in TestQuantizationEliminationLadder.cxx.
 
 #include <algorithm>
 #include <cmath>
@@ -601,7 +599,7 @@ TEST_F(QuantizationAlpakaTest, DuplicateDecodesCollapseWithoutChangingValues)
 // grid makes quantizing the identity, so this compares bit-for-bit.
 TEST_F(QuantizationAlpakaTest, MovementCarrierPropagationMatchesExactReference)
 {
-   // Mirrors MovementCarrierModelGenerator.py; keep the two in sync.
+   // Mirrors emit_movement_carrier in QuantizedModelGenerator.py; keep the two in sync.
    constexpr Idx kM = 8, kK = 32, kRows = 4, kCols = 64, kN = 4;
    constexpr double kInScale = 0.25, kWeightScale = 0.125;
 

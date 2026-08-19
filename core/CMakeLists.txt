@@ -90,6 +90,7 @@ set(sources_quantization_headers
    SOFIE/SOFIE_Quantized.hxx
    SOFIE/SOFIE_QuantizedAlpaka.hxx
    SOFIE/quantization/RQuantization_AlpakaCommon.hxx
+   SOFIE/quantization/RQuantization_Invocations.hxx
    SOFIE/quantization/RQuantization_AlpakaPrimitives.hxx
    SOFIE/quantization/RQuantization_AlpakaBroadcast.hxx
    SOFIE/quantization/RQuantization_AlpakaDenseLinear.hxx

@@ -134,9 +134,8 @@ inline bool SameGrid(const QuantizationGrid &a, const QuantizationGrid &b)
           a.codeMax == b.codeMax;
 }
 
-// Element count above which a folded quantization constant carries its bytes in the weight
-// file rather than in an initializer list. Scale scalars, zero points and per-channel
-// parameters sit below it and stay embedded, where build-time readers expect them.
+// Element count above which a folded quantization constant travels in the weight file; scale
+// scalars, zero points, and per-channel parameters sit below it and stay embedded.
 inline constexpr std::size_t kQuantizedFoldedConstantEmbedMaxLength = 4096;
 
 // The one switch for every quantization trace line: planner, applier, walkers, adoption,
@@ -205,6 +204,13 @@ inline QuantizationGrid IntegerGridFrom(const QuantizationInfo &info)
    return grid;
 }
 
+// E4M3 tops out at 448 and E5M2 at 57344; both symmetric, no infinity in the ONNX "fn"
+// spellings, so the extreme code is the largest finite value.
+inline double Float8CodeLimit(EQuantizationGridKind kind)
+{
+   return kind == EQuantizationGridKind::Float8E5M2 ? 57344.0 : 448.0;
+}
+
 // The float8 counterpart of IntegerGridFrom: a float8 boundary carries only a scale, with
 // no zero point and a code set fixed by the format.
 inline QuantizationGrid Float8GridFrom(double scale, EQuantizationGridKind kind)
@@ -214,9 +220,7 @@ inline QuantizationGrid Float8GridFrom(double scale, EQuantizationGridKind kind)
    grid.scale = scale;
    grid.zeroPoint = 0;
    grid.granularity = EQuantizationGranularity::PerTensor;
-   // E4M3 tops out at 448 and E5M2 at 57344; both symmetric, no infinity in the ONNX "fn"
-   // spellings, so the extreme code is the largest finite value.
-   const double limit = kind == EQuantizationGridKind::Float8E5M2 ? 57344.0 : 448.0;
+   const double limit = Float8CodeLimit(kind);
    grid.codeMin = -limit;
    grid.codeMax = limit;
    return grid;
@@ -416,6 +420,13 @@ struct QuantizedDenseLinearRegion : QuantizedRegionBase {
    std::int64_t transA = 0;
    std::int64_t transB = 0;
 };
+
+// Whether the region's epilogue applies a Relu: from the matched epilogue shape or from an
+// absorbed boundary Relu — two different graph facts, one derived read.
+inline bool QuantizedRegionHasEpilogueRelu(const QuantizedDenseLinearRegion &region)
+{
+   return QuantizedEpilogueHasRelu(region.epilogue.kind) || region.outputReluOpIndex.has_value();
+}
 
 struct QuantizedConvRegion : QuantizedRegionBase {
    std::string inputTensor;

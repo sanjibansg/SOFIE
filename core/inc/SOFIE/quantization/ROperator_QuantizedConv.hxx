@@ -327,10 +327,10 @@ public:
          out << "      " << params << ".matrix.m = " << matrixShape.logicalM << ";\n";
          out << "      " << params << ".matrix.n = " << matrixShape.logicalN << ";\n";
          out << "      " << params << ".matrix.k = " << matrixShape.logicalK << ";\n";
-         out << "      " << params << ".matrix.inputFormat = SOFIE::EQuantizedFP8Format::E4M3;\n";
-         out << "      " << params << ".matrix.weightFormat = SOFIE::EQuantizedFP8Format::E4M3;\n";
-         out << "      " << params << ".matrix.outputCarrier = SOFIE::EQuantizedFP8OutputCarrier::Float32;\n";
-         out << "      " << params << ".matrix.accumulation = SOFIE::EQuantizedFP8Accumulation::Float32;\n";
+         out << "      " << params << ".matrix.inputFormat = SOFIE::ELowPrecisionFormat::FP8E4M3;\n";
+         out << "      " << params << ".matrix.weightFormat = SOFIE::ELowPrecisionFormat::FP8E4M3;\n";
+         out << "      " << params << ".matrix.outputCarrier = SOFIE::ELowPrecisionFormat::Float32;\n";
+         out << "      " << params << ".matrix.accumulation = SOFIE::ELowPrecisionFormat::Float32;\n";
          out << "      " << params << ".matrix.hasBias = "
              << (!fRegion.biasSourceTensor.empty() ? "true" : "false") << ";\n";
          out << "      " << params << ".matrix.beta = "
@@ -479,7 +479,7 @@ public:
           << (fPlan.biasStorage == EQuantizedStorageType::Int32Accumulator ? "Int32" : "Float")
           << ";\n";
       out << "      " << params << ".matrix.weightScaleMode = SOFIE::EQuantizedScaleMode::"
-          << (fPlan.weightScaleMode == EQuantizedParameterMode::PerOutputChannel ? "PerOutputChannel" : "PerTensor") << ";\n";
+          << (!fPlan.weightContract.perChannelScaleTensor.empty() ? "PerOutputChannel" : "PerTensor") << ";\n";
       // Unit-kernel Conv with an INT8 input carrier and exact matrix shapes consumes its NCHW
       // input directly as the GEMM operand; without provider layout support, staged im2col runs.
       const bool unitKernelDirectInput = !directAffine && !depthwise && !padded &&
@@ -509,8 +509,8 @@ public:
       out << (!fRegion.biasSourceTensor.empty()
                  ? "alpaka::getPtrNative(deviceBuf_" + fRegion.biasSourceTensor + ")"
                  : "static_cast<const float *>(nullptr)") << ", ";
-      out << (fPlan.weightScaleMode == EQuantizedParameterMode::PerOutputChannel
-                 ? "alpaka::getPtrNative(deviceBuf_" + fPlan.weightScaleTensor + ")"
+      out << (!fPlan.weightContract.perChannelScaleTensor.empty()
+                 ? "alpaka::getPtrNative(deviceBuf_" + fPlan.weightContract.perChannelScaleTensor + ")"
                  : "static_cast<const float *>(nullptr)") << ", " << params << ");\n";
       out << "   }\n";
       return out.str();

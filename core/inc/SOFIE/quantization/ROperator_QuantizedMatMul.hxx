@@ -77,11 +77,12 @@ inline std::string GenerateFusedQuantizedMatMulCublasLtLaunch(std::string opName
       "ROperator_QuantizedMatMul cuBLASLt int8 MatMul boundary " + opName,
       "quantizedMatMulCudaLtState_" + opName, "params_quantizedMatMul_" + opName,
       region.outputTensor, region.inputSourceTensor, plan.weightStorageTensor,
-      region.epilogue.biasSourceTensor, plan.weightScaleTensor,
+      region.epilogue.biasSourceTensor,
       std::to_string(matrixShape.logicalM), std::to_string(matrixShape.logicalN),
       std::to_string(matrixShape.logicalK), plan, region.inputQuant, region.weightQuant,
       region.epilogue.biasQuant, region.outputQuant, QuantizedEpilogueHasBias(region.epilogue.kind),
-      QuantizedEpilogueHasRelu(region.epilogue.kind), region.weightQuant.isSigned,
+      QuantizedRegionHasEpilogueRelu(region),
+      region.weightQuant.isSigned,
       static_cast<float>(region.outputAlpha));
    call.outputRequantize = region.outputRequantize;
    call.outputClamp = region.outputClamp;
@@ -125,7 +126,7 @@ inline std::string GenerateFusedQuantizedMatMulCublasLtFP8Launch(std::string opN
    // The FP8 layouts are column-major, so only the NT operand order leaves the weight at
    // [N, K] and the result at row-major [M, N]; the weight storage is laid out to match.
    call.weightIsMatrixA = true;
-   call.hasRelu = QuantizedEpilogueHasRelu(region.epilogue.kind);
+   call.hasRelu = QuantizedRegionHasEpilogueRelu(region);
    return INTERNAL::GenerateQuantizedCudaLtFP8DenseLinearCall(call);
 }
 
@@ -142,10 +143,8 @@ private:
    bool IsMatMulSpelling() const { return fRegion.spelling == EQuantizedDenseLinearSpelling::MatMul; }
 
 public:
-   // Producer half of the accumulator handoff, paired by the pipeline with the consumer's
-   // ROperator::CanAcceptInt32Accumulator. Only the fake-quant float epilogue leaves an
-   // accumulator: Quantized mode may have cuBLASLt narrow the store, and a requantize fusion
-   // has already spent it.
+   // Producer half of the accumulator handoff, paired with the consumer's
+   // CanAcceptInt32Accumulator; only the fake-quant float epilogue leaves an accumulator.
    bool CanDeferOutputEpilogue() const
    {
       return IsOptimizedQuantizedAlpakaPlainDevicePlan(fPlan) && !QuantizedPlanUsesFP8DenseLinear(fPlan) &&
@@ -167,9 +166,8 @@ public:
       QuantizedEpilogueSpecialization spec;
       spec.hasBias = IsMatMulSpelling() ? QuantizedEpilogueHasBias(fRegion.epilogue.kind)
                                         : !fRegion.biasSourceTensor.empty();
-      spec.hasRelu = IsMatMulSpelling() ? QuantizedEpilogueHasRelu(fRegion.epilogue.kind)
-                                        : QuantizedEpilogueHasRelu(fRegion.epilogue.kind);
-      spec.perChannelScale = fPlan.weightScaleMode == EQuantizedParameterMode::PerOutputChannel;
+      spec.hasRelu = QuantizedRegionHasEpilogueRelu(fRegion);
+      spec.perChannelScale = !fPlan.weightContract.perChannelScaleTensor.empty();
       // The runtime builds column sums only for a nonzero input zero point; match that.
       spec.correctZeroPoint = fRegion.inputQuant.zeroPoint != 0;
       // Exact only when every factor is a power of two (see IsPowerOfTwoScale). PQuant
