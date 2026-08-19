@@ -43,7 +43,11 @@ enum class OperatorKind {
    SELU=27,
    RMSNORM=28,
    GROUPNORM=29,
-   CUMSUM=30
+   CUMSUM=30,
+   SDPA=31,
+   MAMBA_SCAN=32,
+   RWKV_WKV6=33,
+   GRIFFIN_RGLRU=34
 };
 
 inline const char* toString(OperatorKind kind) {

@@ -699,39 +699,39 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       fGC += RModelProfilerGPU::GenerateSessionMembers();
    }
 
-   // Session constructor
+   // Session constructor(s)
    if (fUseSession) {
-      std::string sessionName = "\n\nSession";
+      std::string sessionName = "Session";
       if (fIsSubGraph)
          sessionName += "_" + fName;
 
+      std::string fileName;
       if (fUseWeightFile) {
-         std::string fileName = fName;
+         fileName = fName;
          if (fWeightFile == WeightFileType::Text)
             fileName += ".dat";
          if (fWeightFile == WeightFileType::RootBinary)
             fileName += ".root";
-
-         fGC += sessionName + "(std::string filename =\"" + fileName + "\"";
-      } else {
-         fGC += sessionName + "(std::string = \"\"";
       }
 
-      if (!fShapeParams.empty()) {
-         for (auto &p : fShapeParams) {
-            fGC += ",\n";
-            fGC += "        size_t " + p.first + " = " + p.second;
-         }
+      // Build shape-param list for _init signature / call sites
+      std::string shapeParamDecl, shapeParamCall;
+      for (auto &p : fShapeParams) {
+         shapeParamDecl += ", size_t " + p.first + " = " + p.second;
+         shapeParamCall += ", " + p.first;
       }
-      fGC += ") {\n";
-      
+
+      // ---- private _init() that carries the actual initialisation body ----
+      fGC += "\nprivate:\n";
+      fGC += "void _init(std::string filename = \"" + fileName + "\"" + shapeParamDecl + ") {\n";
+
       GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA();
       if (fUseWeightFile) {
          fGC += "\n//--- reading weights from file\n";
          ReadInitializedTensorsFromFile(0);
          fGC += "\n";
       }
-      
+
       MoveInitializedTensorsToBuffers_ALPAKA();
       GenerateDynamicTensorInfo_GPU_ALPAKA();
 
@@ -752,6 +752,39 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       }
 
       fGC += "\nalpaka::wait(queue);\n";
+      fGC += "}\n\n";
+
+      // ---- public constructors ----
+      fGC += "public:\n";
+
+      // (1) Original constructor: Session(std::string filename = "model.dat" [, shape params])
+      if (fUseWeightFile)
+         fGC += "\n\n" + sessionName + "(std::string filename = \"" + fileName + "\"";
+      else
+         fGC += "\n\n" + sessionName + "(std::string filename = \"\"";
+      for (auto &p : fShapeParams) {
+         fGC += ",\n";
+         fGC += "        size_t " + p.first + " = " + p.second;
+      }
+      fGC += ") {\n";
+      fGC += SP + "_init(filename" + shapeParamCall + ");\n";
+      fGC += "}\n\n";
+
+      // (2) Queue-accepting constructor — initializer list keeps blas on extQueue's stream.
+      if (fUseWeightFile)
+         fGC += sessionName + "(QueueAcc& extQueue, std::string filename = \"" + fileName + "\"";
+      else
+         fGC += sessionName + "(QueueAcc& extQueue, std::string filename = \"\"";
+      for (auto &p : fShapeParams) {
+         fGC += ",\n";
+         fGC += "        size_t " + p.first + " = " + p.second;
+      }
+      // Member-initializer list: override the in-class initializers for queue (and blas if present)
+      fGC += ")\n    : queue(extQueue)";
+      if (OpNeedsBlas)
+         fGC += ", blas(queue)";
+      fGC += "\n{\n";
+      fGC += SP + "_init(filename" + shapeParamCall + ");\n";
       fGC += "}\n\n";
    }
 
