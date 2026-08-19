@@ -3,6 +3,7 @@
 #include <climits>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 
@@ -593,7 +594,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       bool inFusedGroup = (gIdx != SIZE_MAX) && fEltwiseFusionGroups[gIdx].isFused();
 
       if (inFusedGroup) {
-         // Only emit the fused kernel struct once, at the chain leader
+         // Only emit the fused kernel struct once, at the chain leader.
          if (fEltwiseFusionGroups[gIdx].opIndices[0] == id && !fusedGroupsEmitted.count(gIdx)) {
             const auto& grp = fEltwiseFusionGroups[gIdx];
             std::string sfx = grp.suffix();
@@ -614,7 +615,6 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          }
          // Chain followers: skip (their logic is inside the fused kernel)
       } else {
-         // Unfused op: generate individual kernel struct (with dedup for single_initialized_operators)
          if (single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
             if (registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
                if (fVerbose)
@@ -631,16 +631,6 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    }
 
 
-   fGC += "\ntemplate<typename TDim, typename TIdx>\n";
-   fGC += "inline alpaka::WorkDivMembers<TDim, TIdx> sofie_workdiv(\n";
-   fGC += "    alpaka::Vec<TDim, TIdx> const& numElems, TIdx blockSz = TIdx{256})\n{\n";
-   fGC += "    auto const numBlocks = alpaka::Vec<TDim, TIdx>::all(\n";
-   fGC += "        (numElems[0] + blockSz - TIdx{1}) / blockSz);\n";
-   fGC += "    return alpaka::WorkDivMembers<TDim, TIdx>(\n";
-   fGC += "        numBlocks,\n";
-   fGC += "        alpaka::Vec<TDim, TIdx>::all(blockSz),\n";
-   fGC += "        alpaka::Vec<TDim, TIdx>::all(TIdx{1}));\n";
-   fGC += "}\n\n";
 
    if (fKernelOnly)
       return;
@@ -648,10 +638,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    // define the Session struct (for GNN this is generated in RModel_GNN)
   fGC += "\n\ntemplate <typename tagAcc>\n";
    if (fUseSession) {
-      if (!fIsSubGraph)
-         fGC += "struct Session {\n\n";
-      else
-         fGC += "struct Session_" + fName + " {\n\n";
+      fGC += "struct Session {\n\n";
    }
 
    // define host and device accelerators
@@ -702,8 +689,6 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    // Session constructor(s)
    if (fUseSession) {
       std::string sessionName = "Session";
-      if (fIsSubGraph)
-         sessionName += "_" + fName;
 
       std::string fileName;
       if (fUseWeightFile) {
@@ -714,78 +699,66 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
             fileName += ".root";
       }
 
-      // Build shape-param list for _init signature / call sites
-      std::string shapeParamDecl, shapeParamCall;
-      for (auto &p : fShapeParams) {
-         shapeParamDecl += ", size_t " + p.first + " = " + p.second;
-         shapeParamCall += ", " + p.first;
-      }
+      // ---- build constructor body into a temporary string ----
+      {
+         std::string savedGC = fGC;
+         fGC.clear();
 
-      // ---- private _init() that carries the actual initialisation body ----
-      fGC += "\nprivate:\n";
-      fGC += "void _init(std::string filename = \"" + fileName + "\"" + shapeParamDecl + ") {\n";
-
-      GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA();
-      if (fUseWeightFile) {
-         fGC += "\n//--- reading weights from file\n";
-         ReadInitializedTensorsFromFile(0);
-         fGC += "\n";
-      }
-
-      MoveInitializedTensorsToBuffers_ALPAKA();
-      GenerateDynamicTensorInfo_GPU_ALPAKA();
-
-      for (size_t id = 0; id < fOperators.size(); id++) {
-         if (fSkipOperators.count(id)) continue;
-         fGC += fOperators[id]->GenerateInitCode_GPU_ALPAKA();
-         if (fOperators[id]->GetKind() == OperatorKind::GEMM || fOperators[id]->GetKind() == OperatorKind::CONV) {
-            // GetBlasConfigs() returns one entry per distinct GEMM call shape the
-            // operator's Generate_GPU_ALPAKA() will issue (usually one; a low-rank
-            // factorized Gemm issues two chained calls of different shapes and so
-            // needs two configs registered). Empty entries (e.g. gemmStridedBatched,
-            // legacy cuBLAS path) need no cuBLASLt layout registration.
-            for (auto &blasCfg : fOperators[id]->GetBlasConfigs()) {
-               if (!blasCfg.empty())
-                  fGC += "\nblas.addLayoutConfig("+blasCfg+");\n";
+         GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA();
+         if (fUseWeightFile) {
+            fGC += "\n//--- reading weights from file\n";
+            ReadInitializedTensorsFromFile(0);
+            fGC += "\n";
+         }
+         MoveInitializedTensorsToBuffers_ALPAKA();
+         GenerateDynamicTensorInfo_GPU_ALPAKA();
+         for (size_t id = 0; id < fOperators.size(); id++) {
+            if (fSkipOperators.count(id)) continue;
+            fGC += fOperators[id]->GenerateInitCode_GPU_ALPAKA();
+            if (fOperators[id]->GetKind() == OperatorKind::GEMM || fOperators[id]->GetKind() == OperatorKind::CONV) {
+               for (auto &blasCfg : fOperators[id]->GetBlasConfigs()) {
+                  if (!blasCfg.empty())
+                     fGC += "\nblas.addLayoutConfig(" + blasCfg + ");\n";
+               }
             }
          }
+         fGC += "\nalpaka::wait(queue);\n";
+
+         std::string ctorBody = fGC;
+         fGC = savedGC;
+
+         // ---- public constructors with inlined body ----
+         fGC += "public:\n";
+
+         // (1) default-queue constructor
+         if (fUseWeightFile)
+            fGC += "\n\n" + sessionName + "(std::string filename = \"" + fileName + "\"";
+         else
+            fGC += "\n\n" + sessionName + "(std::string filename = \"\"";
+         for (auto &p : fShapeParams) {
+            fGC += ",\n";
+            fGC += "        size_t " + p.first + " = " + p.second;
+         }
+         fGC += ") {\n";
+         fGC += ctorBody;
+         fGC += "}\n\n";
+
+         // (2) external-queue constructor
+         if (fUseWeightFile)
+            fGC += sessionName + "(QueueAcc& extQueue, std::string filename = \"" + fileName + "\"";
+         else
+            fGC += sessionName + "(QueueAcc& extQueue, std::string filename = \"\"";
+         for (auto &p : fShapeParams) {
+            fGC += ",\n";
+            fGC += "        size_t " + p.first + " = " + p.second;
+         }
+         fGC += ")\n    : queue(extQueue)";
+         if (OpNeedsBlas)
+            fGC += ", blas(queue)";
+         fGC += "\n{\n";
+         fGC += ctorBody;
+         fGC += "}\n\n";
       }
-
-      fGC += "\nalpaka::wait(queue);\n";
-      fGC += "}\n\n";
-
-      // ---- public constructors ----
-      fGC += "public:\n";
-
-      // (1) Original constructor: Session(std::string filename = "model.dat" [, shape params])
-      if (fUseWeightFile)
-         fGC += "\n\n" + sessionName + "(std::string filename = \"" + fileName + "\"";
-      else
-         fGC += "\n\n" + sessionName + "(std::string filename = \"\"";
-      for (auto &p : fShapeParams) {
-         fGC += ",\n";
-         fGC += "        size_t " + p.first + " = " + p.second;
-      }
-      fGC += ") {\n";
-      fGC += SP + "_init(filename" + shapeParamCall + ");\n";
-      fGC += "}\n\n";
-
-      // (2) Queue-accepting constructor — initializer list keeps blas on extQueue's stream.
-      if (fUseWeightFile)
-         fGC += sessionName + "(QueueAcc& extQueue, std::string filename = \"" + fileName + "\"";
-      else
-         fGC += sessionName + "(QueueAcc& extQueue, std::string filename = \"\"";
-      for (auto &p : fShapeParams) {
-         fGC += ",\n";
-         fGC += "        size_t " + p.first + " = " + p.second;
-      }
-      // Member-initializer list: override the in-class initializers for queue (and blas if present)
-      fGC += ")\n    : queue(extQueue)";
-      if (OpNeedsBlas)
-         fGC += ", blas(queue)";
-      fGC += "\n{\n";
-      fGC += SP + "_init(filename" + shapeParamCall + ");\n";
-      fGC += "}\n\n";
    }
 
    registered_operators.clear();
@@ -824,12 +797,12 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
    GenerateOutput_GPU_ALPAKA();
 
-   // emit resetState() — clears recurrent/stateful buffers between files
+   // emit resetState() — zeros all intermediate tensors to reset model state
    if (fUseSession) {
       fGC += "\nvoid resetState(QueueAcc& queue) {\n";
-      for (size_t id = 0; id < fOperators.size(); id++) {
-         if (fSkipOperators.count(id)) continue;
-         fGC += fOperators[id]->GenerateResetStateCode_GPU_ALPAKA();
+      for (auto &i : fIntermediateTensorInfos) {
+         if (fFusionIntermediateTensors.count(i.first)) continue;
+         fGC += SP + "alpaka::memset(queue, deviceBuf_" + i.first + ", 0);\n";
       }
       fGC += SP + "alpaka::wait(queue);\n";
       fGC += "}\n";

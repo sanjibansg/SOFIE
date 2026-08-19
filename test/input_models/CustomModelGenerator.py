@@ -108,7 +108,7 @@ def numpy_mamba_scan(u, delta, A, B, C, D_bias):
             dA  = np.exp(dt * A[:, n])              # [B, D]  broadcast over B
             dBu = dt * B[:, n, t][:, np.newaxis] * u[:, :, t]  # [B, D]
             h[:, :, n] = dA * h[:, :, n] + dBu
-        y[:, :, t] = (C[:, :, t, np.newaxis] * h).sum(axis=1) + D_bias[np.newaxis, :] * u[:, :, t]
+        y[:, :, t] = (h * C[:, :, t][:, np.newaxis, :]).sum(axis=-1) + D_bias[np.newaxis, :] * u[:, :, t]
     return y
 
 
@@ -159,7 +159,7 @@ def numpy_wkv6(r, k, v, w, u):
         # output: y[b,h,t,j] = sum_i r[i] * (s[i,j] + exp(u[i]) * k[i] * v[j])
         kv = kBase[:, :, :, np.newaxis] * vBase[:, :, np.newaxis, :]  # [B,H,Dh,Dh]
         bonus = np.exp(u)[np.newaxis, :, :, np.newaxis] * kv           # [B,H,Dh,Dh]
-        y[:, :, t, :] = (rBase[:, :, np.newaxis, :] * (s + bonus)).sum(axis=-2)
+        y[:, :, t, :] = (rBase[:, :, :, np.newaxis] * (s + bonus)).sum(axis=-2)
 
         # state update
         decay = np.exp(-np.exp(wBase))                # [B, H, Dh]

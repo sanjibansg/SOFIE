@@ -72,7 +72,7 @@ public:
       opName = "op_" + opName;
       std::stringstream out;
       out << "\n//---- RWKV_WKV6 " << opName << "\n";
-      const std::string B  = fB,  H  = fH,  T  = fT,  Dh = fDh;
+      const std::string B  = fB,  H  = fH,  Ts = fT,  Dh = fDh;
       const std::string X  = "tensor_" + fNR;
       const std::string K  = "tensor_" + fNK;
       const std::string V  = "tensor_" + fNV;
@@ -83,9 +83,9 @@ public:
 
       out << SP << "for (size_t b = 0; b < " << B << "; ++b) {\n";
       out << SP << SP << "for (size_t h = 0; h < " << H << "; ++h) {\n";
-      out << SP << SP << SP << "for (size_t t = 0; t < " << T << "; ++t) {\n";
-      out << SP << SP << SP << SP << "size_t rBase = b*" << H << "*" << T << "*" << Dh
-          << " + h*" << T << "*" << Dh << " + t*" << Dh << ";\n";
+      out << SP << SP << SP << "for (size_t t = 0; t < " << Ts << "; ++t) {\n";
+      out << SP << SP << SP << SP << "size_t rBase = b*" << H << "*" << Ts << "*" << Dh
+          << " + h*" << Ts << "*" << Dh << " + t*" << Dh << ";\n";
       out << SP << SP << SP << SP << "size_t sBase = b*" << H << "*" << Dh << "*" << Dh
           << " + h*" << Dh << "*" << Dh << ";\n";
       out << SP << SP << SP << SP << "size_t uBase = h*" << Dh << ";\n";
@@ -141,13 +141,13 @@ public:
       out += SP + SP + SP + SP + SP + "T y_j = static_cast<T>(0);\n";
       out += SP + SP + SP + SP + SP + "for (std::size_t i = 0; i < Dh; ++i) {\n";
       out += SP + SP + SP + SP + SP + SP + "T const kv_ij = k[rBase+i] * v[rBase+j];\n";
-      out += SP + SP + SP + SP + SP + SP + "y_j += r[rBase+i] * (state[sBase+i*Dh+j] + alpaka::math::exp(acc, u[uBase+i]) * kv_ij);\n";
+      out += SP + SP + SP + SP + SP + SP + "y_j += r[rBase+i] * (state[sBase+i*Dh+j] + SOFIE_DEVICE_exp(acc, u[uBase+i]) * kv_ij);\n";
       out += SP + SP + SP + SP + SP + "}\n";
       out += SP + SP + SP + SP + SP + "y[rBase+j] = y_j;\n";
       out += SP + SP + SP + SP + "}\n";
       // Update state
       out += SP + SP + SP + SP + "for (std::size_t i = 0; i < Dh; ++i) {\n";
-      out += SP + SP + SP + SP + SP + "T const decay_i = alpaka::math::exp(acc, -alpaka::math::exp(acc, w[rBase+i]));\n";
+      out += SP + SP + SP + SP + SP + "T const decay_i = SOFIE_DEVICE_exp(acc, -SOFIE_DEVICE_exp(acc, w[rBase+i]));\n";
       out += SP + SP + SP + SP + SP + "for (std::size_t j = 0; j < Dh; ++j)\n";
       out += SP + SP + SP + SP + SP + SP + "state[sBase+i*Dh+j] = decay_i * state[sBase+i*Dh+j] + k[rBase+i] * v[rBase+j];\n";
       out += SP + SP + SP + SP + "}\n";

@@ -128,7 +128,7 @@ public:
       out += SP + SP + SP + SP + "T const dt     = delta[b*D_dim*L + d*L + t];\n";
       out += SP + SP + SP + SP + "T const u_val  = u[b*D_dim*L + d*L + t];\n";
       out += SP + SP + SP + SP + "for (std::size_t n = 0; n < N; ++n) {\n";
-      out += SP + SP + SP + SP + SP + "T const dA  = alpaka::math::exp(acc, dt * A[d*N + n]);\n";
+      out += SP + SP + SP + SP + SP + "T const dA  = SOFIE_DEVICE_exp(acc, dt * A[d*N + n]);\n";
       out += SP + SP + SP + SP + SP + "T const dBu = dt * B[b*N*L + n*L + t] * u_val;\n";
       out += SP + SP + SP + SP + SP + "state[b*D_dim*N + d*N + n] = dA * state[b*D_dim*N + d*N + n] + dBu;\n";
       out += SP + SP + SP + SP + "}\n";

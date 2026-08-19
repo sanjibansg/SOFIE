@@ -239,7 +239,7 @@ public:
             op += SP + SP + SP + "alpaka::syncBlockThreads(acc);\n";
             half >>= 1;
          }
-         op += SP + SP + SP + "T const inv_rms = static_cast<T>(1) / alpaka::math::sqrt(acc,"
+         op += SP + SP + SP + "T const inv_rms = static_cast<T>(1) / sqrt(acc,"
                " shmem[0] / static_cast<T>(" + nl + ") + static_cast<T>(" + eps + "));\n\n";
 
          op += SP + SP + SP + "// Pass 2: Y = scale * X * inv_rms\n";
@@ -280,7 +280,7 @@ public:
          op += ";\n";
          op += SP + SP + SP + SP + SP + "T v = X[idx]; rms_sum += v * v;\n";
          for (size_t j = fAxis; j < fRank; ++j) op += SP + SP + SP + SP + "}\n";
-         op += SP + SP + SP + SP + "T const inv_rms = static_cast<T>(1) / alpaka::math::sqrt(acc,"
+         op += SP + SP + SP + SP + "T const inv_rms = static_cast<T>(1) / sqrt(acc,"
                " rms_sum / static_cast<T>(" + nl + ") + static_cast<T>(" + eps + "));\n\n";
 
          for (size_t j = fAxis; j < fRank; ++j)
