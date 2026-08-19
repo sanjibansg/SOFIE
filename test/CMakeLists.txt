@@ -182,6 +182,8 @@ if (ENABLE_ALPAKA_TESTS)
       alpaka/TestAlpakaPool.cxx
       alpaka/TestAlpakaLowRank.cxx
       alpaka/TestAlpakaKernelOnly.cxx
+      alpaka/TestAlpakaNormReduction.cxx
+      alpaka/TestAlpakaSequenceOps.cxx
     )
 
     set_source_files_properties(

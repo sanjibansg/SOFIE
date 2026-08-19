@@ -19,6 +19,10 @@ void RModel_Base::GenerateHeaderInfo(std::string& hgname) {
                        return std::toupper(c);
                    } );
     hgname = "SOFIE_" + hgname;
+    // An all-caps model name would make the guard macro spell the emitted
+    // namespace SOFIE_<name> and blank it at preprocessing; keep them distinct.
+    if (hgname == "SOFIE_" + fName)
+        hgname += "_HXX";
     fGC += "\n#ifndef " + hgname + "\n";
     fGC += "#define " + hgname + "\n\n";
     for (auto& i: fNeededStdLib) {
@@ -73,6 +77,10 @@ void RModel_Base::GenerateHeaderInfo_GPU_ALPAKA(std::string& hgname) {
                        return std::toupper(c);
                    } );
     hgname = "SOFIE_" + hgname;
+    // An all-caps model name would make the guard macro spell the emitted
+    // namespace SOFIE_<name> and blank it at preprocessing; keep them distinct.
+    if (hgname == "SOFIE_" + fName)
+        hgname += "_HXX";
     fGC += "\n#ifndef " + hgname + "\n";
     fGC += "#define " + hgname + "\n\n";
     for (auto& i: fNeededStdLib) {
