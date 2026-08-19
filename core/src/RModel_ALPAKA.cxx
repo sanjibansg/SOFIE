@@ -791,6 +791,17 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
    GenerateOutput_GPU_ALPAKA();
 
+   // emit resetState() — clears recurrent/stateful buffers between files
+   if (fUseSession) {
+      fGC += "\nvoid resetState(QueueAcc& queue) {\n";
+      for (size_t id = 0; id < fOperators.size(); id++) {
+         if (fSkipOperators.count(id)) continue;
+         fGC += fOperators[id]->GenerateResetStateCode_GPU_ALPAKA();
+      }
+      fGC += SP + "alpaka::wait(queue);\n";
+      fGC += "}\n";
+   }
+
    // inject GPU profiling utility functions and memory report inside Session struct
    if (fProfile && fUseSession) {
       fGC += RModelProfilerGPU::GenerateUtilityFunctions();

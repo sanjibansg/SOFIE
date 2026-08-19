@@ -34,4 +34,7 @@
 #include "SOFIE/ROperator_Comparision.hxx"
 #include "SOFIE/ROperator_EyeLike.hxx"
 #include "SOFIE/ROperator_Range.hxx"
+#include "SOFIE/ROperator_RMSNorm.hxx"
+#include "SOFIE/ROperator_GroupNorm.hxx"
+#include "SOFIE/ROperator_CumSum.hxx"
 
