@@ -142,7 +142,7 @@ wB, wH, wT, wDh = 1, 2, 4, 4
 r_in = rng.standard_normal((wB, wH, wT, wDh)).astype(np.float32)
 k_in = rng.standard_normal((wB, wH, wT, wDh)).astype(np.float32)
 v_in = rng.standard_normal((wB, wH, wT, wDh)).astype(np.float32)
-w_in = rng.standard_normal((wB, wH, wT, wDh)).astype(np.float32) * 0.5  # log-neg decay
+w_in = -np.abs(rng.standard_normal((wB, wH, wT, wDh)).astype(np.float32)) * 0.5  # log-decay (negative)
 u_in = rng.standard_normal((wH, wDh)).astype(np.float32)
 
 
@@ -161,8 +161,8 @@ def numpy_wkv6(r, k, v, w, u):
         bonus = np.exp(u)[np.newaxis, :, :, np.newaxis] * kv           # [B,H,Dh,Dh]
         y[:, :, t, :] = (rBase[:, :, :, np.newaxis] * (s + bonus)).sum(axis=-2)
 
-        # state update
-        decay = np.exp(-np.exp(wBase))                # [B, H, Dh]
+        # state update: w is log-decay (negative), decay = exp(w) in (0,1)
+        decay = np.exp(wBase)                         # [B, H, Dh]
         s = decay[:, :, :, np.newaxis] * s + kv
     return y
 
@@ -207,7 +207,7 @@ def numpy_griffin_rglru(x, a):
     for t in range(L):
         a_t = a[:, t, :]        # [B, D]
         x_t = x[:, t, :]
-        h = a_t * h + np.sqrt(np.maximum(1.0 - a_t * a_t, 0.0)) * x_t
+        h = a_t * h + (1.0 - a_t) * x_t
         y[:, t, :] = h
     return y
 
