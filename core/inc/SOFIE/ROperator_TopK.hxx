@@ -19,7 +19,7 @@ private:
    int fAttrLargest;
    int fAttrSorted;
 
-   size_t fK;
+   size_t fTopKCount;
    std::string fNK;
    std::string fNX;
    std::string fNVal;
@@ -64,10 +64,10 @@ public:
          throw std::runtime_error("TMVA::SOFIE ONNX TopK op axis = " + std::to_string(fAttrAxis) +
             " value exceeds size of tensor " + fNX + " of size " + std::to_string(fShapeX.size()) + " .");
       }
-      fK = fShapeX[fAttrAxis].isParam ? kval : std::min(kval, fShapeX[fAttrAxis].dim);
+      fTopKCount = fShapeX[fAttrAxis].isParam ? kval : std::min(kval, fShapeX[fAttrAxis].dim);
 
       fShapeY = fShapeX;
-      fShapeY[fAttrAxis] = Dim{fK};
+      fShapeY[fAttrAxis] = Dim{fTopKCount};
 
       model.AddIntermediateTensor(fNVal, model.GetTensorType(fNX), fShapeY);
       model.AddIntermediateTensor(fNInd, ETensorType::INT64, fShapeY);
@@ -118,15 +118,15 @@ public:
 
       if (fAttrSorted) {
          if (fAttrLargest)
-            out << SP << SP << "std::partial_sort(elements.begin(),elements.begin()+" << fK << ",elements.end(),"
+            out << SP << SP << "std::partial_sort(elements.begin(),elements.begin()+" << fTopKCount << ",elements.end(),"
                 << "[](std::pair<float,int64_t>a,std::pair<float,int64_t>b){return (a.first!=b.first) ? (a.first>b.first) : a.second < b.second;});\n";
          else
-            out << SP << SP << "std::partial_sort(elements.begin(),elements.begin()+" << fK << ",elements.end(),"
+            out << SP << SP << "std::partial_sort(elements.begin(),elements.begin()+" << fTopKCount << ",elements.end(),"
                 << "[](std::pair<float,int64_t>a,std::pair<float,int64_t>b){return (a.first!=b.first) ? (a.first<b.first) : a.second < b.second;});\n";
       } else
-         out << SP << SP << "std::partial_sort(elements.begin(),elements.begin()+" << fK << ",elements.end());\n";
+         out << SP << SP << "std::partial_sort(elements.begin(),elements.begin()+" << fTopKCount << ",elements.end());\n";
 
-      out << SP << SP << "for (size_t l = 0; l < " << fK << "; l++) {\n";
+      out << SP << SP << "for (size_t l = 0; l < " << fTopKCount << "; l++) {\n";
       out << SP << SP << SP << "tensor_" << fNVal << "[yoffset + " << strideY[axis] << "*l + j] = elements[l].first;\n";
       out << SP << SP << SP << "tensor_" << fNInd << "[yoffset + " << strideY[axis] << "*l + j] = elements[l].second;\n";
       out << SP << SP << "}\n";
@@ -142,7 +142,7 @@ public:
       if (fShapeX.empty())
          throw std::runtime_error("SOFIE Operator TopK called to Generate without being initialized first");
 
-      std::string K   = std::to_string(fK);
+      std::string K   = std::to_string(fTopKCount);
       std::string CMP = fAttrLargest ? ">" : "<";
       std::string kname = "TopKKernel_" + fNVal;
 
@@ -227,7 +227,7 @@ public:
       out << SP << "auto const elementsPerThread_" << fNVal << " = Vec::all(static_cast<Idx>(1));\n";
       out << SP << "auto const elementsPerGrid_"   << fNVal << " = Vec::all(static_cast<Idx>(" << numSlices << "));\n";
       out << SP << "auto const workDiv_" << fNVal << " = sofie_workdiv(elementsPerGrid_" << fNVal << ");\n";
-      out << SP << "alpaka::exec<Acc>(queue, workDiv_" << fNVal << ", topKernel_" << fNVal
+      out << SP << "auto task_" << fNVal << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNVal << ", topKernel_" << fNVal
           << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
           << ", alpaka::getPtrNative(deviceBuf_" << fNVal << ")"
           << ", alpaka::getPtrNative(deviceBuf_" << fNInd << ")"
@@ -238,6 +238,7 @@ public:
           << ", static_cast<std::size_t>(" << strideX_before << ")"
           << ", static_cast<std::size_t>(" << strideY_axis   << ")"
           << ", static_cast<std::size_t>(" << strideY_before << "));\n";
+      out << SP << "alpaka::enqueue(queue, task_" << fNVal << ");\n";
       return out.str();
    }
 

@@ -451,7 +451,12 @@ public:
       return out.str();
    }
 
-   // Computed once so the kernel signature and the call site cannot drift apart.
+   // Per-dimension broadcast layout of the two inputs against the output: rank-padded
+   // shapes (dimA/dimB), broadcast masks (bcastA/bcastB), scalar/contiguous fast-path
+   // flags (isAScalar/isBScalar, isAContiguous/isBContiguous) and the dynamic shape
+   // params the kernel needs (dynParams). Filled by GetGPUBroadcastInfo() and used by
+   // both Generate_GPU_Kernel_ALPAKA (kernel signature and index math) and
+   // Generate_GPU_ALPAKA (launch arguments), so the two cannot drift apart.
    struct GPUBroadcastInfo {
       std::vector<Dim> dimA;
       std::vector<Dim> dimB;

@@ -98,7 +98,7 @@ public:
       return ret;
    }
 
-   std::vector<Dim> DoShapeInference(const std::vector<Dim> & input) {
+   std::vector<Dim> ShapeInference(const std::vector<Dim> & input) {
       auto ret = input;
       auto & outputShape = ret;
       for (size_t j = 0; j < fAttrAxes.size(); j++) {
@@ -145,7 +145,7 @@ public:
             fAttrAxes[i] = i;
       }
       // find shape of Y and add it in the list of intermediate tensors
-      fShapeY = DoShapeInference(fShapeX);
+      fShapeY = ShapeInference(fShapeX);
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShapeY);
       if (model.Verbose()){
          std::cout << Name() << " : " << fNX << " -> " << fNY << " shape " << ConvertDimShapeToString(fShapeY) << std::endl;
@@ -330,7 +330,8 @@ public:
    // This replaces the previous naive "one thread per output element" approach
    // which serialised the entire reduction loop inside a single thread.
    // ---------------------------------------------------------------------------
-   // dynamic identifiers in the index math, passed to the kernel as size_t args
+   // Dynamic shape params (e.g. N, n_pf) that appear in the emitted index math and are
+   // passed to the kernel as size_t args; shared by the kernel signature and the launch.
    std::vector<std::string> GetGPUDynParams() const {
       std::vector<std::string> params;
       UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fShapeX), params);

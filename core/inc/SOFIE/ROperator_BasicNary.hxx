@@ -193,7 +193,12 @@ public:
       return acc_v + " = " + acc_v + " + " + val + ";"; // Sum and Mean both accumulate
    }
 
-   // per-input broadcast layout, computed once and shared by the kernel gen and the launch
+   // Per-input broadcast layout against the output: rank-padded shapes (dims), broadcast
+   // masks (bcast), scalar/contiguous fast-path flags (isScalar/isContiguous) and the
+   // dynamic shape params the kernel needs (dynParams). Filled by
+   // GetGPUNaryBroadcastInfo() and used by both Generate_GPU_Kernel_ALPAKA (kernel
+   // signature and index math) and Generate_GPU_ALPAKA (launch arguments), so the two
+   // cannot drift apart.
    struct GPUNaryBroadcastInfo {
       std::vector<std::vector<Dim>> dims;
       std::vector<std::vector<bool>> bcast;

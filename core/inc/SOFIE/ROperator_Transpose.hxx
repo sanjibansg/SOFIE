@@ -174,7 +174,8 @@ public:
    }
 
 
-   // symbolic names in the kernel stride expressions, shared by the signature and the launch
+   // Dynamic shape params (e.g. N, n_pf) that appear in the emitted index math and are
+   // passed to the kernel as size_t args; shared by the kernel signature and the launch.
    std::vector<std::string> GetGPUDynParams() const {
       auto dimShapeData   = fDimShapeData.empty()   ? ConvertShapeToDim(fShapeData)   : fDimShapeData;
       auto dimShapeOutput = fDimShapeOutput.empty() ? ConvertShapeToDim(fShapeOutput) : fDimShapeOutput;

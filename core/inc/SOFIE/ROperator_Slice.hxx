@@ -494,7 +494,8 @@ public:
       return out.str();
    }
 
-   // symbolic names in the kernel index expressions, shared by the signature and the launch
+   // Dynamic shape params (e.g. N, n_pf) that appear in the emitted index math and are
+   // passed to the kernel as size_t args; shared by the kernel signature and the launch.
    std::vector<std::string> GetGPUDynParams() const {
       std::vector<std::string> params;
       UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fShapeOutput), params);
