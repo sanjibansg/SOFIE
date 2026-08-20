@@ -1,0 +1,331 @@
+// SOFIE Benchmark Emitter
+// Auto-configured by CMake — do not edit directly.
+// For each .onnx model in benchmark/models/ this binary generates:
+//   <ModelName>_GPU_ALPAKA.hxx  — SOFIE inference code
+//   <ModelName>_GPU_ALPAKA.dat  — serialized weights
+//   <ModelName>_bench.hxx       — timing function, following the same
+//                                 pattern as the unit tests
+
+#include "SOFIE/RModel_Base.hxx"
+#include "SOFIE/RModel.hxx"
+#include "SOFIE/RModelParser_ONNX.hxx"
+
+#include <algorithm>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+using namespace SOFIE;
+
+static size_t resolveDim(const Dim &d) {
+    return (d.dim > 0) ? static_cast<size_t>(d.dim) : 1u;
+}
+
+static int EmitBenchmarkModel(const std::string &onnxPath,
+                              const std::string &modelName,
+                              const std::string &outDir)
+{
+    std::cout << "[Benchmark] Processing: " << onnxPath << "\n";
+
+    RModelParser_ONNX parser;
+    RModel model = parser.Parse(onnxPath);
+
+    const auto &inputNames = model.GetInputTensorNames();
+    if (inputNames.empty()) {
+        std::cerr << "[WARN] " << modelName << " has no inputs – skipping.\n";
+        return 1;
+    }
+
+    // Map SOFIE tensor type to C++ type string
+    auto tensorTypeToCpp = [](ETensorType t) -> std::string {
+        switch (t) {
+            case ETensorType::FLOAT:  return "float";
+            case ETensorType::DOUBLE: return "double";
+            case ETensorType::INT32:  return "int32_t";
+            case ETensorType::INT64:  return "int64_t";
+            case ETensorType::UINT8:  return "uint8_t";
+            case ETensorType::INT8:   return "int8_t";
+            case ETensorType::UINT16: return "uint16_t";
+            case ETensorType::INT16:  return "int16_t";
+            case ETensorType::UINT32: return "uint32_t";
+            case ETensorType::UINT64: return "uint64_t";
+            case ETensorType::BOOL:   return "uint8_t";
+            default:                  return "float";
+        }
+    };
+
+    // Collect input metadata before code generation
+    struct TensorMeta {
+        std::string cppType;
+        size_t numElements;
+    };
+    std::vector<TensorMeta> inputs;
+    for (const auto &n : inputNames) {
+        TensorMeta m;
+        try { m.cppType = tensorTypeToCpp(model.GetTensorType(n)); }
+        catch (...) { m.cppType = "float"; }
+        m.numElements = 1;
+        try {
+            for (const auto &d : model.GetDimTensorShape(n))
+                m.numElements *= resolveDim(d);
+        } catch (...) {}
+        inputs.push_back(m);
+    }
+
+    // Generate SOFIE GPU/Alpaka inference code first — this calls Initialize()
+    // which runs shape inference on all operators.  Output tensor shapes are only
+    // available *after* Initialize(), so we must call GenerateGPU_ALPAKA() before
+    // querying output metadata.
+#ifdef SOFIE_BENCHMARK_LOWRANK
+    model.SetLowRankRatio(SOFIE_BENCHMARK_LOWRANK_RATIO);
+#endif
+#if defined(SOFIE_BENCHMARK_PROFILE) && defined(SOFIE_BENCHMARK_LOWRANK)
+    model.GenerateGPU_ALPAKA(Options::kProfile | Options::kLowRankFactorize);
+#elif defined(SOFIE_BENCHMARK_PROFILE)
+    model.GenerateGPU_ALPAKA(Options::kProfile);
+#elif defined(SOFIE_BENCHMARK_LOWRANK)
+    model.GenerateGPU_ALPAKA(Options::kLowRankFactorize);
+#else
+    model.GenerateGPU_ALPAKA();
+#endif
+
+    // Collect output metadata AFTER code generation so shapes are fully propagated.
+    const auto &outputNames = model.GetOutputTensorNames();
+    std::vector<TensorMeta> outputs;
+    for (const auto &n : outputNames) {
+        TensorMeta m;
+        try { m.cppType = tensorTypeToCpp(model.GetTensorType(n)); }
+        catch (...) { m.cppType = "float"; }
+        m.numElements = 1;
+        try {
+            for (const auto &d : model.GetDimTensorShape(n))
+                m.numElements *= resolveDim(d);
+        } catch (...) {}
+        outputs.push_back(m);
+    }
+
+    std::string hxxPath  = outDir + "/" + modelName + "_GPU_ALPAKA.hxx";
+    std::string benchPath = outDir + "/" + modelName + "_bench.hxx";
+
+    model.OutputGenerated(hxxPath);
+
+    // Sanitize model name into a valid C++ identifier
+    std::string cppName = modelName;
+    for (char &c : cppName)
+        if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
+
+    // Build "session.infer(input_d_0, input_d_1, ...)"
+    std::ostringstream inferCall;
+    inferCall << "session.infer(";
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        if (i) inferCall << ", ";
+        inferCall << "input_d_" << i;
+    }
+    inferCall << ")";
+
+    std::ofstream bench(benchPath);
+    if (!bench.is_open()) {
+        std::cerr << "[ERROR] Cannot open " << benchPath << "\n";
+        return 1;
+    }
+
+    bench
+        << "// Auto-generated benchmark for model: " << modelName << "\n"
+        << "// DO NOT EDIT — regenerated by the SOFIE benchmark emitter.\n"
+        << "// Backend is selected at compile time via -DSOFIE_BACKEND_CUDA / -DSOFIE_BACKEND_HIP\n"
+        << "// (see BenchmarkBackend.hxx for the sofie_bench:: type aliases).\n"
+        << "#pragma once\n\n"
+        << "#include \"" << modelName << "_GPU_ALPAKA.hxx\"\n"
+        << "#include \"BenchmarkBackend.hxx\"\n"
+        << "#include \"GpuOccupancy.hxx\"\n"
+        << "#include <chrono>\n"
+        << "#include <iostream>\n"
+        << "#include <random>\n"
+        << "#include <string>\n\n"
+        // Not inline: each model is compiled in its own _bench.cu TU and
+        // called from the main TU via a forward declaration.  Using inline
+        // here would require all 32 models to share one translation unit
+        // which OOM-kills the CUDA compiler.
+        << "void Benchmark_" << cppName
+        << "(int warmup, int iterations, const std::string& weightsDir) {\n"
+        << "    using namespace sofie_bench;\n\n"
+        << "    // ---- Device/host setup (mirrors unit-test pattern) ----\n"
+        << "    alpaka::PlatformCpu hostPlatform{};\n"
+        << "    auto host = alpaka::getDevByIdx(hostPlatform, 0u);\n"
+        << "    Platform platform{};\n"
+        << "    auto device = alpaka::getDevByIdx(platform, 0u);\n"
+        << "    Queue queue{device};\n\n"
+        << "    std::mt19937 rng(42);\n"
+        << "    std::uniform_real_distribution<float> fdist(-1.0f, 1.0f);\n\n";
+
+
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        const std::string &T = inputs[i].cppType;
+        const size_t       N = inputs[i].numElements;
+        bench
+            << "    // Input " << i << ": " << T << "[" << N << "]\n"
+            << "    auto input_h_" << i << " = alpaka::allocBuf<" << T
+            << ", Idx>(host, Ext1::all(Idx{" << N << "}));\n"
+            << "    {\n"
+            << "        auto *p = reinterpret_cast<" << T
+            << "*>(alpaka::getPtrNative(input_h_" << i << "));\n";
+        if (T == "float" || T == "double") {
+            bench
+                << "        for (size_t k = 0; k < " << N
+                << "; ++k) p[k] = static_cast<" << T << ">(fdist(rng));\n";
+        } else {
+            bench
+                << "        std::fill(p, p + " << N
+                << ", static_cast<" << T << ">(0));\n";
+        }
+        bench
+            << "    }\n"
+            << "    auto input_d_" << i << " = alpaka::allocBuf<" << T
+            << ", Idx>(device, Ext1::all(Idx{" << N << "}));\n"
+            << "    alpaka::memcpy(queue, input_d_" << i
+            << ", input_h_" << i << ");\n\n";
+    }
+    bench << "    alpaka::wait(queue);\n\n";
+
+    bench
+        << "    // ---- Create session (loads weights) ----\n"
+        << "    std::string weightFile = weightsDir + \"/"
+        << modelName << "_GPU_ALPAKA.dat\";\n"
+        << "    SOFIE_" << cppName
+        << "::Session<AccTag> session(weightFile);\n\n";
+
+
+    bench << "    // ---- One priming inference to obtain output buffer handle(s) ----\n"
+          << "    auto out_d = " << inferCall.str() << ";\n"
+          << "    alpaka::wait(session.queue);\n\n";
+
+    for (size_t i = 0; i < outputs.size(); ++i) {
+        const std::string &T = outputs[i].cppType;
+        const size_t       N = outputs[i].numElements;
+        bench
+            << "    // Output " << i << ": " << T << "[" << N << "]\n"
+            << "    auto out_h_" << i << " = alpaka::allocBuf<" << T
+            << ", Idx>(host, Ext1::all(Idx{" << N << "}));\n";
+    }
+    bench << "\n";
+
+    auto outBufExpr = [&](size_t i) -> std::string {
+        if (outputs.size() == 1) return "out_d";
+        return "out_d[" + std::to_string(i) + "]";
+    };
+
+    bench << "    // ---- Warmup (not timed) ----\n"
+          << "    for (int w = 0; w < warmup; ++w) {\n";
+    // H2D: inputs host → device
+    for (size_t i = 0; i < inputs.size(); ++i)
+        bench << "        alpaka::memcpy(queue, input_d_" << i
+              << ", input_h_" << i << ");\n";
+    bench << "        alpaka::wait(queue);\n";
+    // Inference
+    bench << "        " << inferCall.str() << ";\n"
+          << "        alpaka::wait(session.queue);\n";
+    // D2H: outputs device → host
+    for (size_t i = 0; i < outputs.size(); ++i)
+        bench << "        alpaka::memcpy(queue, out_h_" << i
+              << ", " << outBufExpr(i) << ");\n";
+    bench << "        alpaka::wait(queue);\n"
+          << "    }\n"
+          << "    cudaDeviceSynchronize();\n\n";
+
+    // ---- Profiling path (mutually exclusive with benchmark path) ----
+    bench << "#ifdef SOFIE_BENCHMARK_PROFILE\n"
+          << "    // ---- Profiling: reset warmup data, run iterations, print results ----\n"
+          << "    session.ResetProfilingResults();\n"
+          << "    for (int _i = 0; _i < iterations; ++_i)\n"
+          << "        " << inferCall.str() << ";\n"
+          << "    alpaka::wait(session.queue);\n"
+          << "    std::printf(\"%s\\n\", std::string(60, '-').c_str());\n"
+          << "    std::printf(\"Model: " << modelName << "\\n\");\n"
+          << "    session.PrintProfilingResults();\n"
+          << "    session.PrintMemoryInfo();\n"
+          << "#else\n";
+
+    // ---- Benchmark path ----
+    bench
+        << "    // ---- Timed input transfer (H2D: host -> device) ----\n"
+        << "    auto t0_in = std::chrono::high_resolution_clock::now();\n"
+        << "    for (int _i = 0; _i < iterations; ++_i) {\n";
+    for (size_t i = 0; i < inputs.size(); ++i)
+        bench << "        alpaka::memcpy(queue, input_d_" << i
+              << ", input_h_" << i << ");\n";
+    bench << "        alpaka::wait(queue);\n"
+          << "    }\n"
+          << "    SOFIE_BENCH_DEVICE_SYNC();\n"
+          << "    auto t1_in = std::chrono::high_resolution_clock::now();\n\n";
+
+    bench
+        << "    // ---- Timed inference (with GPU occupancy sampling) ----\n"
+        << "    GpuOccupancySampler occSampler(0);\n"
+        << "    occSampler.start();\n"
+        << "    auto t0_infer = std::chrono::high_resolution_clock::now();\n"
+        << "    for (int _i = 0; _i < iterations; ++_i)\n"
+        << "        " << inferCall.str() << ";\n"
+        << "    alpaka::wait(session.queue);\n"
+        << "    SOFIE_BENCH_DEVICE_SYNC();\n"
+        << "    auto t1_infer = std::chrono::high_resolution_clock::now();\n"
+        << "    occSampler.stop();\n\n";
+
+    bench
+        << "    // ---- Timed output transfer (D2H: device -> host) ----\n"
+        << "    auto t0_out = std::chrono::high_resolution_clock::now();\n"
+        << "    for (int _i = 0; _i < iterations; ++_i) {\n";
+    for (size_t i = 0; i < outputs.size(); ++i)
+        bench << "        alpaka::memcpy(queue, out_h_" << i
+              << ", " << outBufExpr(i) << ");\n";
+    bench << "        alpaka::wait(queue);\n"
+          << "    }\n"
+          << "    SOFIE_BENCH_DEVICE_SYNC();\n"
+          << "    auto t1_out = std::chrono::high_resolution_clock::now();\n\n";
+
+    bench
+        << "    double avg_infer_ms  = std::chrono::duration<double, std::milli>"
+           "(t1_infer - t0_infer).count() / iterations;\n"
+        << "    double avg_in_ms     = std::chrono::duration<double, std::milli>"
+           "(t1_in    - t0_in   ).count() / iterations;\n"
+        << "    double avg_out_ms    = std::chrono::duration<double, std::milli>"
+           "(t1_out   - t0_out  ).count() / iterations;\n"
+        << "    double throughput    = (avg_infer_ms > 0.0) ? 1000.0 / avg_infer_ms : 0.0;\n\n"
+        << "    char smAvgStr[16], smPeakStr[16], memAvgStr[16];\n"
+        << "    if (occSampler.available() && occSampler.sampleCount() > 0) {\n"
+        << "        std::snprintf(smAvgStr,  sizeof(smAvgStr),  \"%.1f\", occSampler.avgSmUtilPct());\n"
+        << "        std::snprintf(smPeakStr, sizeof(smPeakStr), \"%u\",   occSampler.peakSmUtilPct());\n"
+        << "        std::snprintf(memAvgStr, sizeof(memAvgStr), \"%.1f\", occSampler.avgMemUtilPct());\n"
+        << "    } else {\n"
+        << "        std::snprintf(smAvgStr,  sizeof(smAvgStr),  \"N/A\");\n"
+        << "        std::snprintf(smPeakStr, sizeof(smPeakStr), \"N/A\");\n"
+        << "        std::snprintf(memAvgStr, sizeof(memAvgStr), \"N/A\");\n"
+        << "    }\n"
+        << "    std::printf(\"%-40s  %12.4f  %14.4f  %15.4f  %16.1f  %10s  %9s  %11s\\n\",\n"
+        << "                \"" << modelName << "\",\n"
+        << "                avg_infer_ms, avg_in_ms, avg_out_ms, throughput,\n"
+        << "                smAvgStr, smPeakStr, memAvgStr);\n"
+        << "#endif  // SOFIE_BENCHMARK_PROFILE\n"
+        << "}\n";
+
+    bench.close();
+
+    std::cout << "[Benchmark] Wrote: " << hxxPath  << "\n"
+              << "            Wrote: " << benchPath << "\n";
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        std::cerr << "Usage: sofie_benchmark_emitter <output_dir>\n";
+        return 1;
+    }
+    std::string outDir = argv[1];
+    int failures = 0;
+
+@BENCHMARK_EMIT_CAPTURES@
+
+    std::cout << "[Benchmark Emitter] Done — " << failures << " failure(s).\n";
+    return failures == 0 ? 0 : 1;
+}

@@ -1,0 +1,141 @@
+// SOFIE Alpaka Benchmark Runner — main TU
+// Auto-configured by CMake — do not edit directly.
+//
+// Execution model:
+//   Normal mode  — iterates over all models, spawning ONE subprocess per model
+//                  so each model gets a fresh CUDA context and all GPU memory
+//                  is freed when the subprocess exits.  This avoids the
+//                  cudaErrorMemoryAllocation that occurs when a large model's
+//                  CUDA allocator cache is not returned to the OS between runs.
+//   Single-model mode (--single-model <name>) — called BY the parent; runs
+//                  exactly one model then exits.
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <string>
+#include <sstream>
+
+// Optional ONNX Runtime GPU comparison
+#ifdef SOFIE_BENCHMARK_ORT
+#include "ONNXRuntimeBenchmark.hxx"
+#endif
+
+// Forward-declare one per-model benchmark function (defined in <model>_bench.cu)
+@BENCHMARK_FWD_DECLS@
+
+// ---------------------------------------------------------------------------
+// Dispatch table: called when --single-model <name> is given.
+// ---------------------------------------------------------------------------
+static int run_single_model(const std::string& model,
+                             int warmup, int iterations,
+                             const std::string& weightsDir,
+                             bool run_ort)
+{
+@BENCHMARK_SINGLE_MODEL_CASES@
+    std::fprintf(stderr, "Unknown model: %s\n", model.c_str());
+    return 1;
+}
+
+int main(int argc, char *argv[]) {
+    int warmup     = 10;
+    int iterations = 100;
+    std::string weightsDir = ".";
+    bool run_ort   = false;
+    std::string singleModel;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if      ((a == "--warmup"        || a == "-w") && i + 1 < argc) warmup     = std::stoi(argv[++i]);
+        else if ((a == "--iterations"    || a == "-n") && i + 1 < argc) iterations = std::stoi(argv[++i]);
+        else if  (a == "--weights-dir"                 && i + 1 < argc) weightsDir = argv[++i];
+        else if  (a == "--single-model"                && i + 1 < argc) singleModel = argv[++i];
+        else if  (a == "--onnxruntime"   || a == "--ort")               run_ort    = true;
+        else if  (a == "--help"          || a == "-h") {
+#ifdef SOFIE_BENCHMARK_PROFILE
+            std::cout <<
+                "Usage: sofie_benchmark [options]  [PROFILING MODE]\n"
+                "  Per-operator GPU timing (alpaka::wait per op) + memory breakdown.\n"
+                "  Throughput benchmarking is disabled in this build.\n"
+                "  Rebuild without -DSOFIE_BENCHMARK_PROFILE=ON for throughput numbers.\n\n"
+                "  --warmup,      -w <N>   Warmup iterations  (default: 10)\n"
+                "  --iterations,  -n <N>   Profiling runs      (default: 100)\n"
+                "  --weights-dir    <DIR>  SOFIE .dat files    (default: .)\n"
+                "  --single-model   <N>   Run one model (internal)\n"
+                ;
+#else
+            std::cout <<
+                "Usage: sofie_benchmark [options]\n"
+                "  --warmup,      -w <N>   Warmup iterations       (default: 10)\n"
+                "  --iterations,  -n <N>   Timed iterations         (default: 100)\n"
+                "  --weights-dir    <DIR>  SOFIE .dat weight files  (default: .)\n"
+#ifdef SOFIE_BENCHMARK_ORT
+                "  --onnxruntime, --ort    Also run ONNX Runtime GPU comparison\n"
+#else
+                "  --onnxruntime, --ort    (not available; rebuild with -DSOFIE_BENCHMARK_ORT=ON)\n"
+#endif
+                "  Rebuild with -DSOFIE_BENCHMARK_PROFILE=ON for per-operator profiling.\n"
+                "  --single-model   <N>   Run exactly one model by C++ name (internal)\n"
+                ;
+#endif
+            return 0;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Single-model mode: called as a subprocess, run one model and exit.
+    // All GPU memory is freed when this process exits.
+    // -----------------------------------------------------------------------
+    if (!singleModel.empty())
+        return run_single_model(singleModel, warmup, iterations, weightsDir, run_ort);
+
+    // -----------------------------------------------------------------------
+    // Orchestrator mode: spawn one child process per model so every model
+    // starts with a fresh CUDA context (avoids cudaErrorMemoryAllocation
+    // caused by the CUDA allocator retaining freed pages between models).
+    // -----------------------------------------------------------------------
+#ifndef SOFIE_BENCHMARK_ORT
+    if (run_ort) {
+        std::fprintf(stderr,
+            "Warning: --onnxruntime requested but this binary was built without "
+            "ORT support.  Rebuild with -DSOFIE_BENCHMARK_ORT=ON.\n");
+        run_ort = false;
+    }
+#endif
+
+#ifdef SOFIE_BENCHMARK_PROFILE
+    std::printf("=== SOFIE Alpaka Profiler ===\n");
+    std::printf("Backend: @SOFIE_BENCHMARK_BACKEND@  |  Warmup: %d  |  Iterations: %d\n\n",
+                warmup, iterations);
+#else
+    std::printf("=== SOFIE Alpaka Benchmark ===\n");
+    std::printf("Backend: @SOFIE_BENCHMARK_BACKEND@  |  Warmup: %d  |  Iterations: %d", warmup, iterations);
+#ifdef SOFIE_BENCHMARK_ORT
+    if (run_ort) std::printf("  |  ORT-GPU: ON");
+#endif
+    std::printf("\n\n");
+
+    std::printf("%-40s  %12s  %14s  %15s  %16s  %10s  %9s  %11s\n",
+                "Model", "infer(ms)", "in_xfer(ms)", "out_xfer(ms)", "Throughput(inf/s)",
+                "SM%(avg)", "SM%(pk)", "MemBw%(avg)");
+    std::printf("%s\n", std::string(140, '-').c_str());
+#endif  // SOFIE_BENCHMARK_PROFILE
+    std::fflush(stdout);
+
+    // Build the common argument suffix forwarded to every subprocess.
+    std::ostringstream common;
+    common << " -w " << warmup
+           << " -n " << iterations
+           << " --weights-dir \"" << weightsDir << "\"";
+    if (run_ort) common << " --ort";
+    std::string commonArgs = common.str();
+
+    int totalFailed = 0;
+@BENCHMARK_SPAWN_CALLS@
+
+    if (totalFailed > 0)
+        std::fprintf(stderr, "\n%d model(s) failed.\n", totalFailed);
+
+    return (totalFailed > 0) ? 1 : 0;
+}

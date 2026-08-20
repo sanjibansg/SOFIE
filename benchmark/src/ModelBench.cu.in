@@ -1,0 +1,5 @@
+// Per-model compilation unit for: @MODEL_NAME@
+// Each model is compiled in isolation so the GPU template instantiation
+// for one model's Session<tagAcc> does not share a translation unit with
+// every other model's (which would OOM the CUDA compiler on the all-in-one TU).
+#include "@MODEL_NAME@_bench.hxx"

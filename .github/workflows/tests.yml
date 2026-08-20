@@ -1,0 +1,174 @@
+name: Unit Tests
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+concurrency:
+  group: tests-${{ github.event.issue.number || github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+env:
+  LCG_VIEW:   /cvmfs/sft.cern.ch/lcg/views/LCG_106a/x86_64-el9-gcc13-opt
+  CUDA_CVMFS: /cvmfs/sft.cern.ch/lcg/contrib/cuda/12.4/x86_64-el9
+  CUDA_ARCH:  "native"
+  BUILD_TYPE: Release
+  DEPS_CACHE: /tmp/sofie-cmake-deps
+jobs:
+  parse-command:
+    name: Parse trigger
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        contains(fromJSON('["sanjibansg","lmoneta"]'), github.event.comment.user.login) &&
+        startsWith(github.event.comment.body, '/runtest')
+      )
+    outputs:
+      runner_label: ${{ steps.parse.outputs.runner_label }}
+      valid: ${{ steps.parse.outputs.valid }}
+      flavor: ${{ steps.parse.outputs.flavor }}
+      valid_flavors: ${{ steps.parse.outputs.valid_flavors }}
+    steps:
+      - name: React to trigger comment
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes'
+            });
+      - name: Parse runner flavor
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // default flavor keyed by name -> actual self-hosted runner label
+            const flavors = {
+              l40s: 'ml4ep-l40s',
+              h100: 'ml4ep-h100',
+              'h100-47gb': 'ml4ep-h100-47gb',
+            };
+            let flavor = 'l40s';
+            let valid = true;
+            if (context.eventName === 'issue_comment') {
+              const m = context.payload.comment.body.trim().match(/^\/runtest(?:\s+(\S+))?/i);
+              if (m && m[1]) {
+                flavor = m[1].toLowerCase();
+                valid = Object.prototype.hasOwnProperty.call(flavors, flavor);
+              }
+            }
+            core.setOutput('flavor', flavor);
+            core.setOutput('valid', String(valid));
+            core.setOutput('runner_label', valid ? flavors[flavor] : '');
+            core.setOutput('valid_flavors', Object.keys(flavors).join(', '));
+      - name: Post run link
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `\`/runtest\` (${{ steps.parse.outputs.flavor }}): triggered - [view run](${runUrl})`
+            });
+
+  gpu-tests:
+    name: GPU Unit Tests
+    needs: parse-command
+    if: needs.parse-command.outputs.valid == 'true'
+    runs-on: ${{ needs.parse-command.outputs.runner_label }}
+    container:
+      image: registry.cern.ch/ngt/lxplus-like:9
+      options: --user 0:0
+    timeout-minutes: 60
+    steps:
+      - name: GPU check
+        run: nvidia-smi
+      - name: Setup build environment
+        run: |
+          set -euo pipefail
+          # GTest
+          dnf install -y gtest-devel 2>/dev/null || \
+          dnf install -y googletest-devel 2>/dev/null || (
+            cd /tmp
+            git clone --depth 1 -b v1.14.0 https://github.com/google/googletest.git
+            cmake -B gtest-build -S googletest \
+                  -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON
+            cmake --build gtest-build -j15
+            cmake --install gtest-build
+          )
+          echo "PATH=$PATH"                               >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"    >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH:-}" >> "$GITHUB_ENV"
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/merge', github.event.issue.number) || github.ref }}
+      - name: Cache FetchContent dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DEPS_CACHE }}
+          key: cmake-deps-tests-${{ hashFiles('test/CMakeLists.txt') }}
+          restore-keys: cmake-deps-tests-
+      - name: Configure
+        run: |
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DSOFIE_WITH_ROOT=OFF \
+            -Dtesting=ON \
+            -DENABLE_ALPAKA_TESTS=ON \
+            -DALPAKA_BACKEND=cuda \
+            "-DCMAKE_CUDA_ARCHITECTURES=${{ env.CUDA_ARCH }}" \
+            "-DFETCHCONTENT_BASE_DIR=${{ env.DEPS_CACHE }}"
+      - name: Build and run tests
+        working-directory: build
+        run: ctest --output-on-failure -j15
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ github.run_id }}
+          path: build/Testing/Temporary/LastTest.log
+      - name: Report result on PR
+        if: always() && github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const status = '${{ job.status }}' === 'success' ? '✅ passed' : '❌ failed';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `\`/runtest\` (${{ needs.parse-command.outputs.flavor }}): GPU Unit Tests ${status} - [view run](${runUrl})`
+            });
+
+  report-invalid-flavor:
+    name: Report invalid runner flavor
+    needs: parse-command
+    runs-on: ubuntu-latest
+    if: >-
+      always() && github.event_name == 'issue_comment' &&
+      needs.parse-command.result == 'success' &&
+      needs.parse-command.outputs.valid == 'false'
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `\`/runtest\`: unknown runner flavor \`${{ needs.parse-command.outputs.flavor }}\`. ` +
+                    `Valid options: ${{ needs.parse-command.outputs.valid_flavors }} (or omit for the default, l40s).`
+            });

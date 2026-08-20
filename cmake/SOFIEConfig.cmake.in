@@ -1,0 +1,13 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(Protobuf)
+
+if(@SOFIE_WITH_ROOT@)
+  find_dependency(ROOT COMPONENTS Core TMVA Tree)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/SOFIETargets.cmake")
+
+check_required_components(SOFIE)
