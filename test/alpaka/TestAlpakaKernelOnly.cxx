@@ -17,7 +17,7 @@ TEST_F(SofieAlpakaTest, KernelOnlyLeakyRelu)
     auto input_d = makeDeviceBuf<float>(host, device, queue, input.data(), n);
     auto output_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{n}));
 
-    auto workDiv = SOFIE_LeakyReluKernelOnly::sofie_workdiv<Dim, Idx>(Ext1D::all(Idx{n}));
+    auto workDiv = sofie_workdiv<Dim, Idx>(Ext1D::all(Idx{n}));
     auto task = alpaka::createTaskKernel<Acc>(workDiv, SOFIE_LeakyReluKernelOnly::LeakyReluKernel{},
                                                alpaka::getPtrNative(input_d), alpaka::getPtrNative(output_d),
                                                n, alpha);

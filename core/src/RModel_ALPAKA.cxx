@@ -3,6 +3,7 @@
 #include <climits>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 
@@ -637,7 +638,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       bool inFusedGroup = (gIdx != SIZE_MAX) && fEltwiseFusionGroups[gIdx].isFused();
 
       if (inFusedGroup) {
-         // Only emit the fused kernel struct once, at the chain leader
+         // Only emit the fused kernel struct once, at the chain leader.
          if (fEltwiseFusionGroups[gIdx].opIndices[0] == id && !fusedGroupsEmitted.count(gIdx)) {
             const auto& grp = fEltwiseFusionGroups[gIdx];
             std::string sfx = grp.suffix();
@@ -658,7 +659,6 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          }
          // Chain followers: skip (their logic is inside the fused kernel)
       } else {
-         // Unfused op: generate individual kernel struct (with dedup for single_initialized_operators)
          if (single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
             if (registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
                if (fVerbose)
@@ -675,16 +675,6 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    }
 
 
-   fGC += "\ntemplate<typename TDim, typename TIdx>\n";
-   fGC += "inline alpaka::WorkDivMembers<TDim, TIdx> sofie_workdiv(\n";
-   fGC += "    alpaka::Vec<TDim, TIdx> const& numElems, TIdx blockSz = TIdx{256})\n{\n";
-   fGC += "    auto const numBlocks = alpaka::Vec<TDim, TIdx>::all(\n";
-   fGC += "        (numElems[0] + blockSz - TIdx{1}) / blockSz);\n";
-   fGC += "    return alpaka::WorkDivMembers<TDim, TIdx>(\n";
-   fGC += "        numBlocks,\n";
-   fGC += "        alpaka::Vec<TDim, TIdx>::all(blockSz),\n";
-   fGC += "        alpaka::Vec<TDim, TIdx>::all(TIdx{1}));\n";
-   fGC += "}\n\n";
 
    if (fKernelOnly)
       return;
@@ -692,10 +682,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    // define the Session struct (for GNN this is generated in RModel_GNN)
   fGC += "\n\ntemplate <typename tagAcc>\n";
    if (fUseSession) {
-      if (!fIsSubGraph)
-         fGC += "struct Session {\n\n";
-      else
-         fGC += "struct Session_" + fName + " {\n\n";
+      fGC += "struct Session {\n\n";
    }
 
    // define host and device accelerators
@@ -743,70 +730,93 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       fGC += RModelProfilerGPU::GenerateSessionMembers();
    }
 
-   // Session constructor
+   // Session constructor(s)
    if (fUseSession) {
-      std::string sessionName = "\n\nSession";
-      if (fIsSubGraph)
-         sessionName += "_" + fName;
+      std::string sessionName = "Session";
 
+      std::string fileName;
       if (fUseWeightFile) {
-         std::string fileName = fName;
+         fileName = fName;
          if (fWeightFile == WeightFileType::Text)
             fileName += ".dat";
          if (fWeightFile == WeightFileType::RootBinary)
             fileName += ".root";
-
-         fGC += sessionName + "(std::string filename =\"" + fileName + "\"";
-      } else {
-         fGC += sessionName + "(std::string = \"\"";
       }
 
-      if (!fShapeParams.empty()) {
-         std::unordered_map<std::string, int> seenParam;
-         for (auto &name : fInputTensorNames) {
-            if (IsDimInputTensor(name)) {
-               for (auto &d : GetDynamicTensorShape(name)) {
-                  if (d.isParam && seenParam.count(d.param) == 0) {
-                     seenParam[d.param] = 1;
-                     fGC += ",\n        size_t " + d.param + " = " + fShapeParams[d.param];
-                  }
+      // ---- build constructor body into a temporary string ----
+      {
+         std::string savedGC = fGC;
+         fGC.clear();
+
+         GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA();
+         if (fUseWeightFile) {
+            fGC += "\n//--- reading weights from file\n";
+            ReadInitializedTensorsFromFile(0);
+            fGC += "\n";
+         }
+         MoveInitializedTensorsToBuffers_ALPAKA();
+         GenerateDynamicTensorInfo_GPU_ALPAKA();
+         for (size_t id = 0; id < fOperators.size(); id++) {
+            if (fSkipOperators.count(id)) continue;
+            fGC += fOperators[id]->GenerateInitCode_GPU_ALPAKA();
+            if (fOperators[id]->GetKind() == OperatorKind::GEMM || fOperators[id]->GetKind() == OperatorKind::CONV) {
+               for (auto &blasCfg : fOperators[id]->GetBlasConfigs()) {
+                  if (!blasCfg.empty())
+                     fGC += "\nblas.addLayoutConfig(" + blasCfg + ");\n";
                }
             }
          }
-         for (auto &p : fShapeParams)
-            if (seenParam.count(p.first) == 0)
-               fGC += ",\n        size_t " + p.first + " = " + p.second;
-      }
-      fGC += ") {\n";
-      
-      GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA();
-      if (fUseWeightFile) {
-         fGC += "\n//--- reading weights from file\n";
-         ReadInitializedTensorsFromFile(0);
-         fGC += "\n";
-      }
-      
-      MoveInitializedTensorsToBuffers_ALPAKA();
-      GenerateDynamicTensorInfo_GPU_ALPAKA();
+         fGC += "\nalpaka::wait(queue);\n";
 
-      for (size_t id = 0; id < fOperators.size(); id++) {
-         if (fSkipOperators.count(id)) continue;
-         fGC += fOperators[id]->GenerateInitCode_GPU_ALPAKA();
-         if (fOperators[id]->GetKind() == OperatorKind::GEMM || fOperators[id]->GetKind() == OperatorKind::CONV) {
-            // GetBlasConfigs() returns one entry per distinct GEMM call shape the
-            // operator's Generate_GPU_ALPAKA() will issue (usually one; a low-rank
-            // factorized Gemm issues two chained calls of different shapes and so
-            // needs two configs registered). Empty entries (e.g. gemmStridedBatched,
-            // legacy cuBLAS path) need no cuBLASLt layout registration.
-            for (auto &blasCfg : fOperators[id]->GetBlasConfigs()) {
-               if (!blasCfg.empty())
-                  fGC += "\nblas.addLayoutConfig("+blasCfg+");\n";
+         std::string ctorBody = fGC;
+         fGC = savedGC;
+
+         // shape params in declaration order matching the infer signature, so positional
+         // ctor args cannot permute on multi-symbol models
+         std::string ctorParams;
+         if (!fShapeParams.empty()) {
+            std::unordered_map<std::string, int> seenParam;
+            for (auto &name : fInputTensorNames) {
+               if (IsDimInputTensor(name)) {
+                  for (auto &d : GetDynamicTensorShape(name)) {
+                     if (d.isParam && seenParam.count(d.param) == 0) {
+                        seenParam[d.param] = 1;
+                        ctorParams += ",\n        size_t " + d.param + " = " + fShapeParams[d.param];
+                     }
+                  }
+               }
             }
+            for (auto &p : fShapeParams)
+               if (seenParam.count(p.first) == 0)
+                  ctorParams += ",\n        size_t " + p.first + " = " + p.second;
          }
-      }
 
-      fGC += "\nalpaka::wait(queue);\n";
-      fGC += "}\n\n";
+         // ---- public constructors with inlined body ----
+         fGC += "public:\n";
+
+         // (1) default-queue constructor
+         if (fUseWeightFile)
+            fGC += "\n\n" + sessionName + "(std::string filename = \"" + fileName + "\"";
+         else
+            fGC += "\n\n" + sessionName + "(std::string filename = \"\"";
+         fGC += ctorParams;
+         fGC += ") {\n";
+         fGC += ctorBody;
+         fGC += "}\n\n";
+
+         // (2) external-queue constructor
+         if (fUseWeightFile)
+            fGC += sessionName + "(QueueAcc& extQueue, std::string filename = \"" + fileName + "\"";
+         else
+            fGC += sessionName + "(QueueAcc& extQueue, std::string filename = \"\"";
+         fGC += ctorParams;
+         fGC += ")\n    : queue(extQueue)";
+         if (OpNeedsBlas)
+            fGC += ", blas(queue)";
+         fGC += "\n{\n";
+         fGC += ctorBody;
+         fGC += "}\n\n";
+      }
    }
 
    registered_operators.clear();
@@ -844,6 +854,17 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    }
 
    GenerateOutput_GPU_ALPAKA();
+
+   // emit resetState() — zeros all intermediate tensors to reset model state
+   if (fUseSession) {
+      fGC += "\nvoid resetState(QueueAcc& queue) {\n";
+      for (auto &i : fIntermediateTensorInfos) {
+         if (fFusionIntermediateTensors.count(i.first)) continue;
+         fGC += SP + "alpaka::memset(queue, deviceBuf_" + i.first + ", 0);\n";
+      }
+      fGC += SP + "alpaka::wait(queue);\n";
+      fGC += "}\n";
+   }
 
    // inject GPU profiling utility functions and memory report inside Session struct
    if (fProfile && fUseSession) {

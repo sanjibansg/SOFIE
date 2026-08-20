@@ -34,4 +34,11 @@
 #include "SOFIE/ROperator_Comparision.hxx"
 #include "SOFIE/ROperator_EyeLike.hxx"
 #include "SOFIE/ROperator_Range.hxx"
+#include "SOFIE/ROperator_RMSNorm.hxx"
+#include "SOFIE/ROperator_GroupNorm.hxx"
+#include "SOFIE/ROperator_CumSum.hxx"
+#include "SOFIE/ROperator_SDPA.hxx"
+#include "SOFIE/ROperator_MambaScan.hxx"
+#include "SOFIE/ROperator_RWKV_WKV6.hxx"
+#include "SOFIE/ROperator_GriffinRGLRU.hxx"
 

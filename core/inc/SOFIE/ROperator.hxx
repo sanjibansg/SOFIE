@@ -40,7 +40,14 @@ enum class OperatorKind {
    CLIP=24,
    NOT=25,
    POOL=26,
-   SELU=27
+   SELU=27,
+   RMSNORM=28,
+   GROUPNORM=29,
+   CUMSUM=30,
+   SDPA=31,
+   MAMBA_SCAN=32,
+   RWKV_WKV6=33,
+   GRIFFIN_RGLRU=34
 };
 
 inline const char* toString(OperatorKind kind) {
@@ -73,6 +80,8 @@ public:
    // generate initialization code for session constructor
    virtual std::string GenerateInitCode() { return "";}
    virtual std::string GenerateInitCode_GPU_ALPAKA() { return "";};
+   // generate code to reset recurrent/stateful buffers (called once per file boundary)
+   virtual std::string GenerateResetStateCode_GPU_ALPAKA() { return ""; }
    // generate some specific declaration code for Session
    virtual std::string GenerateDeclCode() { return "";}
    // generate session data members specific to operator
