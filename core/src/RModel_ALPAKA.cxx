@@ -1082,6 +1082,117 @@ void RModel::GenerateIntermediateMemoryPool_GPU_ALPAKA() {
    fGC += "}\n\n";
 }
 
+std::string RModel::GenerateFusionInputIndex(const std::string &inputName, const std::vector<size_t> &outputShape, const std::string &outputIndex) const
+{
+   EFusionInputAccess access;
+   std::vector<size_t> alignedStrides;
+
+   if (!ResolveFusionInputAccess(inputName, outputShape, access, alignedStrides))
+      throw std::runtime_error("Cannot resolve fused input index for tensor " + inputName);
+
+   if (access == EFusionInputAccess::Elementwise)
+      return outputIndex;
+
+   if (access == EFusionInputAccess::Scalar)
+      return "0";
+
+   const auto outputStrides = UTILITY::ComputeStrideFromShape(outputShape);
+   std::string indexExpression;
+
+   for (size_t dimIdx = 0; dimIdx < alignedStrides.size(); ++dimIdx) {
+      const size_t inputStride = alignedStrides[dimIdx];
+
+      if (inputStride == 0)
+         continue;
+
+      std::string coordinate;
+
+      if (outputStrides[dimIdx] == 1)
+         coordinate = "((" + outputIndex + ") % " + std::to_string(outputShape[dimIdx]) + "u)";
+      else
+         coordinate = "(((" + outputIndex + ") / " + std::to_string(outputStrides[dimIdx]) + "u) % " + std::to_string(outputShape[dimIdx]) + "u)";
+
+      if (!indexExpression.empty())
+         indexExpression += " + ";
+
+      indexExpression += coordinate;
+
+      if (inputStride != 1)
+         indexExpression += " * " + std::to_string(inputStride) + "u";
+   }
+
+   return indexExpression.empty() ? "0" : indexExpression;
+}
+
+std::string RModel::GenerateFusionValueAtIndex(const EltwiseFusionGroup &group, const std::string &tensorName, const std::string &logicalIndex, const std::unordered_map<std::string, size_t> &groupProducers, const std::unordered_map<std::string, size_t> &externalInputIndices, std::unordered_map<std::string, std::string> &valueCache, std::string &kernelCode, size_t &valueCounter) const
+{
+   const std::string cacheKey = tensorName + "@" + logicalIndex;
+   const auto cacheIt = valueCache.find(cacheKey);
+
+   if (cacheIt != valueCache.end())
+      return cacheIt->second;
+
+   const auto externalIt = externalInputIndices.find(tensorName);
+
+   if (externalIt != externalInputIndices.end()) {
+      const std::string localName = "v_input_" + std::to_string(valueCounter++);
+      kernelCode += SP + SP + SP + "auto " + localName + " = input" + std::to_string(externalIt->second) + "[" + logicalIndex + "];\n";
+      valueCache[cacheKey] = localName;
+      return localName;
+   }
+
+   const auto producerIt = groupProducers.find(tensorName);
+
+   if (producerIt == groupProducers.end())
+      throw std::runtime_error("Missing fused producer for tensor " + tensorName);
+
+   const size_t opIdx = producerIt->second;
+   const auto &op = fOperators[opIdx];
+   const auto outputs = op->GetOpOutputTensors();
+
+   if (outputs.size() != 1 || std::string(outputs[0]) != tensorName)
+      throw std::runtime_error("Invalid fused producer for tensor " + tensorName);
+
+   const auto outputShape = GetTensorShape(tensorName);
+   const auto opInputs = op->GetOpInputTensors();
+   const auto dataInputIndices = op->GetFusionDataInputIndices();
+   const auto mappingType = op->GetFusionMappingType();
+   std::vector<std::string> inputExpressions;
+
+   for (const size_t inputIdx : dataInputIndices) {
+      const std::string inputName(opInputs[inputIdx]);
+      const auto inputShape = GetTensorShape(inputName);
+      std::string inputIndex;
+
+      if (mappingType == EFusionMappingType::Shuffle) {
+         inputIndex = op->GetFusionInputIndexExpr(inputIdx, logicalIndex, inputShape, outputShape);
+
+         if (inputIndex.empty())
+            throw std::runtime_error("Missing Shuffle index expression for operator " + std::to_string(opIdx));
+      } else if (mappingType == EFusionMappingType::Reorganize) {
+         if (ConvertShapeToLength(inputShape) != ConvertShapeToLength(outputShape))
+            throw std::runtime_error("Invalid Reorganize mapping for operator " + std::to_string(opIdx));
+
+         inputIndex = logicalIndex;
+      } else {
+         inputIndex = GenerateFusionInputIndex(inputName, outputShape, logicalIndex);
+      }
+
+      inputExpressions.push_back(GenerateFusionValueAtIndex(group, inputName, inputIndex, groupProducers, externalInputIndices, valueCache, kernelCode, valueCounter));
+   }
+
+   const std::string expression = op->GetFusionExpr(inputExpressions);
+
+   if (expression.empty())
+      throw std::runtime_error("Operator " + std::to_string(opIdx) + " does not provide a fused expression");
+
+   const std::string localName = "v_op_" + std::to_string(opIdx) + "_" + std::to_string(valueCounter++);
+   kernelCode += SP + SP + SP + "auto " + localName + " = " + expression + ";\n";
+   valueCache[cacheKey] = localName;
+
+   return localName;
+}
+
 std::string RModel::GenerateFusedEltwiseKernel_GPU_ALPAKA(const EltwiseFusionGroup &group) const
 {
    const std::string suffix = group.suffix();
@@ -1111,97 +1222,27 @@ std::string RModel::GenerateFusedEltwiseKernel_GPU_ALPAKA(const EltwiseFusionGro
    kernelCode += SP + SP + "const auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
    kernelCode += SP + SP + "if (idx < n) {\n";
 
-   std::unordered_map<std::string, std::string> tensorValues;
-   const auto fusedOutputShape = GetTensorShape(group.outputTensor);
-   const auto fusedOutputStrides = UTILITY::ComputeStrideFromShape(fusedOutputShape);
-
-   for (size_t inputIdx = 0; inputIdx < group.externalInputs.size(); ++inputIdx) {
-      const std::string localName = "v_input_" + std::to_string(inputIdx);
-      const auto &externalInput = group.externalInputs[inputIdx];
-      std::string indexExpression;
-
-      if (!externalInput.customIndexExpression.empty()) {
-         indexExpression = externalInput.customIndexExpression;
-      } else if (externalInput.access == EFusionInputAccess::Elementwise) {
-         indexExpression = "idx";
-      } else if (externalInput.access == EFusionInputAccess::Scalar) {
-         indexExpression = "0";
-      } else {
-         for (size_t dimIdx = 0; dimIdx < externalInput.alignedStrides.size(); ++dimIdx) {
-            const size_t inputStride = externalInput.alignedStrides[dimIdx];
-
-            if (inputStride == 0)
-               continue;
-
-            std::string coordinate;
-
-            if (fusedOutputStrides[dimIdx] == 1) {
-               coordinate = "(idx % " + std::to_string(fusedOutputShape[dimIdx]) + ")";
-            } else {
-               coordinate = "((idx / " + std::to_string(fusedOutputStrides[dimIdx]) + ") % " +
-                            std::to_string(fusedOutputShape[dimIdx]) + ")";
-            }
-
-            if (!indexExpression.empty())
-               indexExpression += " + ";
-
-            indexExpression += coordinate;
-
-            if (inputStride != 1)
-               indexExpression += " * " + std::to_string(inputStride);
-         }
-
-         if (indexExpression.empty())
-            indexExpression = "0";
-      }
-
-      kernelCode += SP + SP + SP + "auto " + localName + " = input" + std::to_string(inputIdx) +
-                    "[" + indexExpression + "];\n";
-
-      tensorValues[externalInput.tensorName] = localName;
-   }
+   std::unordered_map<std::string, size_t> groupProducers;
+   std::unordered_map<std::string, size_t> externalInputIndices;
 
    for (const size_t opIdx : group.opIndices) {
-      std::vector<std::string> inputExpressions;
-
-      const auto opInputs = fOperators[opIdx]->GetOpInputTensors();
-      const auto dataInputIndices = fOperators[opIdx]->GetFusionDataInputIndices();
-
-      for (const size_t inputIdx : dataInputIndices) {
-         const std::string inputName(opInputs[inputIdx]);
-         const auto valueIt = tensorValues.find(inputName);
-
-         if (valueIt == tensorValues.end())
-            throw std::runtime_error("Missing fused value for tensor " + inputName);
-
-         inputExpressions.push_back(valueIt->second);
-      }
-
-      const std::string expression = fOperators[opIdx]->GetFusionExpr(inputExpressions);
-
-      if (expression.empty())
-         throw std::runtime_error("Operator " + std::to_string(opIdx) + " does not provide a fused expression");
-
       const auto outputs = fOperators[opIdx]->GetOpOutputTensors();
 
       if (outputs.size() != 1)
          throw std::runtime_error("Fused operator " + std::to_string(opIdx) + " must have exactly one output");
 
-      const std::string outputName(outputs[0]);
-      const std::string localName = "v_op_" + std::to_string(opIdx);
-
-      kernelCode += SP + SP + SP + "auto " + localName + " = " + expression + ";\n";
-      tensorValues[outputName] = localName;
+      groupProducers[std::string(outputs[0])] = opIdx;
    }
 
+   for (size_t inputIdx = 0; inputIdx < group.externalInputs.size(); ++inputIdx)
+      externalInputIndices[group.externalInputs[inputIdx].tensorName] = inputIdx;
+
+   std::unordered_map<std::string, std::string> valueCache;
+   size_t valueCounter = 0;
+
    for (size_t outputIdx = 0; outputIdx < group.outputTensors.size(); ++outputIdx) {
-      const auto &outputName = group.outputTensors[outputIdx];
-      const auto valueIt = tensorValues.find(outputName);
-
-      if (valueIt == tensorValues.end())
-         throw std::runtime_error("Missing fused output value for tensor " + outputName);
-
-      kernelCode += SP + SP + SP + "out" + std::to_string(outputIdx) + "[idx] = " + valueIt->second + ";\n";
+      const std::string outputValue = GenerateFusionValueAtIndex(group, group.outputTensors[outputIdx], "idx", groupProducers, externalInputIndices, valueCache, kernelCode, valueCounter);
+      kernelCode += SP + SP + SP + "out" + std::to_string(outputIdx) + "[idx] = " + outputValue + ";\n";
    }
 
    kernelCode += SP + SP + "}\n";

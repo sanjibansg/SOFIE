@@ -86,6 +86,7 @@ private:
       std::vector<std::string> internalTensors; ///< tensors kept only as local fused values
       size_t numElements = 0;
       size_t launchOpIndex = 0;
+      bool usesIndexedEvaluation = false;
 
       bool isFused() const { return opIndices.size() > 1; }
       std::string suffix() const {
@@ -212,6 +213,12 @@ private:
    std::string GenerateFusedEltwiseLaunch_GPU_ALPAKA(const EltwiseFusionGroup &group) const;
 
    std::string GenerateFusedEltwiseKernel_GPU_ALPAKA(const EltwiseFusionGroup &group) const;
+
+   std::string GenerateFusionValueAtIndex(const EltwiseFusionGroup &group, const std::string &tensorName,
+      const std::string &logicalIndex, const std::unordered_map<std::string, size_t> &groupProducers,
+      const std::unordered_map<std::string, size_t> &externalInputIndices, std::unordered_map<std::string, std::string> &valueCache,
+      std::string &kernelCode, size_t &valueCounter) const;
+   std::string GenerateFusionInputIndex(const std::string &inputName, const std::vector<size_t> &outputShape, const std::string &outputIndex) const;
 
    std::string GenerateKernelFusionLaunch_GPU_ALPAKA(const KernelFusionGroup &group) const;
    std::string GenerateKernelFusionKernel_GPU_ALPAKA(const KernelFusionGroup &group) const;

@@ -242,6 +242,53 @@ public:
       return out.str();
    }
 
+   EFusionMappingType GetFusionMappingType() const override
+   {
+      if (fShapeInput.empty() || fShapeY.empty() || fRepeats.empty())
+         return EFusionMappingType::Unsupported;
+
+      return EFusionMappingType::Shuffle;
+   }
+
+   std::vector<size_t> GetFusionDataInputIndices() const override
+   {
+      return {1};
+   }
+
+   bool SupportsFusionTypes(const std::vector<ETensorType> &inputTypes, ETensorType outputType) const override
+   {
+      return inputTypes.size() == 1 && inputTypes[0] == outputType;
+   }
+
+   std::string GetFusionExpr(const std::vector<std::string> &inputs) const override
+   {
+      if (GetFusionMappingType() != EFusionMappingType::Shuffle || inputs.size() != 1)
+         return "";
+
+      return inputs[0];
+   }
+
+   std::string GetFusionInputIndexExpr(size_t inputIndex, const std::string &outputIndex, const std::vector<size_t> &inputShape, const std::vector<size_t> &outputShape) const override
+   {
+      if (inputIndex != 1 || GetFusionMappingType() != EFusionMappingType::Shuffle)
+         return "";
+
+      if (inputShape.size() != outputShape.size())
+         return "";
+
+      const auto inputStrides = UTILITY::ComputeStrideFromShape(inputShape);
+      const auto outputStrides = UTILITY::ComputeStrideFromShape(outputShape);
+      std::string expression;
+
+      for (size_t d = 0; d < outputShape.size(); ++d) {
+         if (!expression.empty())
+            expression += " + ";
+
+         expression += "(((((" + outputIndex + ") / " + std::to_string(outputStrides[d]) + "u) % " + std::to_string(outputShape[d]) + "u) % " + std::to_string(inputShape[d]) + "u) * " + std::to_string(inputStrides[d]) + "u)";
+      }
+
+      return "(" + expression + ")";
+   }
 };
 
 }//SOFIE

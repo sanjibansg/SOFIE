@@ -311,12 +311,12 @@ public:
          if (!expression.empty())
             expression += " + ";
 
-         expression += "((" + outputIndex + " / " + std::to_string(outputStrides[outputAxis]) + "u) % " +
-                       std::to_string(outputShape[outputAxis]) + "u) * " +
-                       std::to_string(inputStrides[inputAxis]) + "u";
+         expression += "(((" + outputIndex + ") / " + std::to_string(outputStrides[outputAxis]) + "u) % " +
+              std::to_string(outputShape[outputAxis]) + "u) * " +
+              std::to_string(inputStrides[inputAxis]) + "u";
       }
 
-      return expression;
+      return "(" + expression + ")";
    }
 
 };

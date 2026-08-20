@@ -371,6 +371,11 @@ std::string GetFusionExpr(const std::vector<std::string> &inputs) const override
 
    return inputs[0];
 }
+
+bool SupportsFusionTypes(const std::vector<ETensorType> &inputTypes, ETensorType outputType) const override
+{
+   return inputTypes.size() == 1 && inputTypes[0] == outputType;
+}
 };
 }//SOFIE
 

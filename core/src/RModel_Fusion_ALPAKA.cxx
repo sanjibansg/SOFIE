@@ -137,11 +137,8 @@ bool RModel::IsValidFusionCandidate(const FusionCandidate &candidate, const Fusi
    if (visited.size() != candidate.opIndices.size())
       return false;
 
-   std::vector<size_t> referenceShape;
-   bool hasReferenceShape = false;
-
    for (const size_t opIdx : candidate.opIndices) {
-      if (!IsSupportedFusionOperator(opIdx, false, false))
+      if (!IsSupportedFusionOperator(opIdx, true, true))
          return false;
 
       const auto outputs = fOperators[opIdx]->GetOpOutputTensors();
@@ -156,42 +153,21 @@ bool RModel::IsValidFusionCandidate(const FusionCandidate &candidate, const Fusi
       } catch (...) {
          return false;
       }
-
-      if (!hasReferenceShape) {
-         referenceShape = outputShape;
-         hasReferenceShape = true;
-      } else if (outputShape != referenceShape) {
-         return false;
-      }
-   }
-
-   for (const size_t opIdx : candidate.opIndices) {
-      const auto inputs = fOperators[opIdx]->GetOpInputTensors();
-      const auto dataInputIndices = fOperators[opIdx]->GetFusionDataInputIndices();
-
-      for (const size_t inputIdx : dataInputIndices) {
-         if (inputIdx >= inputs.size())
-            return false;
-
-         const std::string inputName(inputs[inputIdx]);
-
-         if (std::find(candidate.externalInputs.begin(), candidate.externalInputs.end(), inputName) == candidate.externalInputs.end())
-            continue;
-
-         EFusionInputAccess access;
-         std::vector<size_t> alignedStrides;
-
-         if (!ResolveFusionInputAccess(inputName, referenceShape, access, alignedStrides))
-            return false;
-      }
    }
 
    if (candidate.materializedOutputs.empty())
       return false;
 
+   const size_t materializedLength = ConvertShapeToLength(GetTensorShape(candidate.materializedOutputs.front()));
    const ETensorType materializedType = GetTensorType(candidate.materializedOutputs.front());
 
    for (const auto &outputName : candidate.materializedOutputs) {
+      if (IsAliasTensor(outputName))
+         return false;
+
+      if (ConvertShapeToLength(GetTensorShape(outputName)) != materializedLength)
+         return false;
+
       if (GetTensorType(outputName) != materializedType)
          return false;
    }
@@ -628,7 +604,7 @@ std::vector<RModel::FusionCandidate> RModel::EnumerateFusionCandidates(const Fus
    std::vector<std::vector<size_t>> adjacency(fOperators.size());
 
    for (size_t opIdx = 0; opIdx < fOperators.size(); ++opIdx)
-      supported[opIdx] = IsSupportedFusionOperator(opIdx, false, false);
+      supported[opIdx] = IsSupportedFusionOperator(opIdx, true, true);
 
    // Build an undirected connectivity graph using only actual fusion data dependencies.
    for (size_t consumerIdx = 0; consumerIdx < fOperators.size(); ++consumerIdx) {
@@ -892,12 +868,14 @@ bool RModel::IsSupportedFusionOperator(size_t opIdx, bool allowShuffle, bool all
          return false;
       }
    } else {
-      for (const size_t inputIdx : dataInputIndices) {
-         EFusionInputAccess access;
-         std::vector<size_t> alignedStrides;
+      if (!shuffle && !reorganize) {
+         for (const size_t inputIdx : dataInputIndices) {
+            EFusionInputAccess access;
+            std::vector<size_t> alignedStrides;
 
-         if (!ResolveFusionInputAccess(std::string(inputs[inputIdx]), outputShape, access, alignedStrides))
-            return false;
+            if (!ResolveFusionInputAccess(std::string(inputs[inputIdx]), outputShape, access, alignedStrides))
+               return false;
+         }
       }
    }
 
@@ -1117,8 +1095,11 @@ RModel::FusionBuildState RModel::InitializeFusionBuildState(size_t firstOpIdx) c
 
 RModel::EltwiseFusionGroup RModel::BuildEltwiseFusionGroup(const FusionCandidate &candidate) const
 {
-   if (candidate.prebuiltGroup)
-      return *candidate.prebuiltGroup;
+   if (candidate.prebuiltGroup) {
+      EltwiseFusionGroup group = *candidate.prebuiltGroup;
+      group.usesIndexedEvaluation = true;
+      return group;
+   }
 
    if (candidate.materializedOutputs.empty())
       throw std::runtime_error("Fusion candidate has no materialized output");
@@ -1133,7 +1114,22 @@ RModel::EltwiseFusionGroup RModel::BuildEltwiseFusionGroup(const FusionCandidate
    const auto iterationShape = GetTensorShape(group.outputTensor);
    group.numElements = ConvertShapeToLength(iterationShape);
 
+   group.usesIndexedEvaluation = std::any_of(group.opIndices.begin(), group.opIndices.end(), [&](size_t opIdx) {
+      const auto mappingType = fOperators[opIdx]->GetFusionMappingType();
+
+      if (mappingType == EFusionMappingType::Shuffle || mappingType == EFusionMappingType::Reorganize)
+         return true;
+
+      const auto outputs = fOperators[opIdx]->GetOpOutputTensors();
+      return outputs.size() == 1 && GetTensorShape(std::string(outputs[0])) != iterationShape;
+   });
+
    for (const auto &inputName : candidate.externalInputs) {
+      if (group.usesIndexedEvaluation) {
+         AddFusionExternalInput(group, {inputName, EFusionInputAccess::Elementwise, {}, ""});
+         continue;
+      }
+
       EFusionInputAccess access;
       std::vector<size_t> alignedStrides;
 
@@ -1152,11 +1148,12 @@ std::vector<RModel::EltwiseFusionGroup> RModel::BuildKernelFusionLaunchUnits(con
    std::set<size_t> coveredOps;
 
    for (const auto &group : fEltwiseFusionGroups) {
-      units.push_back(group);
+   for (const size_t opIdx : group.opIndices)
+      coveredOps.insert(opIdx);
 
-      for (const size_t opIdx : group.opIndices)
-         coveredOps.insert(opIdx);
-   }
+   if (!group.usesIndexedEvaluation)
+      units.push_back(group);
+}
 
    for (size_t opIdx = 0; opIdx < fOperators.size(); ++opIdx) {
       if (coveredOps.count(opIdx) || fSkipOperators.count(opIdx))
