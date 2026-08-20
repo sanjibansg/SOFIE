@@ -384,6 +384,47 @@ std::string RModel::GenerateFusedEltwiseLaunch_GPU_ALPAKA(const EltwiseFusionGro
    return profiledCode;
 }
 
+std::string RModel::GenerateKernelFusionLaunch_GPU_ALPAKA(const KernelFusionGroup &group) const
+{
+   const std::string suffix = group.suffix();
+   const std::string kernelName = "kernelFusionKernel" + suffix;
+   std::string launchCode;
+
+   launchCode += "\n//------ KERNEL_FUSION_GPU_ALPAKA" + suffix + "\n";
+   launchCode += SP + "{\n";
+   launchCode += SP + SP + "auto const elementsPerGrid_kernelFusion" + suffix + " = Vec::all(Idx{" + std::to_string(group.numElements) + "});\n";
+   launchCode += SP + SP + "auto const workDiv_kernelFusion" + suffix + " = sofie_workdiv(elementsPerGrid_kernelFusion" + suffix + ");\n";
+   launchCode += SP + SP + "auto task_kernelFusion" + suffix + " = alpaka::createTaskKernel<Acc>(workDiv_kernelFusion" + suffix + ", " + kernelName;
+
+   for (const auto &branch : group.branches) {
+      for (const auto &externalInput : branch.externalInputs)
+         launchCode += ", alpaka::getPtrNative(deviceBuf_" + externalInput.tensorName + ")";
+
+      for (const auto &outputName : branch.outputTensors)
+         launchCode += ", alpaka::getPtrNative(deviceBuf_" + outputName + ")";
+   }
+
+   launchCode += ");\n";
+   launchCode += SP + SP + "alpaka::enqueue(queue, task_kernelFusion" + suffix + ");\n";
+   launchCode += SP + "}\n";
+
+   if (!fProfile)
+      return launchCode;
+
+   const std::string fusedName = "KernelFusion" + suffix;
+   std::string profiledCode;
+
+   profiledCode += "   // -- GPU Profiling horizontal fusion group: " + fusedName + " --\n";
+   profiledCode += "   tp_start = std::chrono::steady_clock::now();\n";
+   profiledCode += launchCode;
+   profiledCode += "   alpaka::wait(queue);\n";
+   profiledCode += "   fProfilingResults[\"" + fusedName + "\"].push_back(\n";
+   profiledCode += "      std::chrono::duration_cast<std::chrono::duration<double, std::micro>>(\n";
+   profiledCode += "         std::chrono::steady_clock::now() - tp_start).count());\n\n";
+
+   return profiledCode;
+}
+
 void RModel::GenerateOutput_GPU_ALPAKA() {
    if (fVerbose)
       std::cout << "Generating main inference code for " << fName << std::endl;
@@ -473,29 +514,42 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    }
 
    std::set<size_t> fusedGroupsLaunched;
+   std::set<size_t> kernelFusionGroupsLaunched;
    for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
       if (fVerbose)
          std::cout << "Generating code for operator .... " << op_idx << std::endl;
 
       if (fSkipOperators.count(op_idx)) continue;
 
+      auto kIt = fOpToKernelFusionGroupIdx.find(op_idx);
+      size_t kIdx = (kIt != fOpToKernelFusionGroupIdx.end()) ? kIt->second : SIZE_MAX;
+      bool inKernelFusionGroup = (kIdx != SIZE_MAX) && fKernelFusionGroups[kIdx].isFused();
+
+      if (inKernelFusionGroup) {
+         const auto &group = fKernelFusionGroups[kIdx];
+
+         if (group.launchOpIndex == op_idx && !kernelFusionGroupsLaunched.count(kIdx)) {
+            fGC += GenerateKernelFusionLaunch_GPU_ALPAKA(group);
+            kernelFusionGroupsLaunched.insert(kIdx);
+         }
+
+         continue;
+      }
+
       auto gIt = fOpToFusionGroupIdx.find(op_idx);
       size_t gIdx = (gIt != fOpToFusionGroupIdx.end()) ? gIt->second : SIZE_MAX;
       bool inFusedGroup = (gIdx != SIZE_MAX) && fEltwiseFusionGroups[gIdx].isFused();
 
       if (inFusedGroup) {
-         // Emit the fused kernel once at the final fused operator's original position.
          if (fEltwiseFusionGroups[gIdx].launchOpIndex == op_idx && !fusedGroupsLaunched.count(gIdx)) {
             fGC += GenerateFusedEltwiseLaunch_GPU_ALPAKA(fEltwiseFusionGroups[gIdx]);
             fusedGroupsLaunched.insert(gIdx);
          }
-         // Chain followers are skipped because their logic is inside the fused kernel.
       } else {
-         if (fProfile) {
+         if (fProfile)
             fGC += RModelProfilerGPU::GenerateOperatorCode(*fOperators[op_idx], op_idx);
-         } else {
+         else
             fGC += fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx));
-         }
       }
    }
    // Final wait (no-op when profiling since each op already syncs)
@@ -1157,10 +1211,159 @@ std::string RModel::GenerateFusedEltwiseKernel_GPU_ALPAKA(const EltwiseFusionGro
    return kernelCode;
 }
 
+std::string RModel::GenerateKernelFusionKernel_GPU_ALPAKA(const KernelFusionGroup &group) const
+{
+   const std::string suffix = group.suffix();
+   std::string kernelCode;
+
+   kernelCode += "\n//------ KERNEL_FUSION_KERNEL" + suffix + "\n";
+   kernelCode += "struct KernelFusionKernel" + suffix + " {\n";
+   kernelCode += SP + "template<typename TAcc";
+
+   for (size_t branchIdx = 0; branchIdx < group.branches.size(); ++branchIdx) {
+      const auto &branch = group.branches[branchIdx];
+
+      for (size_t inputIdx = 0; inputIdx < branch.externalInputs.size(); ++inputIdx)
+         kernelCode += ", typename TInput" + std::to_string(branchIdx) + "_" + std::to_string(inputIdx);
+
+      for (size_t outputIdx = 0; outputIdx < branch.outputTensors.size(); ++outputIdx)
+         kernelCode += ", typename TOutput" + std::to_string(branchIdx) + "_" + std::to_string(outputIdx);
+   }
+
+   kernelCode += ">\n";
+   kernelCode += SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc";
+
+   for (size_t branchIdx = 0; branchIdx < group.branches.size(); ++branchIdx) {
+      const auto &branch = group.branches[branchIdx];
+
+      for (size_t inputIdx = 0; inputIdx < branch.externalInputs.size(); ++inputIdx) {
+         kernelCode += ", TInput" + std::to_string(branchIdx) + "_" + std::to_string(inputIdx) +
+                       " const* __restrict__ input" + std::to_string(branchIdx) + "_" + std::to_string(inputIdx);
+      }
+
+      for (size_t outputIdx = 0; outputIdx < branch.outputTensors.size(); ++outputIdx) {
+         kernelCode += ", TOutput" + std::to_string(branchIdx) + "_" + std::to_string(outputIdx) +
+                       "* __restrict__ out" + std::to_string(branchIdx) + "_" + std::to_string(outputIdx);
+      }
+   }
+
+   kernelCode += ") const {\n";
+   kernelCode += SP + SP + "const auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+
+   for (size_t branchIdx = 0; branchIdx < group.branches.size(); ++branchIdx) {
+      const auto &branch = group.branches[branchIdx];
+      const auto fusedOutputShape = GetTensorShape(branch.outputTensor);
+      const auto fusedOutputStrides = UTILITY::ComputeStrideFromShape(fusedOutputShape);
+
+      kernelCode += "\n";
+      kernelCode += SP + SP + "if (idx < " + std::to_string(branch.numElements) + ") {\n";
+      kernelCode += SP + SP + SP + "using T = TOutput" + std::to_string(branchIdx) + "_0;\n";
+
+      std::unordered_map<std::string, std::string> tensorValues;
+
+      for (size_t inputIdx = 0; inputIdx < branch.externalInputs.size(); ++inputIdx) {
+         const auto &externalInput = branch.externalInputs[inputIdx];
+         const std::string localName = "v_input_" + std::to_string(branchIdx) + "_" + std::to_string(inputIdx);
+         std::string indexExpression;
+
+         if (!externalInput.customIndexExpression.empty()) {
+            indexExpression = externalInput.customIndexExpression;
+         } else if (externalInput.access == EFusionInputAccess::Elementwise) {
+            indexExpression = "idx";
+         } else if (externalInput.access == EFusionInputAccess::Scalar) {
+            indexExpression = "0";
+         } else {
+            for (size_t dimIdx = 0; dimIdx < externalInput.alignedStrides.size(); ++dimIdx) {
+               const size_t inputStride = externalInput.alignedStrides[dimIdx];
+
+               if (inputStride == 0)
+                  continue;
+
+               std::string coordinate;
+
+               if (fusedOutputStrides[dimIdx] == 1) {
+                  coordinate = "(idx % " + std::to_string(fusedOutputShape[dimIdx]) + ")";
+               } else {
+                  coordinate = "((idx / " + std::to_string(fusedOutputStrides[dimIdx]) + ") % " +
+                               std::to_string(fusedOutputShape[dimIdx]) + ")";
+               }
+
+               if (!indexExpression.empty())
+                  indexExpression += " + ";
+
+               indexExpression += coordinate;
+
+               if (inputStride != 1)
+                  indexExpression += " * " + std::to_string(inputStride);
+            }
+
+            if (indexExpression.empty())
+               indexExpression = "0";
+         }
+
+         kernelCode += SP + SP + SP + "auto " + localName + " = input" + std::to_string(branchIdx) + "_" +
+                       std::to_string(inputIdx) + "[" + indexExpression + "];\n";
+
+         tensorValues[externalInput.tensorName] = localName;
+      }
+
+      for (const size_t opIdx : branch.opIndices) {
+         std::vector<std::string> inputExpressions;
+
+         const auto opInputs = fOperators[opIdx]->GetOpInputTensors();
+         const auto dataInputIndices = fOperators[opIdx]->GetFusionDataInputIndices();
+
+         for (const size_t inputIdx : dataInputIndices) {
+            const std::string inputName(opInputs[inputIdx]);
+            const auto valueIt = tensorValues.find(inputName);
+
+            if (valueIt == tensorValues.end())
+               throw std::runtime_error("Missing horizontal fused value for tensor " + inputName);
+
+            inputExpressions.push_back(valueIt->second);
+         }
+
+         const std::string expression = fOperators[opIdx]->GetFusionExpr(inputExpressions);
+
+         if (expression.empty())
+            throw std::runtime_error("Operator " + std::to_string(opIdx) + " does not provide a horizontal fused expression");
+
+         const auto outputs = fOperators[opIdx]->GetOpOutputTensors();
+
+         if (outputs.size() != 1)
+            throw std::runtime_error("Horizontally fused operator " + std::to_string(opIdx) + " must have exactly one output");
+
+         const std::string outputName(outputs[0]);
+         const std::string localName = "v_op_" + std::to_string(opIdx);
+
+         kernelCode += SP + SP + SP + "auto " + localName + " = " + expression + ";\n";
+         tensorValues[outputName] = localName;
+      }
+
+      for (size_t outputIdx = 0; outputIdx < branch.outputTensors.size(); ++outputIdx) {
+         const auto &outputName = branch.outputTensors[outputIdx];
+         const auto valueIt = tensorValues.find(outputName);
+
+         if (valueIt == tensorValues.end())
+            throw std::runtime_error("Missing horizontal fused output value for tensor " + outputName);
+
+         kernelCode += SP + SP + SP + "out" + std::to_string(branchIdx) + "_" + std::to_string(outputIdx) +
+                       "[idx] = " + valueIt->second + ";\n";
+      }
+
+      kernelCode += SP + SP + "}\n";
+   }
+
+   kernelCode += SP + "}\n";
+   kernelCode += "};\n";
+
+   return kernelCode;
+}
 
 void RModel::GenerateSessionCode_GPU_ALPAKA() {
    std::set<SOFIE::OperatorKind> registered_operators;
    std::set<size_t> fusedGroupsEmitted; // tracks which fusion groups have had their struct/decl emitted
+   std::set<size_t> kernelFusionGroupsEmitted;
 
    std::set<SOFIE::OperatorKind> single_initialized_operators = {
       SOFIE::OperatorKind::RELU,
@@ -1193,32 +1396,43 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          OpNeedsBlas = true;
       }
 
-      auto gIt = fOpToFusionGroupIdx.find(id);
-      size_t gIdx = (gIt != fOpToFusionGroupIdx.end()) ? gIt->second : SIZE_MAX;
-      bool inFusedGroup = (gIdx != SIZE_MAX) && fEltwiseFusionGroups[gIdx].isFused();
+      auto kIt = fOpToKernelFusionGroupIdx.find(id);
+      size_t kIdx = (kIt != fOpToKernelFusionGroupIdx.end()) ? kIt->second : SIZE_MAX;
+      bool inKernelFusionGroup = (kIdx != SIZE_MAX) && fKernelFusionGroups[kIdx].isFused();
 
-      if (inFusedGroup) {
-         // Only emit the fused kernel struct once, at the chain leader.
-         const auto &group = fEltwiseFusionGroups[gIdx];
+      if (inKernelFusionGroup) {
+         const auto &group = fKernelFusionGroups[kIdx];
+         const size_t leaderOpIdx = group.branches.front().opIndices.front();
 
-         if (group.opIndices[0] == id && !fusedGroupsEmitted.count(gIdx)) {
-            fGC += GenerateFusedEltwiseKernel_GPU_ALPAKA(group);
-            fusedGroupsEmitted.insert(gIdx);
+         if (leaderOpIdx == id && !kernelFusionGroupsEmitted.count(kIdx)) {
+            fGC += GenerateKernelFusionKernel_GPU_ALPAKA(group);
+            kernelFusionGroupsEmitted.insert(kIdx);
          }
-         // Chain followers are skipped because their logic is inside the fused kernel.
       } else {
-         // Unfused op: generate individual kernel struct (with dedup for single_initialized_operators)
-         if (single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
-            if (registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+         auto gIt = fOpToFusionGroupIdx.find(id);
+         size_t gIdx = (gIt != fOpToFusionGroupIdx.end()) ? gIt->second : SIZE_MAX;
+         bool inFusedGroup = (gIdx != SIZE_MAX) && fEltwiseFusionGroups[gIdx].isFused();
+
+         if (inFusedGroup) {
+            const auto &group = fEltwiseFusionGroups[gIdx];
+
+            if (group.opIndices[0] == id && !fusedGroupsEmitted.count(gIdx)) {
+               fGC += GenerateFusedEltwiseKernel_GPU_ALPAKA(group);
+               fusedGroupsEmitted.insert(gIdx);
+            }
+         } else {
+            if (single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
+               if (registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+                  if (fVerbose)
+                     std::cout << "Generating ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
+                  fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
+                  registered_operators.insert(fOperators[id]->GetKind());
+               }
+            } else {
                if (fVerbose)
                   std::cout << "Generating ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
                fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
-               registered_operators.insert(fOperators[id]->GetKind());
             }
-         } else {
-            if (fVerbose)
-               std::cout << "Generating ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
-            fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
          }
       }
    }
@@ -1313,6 +1527,26 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
                fusedExternalInputs, op_idx);
          }
       }
+
+      const auto kernelGroupIt = fOpToKernelFusionGroupIdx.find(op_idx);
+
+      if (kernelGroupIt != fOpToKernelFusionGroupIdx.end()) {
+         const auto &group = fKernelFusionGroups[kernelGroupIt->second];
+
+         if (group.isFused() && group.launchOpIndex == op_idx) {
+            std::vector<std::string> fusedExternalInputs;
+
+            for (const auto &branch : group.branches) {
+               for (const auto &externalInput : branch.externalInputs) {
+                  if (std::find(fusedExternalInputs.begin(), fusedExternalInputs.end(), externalInput.tensorName) ==
+                      fusedExternalInputs.end())
+                     fusedExternalInputs.push_back(externalInput.tensorName);
+               }
+            }
+
+            CheckAndFlushIntermediateMemory_GPU_ALPAKA(fusedExternalInputs, op_idx);
+         }
+      }
    }
 
    GenerateIntermediateMemoryPool_GPU_ALPAKA();
@@ -1403,34 +1637,50 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
    registered_operators.clear();
    fusedGroupsEmitted.clear();
+   kernelFusionGroupsEmitted.clear();
 
    for (size_t id = 0; id < fOperators.size(); id++) {
       // Same as the kernel-struct loop above: fused activation ops must still
       // declare their member variable (e.g. `leakyReluKernel`) even though
       // their Generate_GPU_ALPAKA call is skipped in the infer-body loop.
 
-      auto gIt = fOpToFusionGroupIdx.find(id);
-      size_t gIdx = (gIt != fOpToFusionGroupIdx.end()) ? gIt->second : SIZE_MAX;
-      bool inFusedGroup = (gIdx != SIZE_MAX) && fEltwiseFusionGroups[gIdx].isFused();
+      auto kIt = fOpToKernelFusionGroupIdx.find(id);
+      size_t kIdx = (kIt != fOpToKernelFusionGroupIdx.end()) ? kIt->second : SIZE_MAX;
+      bool inKernelFusionGroup = (kIdx != SIZE_MAX) && fKernelFusionGroups[kIdx].isFused();
 
-      if (inFusedGroup) {
-         if (fEltwiseFusionGroups[gIdx].opIndices[0] == id && !fusedGroupsEmitted.count(gIdx)) {
-            std::string sfx = fEltwiseFusionGroups[gIdx].suffix();
-            fGC += SP + "FusedEltwiseKernel" + sfx + " fusedEltwiseKernel" + sfx + ";\n";
-            fusedGroupsEmitted.insert(gIdx);
+      if (inKernelFusionGroup) {
+         const auto &group = fKernelFusionGroups[kIdx];
+         const size_t leaderOpIdx = group.branches.front().opIndices.front();
+
+         if (leaderOpIdx == id && !kernelFusionGroupsEmitted.count(kIdx)) {
+            const std::string sfx = group.suffix();
+            fGC += SP + "KernelFusionKernel" + sfx + " kernelFusionKernel" + sfx + ";\n";
+            kernelFusionGroupsEmitted.insert(kIdx);
          }
       } else {
-         if (single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
-            if (registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+         auto gIt = fOpToFusionGroupIdx.find(id);
+         size_t gIdx = (gIt != fOpToFusionGroupIdx.end()) ? gIt->second : SIZE_MAX;
+         bool inFusedGroup = (gIdx != SIZE_MAX) && fEltwiseFusionGroups[gIdx].isFused();
+
+         if (inFusedGroup) {
+            if (fEltwiseFusionGroups[gIdx].opIndices[0] == id && !fusedGroupsEmitted.count(gIdx)) {
+               const std::string sfx = fEltwiseFusionGroups[gIdx].suffix();
+               fGC += SP + "FusedEltwiseKernel" + sfx + " fusedEltwiseKernel" + sfx + ";\n";
+               fusedGroupsEmitted.insert(gIdx);
+            }
+         } else {
+            if (single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
+               if (registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+                  if (fVerbose)
+                     std::cout << "Declaring ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
+                  fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
+                  registered_operators.insert(fOperators[id]->GetKind());
+               }
+            } else {
                if (fVerbose)
                   std::cout << "Declaring ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
                fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
-               registered_operators.insert(fOperators[id]->GetKind());
             }
-         } else {
-            if (fVerbose)
-               std::cout << "Declaring ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
-            fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
          }
       }
    }

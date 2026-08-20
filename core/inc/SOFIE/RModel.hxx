@@ -95,6 +95,23 @@ private:
       }
    };
 
+   struct KernelFusionGroup {
+      std::vector<size_t> unitIndices;
+      std::vector<EltwiseFusionGroup> branches;
+      size_t numElements = 0;
+      size_t launchOpIndex = 0;
+
+      bool isFused() const { return branches.size() > 1; }
+
+      std::string suffix() const {
+         std::string s;
+         for (const auto &branch : branches)
+            for (const auto opIdx : branch.opIndices)
+               s += "_" + std::to_string(opIdx);
+         return s;
+      }
+   };
+
    struct FusionTensorUseGraph {
       std::unordered_map<std::string, std::vector<size_t>> consumers;
       std::unordered_map<std::string, size_t> producers;
@@ -135,7 +152,9 @@ private:
    };
 
    std::vector<EltwiseFusionGroup> fEltwiseFusionGroups; ///<!
+   std::vector<KernelFusionGroup> fKernelFusionGroups; ///< horizontally fused kernel groups
    std::unordered_map<size_t, size_t> fOpToFusionGroupIdx; ///<!  op_idx -> fusion group index
+   std::unordered_map<size_t, size_t> fOpToKernelFusionGroupIdx; ///<! op_idx -> horizontal kernel fusion group index
    std::set<std::string> fFusionIntermediateTensors;        ///<!  intermediate tensors whose alloc is skipped
    std::set<size_t>      fSkipOperators;                    ///<!  ops swallowed by a preceding fusion (e.g. GEMM+LeakyReLU)
 
@@ -174,11 +193,28 @@ private:
 
    EltwiseFusionGroup BuildEltwiseFusionGroup(const FusionCandidate &candidate) const;
 
+   std::vector<EltwiseFusionGroup> BuildKernelFusionLaunchUnits(const FusionTensorUseGraph &tensorUses) const;
+   bool CanHorizontallyFuse(const std::vector<EltwiseFusionGroup> &branches, const FusionTensorUseGraph &tensorUses,
+                         size_t &launchOpIndex) const;
+
+   bool GetKernelFusionLaunchWindow(const EltwiseFusionGroup &unit, const FusionTensorUseGraph &tensorUses,
+                                 size_t &earliestLaunchOpIndex, size_t &latestLaunchOpIndex) const;
+
+   std::vector<KernelFusionGroup> EnumerateKernelFusionGroups(const std::vector<EltwiseFusionGroup> &units,
+                                                           const FusionTensorUseGraph &tensorUses) const;
+
    void ComputeEltwiseFusionGroups();
+
+   size_t ComputeKernelFusionLiveRangeExtensionByteSteps(const KernelFusionGroup &candidate) const;
+
+   std::vector<KernelFusionGroup> SelectKernelFusionGroups(std::vector<KernelFusionGroup> candidates) const;
 
    std::string GenerateFusedEltwiseLaunch_GPU_ALPAKA(const EltwiseFusionGroup &group) const;
 
    std::string GenerateFusedEltwiseKernel_GPU_ALPAKA(const EltwiseFusionGroup &group) const;
+
+   std::string GenerateKernelFusionLaunch_GPU_ALPAKA(const KernelFusionGroup &group) const;
+   std::string GenerateKernelFusionKernel_GPU_ALPAKA(const KernelFusionGroup &group) const;
 
    bool ResolveFusionInputAccess(const std::string &tensorName, const std::vector<size_t> &outputShape,
                               EFusionInputAccess &access, std::vector<size_t> &alignedStrides) const;

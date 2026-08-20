@@ -187,7 +187,7 @@ public:
          return "";
 
       if (fType == ETensorType::BOOL)
-         return "((" + inputs[0] + ") != 0)";
+         return "static_cast<T>(" + inputs[0] + ")";
 
       return "static_cast<" + ConvertTypeToString(fType) + ">(" + inputs[0] + ")";
    }

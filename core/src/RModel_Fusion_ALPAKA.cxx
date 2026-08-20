@@ -1146,11 +1146,344 @@ RModel::EltwiseFusionGroup RModel::BuildEltwiseFusionGroup(const FusionCandidate
    return group;
 }
 
+std::vector<RModel::EltwiseFusionGroup> RModel::BuildKernelFusionLaunchUnits(const FusionTensorUseGraph &tensorUses) const
+{
+   std::vector<EltwiseFusionGroup> units;
+   std::set<size_t> coveredOps;
+
+   for (const auto &group : fEltwiseFusionGroups) {
+      units.push_back(group);
+
+      for (const size_t opIdx : group.opIndices)
+         coveredOps.insert(opIdx);
+   }
+
+   for (size_t opIdx = 0; opIdx < fOperators.size(); ++opIdx) {
+      if (coveredOps.count(opIdx) || fSkipOperators.count(opIdx))
+         continue;
+
+      if (!IsSupportedFusionOperator(opIdx, false, false))
+         continue;
+
+      FusionCandidate candidate = BuildFusionCandidate({opIdx}, tensorUses);
+
+      if (candidate.materializedOutputs.empty())
+         continue;
+
+      candidate.launchOpIndex = opIdx;
+      units.push_back(BuildEltwiseFusionGroup(candidate));
+   }
+
+   std::sort(units.begin(), units.end(), [](const EltwiseFusionGroup &left, const EltwiseFusionGroup &right) {
+      return left.launchOpIndex < right.launchOpIndex;
+   });
+
+   return units;
+}
+
+bool RModel::GetKernelFusionLaunchWindow(const EltwiseFusionGroup &unit, const FusionTensorUseGraph &tensorUses,
+                                         size_t &earliestLaunchOpIndex, size_t &latestLaunchOpIndex) const
+{
+   if (unit.opIndices.empty() || unit.outputTensors.empty() || fOperators.empty())
+      return false;
+
+   earliestLaunchOpIndex = 0;
+   latestLaunchOpIndex = fOperators.size() - 1;
+
+   for (const auto &externalInput : unit.externalInputs) {
+      const auto producerIt = tensorUses.producers.find(externalInput.tensorName);
+
+      if (producerIt != tensorUses.producers.end())
+         earliestLaunchOpIndex = std::max(earliestLaunchOpIndex, producerIt->second + 1);
+   }
+
+   for (const auto &outputName : unit.outputTensors) {
+      const auto consumerIt = tensorUses.consumers.find(outputName);
+
+      if (consumerIt == tensorUses.consumers.end())
+         continue;
+
+      for (const size_t consumerOpIdx : consumerIt->second) {
+         if (std::find(unit.opIndices.begin(), unit.opIndices.end(), consumerOpIdx) != unit.opIndices.end())
+            continue;
+
+         latestLaunchOpIndex = std::min(latestLaunchOpIndex, consumerOpIdx);
+      }
+   }
+
+   return earliestLaunchOpIndex <= latestLaunchOpIndex;
+}
+
+bool RModel::CanHorizontallyFuse(const std::vector<EltwiseFusionGroup> &branches, const FusionTensorUseGraph &tensorUses, size_t &launchOpIndex) const
+{
+   if (branches.size() < 2)
+      return false;
+
+   std::unordered_map<size_t, size_t> opToBranch;
+   size_t commonLaunchOpIndex = 0;
+
+   for (size_t branchIdx = 0; branchIdx < branches.size(); ++branchIdx) {
+      const auto &branch = branches[branchIdx];
+
+      if (branch.opIndices.empty() || branch.outputTensors.empty())
+         return false;
+
+      commonLaunchOpIndex = std::max(commonLaunchOpIndex, branch.launchOpIndex);
+
+      for (const size_t opIdx : branch.opIndices) {
+         if (!opToBranch.emplace(opIdx, branchIdx).second)
+            return false;
+      }
+   }
+
+   for (size_t branchIdx = 0; branchIdx < branches.size(); ++branchIdx) {
+      const auto &branch = branches[branchIdx];
+
+      // Inputs of one branch may not be produced by another horizontally fused branch.
+      for (const auto &externalInput : branch.externalInputs) {
+         const auto producerIt = tensorUses.producers.find(externalInput.tensorName);
+
+         if (producerIt == tensorUses.producers.end())
+            continue;
+
+         const auto branchIt = opToBranch.find(producerIt->second);
+
+         if (branchIt != opToBranch.end() && branchIt->second != branchIdx)
+            return false;
+
+         if (branchIt == opToBranch.end() && producerIt->second >= commonLaunchOpIndex)
+            return false;
+      }
+
+      // Delaying this branch to the common launch point must not cross an external consumer.
+      for (const auto &outputName : branch.outputTensors) {
+         const auto consumerIt = tensorUses.consumers.find(outputName);
+
+         if (consumerIt == tensorUses.consumers.end())
+            continue;
+
+         for (const size_t consumerOpIdx : consumerIt->second) {
+            const auto branchIt = opToBranch.find(consumerOpIdx);
+
+            if (branchIt != opToBranch.end()) {
+               if (branchIt->second != branchIdx)
+                  return false;
+
+               continue;
+            }
+
+            if (consumerOpIdx < commonLaunchOpIndex)
+               return false;
+         }
+      }
+   }
+
+   launchOpIndex = commonLaunchOpIndex;
+   return true;
+}
+
+std::vector<RModel::KernelFusionGroup> RModel::EnumerateKernelFusionGroups(const std::vector<EltwiseFusionGroup> &units,
+                                    const FusionTensorUseGraph &tensorUses) const
+{
+   constexpr size_t maxBranches = 2;
+   constexpr size_t maxLookaheadUnits = 8;
+
+   struct LaunchWindow {
+      size_t earliest = 0;
+      size_t latest = 0;
+      bool valid = false;
+   };
+
+   std::vector<LaunchWindow> windows(units.size());
+
+   for (size_t unitIdx = 0; unitIdx < units.size(); ++unitIdx) {
+      windows[unitIdx].valid =
+         GetKernelFusionLaunchWindow(units[unitIdx], tensorUses, windows[unitIdx].earliest, windows[unitIdx].latest);
+   }
+
+   std::vector<KernelFusionGroup> candidates;
+   std::set<std::vector<size_t>> emitted;
+
+   for (size_t seedIdx = 0; seedIdx < units.size(); ++seedIdx) {
+      if (!windows[seedIdx].valid)
+         continue;
+
+      const size_t endIdx = std::min(units.size(), seedIdx + maxLookaheadUnits);
+
+      std::vector<std::vector<size_t>> pending{{seedIdx}};
+
+      while (!pending.empty()) {
+         std::vector<size_t> unitIndices = std::move(pending.back());
+         pending.pop_back();
+
+         const size_t commonLaunchOpIndex = units[unitIndices.back()].launchOpIndex;
+
+         bool windowsOverlap = true;
+
+         for (const size_t unitIdx : unitIndices) {
+            if (!windows[unitIdx].valid ||
+                commonLaunchOpIndex < windows[unitIdx].earliest ||
+                commonLaunchOpIndex > windows[unitIdx].latest) {
+               windowsOverlap = false;
+               break;
+            }
+         }
+
+         if (!windowsOverlap)
+            continue;
+
+         if (unitIndices.size() >= 2) {
+            std::vector<EltwiseFusionGroup> branches;
+            branches.reserve(unitIndices.size());
+
+            for (const size_t unitIdx : unitIndices)
+               branches.push_back(units[unitIdx]);
+
+            size_t launchOpIndex = 0;
+
+            if (!CanHorizontallyFuse(branches, tensorUses, launchOpIndex))
+               continue;
+
+            if (emitted.insert(unitIndices).second) {
+               KernelFusionGroup candidate;
+               candidate.unitIndices = unitIndices;
+               candidate.branches = std::move(branches);
+               candidate.launchOpIndex = launchOpIndex;
+
+               for (const auto &branch : candidate.branches)
+                  candidate.numElements = std::max(candidate.numElements, branch.numElements);
+
+               candidates.push_back(std::move(candidate));
+            }
+         }
+
+         if (unitIndices.size() >= maxBranches)
+            continue;
+
+         const size_t firstNextIdx = unitIndices.back() + 1;
+
+         for (size_t nextIdx = firstNextIdx; nextIdx < endIdx; ++nextIdx) {
+            if (!windows[nextIdx].valid)
+               continue;
+
+            const size_t nextLaunchOpIndex = units[nextIdx].launchOpIndex;
+
+            bool canOverlap = true;
+
+            for (const size_t unitIdx : unitIndices) {
+               if (nextLaunchOpIndex < windows[unitIdx].earliest ||
+                   nextLaunchOpIndex > windows[unitIdx].latest) {
+                  canOverlap = false;
+                  break;
+               }
+            }
+
+            if (!canOverlap)
+               continue;
+
+            std::vector<size_t> nextIndices = unitIndices;
+            nextIndices.push_back(nextIdx);
+            pending.push_back(std::move(nextIndices));
+         }
+      }
+   }
+
+   return candidates;
+}
+
+size_t RModel::ComputeKernelFusionLiveRangeExtensionByteSteps(const KernelFusionGroup &candidate) const
+{
+   std::unordered_map<std::string, size_t> requiredLastUses;
+
+   for (const auto &branch : candidate.branches) {
+      for (const auto &externalInput : branch.externalInputs) {
+         const std::string tensorName = ResolveAliasTensor(externalInput.tensorName);
+         const auto frequencyIt = fIntermediateTensorFrequencyLookup.find(tensorName);
+
+         if (frequencyIt == fIntermediateTensorFrequencyLookup.end() || candidate.launchOpIndex <= frequencyIt->second)
+            continue;
+
+         auto [requiredIt, inserted] = requiredLastUses.try_emplace(tensorName, candidate.launchOpIndex);
+
+         if (!inserted)
+            requiredIt->second = std::max(requiredIt->second, candidate.launchOpIndex);
+      }
+   }
+
+   size_t cost = 0;
+
+   for (const auto &[tensorName, requiredLastUse] : requiredLastUses) {
+      const size_t originalLastUse = fIntermediateTensorFrequencyLookup.at(tensorName);
+      const size_t tensorBytes = GetTypeSize(GetTensorType(tensorName)) * ConvertShapeToLength(GetTensorShape(tensorName));
+      cost += tensorBytes * (requiredLastUse - originalLastUse);
+   }
+
+   return cost;
+}
+
+std::vector<RModel::KernelFusionGroup> RModel::SelectKernelFusionGroups(std::vector<KernelFusionGroup> candidates) const
+{
+   std::vector<size_t> order;
+   order.reserve(candidates.size());
+
+   for (size_t candidateIdx = 0; candidateIdx < candidates.size(); ++candidateIdx)
+      order.push_back(candidateIdx);
+
+   std::vector<size_t> liveRangeCosts(candidates.size());
+
+   for (size_t candidateIdx = 0; candidateIdx < candidates.size(); ++candidateIdx)
+      liveRangeCosts[candidateIdx] = ComputeKernelFusionLiveRangeExtensionByteSteps(candidates[candidateIdx]);
+
+   std::sort(order.begin(), order.end(), [&](size_t leftIdx, size_t rightIdx) {
+      const auto &left = candidates[leftIdx];
+      const auto &right = candidates[rightIdx];
+
+      const size_t leftLaunchesRemoved = left.branches.size() - 1;
+      const size_t rightLaunchesRemoved = right.branches.size() - 1;
+
+      if (leftLaunchesRemoved != rightLaunchesRemoved)
+         return leftLaunchesRemoved > rightLaunchesRemoved;
+
+      if (liveRangeCosts[leftIdx] != liveRangeCosts[rightIdx])
+         return liveRangeCosts[leftIdx] < liveRangeCosts[rightIdx];
+
+      if (left.numElements != right.numElements)
+         return left.numElements < right.numElements;
+
+      return left.unitIndices < right.unitIndices;
+   });
+
+   std::set<size_t> usedUnits;
+   std::vector<KernelFusionGroup> selected;
+
+   for (const size_t candidateIdx : order) {
+      const auto &candidate = candidates[candidateIdx];
+
+      const bool overlaps = std::any_of(candidate.unitIndices.begin(), candidate.unitIndices.end(),
+         [&](size_t unitIdx) { return usedUnits.count(unitIdx) != 0; });
+
+      if (overlaps)
+         continue;
+
+      selected.push_back(candidate);
+
+      for (const size_t unitIdx : candidate.unitIndices)
+         usedUnits.insert(unitIdx);
+   }
+
+   std::sort(selected.begin(), selected.end(), [](const KernelFusionGroup &left, const KernelFusionGroup &right) {
+      return left.launchOpIndex < right.launchOpIndex;
+   });
+
+   return selected;
+}
 
 void RModel::ComputeEltwiseFusionGroups()
 {
    fEltwiseFusionGroups.clear();
+   fKernelFusionGroups.clear();
    fOpToFusionGroupIdx.clear();
+   fOpToKernelFusionGroupIdx.clear();
    fFusionIntermediateTensors.clear();
 
    const auto tensorUses = BuildFusionTensorUseGraph();
@@ -1204,6 +1537,27 @@ void RModel::ComputeEltwiseFusionGroups()
          const std::string tensorName = ResolveAliasTensor(externalInput.tensorName);
          const auto frequencyIt = fIntermediateTensorFrequencyLookup.find(tensorName);
          if (frequencyIt != fIntermediateTensorFrequencyLookup.end()) frequencyIt->second = std::max(frequencyIt->second, group.launchOpIndex);
+      }
+   }
+
+   const auto kernelFusionUnits = BuildKernelFusionLaunchUnits(tensorUses);
+   auto kernelFusionCandidates = EnumerateKernelFusionGroups(kernelFusionUnits, tensorUses);
+   fKernelFusionGroups = SelectKernelFusionGroups(std::move(kernelFusionCandidates));
+
+   for (size_t groupIdx = 0; groupIdx < fKernelFusionGroups.size(); ++groupIdx) {
+      const auto &group = fKernelFusionGroups[groupIdx];
+
+      for (const auto &branch : group.branches) {
+         for (const size_t opIdx : branch.opIndices)
+            fOpToKernelFusionGroupIdx[opIdx] = groupIdx;
+
+         for (const auto &externalInput : branch.externalInputs) {
+            const std::string tensorName = ResolveAliasTensor(externalInput.tensorName);
+            const auto frequencyIt = fIntermediateTensorFrequencyLookup.find(tensorName);
+
+            if (frequencyIt != fIntermediateTensorFrequencyLookup.end())
+               frequencyIt->second = std::max(frequencyIt->second, group.launchOpIndex);
+         }
       }
    }
 }
