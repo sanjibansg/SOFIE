@@ -480,6 +480,83 @@ std::string Generate_GPU_ALPAKA(std::string OpName) override {
    return out.str();
 }
 
+EFusionMappingType GetFusionMappingType() const override
+{
+   if (fIsOutputConstant || fIsOutputParamShape || fnewAxis != 0 || fInputs.size() < 2 || fInputShapes.empty() || fOutputShape.empty())
+      return EFusionMappingType::Unsupported;
+
+   const auto isStatic = [](const std::vector<Dim> &shape) {
+      return std::all_of(shape.begin(), shape.end(), [](const Dim &dim) { return !dim.isParam; });
+   };
+
+   if (!isStatic(fOutputShape))
+      return EFusionMappingType::Unsupported;
+
+   for (const auto &shape : fInputShapes) {
+      if (!isStatic(shape))
+         return EFusionMappingType::Unsupported;
+   }
+
+   return EFusionMappingType::ManyToMany;
+}
+
+bool SupportsFusionTypes(const std::vector<ETensorType> &inputTypes, ETensorType outputType) const override
+{
+   return !inputTypes.empty() && std::all_of(inputTypes.begin(), inputTypes.end(), [&](ETensorType type) { return type == outputType; });
+}
+
+std::string GetFusionExpr(const std::vector<std::string> &inputs) const override
+{
+   if (GetFusionMappingType() != EFusionMappingType::ManyToMany || inputs.size() != 1)
+      return "";
+
+   return inputs[0];
+}
+
+std::string GetFusionInputConditionExpr(size_t inputIndex, const std::string &outputIndex, const std::vector<size_t> &inputShape, const std::vector<size_t> &outputShape) const override
+{
+   if (GetFusionMappingType() != EFusionMappingType::ManyToMany || inputIndex >= fInputShapes.size() || inputShape.size() != outputShape.size())
+      return "";
+
+   const size_t axis = static_cast<size_t>(fAxis);
+   const auto outputStrides = UTILITY::ComputeStrideFromShape(outputShape);
+   const size_t innerSize = outputStrides[axis];
+   const size_t outputBlockSize = outputShape[axis] * innerSize;
+   size_t prefixElements = 0;
+
+   for (size_t k = 0; k < inputIndex; ++k)
+      prefixElements += fInputShapes[k][axis].dim * innerSize;
+
+   const size_t inputBlockSize = inputShape[axis] * innerSize;
+   const std::string withinOuter = "((" + outputIndex + ") % " + std::to_string(outputBlockSize) + "u)";
+
+   if (prefixElements == 0)
+      return "(" + withinOuter + " < " + std::to_string(inputBlockSize) + "u)";
+
+   return "(" + withinOuter + " >= " + std::to_string(prefixElements) + "u && " + withinOuter + " < " + std::to_string(prefixElements + inputBlockSize) + "u)";
+}
+
+std::string GetFusionInputIndexExpr(size_t inputIndex, const std::string &outputIndex, const std::vector<size_t> &inputShape, const std::vector<size_t> &outputShape) const override
+{
+   if (GetFusionMappingType() != EFusionMappingType::ManyToMany || inputIndex >= fInputShapes.size() || inputShape.size() != outputShape.size())
+      return "";
+
+   const size_t axis = static_cast<size_t>(fAxis);
+   const auto outputStrides = UTILITY::ComputeStrideFromShape(outputShape);
+   const size_t innerSize = outputStrides[axis];
+   const size_t outputBlockSize = outputShape[axis] * innerSize;
+   size_t prefixElements = 0;
+
+   for (size_t k = 0; k < inputIndex; ++k)
+      prefixElements += fInputShapes[k][axis].dim * innerSize;
+
+   const size_t inputBlockSize = inputShape[axis] * innerSize;
+   const std::string outerIndex = "((" + outputIndex + ") / " + std::to_string(outputBlockSize) + "u)";
+   const std::string withinOuter = "((" + outputIndex + ") % " + std::to_string(outputBlockSize) + "u)";
+
+   return "(" + outerIndex + " * " + std::to_string(inputBlockSize) + "u + (" + withinOuter + " - " + std::to_string(prefixElements) + "u))";
+}
+
 };
 }//SOFIE
 

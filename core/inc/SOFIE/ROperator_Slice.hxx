@@ -632,6 +632,72 @@ public:
       return out.str();
    }
 
+      EFusionMappingType GetFusionMappingType() const override
+   {
+      if (fIsOutputConstant || fIsOutputParamShape || fShapeInput.empty() || fShapeOutput.empty())
+         return EFusionMappingType::Unsupported;
+
+      const auto isStatic = [](const std::vector<Dim> &values) {
+         return std::all_of(values.begin(), values.end(), [](const Dim &value) { return !value.isParam; });
+      };
+
+      if (!isStatic(fShapeInput) || !isStatic(fShapeOutput) || !isStatic(fStart) || !isStatic(fEnd) || !isStatic(fSteps))
+         return EFusionMappingType::Unsupported;
+
+      return EFusionMappingType::Shuffle;
+   }
+
+   std::vector<size_t> GetFusionDataInputIndices() const override
+   {
+      return {0};
+   }
+
+   bool SupportsFusionTypes(const std::vector<ETensorType> &inputTypes, ETensorType outputType) const override
+   {
+      return inputTypes.size() == 1 && inputTypes[0] == outputType;
+   }
+
+   std::string GetFusionExpr(const std::vector<std::string> &inputs) const override
+   {
+      if (GetFusionMappingType() != EFusionMappingType::Shuffle || inputs.size() != 1)
+         return "";
+
+      return inputs[0];
+   }
+
+   std::string GetFusionInputIndexExpr(size_t inputIndex, const std::string &outputIndex, const std::vector<size_t> &inputShape, const std::vector<size_t> &outputShape) const override
+   {
+      if (inputIndex != 0 || GetFusionMappingType() != EFusionMappingType::Shuffle)
+         return "";
+
+      if (inputShape.size() != outputShape.size() || fStart.size() != inputShape.size() || fSteps.size() != inputShape.size())
+         return "";
+
+      const auto inputStrides = UTILITY::ComputeStrideFromShape(inputShape);
+      const auto outputStrides = UTILITY::ComputeStrideFromShape(outputShape);
+      std::string expression;
+
+      for (size_t d = 0; d < outputShape.size(); ++d) {
+         std::string coordinate;
+
+         if (outputStrides[d] == 1)
+            coordinate = "((" + outputIndex + ") % " + std::to_string(outputShape[d]) + "u)";
+         else
+            coordinate = "(((" + outputIndex + ") / " + std::to_string(outputStrides[d]) + "u) % " + std::to_string(outputShape[d]) + "u)";
+
+         const std::string inputCoordinate = "(" + fStart[d].GetVal() + " + static_cast<int64_t>(" + coordinate + ") * " + fSteps[d].GetVal() + ")";
+
+         if (!expression.empty())
+            expression += " + ";
+
+         expression += "static_cast<std::size_t>(" + inputCoordinate + ")";
+
+         if (inputStrides[d] != 1)
+            expression += " * " + std::to_string(inputStrides[d]) + "u";
+      }
+
+      return "(" + expression + ")";
+   }
 };
 }//SOFIE
 

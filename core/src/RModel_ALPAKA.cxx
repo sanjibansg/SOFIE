@@ -1157,8 +1157,51 @@ std::string RModel::GenerateFusionValueAtIndex(const EltwiseFusionGroup &group, 
    const auto opInputs = op->GetOpInputTensors();
    const auto dataInputIndices = op->GetFusionDataInputIndices();
    const auto mappingType = op->GetFusionMappingType();
-   std::vector<std::string> inputExpressions;
 
+      if (mappingType == EFusionMappingType::ManyToMany) {
+      const std::string localName = "v_op_" + std::to_string(opIdx) + "_" + std::to_string(valueCounter++);
+      kernelCode += SP + SP + SP + ConvertTypeToString(GetTensorType(tensorName)) + " " + localName + "{};\n";
+
+      for (size_t dataIdx = 0; dataIdx < dataInputIndices.size(); ++dataIdx) {
+         const size_t inputIdx = dataInputIndices[dataIdx];
+         const std::string inputName(opInputs[inputIdx]);
+         const auto inputShape = GetTensorShape(inputName);
+         const std::string inputIndex = op->GetFusionInputIndexExpr(inputIdx, logicalIndex, inputShape, outputShape);
+
+         if (inputIndex.empty())
+            throw std::runtime_error("Missing ManyToMany index expression for operator " + std::to_string(opIdx));
+
+         std::string condition;
+
+         if (dataIdx + 1 < dataInputIndices.size()) {
+            condition = op->GetFusionInputConditionExpr(inputIdx, logicalIndex, inputShape, outputShape);
+
+            if (condition.empty())
+               throw std::runtime_error("Missing ManyToMany input condition for operator " + std::to_string(opIdx));
+         }
+
+         std::unordered_map<std::string, std::string> branchCache = valueCache;
+         std::string branchCode;
+         const std::string branchValue = GenerateFusionValueAtIndex(group, inputName, inputIndex, groupProducers,
+            externalInputIndices, branchCache, branchCode, valueCounter);
+
+         if (dataIdx == 0)
+            kernelCode += SP + SP + SP + "if (" + condition + ") {\n";
+         else if (dataIdx + 1 < dataInputIndices.size())
+            kernelCode += SP + SP + SP + "else if (" + condition + ") {\n";
+         else
+            kernelCode += SP + SP + SP + "else {\n";
+
+         kernelCode += branchCode;
+         kernelCode += SP + SP + SP + SP + localName + " = " + op->GetFusionExpr({branchValue}) + ";\n";
+         kernelCode += SP + SP + SP + "}\n";
+      }
+
+      valueCache[cacheKey] = localName;
+      return localName;
+   }
+
+   std::vector<std::string> inputExpressions;
    for (const size_t inputIdx : dataInputIndices) {
       const std::string inputName(opInputs[inputIdx]);
       const auto inputShape = GetTensorShape(inputName);

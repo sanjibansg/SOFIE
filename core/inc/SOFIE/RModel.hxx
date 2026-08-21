@@ -226,7 +226,7 @@ private:
    bool ResolveFusionInputAccess(const std::string &tensorName, const std::vector<size_t> &outputShape,
                               EFusionInputAccess &access, std::vector<size_t> &alignedStrides) const;
 
-   bool IsSupportedFusionOperator(size_t opIdx, bool allowShuffle, bool allowReorganize) const;
+   bool IsSupportedFusionOperator(size_t opIdx, bool allowShuffle, bool allowReorganize, bool allowManyToMany = false) const;
 
    void AddFusionExternalInput(EltwiseFusionGroup &group, const FusionExternalInput &input) const;
 

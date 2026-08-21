@@ -169,6 +169,12 @@ public:
       return "";
    }
 
+   virtual std::string GetFusionInputConditionExpr(size_t /*inputIndex*/, const std::string &/*outputIndex*/,
+      const std::vector<size_t> &/*inputShape*/, const std::vector<size_t> &/*outputShape*/) const
+   {
+      return "";
+   }
+
    virtual std::vector<size_t> GetFusionDataInputIndices() const
    {
       std::vector<size_t> indices;

@@ -13,12 +13,13 @@ namespace SOFIE {
 
 namespace {
 
-   bool IsSupportedFusionMapping(EFusionMappingType mappingType, bool allowShuffle, bool allowReorganize)
+   bool IsSupportedFusionMapping(EFusionMappingType mappingType, bool allowShuffle, bool allowReorganize, bool allowManyToMany)
    {
       const bool pointwise = mappingType == EFusionMappingType::OneToOne || mappingType == EFusionMappingType::OneToMany;
 
       return pointwise || (allowShuffle && mappingType == EFusionMappingType::Shuffle) ||
-             (allowReorganize && mappingType == EFusionMappingType::Reorganize);
+             (allowReorganize && mappingType == EFusionMappingType::Reorganize) ||
+             (allowManyToMany && mappingType == EFusionMappingType::ManyToMany);
    }
 
 } // anonymous
@@ -29,11 +30,23 @@ RModel::FusionTensorUseGraph RModel::BuildFusionTensorUseGraph() const
    FusionTensorUseGraph graph;
 
    for (size_t opIdx = 0; opIdx < fOperators.size(); ++opIdx) {
-      for (const auto &inputName : fOperators[opIdx]->GetOpInputTensors())
-         graph.consumers[std::string(inputName)].push_back(opIdx);
+      const auto outputs = fOperators[opIdx]->GetOpOutputTensors();
 
-      for (const auto &outputName : fOperators[opIdx]->GetOpOutputTensors())
-         graph.producers[std::string(outputName)] = opIdx;
+      const bool hasRuntimeOutput = std::any_of(outputs.begin(), outputs.end(), [&](const auto &outputNameView) {
+         return !IsInitializedTensor(std::string(outputNameView));
+      });
+
+      if (hasRuntimeOutput) {
+         for (const auto &inputName : fOperators[opIdx]->GetOpInputTensors())
+            graph.consumers[std::string(inputName)].push_back(opIdx);
+      }
+
+      for (const auto &outputNameView : outputs) {
+         const std::string outputName(outputNameView);
+
+         if (!IsInitializedTensor(outputName))
+            graph.producers[outputName] = opIdx;
+      }
    }
 
    return graph;
@@ -138,7 +151,7 @@ bool RModel::IsValidFusionCandidate(const FusionCandidate &candidate, const Fusi
       return false;
 
    for (const size_t opIdx : candidate.opIndices) {
-      if (!IsSupportedFusionOperator(opIdx, true, true))
+      if (!IsSupportedFusionOperator(opIdx, true, true, true))
          return false;
 
       const auto outputs = fOperators[opIdx]->GetOpOutputTensors();
@@ -604,7 +617,7 @@ std::vector<RModel::FusionCandidate> RModel::EnumerateFusionCandidates(const Fus
    std::vector<std::vector<size_t>> adjacency(fOperators.size());
 
    for (size_t opIdx = 0; opIdx < fOperators.size(); ++opIdx)
-      supported[opIdx] = IsSupportedFusionOperator(opIdx, true, true);
+      supported[opIdx] = IsSupportedFusionOperator(opIdx, true, true, true);
 
    // Build an undirected connectivity graph using only actual fusion data dependencies.
    for (size_t consumerIdx = 0; consumerIdx < fOperators.size(); ++consumerIdx) {
@@ -792,7 +805,7 @@ bool RModel::ResolveFusionInputAccess(const std::string &tensorName, const std::
 }
 
 
-bool RModel::IsSupportedFusionOperator(size_t opIdx, bool allowShuffle, bool allowReorganize) const
+bool RModel::IsSupportedFusionOperator(size_t opIdx, bool allowShuffle, bool allowReorganize, bool allowManyToMany) const
 {
    if (opIdx >= fOperators.size() || fSkipOperators.count(opIdx))
       return false;
@@ -801,8 +814,9 @@ bool RModel::IsSupportedFusionOperator(size_t opIdx, bool allowShuffle, bool all
    const auto mappingType = op->GetFusionMappingType();
    const bool shuffle = mappingType == EFusionMappingType::Shuffle;
    const bool reorganize = mappingType == EFusionMappingType::Reorganize;
+   const bool manyToMany = mappingType == EFusionMappingType::ManyToMany;
 
-   if (!IsSupportedFusionMapping(mappingType, allowShuffle, allowReorganize))
+   if (!IsSupportedFusionMapping(mappingType, allowShuffle, allowReorganize, allowManyToMany))
       return false;
 
    const auto inputs = op->GetOpInputTensors();
@@ -839,7 +853,29 @@ bool RModel::IsSupportedFusionOperator(size_t opIdx, bool allowShuffle, bool all
    if (!op->SupportsFusionTypes(inputTypes, outputType))
       return false;
 
-   if (shuffle) {
+   if (manyToMany) {
+      if (dataInputIndices.size() < 2)
+         return false;
+
+      for (size_t dataIdx = 0; dataIdx < dataInputIndices.size(); ++dataIdx) {
+         const size_t inputIdx = dataInputIndices[dataIdx];
+         std::vector<size_t> inputShape;
+
+         try {
+            inputShape = GetTensorShape(std::string(inputs[inputIdx]));
+         } catch (...) {
+            return false;
+         }
+
+         if (op->GetFusionInputIndexExpr(inputIdx, "idx", inputShape, outputShape).empty())
+            return false;
+
+         if (dataIdx + 1 < dataInputIndices.size() && op->GetFusionInputConditionExpr(inputIdx, "idx", inputShape, outputShape).empty())
+            return false;
+      }
+
+      return !op->GetFusionExpr({"x"}).empty();
+   } else if (shuffle) {
       if (dataInputIndices.size() != 1)
          return false;
 
@@ -1117,7 +1153,7 @@ RModel::EltwiseFusionGroup RModel::BuildEltwiseFusionGroup(const FusionCandidate
    group.usesIndexedEvaluation = std::any_of(group.opIndices.begin(), group.opIndices.end(), [&](size_t opIdx) {
       const auto mappingType = fOperators[opIdx]->GetFusionMappingType();
 
-      if (mappingType == EFusionMappingType::Shuffle || mappingType == EFusionMappingType::Reorganize)
+      if (mappingType == EFusionMappingType::Shuffle || mappingType == EFusionMappingType::Reorganize || mappingType == EFusionMappingType::ManyToMany)
          return true;
 
       const auto outputs = fOperators[opIdx]->GetOpOutputTensors();
