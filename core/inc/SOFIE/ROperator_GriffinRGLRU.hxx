@@ -70,7 +70,7 @@ public:
       out << SP << SP << SP << SP << fType << " a_val = tensor_" << fNA << "[b*" << fL << "*" << fD << " + t*" << fD << " + d];\n";
       out << SP << SP << SP << SP << fType << " x_val = tensor_" << fNX << "[b*" << fL << "*" << fD << " + t*" << fD << " + d];\n";
       out << SP << SP << SP << SP << fType << " h_val = tensor_" << fNState << "[b*" << fD << " + d];\n";
-      out << SP << SP << SP << SP << fType << " h_new = a_val*h_val + (static_cast<" << fType << ">(1) - a_val)*x_val;\n";
+      out << SP << SP << SP << SP << fType << " h_new = a_val*h_val + std::sqrt(static_cast<" << fType << ">(1) - a_val*a_val)*x_val;\n";
       out << SP << SP << SP << SP << "tensor_" << fNState << "[b*" << fD << " + d] = h_new;\n";
       out << SP << SP << SP << SP << "tensor_" << fNY << "[b*" << fL << "*" << fD << " + t*" << fD << " + d] = h_new;\n";
       out << SP << SP << SP << "}\n" << SP << SP << "}\n" << SP << "}\n";
@@ -101,7 +101,7 @@ public:
       out += SP + SP + SP + SP + "T const a_val = A[b*L*D + t*D + d];\n";
       out += SP + SP + SP + SP + "T const x_val = X[b*L*D + t*D + d];\n";
       out += SP + SP + SP + SP + "T h_val = state[b*D + d];\n";
-      out += SP + SP + SP + SP + "T h_new = a_val * h_val + (static_cast<T>(1) - a_val) * x_val;\n";
+      out += SP + SP + SP + SP + "T h_new = a_val * h_val + SOFIE_DEVICE_sqrt(acc, static_cast<T>(1) - a_val * a_val) * x_val;\n";
       out += SP + SP + SP + SP + "state[b*D + d] = h_new;\n";
       out += SP + SP + SP + SP + "Y[b*L*D + t*D + d] = h_new;\n";
       out += SP + SP + SP + "}\n";
