@@ -43,3 +43,5 @@ benchmark/results/
 benchmark/cache/
 benchmark/build-profile
 benchmark/benchmark
+
+benchmark/models/aot_models/
