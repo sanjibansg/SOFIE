@@ -123,6 +123,10 @@ public:
       return SP + "alpaka::memset(queue, deviceBuf_" + fNState + ", 0);\n";
    }
 
+   std::vector<std::string> GetPersistentTensorNames_GPU_ALPAKA() const override {
+      return {fNState};
+   }
+
    std::string Generate_GPU_ALPAKA(std::string opName) override {
       opName = "op_" + opName;
       std::stringstream out;

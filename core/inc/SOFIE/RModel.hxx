@@ -424,6 +424,7 @@ protected:
    void GenerateSessionCode();
    void GenerateSessionCode_GPU_ALPAKA();
    void GenerateGPU_ALPAKA_Buffers();
+   void GeneratePersistentTensorInfo_GPU_ALPAKA();
 
    void CheckAndFuseOperators();
    bool IsInputTensorShapeParam(std::string const &paramName) const;

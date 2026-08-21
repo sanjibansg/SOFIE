@@ -158,6 +158,41 @@ void RModel::GenerateInitializedTensorInfo_GPU_ALPAKA() {
    }
 }
 
+void RModel::GeneratePersistentTensorInfo_GPU_ALPAKA()
+{
+   std::set<std::string> persistentTensors;
+
+   for (size_t id = 0; id < fOperators.size(); ++id) {
+      if (fSkipOperators.count(id)) continue;
+
+      for (const auto &name : fOperators[id]->GetPersistentTensorNames_GPU_ALPAKA())
+         persistentTensors.insert(name);
+   }
+
+   if (persistentTensors.empty())
+      return;
+
+   fGC += "\n// persistent state tensors\n";
+
+   for (const auto &name : persistentTensors) {
+      const ETensorType type = GetTensorType(name);
+      const size_t length = ConvertShapeToLength(GetTensorShape(name));
+
+      if (type == ETensorType::FLOAT)
+         fGC += "BufF1D deviceBuf_" + name + " = alpaka::allocBuf<float, Idx>(devAcc, Ext1D::all(Idx{" + std::to_string(length) + "}));\n";
+      else if (type == ETensorType::DOUBLE)
+         fGC += "BufD1D deviceBuf_" + name + " = alpaka::allocBuf<double, Idx>(devAcc, Ext1D::all(Idx{" + std::to_string(length) + "}));\n";
+      else if (type == ETensorType::INT32)
+         fGC += "BufI321D deviceBuf_" + name + " = alpaka::allocBuf<int32_t, Idx>(devAcc, Ext1D::all(Idx{" + std::to_string(length) + "}));\n";
+      else if (type == ETensorType::INT64)
+         fGC += "BufI641D deviceBuf_" + name + " = alpaka::allocBuf<int64_t, Idx>(devAcc, Ext1D::all(Idx{" + std::to_string(length) + "}));\n";
+      else if (type == ETensorType::BOOL || type == ETensorType::UINT8)
+         fGC += "BufUI81D deviceBuf_" + name + " = alpaka::allocBuf<uint8_t, Idx>(devAcc, Ext1D::all(Idx{" + std::to_string(length) + "}));\n";
+      else
+         throw std::runtime_error("Unsupported persistent GPU tensor type: " + name);
+   }
+}
+
 void RModel::GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA()
 {
    if (!fInitializedTensors.empty())
@@ -460,8 +495,9 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
 
    auto GetOutputReturnType = [&](const std::string &name) -> std::string {
       ETensorType type = GetTensorType(name);
+      const std::string storageName = ResolveAliasTensor(name);
 
-      if (IsPooledIntermediate(name)) {
+      if (IsPooledIntermediate(storageName)) {
          if (type == ETensorType::FLOAT)  return "ViewF1D";
          if (type == ETensorType::DOUBLE) return "ViewD1D";
          if (type == ETensorType::INT32)  return "ViewI321D";
@@ -479,10 +515,12 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    };
 
    auto GetOutputBufferName = [this](const std::string &name) -> std::string {
-      if (fDynamicTensorInfos.count(name) > 0)
-         return "bufDev_" + name;
+      const std::string storageName = ResolveAliasTensor(name);
 
-      return "deviceBuf_" + name;
+      if (fDynamicTensorInfos.count(storageName) > 0)
+         return "bufDev_" + storageName;
+
+      return "deviceBuf_" + storageName;
    };
 
    // Collect deduplicated dynamic dimension parameter names in declaration order
@@ -1570,8 +1608,9 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          fGC += "sofieBLAS<tagAcc> blas{queue};\n";
     }
 
-   // Allocate memory efficiently
+   /// Allocate memory efficiently
    GenerateInitializedTensorInfo_GPU_ALPAKA();
+   GeneratePersistentTensorInfo_GPU_ALPAKA();
 
    std::string intermediate_memory_alloc_string = "";
    intermediate_memory_alloc_string += "\n// --- Positioning GPU intermediate tensor memory --\n";
@@ -1791,7 +1830,6 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       fGC += SP + "alpaka::wait(queue);\n";
       fGC += "}\n";
    }
-   
    // inject GPU profiling utility functions and memory report inside Session struct
    if (fProfile && fUseSession) {
       fGC += RModelProfilerGPU::GenerateUtilityFunctions();

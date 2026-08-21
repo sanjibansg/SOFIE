@@ -118,6 +118,7 @@ public:
    virtual std::string GenerateInitCode_GPU_ALPAKA() { return "";};
    // generate code to reset recurrent/stateful buffers (called once per file boundary)
    virtual std::string GenerateResetStateCode_GPU_ALPAKA() { return ""; }
+   virtual std::vector<std::string> GetPersistentTensorNames_GPU_ALPAKA() const { return {}; }
    // generate some specific declaration code for Session
    virtual std::string GenerateDeclCode() { return "";}
    // generate session data members specific to operator
