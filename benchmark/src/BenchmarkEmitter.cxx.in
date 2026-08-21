@@ -58,18 +58,28 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
 
     // Collect input metadata before code generation
     struct TensorMeta {
+        ETensorType type;
         std::string cppType;
         size_t numElements;
+        std::vector<size_t> shape;
     };
     std::vector<TensorMeta> inputs;
     for (const auto &n : inputNames) {
         TensorMeta m;
-        try { m.cppType = tensorTypeToCpp(model.GetTensorType(n)); }
-        catch (...) { m.cppType = "float"; }
+        try {
+            m.type = model.GetTensorType(n);
+            m.cppType = tensorTypeToCpp(m.type);
+        } catch (...) {
+            m.type = ETensorType::FLOAT;
+            m.cppType = "float";
+        }
         m.numElements = 1;
         try {
-            for (const auto &d : model.GetDimTensorShape(n))
-                m.numElements *= resolveDim(d);
+            for (const auto &d : model.GetDimTensorShape(n)) {
+                const size_t dim = resolveDim(d);
+                m.shape.push_back(dim);
+                m.numElements *= dim;
+            }
         } catch (...) {}
         inputs.push_back(m);
     }
@@ -89,18 +99,27 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
     std::vector<TensorMeta> outputs;
     for (const auto &n : outputNames) {
         TensorMeta m;
-        try { m.cppType = tensorTypeToCpp(model.GetTensorType(n)); }
-        catch (...) { m.cppType = "float"; }
+        try {
+            m.type = model.GetTensorType(n);
+            m.cppType = tensorTypeToCpp(m.type);
+        } catch (...) {
+            m.type = ETensorType::FLOAT;
+            m.cppType = "float";
+        }
         m.numElements = 1;
         try {
-            for (const auto &d : model.GetDimTensorShape(n))
-                m.numElements *= resolveDim(d);
+            for (const auto &d : model.GetDimTensorShape(n)) {
+                const size_t dim = resolveDim(d);
+                m.shape.push_back(dim);
+                m.numElements *= dim;
+            }
         } catch (...) {}
         outputs.push_back(m);
     }
 
     std::string hxxPath  = outDir + "/" + modelName + "_GPU_ALPAKA.hxx";
     std::string benchPath = outDir + "/" + modelName + "_bench.hxx";
+    std::string aotMetaPath = outDir + "/" + modelName + "_aot_meta.hxx";
 
     model.OutputGenerated(hxxPath);
 
@@ -108,6 +127,46 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
     std::string cppName = modelName;
     for (char &c : cppName)
         if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
+
+    std::ofstream aotMeta(aotMetaPath);
+    if (!aotMeta.is_open()) {
+        std::cerr << "[ERROR] Cannot open " << aotMetaPath << "\n";
+        return 1;
+    }
+
+    aotMeta << "#pragma once\n\n";
+    aotMeta << "#include \"AOTInductorBenchmark.hxx\"\n\n";
+    aotMeta << "inline std::vector<AOTInputSpec> GetAOTInputSpecs_" << cppName << "() {\n";
+    aotMeta << "    return {\n";
+
+    for (const auto &input : inputs) {
+        aotMeta << "        {AOTDataType::";
+
+        switch (input.type) {
+            case ETensorType::FLOAT:  aotMeta << "Float32"; break;
+            case ETensorType::DOUBLE: aotMeta << "Float64"; break;
+            case ETensorType::INT32:  aotMeta << "Int32"; break;
+            case ETensorType::INT64:  aotMeta << "Int64"; break;
+            case ETensorType::UINT8:  aotMeta << "UInt8"; break;
+            case ETensorType::INT8:   aotMeta << "Int8"; break;
+            case ETensorType::INT16:  aotMeta << "Int16"; break;
+            case ETensorType::BOOL:   aotMeta << "Bool"; break;
+            default:                  aotMeta << "Unsupported"; break;
+        }
+
+        aotMeta << ", {";
+
+        for (size_t i = 0; i < input.shape.size(); ++i) {
+            if (i)
+                aotMeta << ", ";
+            aotMeta << input.shape[i];
+        }
+
+        aotMeta << "}},\n";
+    }
+
+    aotMeta << "    };\n";
+    aotMeta << "}\n";
 
     // Build "session.infer(input_d_0, input_d_1, ...)"
     std::ostringstream inferCall;

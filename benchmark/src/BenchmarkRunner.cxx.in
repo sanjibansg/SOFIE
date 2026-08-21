@@ -32,6 +32,12 @@
 #include "TensorRTBenchmark.hxx"
 #endif
 
+// Optional Pytorch AOT comparison
+#ifdef SOFIE_BENCHMARK_AOT
+#include "AOTInductorBenchmark.hxx"
+@BENCHMARK_AOT_META_HEADERS@
+#endif
+
 // Forward-declare one per-model benchmark function (defined in <model>_bench.cu)
 @BENCHMARK_FWD_DECLS@
 
@@ -45,7 +51,8 @@ static int run_single_model(const std::string& model,
                             bool profile,
                             bool run_sofie,
                             bool run_ort,
-                            bool run_trt)
+                            bool run_trt,
+                            bool run_aot)
 {
 @BENCHMARK_SINGLE_MODEL_CASES@
     std::fprintf(stderr, "Unknown model: %s\n", model.c_str());
@@ -59,6 +66,7 @@ int main(int argc, char *argv[]) {
     bool run_ort   = false;
     bool run_trt   = false;
     bool run_sofie = true;
+    bool run_aot   = false;
     bool profile   = false;
     std::string ncuPath;
     std::string singleModel;
@@ -71,6 +79,7 @@ int main(int argc, char *argv[]) {
         else if  (a == "--single-model"                && i + 1 < argc) singleModel = argv[++i];
         else if  (a == "--onnxruntime"   || a == "--ort")               run_ort    = true;
         else if (a == "--tensorrt" || a == "--trt")                     run_trt = true;
+        else if (a == "--pytorch-aot" || a == "--aot")                  run_aot = true;
         else if (a == "--profile")                                      profile = true;
         else if (a == "--ncu" && i + 1 < argc)                          ncuPath = argv[++i];
         else if  (a == "--help"          || a == "-h") {
@@ -108,16 +117,25 @@ int main(int argc, char *argv[]) {
             run_sofie = true;
             run_ort = false;
             run_trt = false;
+            run_aot = false;
         }
         else if (a == "--ort-only") {
             run_sofie = false;
             run_ort = true;
             run_trt = false;
+            run_aot = false;
         }
         else if (a == "--trt-only") {
             run_sofie = false;
             run_ort = false;
             run_trt = true;
+            run_aot = false;
+        }
+        else if (a == "--aot-only") {
+            run_sofie = false;
+            run_ort = false;
+            run_trt = false;
+            run_aot = true;
         }
     }
 
@@ -159,8 +177,8 @@ int main(int argc, char *argv[]) {
     // All GPU memory is freed when this process exits.
     // -----------------------------------------------------------------------
     if (!singleModel.empty())
-        return run_single_model(singleModel, warmup, iterations, weightsDir, profile, run_sofie, run_ort, run_trt);
-        
+        return run_single_model(singleModel, warmup, iterations, weightsDir, profile, run_sofie, run_ort, run_trt, run_aot);
+
     // -----------------------------------------------------------------------
     // Orchestrator mode: spawn one child process per model so every model
     // starts with a fresh CUDA context (avoids cudaErrorMemoryAllocation
@@ -172,6 +190,14 @@ int main(int argc, char *argv[]) {
             "Warning: --onnxruntime requested but this binary was built without "
             "ORT support.  Rebuild with -DSOFIE_BENCHMARK_ORT=ON.\n");
         run_ort = false;
+    }
+#endif
+#ifndef SOFIE_BENCHMARK_AOT
+    if (run_aot) {
+        std::fprintf(stderr,
+            "Warning: --pytorch-aot requested but this binary was built without "
+            "AOTInductor support. Rebuild with -DSOFIE_BENCHMARK_AOT=ON.\n");
+        run_aot = false;
     }
 #endif
 
@@ -203,6 +229,9 @@ int main(int argc, char *argv[]) {
     if (run_trt)
         fs::create_directories(resultsDir + "/tensorrt");
 
+    if (run_aot)
+        fs::create_directories(resultsDir + "/pytorch_aot");
+        
 #ifdef _WIN32
     _putenv_s("SOFIE_BENCHMARK_RESULTS_DIR", resultsDir.c_str());
 #else
@@ -257,6 +286,7 @@ int main(int argc, char *argv[]) {
 
     std::string ortDir;
     std::string trtDir;
+    std::string aotDir;
 
     if (run_ort) {
         ortDir = resultsDir + "/ort";
@@ -268,17 +298,26 @@ int main(int argc, char *argv[]) {
         fs::create_directories(trtDir);
     }
 
+    if (run_aot) {
+        aotDir = resultsDir + "/pytorch_aot";
+        fs::create_directories(aotDir);
+    }
+
     // Result files
 
     std::string resultsFile = sofieDir + "/benchmark.csv";
     std::string ortResultsFile;
     std::string trtResultsFile;
+    std::string aotResultsFile;
 
     if (run_ort)
         ortResultsFile = ortDir + "/benchmark.csv";
 
     if (run_trt)
         trtResultsFile = trtDir + "/benchmark.csv";
+
+    if (run_aot)
+        aotResultsFile = aotDir + "/benchmark.csv";
 
     // Environment variables
 
@@ -293,6 +332,9 @@ int main(int argc, char *argv[]) {
     if (run_trt)
         _putenv_s("SOFIE_TRT_RESULTS", trtResultsFile.c_str());
 
+    if (run_aot)
+        _putenv_s("SOFIE_AOT_RESULTS", aotResultsFile.c_str());
+
     #else
 
     setenv("SOFIE_BENCHMARK_RESULTS", resultsFile.c_str(), 1);
@@ -303,6 +345,9 @@ int main(int argc, char *argv[]) {
 
     if (run_trt)
         setenv("SOFIE_TRT_RESULTS", trtResultsFile.c_str(), 1);
+
+    if (run_aot)
+        setenv("SOFIE_AOT_RESULTS", aotResultsFile.c_str(), 1);
 
     #endif
 
@@ -345,6 +390,15 @@ int main(int argc, char *argv[]) {
         std::ofstream trtResults(trtResultsFile);
 
         trtResults
+            << "Model,"
+            << "infer_ms,"
+            << "throughput_inf_s,"
+            << "gpu_peak_mem_mb\n";
+    }
+
+    if (run_aot) {
+        std::ofstream aotResults(aotResultsFile);
+        aotResults
             << "Model,"
             << "infer_ms,"
             << "throughput_inf_s,"

@@ -35,6 +35,7 @@ BACKENDS = {
     "sofie": {"label": "SOFIE", "short": "SOFIE"},
     "ort": {"label": "ONNX Runtime", "short": "ORT"},
     "tensorrt": {"label": "TensorRT", "short": "TensorRT"},
+    "pytorch_aot": {"label": "Pytorch AOT", "short": "AOT"},
 }
 
 REFERENCE_BACKEND = "ONNX Runtime"
