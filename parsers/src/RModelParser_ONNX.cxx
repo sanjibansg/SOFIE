@@ -112,6 +112,13 @@ extern ParserFuncSignature ParseBitwiseXor;
 extern ParserFuncSignature ParseBitwiseNot;
 extern ParserFuncSignature ParseNonZero;
 extern ParserFuncSignature ParseScatterND;
+extern ParserFuncSignature ParseRMSNorm;
+extern ParserFuncSignature ParseGroupNorm;
+extern ParserFuncSignature ParseCumSum;
+extern ParserFuncSignature ParseSDPA;
+extern ParserFuncSignature ParseMambaScan;
+extern ParserFuncSignature ParseRWKVWKV6;
+extern ParserFuncSignature ParseGriffinRGLRU;
 // Declaration of fused operators
 extern ParserFuseFuncSignature ParseFuseConvAdd;
 extern ParserFuseFuncSignature ParseFuseGemmRelu;
@@ -298,6 +305,14 @@ RModelParser_ONNX::RModelParser_ONNX() noexcept : fOperatorsMapImpl(std::make_un
    RegisterOperator("BitwiseOr", ParseBitwiseOr);
    RegisterOperator("BitwiseXor", ParseBitwiseXor);
    RegisterOperator("BitwiseNot", ParseBitwiseNot);
+
+   RegisterOperator("RMSNorm", ParseRMSNorm);
+   RegisterOperator("GroupNormalization", ParseGroupNorm);
+   RegisterOperator("CumSum", ParseCumSum);
+   RegisterOperator("ScaledDotProductAttention", ParseSDPA);
+   RegisterOperator("MambaScan", ParseMambaScan);
+   RegisterOperator("RWKV_WKV6", ParseRWKVWKV6);
+   RegisterOperator("GriffinRGLRU", ParseGriffinRGLRU);
 }
 
 // Destructor of the parser

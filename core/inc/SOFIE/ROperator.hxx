@@ -44,7 +44,14 @@ enum class OperatorKind {
    UNARY_FLOOR=28,
    L2NORMALIZATION=29,
    POOL=30,
-   SELU=31
+   SELU=31,
+   RMSNORM=32,
+   GROUPNORM=33,
+   CUMSUM=34,
+   SDPA=35,
+   MAMBA_SCAN=36,
+   RWKV_WKV6=37,
+   GRIFFIN_RGLRU=38
 };
 
 enum class EFusionMappingType {
@@ -109,6 +116,8 @@ public:
    // generate initialization code for session constructor
    virtual std::string GenerateInitCode() { return "";}
    virtual std::string GenerateInitCode_GPU_ALPAKA() { return "";};
+   // generate code to reset recurrent/stateful buffers (called once per file boundary)
+   virtual std::string GenerateResetStateCode_GPU_ALPAKA() { return ""; }
    // generate some specific declaration code for Session
    virtual std::string GenerateDeclCode() { return "";}
    // generate session data members specific to operator

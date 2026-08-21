@@ -171,6 +171,8 @@ ROOTTEST_GENERATE_EXECUTABLE(
       alpaka/TestAlpakaPool.cxx
       alpaka/TestAlpakaLowRank.cxx
       alpaka/TestAlpakaKernelOnly.cxx
+      alpaka/TestAlpakaNormReduction.cxx
+      alpaka/TestAlpakaSequenceOps.cxx
     )
 
     set_source_files_properties(

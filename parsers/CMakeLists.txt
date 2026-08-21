@@ -90,7 +90,13 @@ set(sources_cxx
     src/ParseTrilu.cxx
     src/ParseLogic.cxx
     src/ParseNonZero.cxx
-    src/ParseScatterND.cxx
+    src/ParseRMSNorm.cxx
+    src/ParseGroupNorm.cxx
+    src/ParseCumSum.cxx
+    src/ParseSDPA.cxx
+    src/ParseMambaScan.cxx
+    src/ParseRWKVWKV6.cxx
+    src/ParseGriffinRGLRU.cxx
     ${PROTO_SRCS}
   ${DEPENDENCIES}
     ${SOFIE_core}
