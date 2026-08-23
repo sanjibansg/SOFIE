@@ -354,6 +354,17 @@ public:
                       << "  B=" << ConvertDimShapeToString(fDimShapeY)
                       << " --> Y=" << ConvertDimShapeToString(fDimShapeZ) << "\n";
       }
+
+      // Broadcasted initialized tensors are temporary initialization artifacts.
+      // Runtime CPU/GPU code performs broadcasting directly from the original inputs.
+      if (!fNBroadcastedX.empty() && model.IsInitializedTensor(fNBroadcastedX))
+         model.RemoveInitializedTensor(fNBroadcastedX);
+
+      if (!fNBroadcastedY.empty() && model.IsInitializedTensor(fNBroadcastedY))
+         model.RemoveInitializedTensor(fNBroadcastedY);
+
+      if (!fNBroadcastedC.empty() && model.IsInitializedTensor(fNBroadcastedC))
+         model.RemoveInitializedTensor(fNBroadcastedC);
    }
 
    std::string GenerateInitCode() override {

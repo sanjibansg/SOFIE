@@ -27,6 +27,7 @@ import re
 import sys
 from pathlib import Path
 
+import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 
@@ -319,6 +320,70 @@ def plot_peak_memory_by_model(df: pd.DataFrame, out_dir: Path) -> None:
     ax.legend(title="")
     save_figure(fig, out_dir, "peak_gpu_memory_all_models")
 
+def plot_geometric_mean_comparison(df: pd.DataFrame, out_dir: Path) -> None:
+    backends = backend_labels()
+
+    latency = df.pivot(index="Model", columns="backend", values="infer_ms")
+    memory = df.pivot(index="Model", columns="backend", values="gpu_peak_mem_mb")
+
+    # Only compare models that exist for every backend.
+    common_models = latency.dropna(subset=backends).index.intersection(
+        memory.dropna(subset=backends).index
+    )
+
+    if len(common_models) == 0:
+        return
+
+    latency = latency.loc[common_models, backends]
+    memory = memory.loc[common_models, backends]
+
+    sofie_latency = latency["SOFIE"]
+    sofie_memory = memory["SOFIE"]
+
+    speed_ratios = latency.apply(lambda column: sofie_latency / column)
+    memory_efficiency_ratios = memory.apply(lambda column: sofie_memory / column)
+
+    geometric_speed = np.exp(np.log(speed_ratios).mean(axis=0))
+    geometric_memory_efficiency = np.exp(np.log(memory_efficiency_ratios).mean(axis=0))
+
+    labels = [backend_short_name(backend) for backend in backends]
+
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2))
+
+    speed_bars = axes[0].bar(labels, geometric_speed.values)
+    axes[0].axhline(1.0, linestyle=":", linewidth=1)
+    axes[0].set_ylabel("Geometric mean speed vs SOFIE (×)")
+    axes[0].set_title("Geometric Mean Inference Speed")
+    axes[0].grid(True, axis="y", alpha=0.3)
+
+    for bar, value in zip(speed_bars, geometric_speed.values):
+        axes[0].text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height(),
+            f"{value:.2f}×",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            )
+
+    memory_bars = axes[1].bar(labels, geometric_memory_efficiency.values)
+    axes[1].axhline(1.0, linestyle=":", linewidth=1)
+    axes[1].set_ylabel("Geometric mean memory efficiency vs SOFIE (×)")
+    axes[1].set_title("Geometric Mean Memory Efficiency")
+    axes[1].grid(True, axis="y", alpha=0.3)
+
+    for bar, value in zip(memory_bars, geometric_memory_efficiency.values):
+        axes[1].text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height(),
+            f"{value:.2f}×",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            )
+
+    fig.suptitle(f"Common models across all backends (n={len(common_models)})", fontsize=10)
+    save_figure(fig, out_dir, "geometric_mean_baseline_comparison")
 
 def write_summary(df: pd.DataFrame, out_dir: Path) -> None:
     pivot_latency = df.pivot(index="Model", columns="backend", values="infer_ms")
@@ -372,6 +437,7 @@ def main() -> None:
     plot_family_scaling(df, out_dir)
     plot_speedup_vs_reference(df, out_dir)
     plot_peak_memory_by_model(df, out_dir)
+    plot_geometric_mean_comparison(df, out_dir)
 
     print(f"Plots written to: {out_dir}")
     print("Generated PNG + PDF versions of each figure.")
