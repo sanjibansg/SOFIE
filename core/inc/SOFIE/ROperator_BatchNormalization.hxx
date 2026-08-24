@@ -68,15 +68,6 @@ public:
       return {out};
    }
 
-   std::vector<std::vector<size_t>> ShapeInference(std::vector<std::vector<size_t>> input) override {
-      if (input.size() != 5 ) {
-         throw
-         std::runtime_error("SOFIE BatchNormalization Op Shape inference need 5 input tensors");
-      }
-      auto ret = input;
-      return ret;
-   }
-
    void Initialize(RModel& model) override {
       if (!model.CheckIfTensorAlreadyExist(fNX)) {
          throw std::runtime_error("SOFIE BatchNormalization op Input Tensor " + fNX + " is not found in model");
@@ -163,31 +154,14 @@ public:
       return out.str();
    }
 
-   // Dynamic shape params (e.g. N, n_pf) that appear in the emitted index math and are
-   // passed to the kernel as size_t args; shared by the kernel signature and the launch.
-   std::vector<std::string> GetGPUDynParams() const {
-      std::vector<std::string> params;
-      if (fShapeX.size() > 2) {
-         std::vector<Dim> spatialShape(fShapeX.begin() + 2, fShapeX.end());
-         UTILITY::CollectDimParams(spatialShape, params);
-      }
-      return params;
-   }
 
    std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
       opName = "op_" + opName;
       if (fShapeX.empty())
          throw std::runtime_error("SOFIE BatchNormalization called to Generate without being initialized first");
 
-      std::string totalElements = ConvertDimShapeToLength(fShapeY);
-      std::string channels      = fShapeX[1].GetVal();
-
-      std::string spatial_dim = "1";
-      std::vector<Dim> spatialShape;
-      if (fShapeX.size() > 2) {
-         spatialShape.assign(fShapeX.begin() + 2, fShapeX.end());
-         spatial_dim = ConvertDimShapeToLength(spatialShape);
-      }
+      std::string channels    = fShapeX[1].GetVal();
+      std::string spatial_dim = ConvertDimShapeToLength(std::vector<Dim>(fShapeX.begin() + 2, fShapeX.end()));   //"1" for rank-2 input
       std::string kname = "BatchNormKernel_" + opName;
       std::string op;
       op  = "\n//------ BATCHNORM_KERNEL_ALPAKA\n";

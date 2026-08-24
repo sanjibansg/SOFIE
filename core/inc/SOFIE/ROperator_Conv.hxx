@@ -45,6 +45,27 @@ private:
 
    size_t fDim;   // dimension of the convolution
 
+   //the GEMM this conv lowers to and the extents defining it, shared by the GPU launch and the cuBLASLt layout
+   struct GemmInfo {
+      std::string oDepth, oHeight, oWidth, iDepth, iHeight, iWidth;
+      std::string m;   //output spatial size per channel
+      size_t n, k;     //output channels per group, input channels per group * kernel volume
+   };
+
+   GemmInfo GetGemmInfo() const {
+      GemmInfo gemm;
+      gemm.oDepth  = (fDim > 2) ? fShapeY[2].GetVal()    : "1";
+      gemm.oHeight = (fDim > 1) ? fShapeY[fDim].GetVal() : "1";
+      gemm.oWidth  = fShapeY[fDim + 1].GetVal();
+      gemm.iDepth  = (fDim > 2) ? fShapeX[2].GetVal()    : "1";
+      gemm.iHeight = (fDim > 1) ? fShapeX[fDim].GetVal() : "1";
+      gemm.iWidth  = fShapeX[fDim + 1].GetVal();
+      gemm.m = UTILITY::ComputeStrideFromShape(fShapeY)[1].GetVal();   //channel stride = oD*oH*oW
+      gemm.n = fShapeW[0] / fAttrGroup;
+      gemm.k = fShapeW[1] * fAttrKernelShape[0] * fAttrKernelShape[1] * fAttrKernelShape[2];
+      return gemm;
+   }
+
 
 public:
 
@@ -605,22 +626,11 @@ public:
       if (fShapeX.empty() || fShapeW.empty() || fShapeY.empty())
          throw std::runtime_error("TMVA SOFIE Conv Op called to Generate without being initialized first");
 
-      size_t oDepth  = (fDim > 2) ? fShapeY[2].dim      : 1;
-      size_t oHeight = (fDim > 1) ? fShapeY[fDim].dim   : 1;
-      size_t oWidth  = fShapeY[fDim + 1].dim;
-      size_t iDepth  = (fDim > 2) ? fShapeX[2].dim      : 1;
-      size_t iHeight = (fDim > 1) ? fShapeX[fDim].dim   : 1;
-      size_t iWidth  = fShapeX[fDim + 1].dim;
       size_t kHeight = (fDim > 1) ? fShapeW[fDim]   : 1;
       size_t kWidth  = fShapeW[fDim + 1];
       size_t kDepth  = (fDim > 2) ? fShapeW[2]      : 1;
 
       size_t kernelSize  = fAttrKernelShape[0] * fAttrKernelShape[1] * fAttrKernelShape[2];
-      size_t colRows     = fShapeW[1] * kernelSize;
-      size_t colCols     = oDepth * oHeight * oWidth;
-      size_t colElements = colRows * colCols;
-      size_t outChannels = fShapeW[0];
-      size_t spatialSize = oDepth * oHeight * oWidth;
 
       // Strides for weight vectorisation
       size_t id = (fDim > 2) ? fDim - 3 : 2;
@@ -631,11 +641,8 @@ public:
       size_t dstrideDil  = fAttrDilations[id]  * fAttrKernelShape[ih] * fAttrKernelShape[iw];
       size_t icstrideDil = fAttrKernelShape[id] * fAttrKernelShape[ih] * fAttrKernelShape[iw];
       size_t ocstrideDil = fShapeW[1] * icstrideDil;
-      size_t hstride     = kWidth;
-      size_t dstride     = kHeight * kWidth;
       size_t icstride    = kHeight * kWidth * kDepth;
       size_t ocstride    = fShapeW[1] * icstride;
-      size_t wTotalElements = ConvertShapeToLength(fShapeW);
 
       // effective (dilation-expanded) kernel extents, used for the dense im2col decode
       size_t kHeightEff = (fDim > 1) ? fAttrKernelShape[ih] : 1;
@@ -833,25 +840,16 @@ public:
       if (fShapeX.empty() || fShapeW.empty() || fShapeY.empty())
          throw std::runtime_error("SOFIE Conv Op called to Generate without being initialized first");
 
+      auto gemm = GetGemmInfo();
+      auto strideX = UTILITY::ComputeStrideFromShape(fShapeX);   //[0] = one sample (C*D*H*W), [1] = one channel (D*H*W)
+      auto strideY = UTILITY::ComputeStrideFromShape(fShapeY);
       std::string bsize = fShapeX[0].GetVal();
-      std::string oDepth = (fDim > 2) ? fShapeY[2].GetVal() : "1";
-      std::string oHeight = (fDim > 1) ? fShapeY[fDim].GetVal() : "1";
-      std::string oWidth = fShapeY[fDim + 1].GetVal();
-      std::string iDepth  = (fDim > 2) ? fShapeX[2].GetVal()    : "1";
-      std::string iHeight = (fDim > 1) ? fShapeX[fDim].GetVal() : "1";
-      std::string iWidth  = fShapeX[fDim + 1].GetVal();
-      size_t outChannels = fShapeW[0];
-      size_t kernelSize  = fAttrKernelShape[0] * fAttrKernelShape[1] * fAttrKernelShape[2];
-      // gemm dimensions computed from shape members
-      size_t gemm_n      = outChannels;                   // output channels
-      size_t gemm_k      = fShapeW[1] * kernelSize;       // input channels/group * kernel volume
-      std::string gemm_m = "(" + oDepth + " * " + oHeight + " * " + oWidth + ")";  // output spatial size per channel
-      std::string colElements = std::to_string(gemm_k) + " * " + gemm_m;   // colRows * colCols
-      size_t wTotal      = ConvertShapeToLength(fShapeW);
-
-      // For group conv: per-group output channels and _f offset
-      size_t gemm_n_group     = gemm_n / fAttrGroup;  // output channels produced by a single group
-      size_t groupFOffset     = gemm_n_group * gemm_k;  // elements of _f per group
+      std::string colElements = std::to_string(gemm.k) + " * " + gemm.m;   // colRows * colCols
+      size_t wTotal       = ConvertShapeToLength(fShapeW);
+      size_t groupFOffset = gemm.n * gemm.k;  // elements of _f per group
+      std::string im2colExtents;  //the six extent args of Im2ColKernel, same order as its signature
+      for (const std::string &e : {gemm.oDepth, gemm.oHeight, gemm.oWidth, gemm.iDepth, gemm.iHeight, gemm.iWidth})
+         im2colExtents += ", static_cast<std::size_t>(" + e + ")";
 
       std::stringstream out;
       out << "\n//------ CONV_GPU_ALPAKA\n";
@@ -884,9 +882,9 @@ public:
       // -----------------------------------------------------------------------
       out << SP << "for (std::size_t n = 0; n < " << bsize << "; n++) {\n\n";
       out << SP << SP << "std::size_t const x_offset   = n * ("
-         << std::to_string(fShapeX[1].dim) + " * " + iDepth + " * " + iHeight + " * " + iWidth << ");\n";
+         << strideX[0].GetVal() << ");\n";
       out << SP << SP << "std::size_t const out_offset = n * ("
-         << std::to_string(fShapeY[1].dim) + " * " + gemm_m << ");\n\n";
+         << strideY[0].GetVal() << ");\n\n";
 
       // -----------------------------------------------------------------------
       // Step 3 + 4: Im2Col then GEMM — structure differs for grouped vs non-grouped
@@ -901,14 +899,13 @@ public:
          out << SP << SP << SP << "alpaka::exec<Acc>(queue, workDiv_im2col, im2colKernel_" << opName
             << ", alpaka::getPtrNative(deviceBuf_" << fNX << ") + x_offset"
             << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
-            << ", static_cast<std::size_t>(" << oDepth << "), static_cast<std::size_t>(" << oHeight << "), static_cast<std::size_t>(" << oWidth << ")"
-            << ", static_cast<std::size_t>(" << iDepth << "), static_cast<std::size_t>(" << iHeight << "), static_cast<std::size_t>(" << iWidth << ")"
+            << im2colExtents
             << ", static_cast<Idx>(" << colElements << "));\n";
          out << SP << SP << SP << "alpaka::wait(queue);\n";
          out << SP << SP << "}\n\n";
 
          if (!fNB.empty()) {
-               std::string biasElements = std::to_string(gemm_n) + " * " + gemm_m;
+               std::string biasElements = std::to_string(gemm.n) + " * " + gemm.m;
                out << SP << SP << "// Step 4a: broadcast bias into output slice\n";
                out << SP << SP << "{\n";
                out << SP << SP << SP << "auto const elementsPerThread_bias = Vec::all(static_cast<Idx>(1));\n";
@@ -917,20 +914,20 @@ public:
                out << SP << SP << SP << "alpaka::exec<Acc>(queue, workDiv_bias, biasBroadcastKernel_" << opName
                   << ", alpaka::getPtrNative(deviceBuf_" << fNB << ")"
                   << ", alpaka::getPtrNative(deviceBuf_" << fNY << ") + out_offset"
-                  << ", static_cast<std::size_t>(" << gemm_m << ")"
+                  << ", static_cast<std::size_t>(" << gemm.m << ")"
                   << ", static_cast<Idx>(" << biasElements << "));\n";
                out << SP << SP << SP << "alpaka::wait(queue);\n";
                out << SP << SP << "}\n\n";
                out << SP << SP << "// Step 4b: GEMM beta=1 accumulates onto bias-initialised output\n";
                out << SP << SP << "blas.matmul('n', 'n', "
-                  << gemm_m << ", " << gemm_n << ", " << gemm_k
+                  << gemm.m << ", " << gemm.n << ", " << gemm.k
                   << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << imcol << ")"
                   << ", alpaka::getPtrNative(deviceBuf_" << convK << ")"
                   << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << fNY << ") + out_offset);\n\n";
          } else {
                out << SP << SP << "// Step 4: GEMM beta=0 (no bias)\n";
                out << SP << SP << "blas.matmul('n', 'n', "
-                  << gemm_m << ", " << gemm_n << ", " << gemm_k
+                  << gemm.m << ", " << gemm.n << ", " << gemm.k
                   << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << imcol << ")"
                   << ", alpaka::getPtrNative(deviceBuf_" << convK << ")"
                   << ", 0.0f, alpaka::getPtrNative(deviceBuf_" << fNY << ") + out_offset);\n\n";
@@ -943,9 +940,9 @@ public:
          // Each group processes fShapeW[1] input channels starting at g * fShapeW[1].
          out << SP << SP << "for (std::size_t g = 0; g < " << fAttrGroup << "; g++) {\n\n";
          out << SP << SP << SP << "std::size_t const g_in_offset  = x_offset   + g * ("
-               << std::to_string(fShapeW[1]) + " * " + iDepth + " * " + iHeight + " * " + iWidth << ");\n";
+               << std::to_string(fShapeW[1]) + " * " + strideX[1].GetVal() << ");\n";
          out << SP << SP << SP << "std::size_t const g_out_offset = out_offset + g * ("
-               << std::to_string(gemm_n_group) + " * " + gemm_m << ");\n";
+               << std::to_string(gemm.n) + " * " + gemm.m << ");\n";
          out << SP << SP << SP << "std::size_t const f_offset     = g * " << groupFOffset << "u;\n\n";
 
          out << SP << SP << SP << "// im2col for group g (reads only this group's input channels)\n";
@@ -956,34 +953,33 @@ public:
          out << SP << SP << SP << SP << "alpaka::exec<Acc>(queue, workDiv_im2col, im2colKernel_" << opName
             << ", alpaka::getPtrNative(deviceBuf_" << fNX << ") + g_in_offset"
             << ", alpaka::getPtrNative(deviceBuf_" << imcol << ")"
-            << ", static_cast<std::size_t>(" << oDepth << "), static_cast<std::size_t>(" << oHeight << "), static_cast<std::size_t>(" << oWidth << ")"
-            << ", static_cast<std::size_t>(" << iDepth << "), static_cast<std::size_t>(" << iHeight << "), static_cast<std::size_t>(" << iWidth << ")"
+            << im2colExtents
             << ", static_cast<Idx>(" << colElements << "));\n";
          out << SP << SP << SP << SP << "alpaka::wait(queue);\n";
          out << SP << SP << SP << "}\n\n";
 
          if (!fNB.empty()) {
-               std::string groupBiasElements = std::to_string(gemm_n_group) + " * " + gemm_m;
+               std::string groupBiasElements = std::to_string(gemm.n) + " * " + gemm.m;
                out << SP << SP << SP << "// Broadcast group bias\n";
                out << SP << SP << SP << "{\n";
                out << SP << SP << SP << SP << "auto const elementsPerThread_bias = Vec::all(static_cast<Idx>(1));\n";
                out << SP << SP << SP << SP << "auto const elementsPerGrid_bias   = Vec::all(Idx{" << groupBiasElements << "});\n";
                out << SP << SP << SP << SP << "auto const workDiv_bias = sofie_workdiv(elementsPerGrid_bias);\n";
                out << SP << SP << SP << SP << "alpaka::exec<Acc>(queue, workDiv_bias, biasBroadcastKernel_" << opName
-                  << ", alpaka::getPtrNative(deviceBuf_" << fNB << ") + g * " << gemm_n_group
+                  << ", alpaka::getPtrNative(deviceBuf_" << fNB << ") + g * " << gemm.n
                   << ", alpaka::getPtrNative(deviceBuf_" << fNY << ") + g_out_offset"
-                  << ", static_cast<std::size_t>(" << gemm_m << ")"
+                  << ", static_cast<std::size_t>(" << gemm.m << ")"
                   << ", static_cast<Idx>(" << groupBiasElements << "));\n";
                out << SP << SP << SP << SP << "alpaka::wait(queue);\n";
                out << SP << SP << SP << "}\n\n";
                out << SP << SP << SP << "blas.matmul('n', 'n', "
-                  << gemm_m << ", " << gemm_n_group << ", " << gemm_k
+                  << gemm.m << ", " << gemm.n << ", " << gemm.k
                   << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << imcol << ")"
                   << ", alpaka::getPtrNative(deviceBuf_" << convK << ") + f_offset"
                   << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << fNY << ") + g_out_offset);\n\n";
          } else {
                out << SP << SP << SP << "blas.matmul('n', 'n', "
-                  << gemm_m << ", " << gemm_n_group << ", " << gemm_k
+                  << gemm.m << ", " << gemm.n << ", " << gemm.k
                   << ", 1.0f, alpaka::getPtrNative(deviceBuf_" << imcol << ")"
                   << ", alpaka::getPtrNative(deviceBuf_" << convK << ") + f_offset"
                   << ", 0.0f, alpaka::getPtrNative(deviceBuf_" << fNY << ") + g_out_offset);\n\n";
@@ -1003,14 +999,9 @@ public:
 
 
    std::string GetBlasConfig(){
-      std::string oDepth_  = (fDim > 2) ? fShapeY[2].GetVal()    : "1";
-      std::string oHeight_ = (fDim > 1) ? fShapeY[fDim].GetVal() : "1";
-      std::string oWidth_  = fShapeY[fDim + 1].GetVal();
-      size_t kSize_        = fAttrKernelShape[0] * fAttrKernelShape[1] * fAttrKernelShape[2];
-      std::string gemm_n_  = std::to_string(fShapeW[0] / fAttrGroup);
-      std::string gemm_k_  = std::to_string(fShapeW[1] * kSize_);
-      std::string gemm_m_  = "(" + oDepth_ + " * " + oHeight_ + " * " + oWidth_ + ")";
-      return gemm_m_ + ", " + gemm_n_ + ", " + gemm_k_ + ", " + gemm_m_ + ", " + gemm_k_ + ", " + gemm_m_ + ", 'n', 'n'";
+      auto gemm = GetGemmInfo();
+      std::string n = std::to_string(gemm.n), k = std::to_string(gemm.k);
+      return gemm.m + ", " + n + ", " + k + ", " + gemm.m + ", " + k + ", " + gemm.m + ", 'n', 'n'";
    }
 
 };

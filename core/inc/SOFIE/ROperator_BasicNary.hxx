@@ -145,6 +145,11 @@ public:
             fNBroadcastedInputs.emplace_back("tensor_" + fNInputs[i]);
          }
       }
+      // rank-pad each input shape to fShapeY; the GPU emitters read them directly
+      for (auto &s : fShapeInputs) {
+         auto y = fShapeY;
+         UTILITY::MultidirectionalBroadcastShape(s, y);
+      }
       fType = ConvertTypeToString(model.GetTensorType(fNInputs[0]));
    }
 
@@ -193,59 +198,24 @@ public:
       return acc_v + " = " + acc_v + " + " + val + ";"; // Sum and Mean both accumulate
    }
 
-   // Per-input broadcast layout against the output: rank-padded shapes (dims), broadcast
-   // masks (bcast), scalar/contiguous fast-path flags (isScalar/isContiguous) and the
-   // dynamic shape params the kernel needs (dynParams). Filled by
-   // GetGPUNaryBroadcastInfo() and used by both Generate_GPU_Kernel_ALPAKA (kernel
-   // signature and index math) and Generate_GPU_ALPAKA (launch arguments), so the two
-   // cannot drift apart.
-   struct GPUNaryBroadcastInfo {
-      std::vector<std::vector<Dim>> dims;
-      std::vector<std::vector<bool>> bcast;
-      std::vector<bool> isScalar;
-      std::vector<bool> isContiguous;
-      bool needCoords = false;
-      std::vector<std::string> dynParams;
-   };
-
-   GPUNaryBroadcastInfo GetGPUNaryBroadcastInfo() const {
-      GPUNaryBroadcastInfo info;
-      const std::size_t nIn = fShapeInputs.size();
-      const std::size_t D = fShapeY.size();
-      info.dims.resize(nIn);
-      info.bcast.resize(nIn);
-      info.isScalar.assign(nIn, true);
-      info.isContiguous.assign(nIn, true);
-      bool anyGeneral = false;
-      for (std::size_t i = 0; i < nIn; i++) {
-         info.dims[i].assign(D, Dim{1});
-         for (std::size_t k = 0; k < fShapeInputs[i].size(); k++)
-            info.dims[i][D - fShapeInputs[i].size() + k] = fShapeInputs[i][k];
-         info.bcast[i].resize(D);
-         for (std::size_t d = 0; d < D; d++) {
-            info.bcast[i][d] = !info.dims[i][d].isParam && info.dims[i][d].dim == 1;
-            if (!info.bcast[i][d]) info.isScalar[i] = false;
-            if (info.dims[i][d].GetVal() != fShapeY[d].GetVal()) info.isContiguous[i] = false;
-         }
-         if (!info.isScalar[i] && !info.isContiguous[i]) anyGeneral = true;
-      }
-      info.needCoords = anyGeneral;
-      if (!info.needCoords)
-         return info;
-
-      UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fShapeY), info.dynParams);
-      for (std::size_t i = 0; i < nIn; i++)
-         if (!info.isScalar[i] && !info.isContiguous[i])
-            UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(info.dims[i]), info.dynParams);
-      return info;
-   }
-
    std::string Generate_GPU_Kernel_ALPAKA(std::string OpName) override {
       OpName = "op_" + OpName;
       size_t nIn = fNInputs.size();
-      auto info = GetGPUNaryBroadcastInfo();
       const std::size_t D = fShapeY.size();
       auto stridesY = UTILITY::ComputeStrideFromShape(fShapeY);
+      auto isOne = [](const Dim &d) { return d.GetVal() == "1"; };
+      std::vector<bool> isScalar(nIn), isContiguous(nIn), isPartial(nIn);
+      std::vector<std::vector<Dim>> strides(nIn);
+      bool anyPartial = false;
+      for (size_t i = 0; i < nIn; i++) {
+         isScalar[i]     = ConvertDimShapeToLength(fShapeInputs[i]) == "1";
+         isContiguous[i] = UTILITY::AreSameShape(fShapeInputs[i], fShapeY);
+         isPartial[i]    = !isScalar[i] && !isContiguous[i];
+         if (isPartial[i]) {
+            strides[i] = UTILITY::ComputeStrideFromShape(fShapeInputs[i]);
+            anyPartial = true;
+         }
+      }
       std::string op;
       op += "\n//------ BASICNARY_KERNEL_ALPAKA\n";
       op += SP + "struct BasicNaryKernel_" + OpName + " {\n";
@@ -257,18 +227,18 @@ public:
       for (size_t i = 0; i < nIn; i++)
          op += ", Tin" + std::to_string(i) + " const* in" + std::to_string(i);
       op += ", TOut* out";
-      for (auto &p : info.dynParams)
+      for (auto &p : GetGPUDynParams())
          op += ", std::size_t const " + p;
       op += ", std::size_t n) const {\n";
       op += SP + SP + SP + "auto const idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
       op += SP + SP + SP + "if (idx >= n) return;\n";
 
       // decompose idx into output coords, skipping broadcast dims (stride 0)
-      if (info.needCoords) {
+      if (anyPartial) {
          op += SP + SP + SP + "std::size_t remaining = idx;\n";
          op += SP + SP + SP + "std::size_t coord;\n";
          for (size_t i = 0; i < nIn; i++)
-            if (!info.isScalar[i] && !info.isContiguous[i])
+            if (isPartial[i])
                op += SP + SP + SP + "std::size_t idx" + std::to_string(i) + " = 0;\n";
          for (std::size_t d = 0; d < D; d++) {
             std::string sY = "(" + stridesY[d].GetVal() + ")";
@@ -276,15 +246,14 @@ public:
             if (d + 1 < D)
                op += SP + SP + SP + "remaining -= coord * " + sY + ";\n";
             for (size_t i = 0; i < nIn; i++) {
-               if (info.isScalar[i] || info.isContiguous[i] || info.bcast[i][d]) continue;
-               auto strides = UTILITY::ComputeStrideFromShape(info.dims[i]);
-               op += SP + SP + SP + "idx" + std::to_string(i) + " += coord * (" + strides[d].GetVal() + ");\n";
+               if (!isPartial[i] || isOne(fShapeInputs[i][d])) continue;
+               op += SP + SP + SP + "idx" + std::to_string(i) + " += coord * (" + strides[i][d].GetVal() + ");\n";
             }
          }
       }
-      auto index = [&info](size_t i) -> std::string {
-         if (info.isContiguous[i]) return "idx";
-         if (info.isScalar[i]) return "0";
+      auto index = [&](size_t i) -> std::string {
+         if (isContiguous[i]) return "idx";
+         if (isScalar[i]) return "0";
          return "idx" + std::to_string(i);
       };
       op += SP + SP + SP + "TOut v = static_cast<TOut>(in0[" + index(0) + "]);\n";
@@ -307,7 +276,6 @@ public:
       if (fShapeY.empty())
          throw std::runtime_error("SOFIE BasicNary Op called to Generate without being initialized first");
       OpName = "op_" + OpName;
-      auto info = GetGPUNaryBroadcastInfo();
       std::stringstream out;
       std::string length = ConvertDimShapeToLength(fShapeY);
       out << "\n//------ BASICNARY_GPU_ALPAKA\n";
@@ -318,7 +286,7 @@ public:
       for (auto &in : fNInputs)
          out << ", alpaka::getPtrNative(deviceBuf_" << in << ")";
       out << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")";
-      for (auto &p : info.dynParams)
+      for (auto &p : GetGPUDynParams())
          out << ", static_cast<std::size_t>(" << p << ")";
       out << ", static_cast<std::size_t>(" << length << "));\n";
       out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";

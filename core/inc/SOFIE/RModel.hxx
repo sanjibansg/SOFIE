@@ -211,6 +211,12 @@ public:
    // generate the infer function signature for inference on ALPAKA. If isdecl= false generate the calling infer function
    // used to infer the sub-graphs
    std::string GenerateInferSignature_GPU_ALPAKA(bool isdecl = true);
+   /// iterate the GPU infer argument sequence in order: onParam(param) for each dynamic
+   /// shape parameter at the position of the input introducing it, onInput(name) for each
+   /// input tensor; single source of the argument-order convention shared by the
+   /// signatures, the _infer_impl call sites and the Session constructor
+   void ForEachInferArg_GPU_ALPAKA(const std::function<void(const std::string &)> &onParam,
+                                   const std::function<void(const std::string &)> &onInput) const;
 
    // generate the _infer_impl signature using ViewPlainPtr types instead of Buf types
    std::string GenerateImplSignature_GPU_ALPAKA(bool isdecl = true);

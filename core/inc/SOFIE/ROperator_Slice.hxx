@@ -494,18 +494,6 @@ public:
       return out.str();
    }
 
-   // Dynamic shape params (e.g. N, n_pf) that appear in the emitted index math and are
-   // passed to the kernel as size_t args; shared by the kernel signature and the launch.
-   std::vector<std::string> GetGPUDynParams() const {
-      std::vector<std::string> params;
-      UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fShapeOutput), params);
-      UTILITY::CollectDimParams(fShapeOutput, params);
-      UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fShapeInput), params);
-      UTILITY::CollectDimParams(fStart, params);
-      UTILITY::CollectDimParams(fSteps, params);
-      return params;
-   }
-
    std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
       if (fIsOutputConstant) return "";
       opName = "op_" + opName;
@@ -537,11 +525,7 @@ public:
 
       op += SP + SP + SP + "for (std::size_t elem_idx = global_thread_idx; elem_idx < totalElements; elem_idx += grid_thread_extent) {\n\n";
 
-      for (std::size_t d = 0; d < D; ++d) {
-         op += SP + SP + SP + SP + "std::size_t const out_" + std::to_string(d)
-               + " = (elem_idx / (" + outputStrides[d].GetVal() + ")) % ("
-               + fShapeOutput[d].GetVal() + ");\n";
-      }
+      EmitOutputCoords(op, SP + SP + SP + SP, outputStrides, fShapeOutput);
       op += "\n";
 
       // Map each output coord back to input coord:

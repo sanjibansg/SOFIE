@@ -114,6 +114,13 @@ public:
    std::string fName = "UnnamedOperator";
    const std::string &Name() const { return fName; }
 
+   /// model dynamic shape parameters (e.g. N), in infer-argument order; set once by
+   /// RModel before GPU codegen. Kernels receive them all as size_t arguments so the
+   /// emitted index expressions can reference any of them, and the kernel signature and
+   /// launch loops read the same list so the two cannot drift apart.
+   void SetGPUDynParams(std::vector<std::string> params) { fGPUDynParams = std::move(params); }
+   const std::vector<std::string> &GetGPUDynParams() const { return fGPUDynParams; }
+
 protected:
    OperatorKind fKind = OperatorKind::UNDEFINED;
    size_t fOpOrder = 0;
@@ -124,6 +131,8 @@ protected:
 
    mutable std::vector<std::string> fInputTensorNames;
    mutable std::vector<std::string> fOutputTensorNames;
+
+   std::vector<std::string> fGPUDynParams;  ///< model dynamic shape params, see SetGPUDynParams
 
 public:
    std::span<const std::string> GetOpInputTensors() const {

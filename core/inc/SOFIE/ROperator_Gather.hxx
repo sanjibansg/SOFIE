@@ -71,19 +71,27 @@ public:
       // case indices tensor is initialized
       if (model.IsInitializedTensor(fNIndices)) {
           // empty shape Indices is a scalar value for the indices
+         bool hasNegativeIndex = false;
          size_t indicesLength = ConvertShapeToLength(model.GetTensorShape(fNIndices));
-         int64_t* indicesData = static_cast<int64_t*>(model.GetInitializedTensorData(fNIndices).get());
+         int64_t* data = static_cast<int64_t*>(model.GetInitializedTensorData(fNIndices).get());
+         // copy in a vector since we may need to update the values in case of negative indices
+         fIndices = std::vector<int64_t>(data, data + indicesLength);
          // update indices data in case of negative dim values
          for (size_t i = 0; i < indicesLength; i++) {
             // move this at generation time?
             if (!fShapeX[fAttrAxis].isParam) {
-               if (indicesData[i] < 0) {
-                  indicesData[i] += fShapeX[fAttrAxis].dim;
+               if (fIndices[i] < 0) {
+                  hasNegativeIndex = true;
+                  fIndices[i] += fShapeX[fAttrAxis].dim;
                }
             }
          }
-         // Save in a vector gather Indices of size q
-         fIndices = std::vector<int64_t>(indicesData, indicesData + indicesLength);
+         // for negative indices we need to add an extra constant tensor
+         if (hasNegativeIndex) {
+            std::string nameIndicesUpdated = fNIndices + "_updated";
+            model.AddConstantTensor(nameIndicesUpdated, model.GetTensorShape(fNIndices), fIndices.data());
+            fNIndices = nameIndicesUpdated;
+         }
       }
       // Output shape
       if (model.Verbose())
@@ -285,25 +293,12 @@ public:
       return out.str();
    }
 
-// Dynamic shape params (e.g. N, n_pf) that appear in the emitted index math and are
-// passed to the kernel as size_t args; shared by the kernel signature and the launch.
-std::vector<std::string> GetGPUDynParams() const {
-    std::vector<std::string> params;
-    UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fShapeY), params);
-    UTILITY::CollectDimParams(fShapeY, params);
-    UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fShapeIndices), params);
-    UTILITY::CollectDimParams({fShapeX[fAttrAxis]}, params);
-    UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fShapeX), params);
-    return params;
-}
-
 std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
     if (fIsOutputConstant || fIsOutputParamShape) return "";
     opName = "op_" + opName;
     if (fShapeY.empty())
         throw std::runtime_error("SOFIE Gather Op called to Generate without being initialized first");
 
-    const std::size_t D  = fShapeY.size();   // output rank = q + r - 1
     const std::size_t r  = fShapeX.size();
     const std::size_t q  = fShapeIndices.size();
 
@@ -332,11 +327,7 @@ std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
 
     op += SP + SP + SP + "for (std::size_t elem_idx = global_thread_idx; elem_idx < totalElements; elem_idx += grid_thread_extent) {\n\n";
 
-    for (std::size_t d = 0; d < D; ++d) {
-        op += SP + SP + SP + SP + "std::size_t const out_" + std::to_string(d)
-            + " = (elem_idx / (" + stridesY[d].GetVal() + ")) % ("
-            + fShapeY[d].GetVal() + ");\n";
-    }
+    EmitOutputCoords(op, SP + SP + SP + SP, stridesY, fShapeY);
     op += "\n";
 
     // Output dims [axis ... axis+q) correspond to the indices tensor dims [0 ... q)
@@ -433,4 +424,4 @@ std::string Generate_GPU_ALPAKA(std::string opName) override {
 
 }//SOFIE
 
-#endif //SOFIE_ROPERATOR_RELU
+#endif //SOFIE_ROPERATOR_GATHER

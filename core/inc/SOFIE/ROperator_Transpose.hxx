@@ -23,10 +23,8 @@ private:
 
    std::string fNData;
    std::string fNOutput;
-   std::vector<size_t> fShapeData;    // used for initialized (constant) tensor case
-   std::vector<size_t> fShapeOutput;  // used for initialized (constant) tensor case
-   std::vector<Dim> fDimShapeData;    // used for dynamic/runtime tensor case
-   std::vector<Dim> fDimShapeOutput;  // used for dynamic/runtime tensor case
+   std::vector<Dim> fDimShapeData;
+   std::vector<Dim> fDimShapeOutput;
 
 public:
 
@@ -70,21 +68,21 @@ public:
       }
       if (model.IsInitializedTensor(fNData)) {
          // Constant/initialized tensor: use concrete shapes and perform transpose at init time
-         fShapeData = model.GetTensorShape(fNData);
+         std::vector<size_t> shapeData = model.GetTensorShape(fNData);
          if (fAttrPerm.empty()){
-            fAttrPerm.reserve(fShapeData.size());
-            for (int i = fShapeData.size() - 1; i >= 0; i--){
+            fAttrPerm.reserve(shapeData.size());
+            for (int i = shapeData.size() - 1; i >= 0; i--){
                fAttrPerm.push_back(i);
             }
          }
-         std::vector<std::vector<size_t>> inputs = { fShapeData };
-         fShapeOutput = ShapeInference(inputs).front();
+         std::vector<std::vector<size_t>> inputs = { shapeData };
+         std::vector<size_t> shapeOutput = ShapeInference(inputs).front();
          fIsOutputConstant = true;
-         auto inStrides = UTILITY::ComputeStrideFromShape(fShapeData);
-         auto outStrides = UTILITY::ComputeStrideFromShape(fShapeOutput);
-         size_t length = ConvertShapeToLength(fShapeOutput);
+         auto inStrides = UTILITY::ComputeStrideFromShape(shapeData);
+         auto outStrides = UTILITY::ComputeStrideFromShape(shapeOutput);
+         size_t length = ConvertShapeToLength(shapeOutput);
          auto inputData = static_cast<T*>(model.GetInitializedTensorData(fNData).get());
-         size_t dim = fShapeData.size();
+         size_t dim = shapeData.size();
          std::vector<size_t> outputIdx(dim);
          std::vector<T> outputData(length);
          for (size_t i = 0; i < length; i++) {
@@ -101,9 +99,12 @@ public:
             }
             outputData[i] = inputData[inputIndex];
          }
-         model.AddConstantTensor<T>(fNOutput, fShapeOutput, outputData.data());
+         model.AddConstantTensor<T>(fNOutput, shapeOutput, outputData.data());
+         //keep the Dim members valid in every path
+         fDimShapeData = ConvertShapeToDim(shapeData);
+         fDimShapeOutput = ConvertShapeToDim(shapeOutput);
          if (model.Verbose()) {
-            std::cout << "Transpose: output is a constant tensor " << ConvertShapeToString(fShapeOutput) << " : "
+            std::cout << "Transpose: output is a constant tensor " << ConvertShapeToString(shapeOutput) << " : "
                << ConvertValuesToString(outputData) << std::endl;
          }
       } else {
@@ -130,16 +131,13 @@ public:
    std::string Generate(std::string OpName) override {
       if (fIsOutputConstant) return "";  //no op for constant tensors
       OpName = "op_" + OpName;
-      // Use Dim shapes when available (dynamic case), else convert from concrete shapes
-      auto dimShapeData   = fDimShapeData.empty()   ? ConvertShapeToDim(fShapeData)   : fDimShapeData;
-      auto dimShapeOutput = fDimShapeOutput.empty() ? ConvertShapeToDim(fShapeOutput) : fDimShapeOutput;
-      if (dimShapeData.empty() || dimShapeOutput.empty()){
+      if (fDimShapeData.empty() || fDimShapeOutput.empty()){
          throw std::runtime_error("SOFIE Transpose Op called to Generate without being initialized first");
       }
-      int dim = dimShapeData.size();
-      auto inStrides  = UTILITY::ComputeStrideFromShape(dimShapeData);
-      auto outStrides = UTILITY::ComputeStrideFromShape(dimShapeOutput);
-      std::string length = ConvertDimShapeToLength(dimShapeOutput);
+      int dim = fDimShapeData.size();
+      auto inStrides  = UTILITY::ComputeStrideFromShape(fDimShapeData);
+      auto outStrides = UTILITY::ComputeStrideFromShape(fDimShapeOutput);
+      std::string length = ConvertDimShapeToLength(fDimShapeOutput);
 
       std::stringstream out;
       // Implement transpose operator using consecutive write outputs.
@@ -174,18 +172,8 @@ public:
    }
 
 
-   // Dynamic shape params (e.g. N, n_pf) that appear in the emitted index math and are
-   // passed to the kernel as size_t args; shared by the kernel signature and the launch.
-   std::vector<std::string> GetGPUDynParams() const {
-      auto dimShapeData   = fDimShapeData.empty()   ? ConvertShapeToDim(fShapeData)   : fDimShapeData;
-      auto dimShapeOutput = fDimShapeOutput.empty() ? ConvertShapeToDim(fShapeOutput) : fDimShapeOutput;
-      std::vector<std::string> params;
-      UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(dimShapeOutput), params);
-      UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(dimShapeData), params);
-      return params;
-   }
-
-   std::string Generate_GPU_Kernel_ALPAKA(std::string OpName) {
+   std::string Generate_GPU_Kernel_ALPAKA(std::string OpName) override {
+      if (fIsOutputConstant) return "";
       std::string op;
       OpName = "op_" + OpName;
       op = "\n//------ TRANSPOSE_KERNEL_ALPAKA\n";
@@ -201,12 +189,10 @@ public:
       op += SP + SP + SP + SP + "std::size_t remaining = idx;\n";
       op += SP + SP + SP + SP + "std::size_t coord;\n";
 
-      auto dimShapeData   = fDimShapeData.empty()   ? ConvertShapeToDim(fShapeData)   : fDimShapeData;
-      auto dimShapeOutput = fDimShapeOutput.empty() ? ConvertShapeToDim(fShapeOutput) : fDimShapeOutput;
-      auto inputStrides  = UTILITY::ComputeStrideFromShape(dimShapeData);
-      auto outputStrides = UTILITY::ComputeStrideFromShape(dimShapeOutput);
+      auto inputStrides  = UTILITY::ComputeStrideFromShape(fDimShapeData);
+      auto outputStrides = UTILITY::ComputeStrideFromShape(fDimShapeOutput);
 
-      for (size_t k = 0; k < dimShapeData.size(); k++) {
+      for (size_t k = 0; k < fDimShapeData.size(); k++) {
          op += SP + SP + SP + SP + "coord = remaining / ("
                + outputStrides[k].GetVal() + ");\n";
          op += SP + SP + SP + SP + "remaining = remaining - coord * ("
@@ -223,16 +209,17 @@ public:
    }
 
    std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string OpName) override {
+      if (fIsOutputConstant) return "";
       return SP + "TransposeKernel_op_" + OpName + " transposeKernel_" + OpName + ";\n";
    }
 
    std::string Generate_GPU_ALPAKA(std::string OpName) override {
-      auto dimShapeOutput = fDimShapeOutput.empty() ? ConvertShapeToDim(fShapeOutput) : fDimShapeOutput;
-      if (dimShapeOutput.empty()) {
+      if (fIsOutputConstant) return "";
+      if (fDimShapeOutput.empty()) {
          throw std::runtime_error("SOFIE Operator Transpose called to Generate without being initialized first");
       }
       std::stringstream out;
-      std::string length = ConvertDimShapeToLength(dimShapeOutput);
+      std::string length = ConvertDimShapeToLength(fDimShapeOutput);
 
       out << "\n//------ TRANSPOSE_GPU_ALPAKA\n";
       out << SP << "auto const elementsPerThread_"<<fNOutput<<" = Vec::all(static_cast<Idx>(1));\n";

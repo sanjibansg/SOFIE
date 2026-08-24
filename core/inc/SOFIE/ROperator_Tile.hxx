@@ -21,7 +21,6 @@ private:
    std::string fNY;
    std::vector<Dim> fShapeInput;
    std::vector<Dim> fShapeY;
-   std::vector<size_t> fRepeats;
 
 public:
    ROperator_Tile(){}
@@ -37,11 +36,18 @@ public:
       return input;
    }
 
-   std::vector<std::vector<size_t>> ShapeInference(std::vector<std::vector<size_t>> input) override {
-      std::vector<size_t> ret = input[0];
-      for (size_t i = 0; i < input[1].size(); i++)
-         ret[i] = ret[i] * input[1][i];
-      return {ret};
+   std::vector<Dim> DoShapeInference(const std::vector<Dim> & input, const std::vector<size_t> repeat)  {
+      std::vector<Dim> ret = input;
+      for(size_t i=0; i < repeat.size(); i++) {
+         if (repeat[i] != 1) {
+            if (ret[i].isParam) {
+               ret[i] = Dim{ std::string(ret[i].GetVal() + "*" + std::to_string(repeat[i])), static_cast<size_t>(-1) };
+            } else {
+               ret[i]=Dim { ret[i].dim *repeat[i] };
+            }
+         }
+      }
+      return ret;
    }
 
    void Initialize(RModel& model) override {
@@ -52,6 +58,8 @@ public:
 
       fShapeInput = model.GetDimTensorShape(fNInput);
 
+      // if repeats vector is not initialized we cannot deduce shape of output
+      // not support for time being this case
       if (!model.IsInitializedTensor(fNRepeats))
          throw std::runtime_error("SOFIE Tile Op: non-initialized repeats input is not supported");
 
@@ -65,30 +73,17 @@ public:
          throw std::runtime_error("SOFIE Tile Op: repeats tensor must be 1D");
 
       size_t num_elements = repeats_shape[0];
+      std::vector<size_t> repeats_vector(num_elements);
+      std::copy(repeats_data, repeats_data + num_elements, repeats_vector.begin());
 
-      // Save repeats if known at generation time so the GPU kernel can bake
-      // fShapeInput[d] directly without needing a runtime repeats pointer.
-      // fRepeats is left empty if repeats are not initialized (future case),
-      // which will cause the kernel to use the runtime repeats pointer path.
-      fRepeats.resize(num_elements);
-      std::copy(repeats_data, repeats_data + num_elements, fRepeats.begin());
-      if (fRepeats.size()){
-         model.RemoveInitializedTensor(fNRepeats);
-      }
-      fShapeY = fShapeInput;
-      for (size_t i = 0; i < fRepeats.size(); i++) {
-         if (fShapeInput[i].isParam)
-            fShapeY[i] = Dim{fShapeInput[i].GetVal() + " * " + std::to_string(fRepeats[i]), static_cast<size_t>(-1)};
-         else
-            fShapeY[i] = Dim{fShapeInput[i].dim * fRepeats[i]};
-      }
+      fShapeY = DoShapeInference(fShapeInput, repeats_vector);
 
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNInput), fShapeY);
 
       if (model.Verbose())
          std::cout << "Tile: " << fNInput << " " << ConvertDimShapeToString(fShapeInput)
                    << " -> " << fNY << " with shape " << ConvertDimShapeToString(fShapeY)
-                   << " given repeats " << ConvertShapeToString(fRepeats) << std::endl;
+                   << " given repeats " << ConvertShapeToString(repeats_vector) << std::endl;
    }
 
    std::string Generate(std::string OpName) override {
@@ -97,55 +92,45 @@ public:
          throw std::runtime_error("SOFIE Tile Op called to Generate without being initialized first");
 
       std::stringstream out;
-      std::string input   = "tensor_" + fNInput;
-      std::string output  = "tensor_" + fNY;
-      std::string repeats = "tensor_" + fNRepeats;
-
+      std::string input = "tensor_" + fNInput;
+      std::string output = "tensor_" + fNY;
       out << "///-------- Tile operator\n";
-      out << "{\n";
+      out << "{\n"; // add scope to re-use same names
+      out << "const size_t input_shape[" << fShapeInput.size() << "] = " << ConvertDimShapeToString(fShapeInput) << ";\n";
 
-      out << SP << "const int input_shape[" << fShapeInput.size() << "] = {";
-      for (size_t i = 0; i < fShapeInput.size(); ++i) {
-         if (i > 0) out << ", ";
-         out << fShapeInput[i].GetVal();
-      }
-      out << "};\n";
-
-      out << SP << "int inputLength = " << ConvertDimShapeToLength(fShapeInput) << ";\n";
-      out << SP << "int s = 1;\n";
-
-      // Read repeats from the tensor at runtime so the generated code remains
-      // correct even if repeats become a runtime input/intermediate in the future
-      out << SP << "for (int i = " << fShapeInput.size() - 1 << "; i >= 0; i--) {\n";
-      out << SP << SP << "int r = " << repeats << "[i];\n";
-      out << SP << SP << "int i_offset = 0, o_offset = 0;\n";
-      out << SP << SP << "s = s * input_shape[i];\n";
-      out << SP << SP << "if (i == " << fShapeInput.size() - 1 << ") {\n";
-      out << SP << SP << SP << "for (int j = 0; j < inputLength / s; j++) {\n";
-      out << SP << SP << SP << SP << "for (int k = 0; k < r; k++) {\n";
-      out << SP << SP << SP << SP << SP << "std::copy(" << input << " + i_offset, "
-                                        << input << " + i_offset + s, "
-                                        << output << " + o_offset);\n";
-      out << SP << SP << SP << SP << SP << "o_offset += s;\n";
-      out << SP << SP << SP << SP << "}\n";
-      out << SP << SP << SP << SP << "i_offset += s;\n";
-      out << SP << SP << SP << "}\n";
-      out << SP << SP << "} else {\n";
-      out << SP << SP << SP << "for (int j = inputLength / s - 1; j >= 0; j--) {\n";
-      out << SP << SP << SP << SP << "o_offset = j * s * r;\n";
-      out << SP << SP << SP << SP << "i_offset = j * s;\n";
-      out << SP << SP << SP << SP << "for (int k = 0; k < r; k++) {\n";
-      out << SP << SP << SP << SP << SP << "std::copy(" << output << " + i_offset, "
-                                        << output << " + i_offset + s, "
-                                        << output << " + o_offset);\n";
-      out << SP << SP << SP << SP << SP << "o_offset += s;\n";
-      out << SP << SP << SP << SP << "}\n";
-      out << SP << SP << SP << "}\n";
-      out << SP << SP << "}\n";
-      out << SP << SP << "s *= r;\n";
-      out << SP << SP << "inputLength *= r;\n";
-      out << SP << "}\n";
-      out << "}\n";
+      out << "int inputLength = " << ConvertDimShapeToLength(fShapeInput) << ";\n";
+      out << "int s = 1;\n";
+      // loop from inverse dim order
+      out << "for (int i = " << fShapeInput.size()-1 << "; i >=0; i--) {\n";
+      out << SP << "int r = tensor_" << fNRepeats << "[i];\n";
+      out << SP << "int i_offset = 0, o_offset = 0;\n";
+      out << SP << "s = s * input_shape[i];\n";
+      // case we have first copy
+      out << SP << "if (i == " << fShapeInput.size()-1 <<  ") {\n";
+      out << SP << SP <<  "for (int j = 0; j < inputLength/s ; j++) {\n";
+      out << SP << SP << SP << "for (int k = 0; k < r ; k++) {\n";
+      out << SP << SP << SP << SP << "std::copy(" << input << "+ i_offset, "
+                                    << input << "+ i_offset + s, " << output << "+ o_offset);\n";
+      out << SP << SP << SP << SP << "o_offset += s;\n";
+      out << SP << SP << SP << "}\n"; // end k loop
+      out << SP << SP << SP << "i_offset += s;\n";
+      out << SP << SP << "}\n"; // end j loop
+      out << SP << "} else {\n";  // second copy we do from output to output
+      // and we need to loop on j from reverse order to avoid re-writing in output tensor
+      out << SP << SP << "for (int j = inputLength/s - 1 ; j>=0; j--) {\n";
+      out << SP << SP << SP << "o_offset = j*s*r;\n";
+      out << SP << SP << SP << "i_offset = j*s;\n";
+      out << SP << SP << SP << "for (int k = 0; k < r ; k++) {\n";
+      out << SP << SP << SP << SP << "std::copy(" << output << "+ i_offset, "
+                                    << output << "+ i_offset + s, " << output << "+ o_offset);\n";
+      out << SP << SP << SP << SP << "o_offset += s;\n";
+      out << SP << SP << SP << "}\n"; // end k loop
+      out << SP << SP << "}\n"; // end j loop
+      out << SP << "}\n"; // end if
+      out << SP << "s *= r;\n";
+      out << SP << "inputLength *= r;\n";
+      out << "}\n"; // end i loop
+      out << "}\n";  // end of scope
       return out.str();
    }
 
@@ -159,20 +144,6 @@ public:
       auto inputStrides  = UTILITY::ComputeStrideFromShape(fShapeInput);
       auto outputStrides = UTILITY::ComputeStrideFromShape(fShapeY);
 
-      // If fRepeats is populated, repeats were known at generation time and
-      // we can bake fShapeInput[d] as literals — no runtime repeats pointer needed.
-      // If fRepeats is empty (future: runtime repeats), pass repeats as a kernel arg.
-      bool repeatsKnown = !fRepeats.empty();
-
-      auto isIdent = [](const std::string &s){
-         if (s.empty() || (s[0] >= '0' && s[0] <= '9')) return false;
-         for (char c : s)
-            if (!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_')) return false;
-         return true;
-      };
-      std::vector<std::string> dynParams;
-      UTILITY::CollectDimParams(fShapeInput, dynParams);
-
       std::string kname = "TileKernel_" + opName;
 
       std::string op;
@@ -183,9 +154,7 @@ public:
       op += SP + SP + SP + "TAcc const& acc,\n";
       op += SP + SP + SP + "T const* __restrict__ input,\n";
       op += SP + SP + SP + "T* __restrict__ output,\n";
-      if (!repeatsKnown)
-         op += SP + SP + SP + "int64_t const* __restrict__ repeats,\n";
-      for (auto &p : dynParams)
+      for (auto &p : GetGPUDynParams())
          op += SP + SP + SP + "std::size_t const " + p + ",\n";
       op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
 
@@ -195,19 +164,10 @@ public:
 
       op += SP + SP + SP + "for (std::size_t elem_idx = global_thread_idx; elem_idx < totalElements; elem_idx += grid_thread_extent) {\n\n";
 
-      // Decompose output linear index — output strides always compile-time
-      for (std::size_t d = 0; d < D; ++d) {
-         op += SP + SP + SP + SP + "std::size_t const out_" + std::to_string(d)
-             + " = (elem_idx / (" + outputStrides[d].GetVal() + ")) % ("
-             + fShapeY[d].GetVal() + ");\n";
-      }
+      EmitOutputCoords(op, SP + SP + SP + SP, outputStrides, fShapeY);
       op += "\n";
 
-      // Input index: fShapeInput[d] is always a compile-time constant since
-      // it is the input tensor shape, never runtime-variable.
-      // When repeatsKnown, we bake it directly as a literal.
-      // When not repeatsKnown (future), we still use fShapeInput[d] as a
-      // literal for the % — repeats pointer is only needed if fShapeY is dynamic.
+      // Input index: tiling wraps each output coordinate back into the input shape
       op += SP + SP + SP + SP + "std::size_t const input_idx =\n";
       for (std::size_t d = 0; d < D; ++d) {
          op += SP + SP + SP + SP + SP
@@ -235,26 +195,13 @@ public:
       if (fShapeInput.empty() || fShapeY.empty())
          throw std::runtime_error("SOFIE Operator Tile called to Generate without being initialized first");
 
-      bool repeatsKnown = !fRepeats.empty();
       std::string totalElements = ConvertDimShapeToLength(fShapeY);
       std::string kname = "tileKernel_" + opName;
 
-      auto isIdent = [](const std::string &s){
-         if (s.empty() || (s[0] >= '0' && s[0] <= '9')) return false;
-         for (char c : s)
-            if (!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_')) return false;
-         return true;
-      };
-      std::vector<std::string> dynParams;
-      UTILITY::CollectDimParams(fShapeInput, dynParams);
-
-      // Build argument list once, reused for both getValidWorkDiv and exec
       std::string args =
           "alpaka::getPtrNative(deviceBuf_" + fNInput + "), "
           + "alpaka::getPtrNative(deviceBuf_" + fNY + ")";
-      if (!repeatsKnown)
-         args += ", alpaka::getPtrNative(deviceBuf_" + fNRepeats + ")";
-      for (auto &p : dynParams)
+      for (auto &p : GetGPUDynParams())
          args += ", static_cast<std::size_t>(" + p + ")";
       args += ", static_cast<Idx>(" + totalElements + ")";
 

@@ -188,12 +188,10 @@ public:
 
    // Threads per row: pow2 (the tree reduction halves its stride), clamped to a warp and
    // the 1024/block limit, 256 if dynamic.
-   size_t SoftmaxBlockSize() const {
-      size_t axis = fAttrAxis < 0 ? fShape.size() + fAttrAxis : fAttrAxis;
-      std::string as = fShape[axis].GetVal();
-      if (!IsInteger(as))
+   static size_t BlockSize(const std::string &rowLength) {
+      if (!IsInteger(rowLength))
          return 256;
-      size_t n = std::stoul(as);
+      size_t n = std::stoul(rowLength);
       size_t p = 1;
       while (p < n) p <<= 1;
       if (p < 32)   p = 32;
@@ -208,14 +206,10 @@ public:
       opName = "op_" + opName;
       std::string kname = "SoftmaxKernel_" + opName;
 
-      size_t size = fShape.size();
-      size_t axis = fAttrAxis < 0 ? size + fAttrAxis : fAttrAxis;
-
-      std::string axis_size    = fShape[axis].GetVal();
-      std::string inner_stride = UTILITY::ComputeStrideFromShape(fShape)[axis].GetVal();
-
-      const size_t kBlock = SoftmaxBlockSize();
-      std::string bs = std::to_string(kBlock);
+      size_t axis = fAttrAxis < 0 ? fShape.size() + fAttrAxis : fAttrAxis;
+      //a kernel row = one slice along the axis: nElements is the row length, strideAxis the step between its elements
+      auto s = UTILITY::ComputeSliceInfo(fShape, axis);
+      std::string bs = std::to_string(BlockSize(s.nElements));
 
       // block-per-row online softmax
 
@@ -227,6 +221,8 @@ public:
       op += SP + SP + SP + "TAcc const& acc,\n";
       op += SP + SP + SP + "T const* __restrict__ X,\n";
       op += SP + SP + SP + "T* __restrict__ Y,\n";
+      for (auto &p : GetGPUDynParams())
+         op += SP + SP + SP + "std::size_t const " + p + ",\n";
       op += SP + SP + SP + "std::size_t const numRows) const {\n\n";
 
       // declared before the early return so every thread reaches the collective declaration
@@ -236,8 +232,8 @@ public:
       op += SP + SP + SP + "auto const tid = alpaka::getIdx<alpaka::Block, alpaka::Threads>(acc)[0];\n";
       op += SP + SP + SP + "if (row >= numRows) return;\n\n";
 
-      op += SP + SP + SP + "std::size_t const axis_size = " + axis_size + ";\n";
-      op += SP + SP + SP + "std::size_t const inner_stride = " + inner_stride + ";\n";
+      op += SP + SP + SP + "std::size_t const axis_size = " + s.nElements + ";\n";
+      op += SP + SP + SP + "std::size_t const inner_stride = " + s.strideAxis + ";\n";
       op += SP + SP + SP + "std::size_t const row_block = axis_size * inner_stride;\n";
       op += SP + SP + SP + "std::size_t const row_base = (row / inner_stride) * row_block + (row % inner_stride);\n\n";
 
@@ -298,30 +294,24 @@ public:
       opName = "op_" + opName;
       std::string kname = "softmaxKernel_" + opName;
 
-      size_t size = fShape.size();
-      size_t axis = fAttrAxis < 0 ? size + fAttrAxis : fAttrAxis;
-      std::string axis_size  = fShape[axis].GetVal();
-      std::string length_str = ConvertDimShapeToLength(fShape);
-
-      std::string num_rows;
-      if (IsInteger(length_str) && IsInteger(axis_size))
-         num_rows = std::to_string(std::stoul(length_str) / std::stoul(axis_size));
-      else
-         num_rows = "(" + length_str + ") / (" + axis_size + ")";
-
-      const size_t kBlock = SoftmaxBlockSize();
+      size_t axis = fAttrAxis < 0 ? fShape.size() + fAttrAxis : fAttrAxis;
+      auto s = UTILITY::ComputeSliceInfo(fShape, axis);   //nSlices = number of rows, nElements = row length
+      const size_t kBlock = BlockSize(s.nElements);         //threads per row
+      std::string dynArgs;                                  //shape params the kernel body may name (dynamic axis or stride)
+      for (auto &p : GetGPUDynParams()) dynArgs += ", static_cast<std::size_t>(" + p + ")";
 
       std::stringstream out;
       out << "\n//------ SOFTMAX_GPU_ALPAKA\n";
       out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_" << opName << "(\n";
-      out << SP << SP << "Vec::all(static_cast<Idx>(" << num_rows << ")),\n";
-      out << SP << SP << "Vec::all(Idx{" << kBlock << "u}),\n";
+      out << SP << SP << "Vec::all(static_cast<Idx>(" << s.nSlices << ")),\n";   //blocks: one per row
+      out << SP << SP << "Vec::all(Idx{" << kBlock << "u}),\n";                    //threads per block
       out << SP << SP << "Vec::all(Idx{1u}));\n";
       out << SP << "auto task_" << opName << " = alpaka::createTaskKernel<Acc>(workDiv_" << opName
           << ", " << kname
           << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
           << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
-          << ", static_cast<Idx>(" << num_rows << "));\n";
+          << dynArgs
+          << ", static_cast<Idx>(" << s.nSlices << "));\n";
       out << SP << "alpaka::enqueue(queue, task_" << opName << ");\n";
       return out.str();
    }

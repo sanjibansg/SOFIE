@@ -35,17 +35,10 @@ public:
       }
       static_assert( (std::is_same_v<T, float> || std::is_same_v<T, int64_t>),
                   "TMVA::SOFIE - Unsupported type by Range operator");
-      fInputTensorNames = { fNStart, fNLimit, fNDelta };
-      fOutputTensorNames = { fNOutput };
-   }
-
-   std::vector<ETensorType> TypeInference(std::vector<ETensorType> input) override {
-      return input;
-   }
-
-   std::vector<std::vector<size_t>> ShapeInference(std::vector<std::vector<size_t>> input) override {
-      auto ret = input; //suggest copy to compiler
-      return ret;
+      {
+         fInputTensorNames = { fNStart, fNLimit, fNDelta };
+         fOutputTensorNames = { fNOutput };
+      }
    }
 
    void Initialize(RModel& model) override {
@@ -64,12 +57,14 @@ public:
       }
       ETensorType type = ConvertStringToType(fType);
 
+
+
       auto analyzeInput = [&](const std::string & tName, T & value, Dim & dim) {
-         int ftype = 0;
+         int ftype = 0; // type of input (0 intermediate, 1 constant , 2 shape)
          if (model.IsInitializedTensor(tName)) {
             T * data = static_cast<T*>(model.GetInitializedTensorData(tName).get());
             if (!data)
-               throw std::runtime_error("SOFIE Range Op Input Tensor has invalid input data");
+               throw std::runtime_error("SOFIE Range Op Input Tensor has invalid input  data");
             value = *data;
             ftype = 1;
          } else if (model.IsShapeTensor(tName)) {
@@ -94,11 +89,15 @@ public:
       int res2 = analyzeInput(fNLimit, limit_value, limit_dim);
       int res3 = analyzeInput(fNDelta, delta_value, delta_dim);
       if (res1 == 0 || res2 == 0 || res3 == 0) {
+         // cannot know at compile time- need to do fully at run time
+         //
          fShape = {Dim{"range_size_" + fNStart + "_" + fNLimit}};
          model.AddDynamicTensor(fNOutput, type, fShape);
       } else if (res1 == 1 && res2 == 1 && res3 == 1) {
          size_t number_of_elements = std::max(static_cast<int>(std::ceil((limit_value - start_value) / delta_value )) , 0 );
          fIsOutputConstant = true;
+
+         // compute output
          std::vector<T> output(number_of_elements);
          for (size_t i=0; i<number_of_elements; ++i) {
             output[i] =  start_value + (i * delta_value);
@@ -106,7 +105,8 @@ public:
          std::vector<size_t> shape = {number_of_elements};
          model.AddConstantTensor(fNOutput,shape, output.data());
          fShape = ConvertShapeToDim(shape);
-      } else {
+
+      } else { // case of a shape tensor
          std::string start = (res1 == 1) ? std::to_string(start_value) : start_dim.GetVal();
          std::string limit = (res2 == 1) ? std::to_string(limit_value) : limit_dim.GetVal();
          std::string delta = (res3 == 1) ? std::to_string(delta_value) : delta_dim.GetVal();
@@ -132,25 +132,17 @@ public:
             throw
                std::runtime_error("SOFIE Range Op Input Tensor " + ConvertTypeToString(type) + "is not supported");
          }
+
+
          fShape = { Dim {s.str(), static_cast<size_t>(-1)} };
          model.AddDynamicTensor(fNOutput,type, fShape);
       }
+
 
       if (model.Verbose()) {
          std::cout << "Range -> output is " << fNOutput << " : " << ConvertDimShapeToString(fShape);
          if (fIsOutputConstant) std::cout << " : " << ConvertValuesToString(model.GetTensorData<T>(fNOutput));
          std::cout << std::endl;
-      }
-   }
-
-   void GetRangeSize(std::string & outputSizeVar, std::string & outputSize) const {
-      outputSize = fShape[0].param;
-      if (outputSize.find("range_size") != std::string::npos) {
-         outputSizeVar = outputSize;
-         outputSize = "static_cast<size_t>(std::max(std::ceil((static_cast<float>(*tensor_" + fNLimit +
-                ") - static_cast<float>(*tensor_" + fNStart + ")) / static_cast<float>(*tensor_" + fNDelta + ")), 0.0f))";
-      } else {
-         outputSizeVar = "range_op_" + fNOutput;
       }
    }
 
@@ -160,13 +152,20 @@ public:
       out << "\n//------ Range " << opName << "---> " << ConvertDimShapeToString(fShape) << "\n";
       if (fIsOutputConstant) return out.str();
 
+      opName = "op_" + opName;
       if (fShape.empty()) {
          throw std::runtime_error("SOFIE Range operator called to Generate without being initialized first");
       }
 
       std::string outputSizeVar;
-      std::string outputSize;
-      GetRangeSize(outputSizeVar, outputSize);
+      std::string outputSize = fShape[0].param;
+      if (outputSize.find("range_size") != std::string::npos) {
+         outputSizeVar = outputSize;
+         outputSize = "static_cast<size_t>(std::max(std::ceil((static_cast<float>(*tensor_" + fNLimit +
+                ") - static_cast<float>(*tensor_" + fNStart + ")) / static_cast<float>(*tensor_" + fNDelta + ")), 0.0f))";
+      } else {
+         outputSizeVar = "range_" + opName;
+      }
       out << SP << "size_t " << outputSizeVar <<  " = " << outputSize << ";\n";
       out << SP << "for (size_t i = 0; i < " << outputSizeVar << "; i++) {\n";
       out << SP << SP << "tensor_" << fNOutput << "[i] = *tensor_" << fNStart << " + i * (*tensor_" << fNDelta << ");\n";

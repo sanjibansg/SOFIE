@@ -547,8 +547,17 @@ void UnidirectionalBroadcast(const T* data, const std::vector<size_t>& shape, co
 std::vector<size_t> ComputeStrideFromShape(const std::vector<size_t> & shape);
 std::vector<Dim> ComputeStrideFromShape(const std::vector<Dim> & shape);
 
-/// collect the symbolic identifiers used in the dims, deduplicated in first-seen order
-void CollectDimParams(const std::vector<Dim> & dims, std::vector<std::string> & params);
+/// layout of the independent 1-D slices of a row-major tensor along one axis, as code expressions
+/// (shared by the operators working along an axis: TopK, Softmax)
+struct SliceInfo {
+   std::string nBefore;        // slice groups before the axis ("1" for axis 0)
+   std::string nAfter;         // slices per group after the axis
+   std::string nSlices;        // nBefore * nAfter
+   std::string nElements;      // length of a slice (the axis dimension)
+   std::string strideAxis;     // step along the axis
+   std::string strideBefore;   // step between slice groups ("0" for axis 0)
+};
+SliceInfo ComputeSliceInfo(const std::vector<Dim> & shape, size_t axis);
 
 /// function to check if a >> 0 and a < MAX using a single comparison
 //// use trick casting to unsigned values so it becomes a single comparison
@@ -865,6 +874,11 @@ void ReadTensorFromStream(std::istream &is, T &target, std::string const &expect
 //Utility functions to generate code
 void EmitNestedLoops(std::stringstream &out, size_t loopRank, const std::vector<Dim> shape);
 void CloseNestedLoops(std::stringstream &out, size_t loopRank);
+
+//emit the out_0..out_{D-1} coordinate declarations of the flat kernel index elem_idx
+//from the output strides and shape
+void EmitOutputCoords(std::string &op, const std::string &indent,
+                      const std::vector<Dim> &strides, const std::vector<Dim> &shape);
 
 
 // code for the memory greeding allocations

@@ -19,7 +19,9 @@ private:
    int fAttrLargest;
    int fAttrSorted;
 
-   size_t fTopKCount;
+   Dim fTopKCount;      // k clamped to the axis dimension: a number for a static axis, a
+                        // std::min(k, axis) expression for a dynamic one
+   size_t fRequestedK;  // the model's requested k, unclamped; sizes the GPU register buffers
    std::string fNK;
    std::string fNX;
    std::string fNVal;
@@ -43,33 +45,43 @@ public:
         }
 
    std::vector<ETensorType> TypeInference(std::vector<ETensorType> input) override {
-         ETensorType ret = input[0];
-         return {ret, ret};
-      }
+      ETensorType ret = input[0];
+      return {ret, ret};
+   }
 
    void Initialize(RModel& model) override {
       if (model.CheckIfTensorAlreadyExist(fNX) == false) {
+         // input must be a graph input, or already initialized intermediate tensor
          throw std::runtime_error("SOFIE TopK Op Input Tensor is not found in model");
       }
       if (model.CheckIfTensorAlreadyExist(fNK) == false) {
+         // input must be a graph input, or already initialized intermediate tensor
          throw std::runtime_error("SOFIE TopK Op Input Tensor i.e. K is not found in model");
       }
 
       fShapeX = model.GetDimTensorShape(fNX);
       auto kptr = static_cast<int64_t *>(model.GetInitializedTensorData(fNK).get());
       size_t kval = *kptr;
+      fRequestedK = kval;
       model.SetNotWritableInitializedTensor(fNK);
       fAttrAxis = fAttrAxis < 0 ? fShapeX.size() + fAttrAxis : fAttrAxis;
       if (static_cast<size_t>(fAttrAxis) >= fShapeX.size()) {
-         throw std::runtime_error("TMVA::SOFIE ONNX TopK op axis = " + std::to_string(fAttrAxis) +
+         throw std::runtime_error("SOFIE TopK op axis = " + std::to_string(fAttrAxis) +
             " value exceeds size of tensor " + fNX + " of size " + std::to_string(fShapeX.size()) + " .");
       }
-      fTopKCount = fShapeX[fAttrAxis].isParam ? kval : std::min(kval, fShapeX[fAttrAxis].dim);
+      // fTopKCount cannot be larger than the axis dimension
+      if (fShapeX[fAttrAxis].isParam)
+         fTopKCount = Dim{std::string("std::min(size_t(" + std::to_string(kval) + "), " + fShapeX[fAttrAxis].GetVal() + ")" ), static_cast<size_t>(-1) };
+      else
+         fTopKCount = Dim { std::min(kval, fShapeX[fAttrAxis].dim) };
 
+      // output shape is equal to input shape apart for value in fAttrAxis
       fShapeY = fShapeX;
       fShapeY[fAttrAxis] = Dim{fTopKCount};
 
       model.AddIntermediateTensor(fNVal, model.GetTensorType(fNX), fShapeY);
+
+      // output indices should be an int64 tensor
       model.AddIntermediateTensor(fNInd, ETensorType::INT64, fShapeY);
       fType = ConvertTypeToString(model.GetTensorType(fNX));
 
@@ -85,35 +97,32 @@ public:
          throw std::runtime_error("SOFIE Operator TopK called to Generate without being initialized first");
       }
       std::stringstream out;
-      size_t size = fShapeX.size();
-      size_t axis = fAttrAxis < 0 ? size + fAttrAxis : fAttrAxis;
       out << "\n" << SP << "//------ TopK\n";
 
-      auto strideX = UTILITY::ComputeStrideFromShape(fShapeX);
-      auto strideY = UTILITY::ComputeStrideFromShape(fShapeY);
-      std::vector<Dim> shape_before(fShapeX.begin(), fShapeX.begin() + axis);
-      std::string n_before = (axis > 0) ? ConvertDimShapeToLength(shape_before) : "1";
-      std::string n_after = strideX[axis].GetVal();
-      std::string n_elements = fShapeX[axis].GetVal();
+      // we perform loop on dimension before sorted axis and after sorted axis
+      size_t axis = fAttrAxis < 0 ? fShapeX.size() + fAttrAxis : fAttrAxis;
+      auto sx = UTILITY::ComputeSliceInfo(fShapeX, axis), sy = UTILITY::ComputeSliceInfo(fShapeY, axis);   //X has n elements along the axis, Y has k: two layouts
 
-      out << SP << "{\n";
-      out << SP << "std::vector<std::pair<float,int64_t>> elements(" << n_elements << ");\n";
-      if (n_before != "1") {
-         out << SP << "for (size_t i = 0; i < " << n_before << "; i++) {\n";
-         out << SP << SP << "size_t xoffset = i*" << strideX[axis-1] << ";\n";
-         out << SP << SP << "size_t yoffset = i*" << strideY[axis-1] << ";\n";
+      out << SP << "{\n"; // to define a separate scope for the operator code
+      out << SP << "std::vector<std::pair<float,int64_t>> elements(" << sx.nElements << ");\n";
+      // loop on elements before
+      if (sx.nBefore != "1") {
+         out << SP << "for (size_t i = 0; i < " << sx.nBefore << "; i++) {\n";
+         out << SP << SP << "size_t xoffset = i*" << sx.strideBefore << ";\n";
+         out << SP << SP << "size_t yoffset = i*" << sy.strideBefore << ";\n";
          out << SP;
       } else {
          out << SP << "size_t xoffset = 0;\n";
          out << SP << "size_t yoffset = 0;\n";
       }
-      if (n_after != "1")
-         out << SP << "for (size_t j = 0; j < " << n_after << "; j++) {\n";
+      if (sx.nAfter != "1")
+         out << SP << "for (size_t j = 0; j < " << sx.nAfter << "; j++) {\n";
       else
          out << SP << "const size_t j = 0;\n";
 
-      out << SP << SP << "for (size_t l = 0; l < " << n_elements << "; l++) {\n";
-      out << SP << SP << SP << "elements[l] = std::make_pair(tensor_" << fNX << "[xoffset + " << strideX[axis] << "*l + j], l);\n";
+      // copy elements to be sorted in vector of pair
+      out << SP << SP << "for (size_t l = 0; l < " << sx.nElements << "; l++) {\n";
+      out << SP << SP << SP << "elements[l] = std::make_pair(tensor_" << fNX << "[xoffset + " << sx.strideAxis << "*l + j], l);\n";
       out << SP << SP << "}\n";
 
       if (fAttrSorted) {
@@ -124,15 +133,17 @@ public:
             out << SP << SP << "std::partial_sort(elements.begin(),elements.begin()+" << fTopKCount << ",elements.end(),"
                 << "[](std::pair<float,int64_t>a,std::pair<float,int64_t>b){return (a.first!=b.first) ? (a.first<b.first) : a.second < b.second;});\n";
       } else
+         // in this case we don't need to return sorted elements, so we keep same order as before
          out << SP << SP << "std::partial_sort(elements.begin(),elements.begin()+" << fTopKCount << ",elements.end());\n";
 
+      // copy the selected elements in the output
       out << SP << SP << "for (size_t l = 0; l < " << fTopKCount << "; l++) {\n";
-      out << SP << SP << SP << "tensor_" << fNVal << "[yoffset + " << strideY[axis] << "*l + j] = elements[l].first;\n";
-      out << SP << SP << SP << "tensor_" << fNInd << "[yoffset + " << strideY[axis] << "*l + j] = elements[l].second;\n";
+      out << SP << SP << SP << "tensor_" << fNVal << "[yoffset + " << sy.strideAxis << "*l + j] = elements[l].first;\n";
+      out << SP << SP << SP << "tensor_" << fNInd << "[yoffset + " << sy.strideAxis << "*l + j] = elements[l].second;\n";
       out << SP << SP << "}\n";
-      if (n_after != "1") out << SP << SP << "}\n";
-      if (n_before != "1") out << SP << "}\n";
-      out << SP << "}\n";
+      if (sx.nAfter != "1") out << SP << SP << "}\n";
+      if (sx.nBefore != "1") out << SP << "}\n";
+      out << SP << "}\n"; // end operator scope
       return out.str();
    }
 
@@ -142,7 +153,9 @@ public:
       if (fShapeX.empty())
          throw std::runtime_error("SOFIE Operator TopK called to Generate without being initialized first");
 
-      std::string K   = std::to_string(fTopKCount);
+      // register buffers need a compile-time size: the requested k (the runtime clamp
+      // only limits how many elements are scanned into them)
+      std::string K   = std::to_string(fTopKCount.isParam ? fRequestedK : fTopKCount.dim);
       std::string CMP = fAttrLargest ? ">" : "<";
       std::string kname = "TopKKernel_" + fNVal;
 
@@ -210,17 +223,8 @@ public:
          throw std::runtime_error("SOFIE Operator TopK called to Generate without being initialized first");
 
       size_t axis = fAttrAxis < 0 ? fShapeX.size() + fAttrAxis : fAttrAxis;
-      auto strideX = UTILITY::ComputeStrideFromShape(fShapeX);
-      auto strideY = UTILITY::ComputeStrideFromShape(fShapeY);
-      std::vector<Dim> shape_before(fShapeX.begin(), fShapeX.begin() + axis);
-      std::string n_before = (axis > 0) ? ConvertDimShapeToLength(shape_before) : "1";
-      std::string n_after = strideX[axis].GetVal();
-      std::string numSlices = "((" + n_before + ")*(" + n_after + "))";
-      std::string nElAxis = fShapeX[axis].GetVal();
-      std::string strideX_axis = strideX[axis].GetVal();
-      std::string strideY_axis = strideY[axis].GetVal();
-      std::string strideX_before = (axis > 0) ? strideX[axis-1].GetVal() : "0";
-      std::string strideY_before = (axis > 0) ? strideY[axis-1].GetVal() : "0";
+      auto sx = UTILITY::ComputeSliceInfo(fShapeX, axis), sy = UTILITY::ComputeSliceInfo(fShapeY, axis);   //X has n elements along the axis, Y has k: two layouts
+      std::string numSlices = "((" + sx.nBefore + ")*(" + sx.nAfter + "))";
 
       std::stringstream out;
       out << "\n//-- TopK_GPU_ALPAKA\n";
@@ -231,13 +235,13 @@ public:
           << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
           << ", alpaka::getPtrNative(deviceBuf_" << fNVal << ")"
           << ", alpaka::getPtrNative(deviceBuf_" << fNInd << ")"
-          << ", static_cast<std::size_t>(" << numSlices      << ")"
-          << ", static_cast<std::size_t>(" << n_after        << ")"
-          << ", static_cast<std::size_t>(" << nElAxis        << ")"
-          << ", static_cast<std::size_t>(" << strideX_axis   << ")"
-          << ", static_cast<std::size_t>(" << strideX_before << ")"
-          << ", static_cast<std::size_t>(" << strideY_axis   << ")"
-          << ", static_cast<std::size_t>(" << strideY_before << "));\n";
+          << ", static_cast<std::size_t>(" << numSlices        << ")"
+          << ", static_cast<std::size_t>(" << sx.nAfter         << ")"
+          << ", static_cast<std::size_t>(" << sx.nElements      << ")"
+          << ", static_cast<std::size_t>(" << sx.strideAxis    << ")"
+          << ", static_cast<std::size_t>(" << sx.strideBefore  << ")"
+          << ", static_cast<std::size_t>(" << sy.strideAxis    << ")"
+          << ", static_cast<std::size_t>(" << sy.strideBefore  << "));\n";
       out << SP << "alpaka::enqueue(queue, task_" << fNVal << ");\n";
       return out.str();
    }

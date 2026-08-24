@@ -375,18 +375,6 @@
             return out.str();
          }
 
-   // Dynamic shape params (e.g. N, n_pf) that appear in the emitted index math and are
-   // passed to the kernel as size_t args; shared by the kernel signature and the launch.
-   std::vector<std::string> GetGPUDynParams() const {
-      std::vector<std::string> params;
-      UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fOutputShape), params);
-      for (std::size_t k = 0; k < fInputShapes.size(); ++k) {
-         UTILITY::CollectDimParams({fInputShapes[k][fAxis]}, params);
-         UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fInputShapes[k]), params);
-      }
-      return params;
-   }
-
    std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
       if (fIsOutputConstant || fIsOutputParamShape) return "";
       opName = "op_" + opName;

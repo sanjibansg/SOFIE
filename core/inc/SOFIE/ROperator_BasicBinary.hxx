@@ -276,6 +276,9 @@ public:
                          << ConvertShapeToString(fShapeY) << std::endl;
             }
             // we convert non-dim shapes to Dim shapes
+            // (fShapeA/fShapeB were rank-padded to fShapeY by MultidirectionalBroadcastShape)
+            fDimShapeA = ConvertShapeToDim(fShapeA);
+            fDimShapeB = ConvertShapeToDim(fShapeB);
             fDimShapeY = ConvertShapeToDim(fShapeY);
          }
       } else {
@@ -451,55 +454,12 @@ public:
       return out.str();
    }
 
-   // Per-dimension broadcast layout of the two inputs against the output: rank-padded
-   // shapes (dimA/dimB), broadcast masks (bcastA/bcastB), scalar/contiguous fast-path
-   // flags (isAScalar/isBScalar, isAContiguous/isBContiguous) and the dynamic shape
-   // params the kernel needs (dynParams). Filled by GetGPUBroadcastInfo() and used by
-   // both Generate_GPU_Kernel_ALPAKA (kernel signature and index math) and
-   // Generate_GPU_ALPAKA (launch arguments), so the two cannot drift apart.
-   struct GPUBroadcastInfo {
-      std::vector<Dim> dimA;
-      std::vector<Dim> dimB;
-      std::vector<bool> bcastA;
-      std::vector<bool> bcastB;
-      bool isAScalar = true;
-      bool isBScalar = true;
-      bool isAContiguous = true;
-      bool isBContiguous = true;
-      bool needCoords = false;
-      std::vector<std::string> dynParams;
-   };
-
-   GPUBroadcastInfo GetGPUBroadcastInfo() const {
-      GPUBroadcastInfo info;
-      const std::size_t D = fDimShapeY.size();
-      info.dimA.assign(D, Dim{1});
-      info.dimB.assign(D, Dim{1});
-      for (std::size_t i = 0; i < fDimShapeA.size(); i++)
-         info.dimA[D - fDimShapeA.size() + i] = fDimShapeA[i];
-      for (std::size_t i = 0; i < fDimShapeB.size(); i++)
-         info.dimB[D - fDimShapeB.size() + i] = fDimShapeB[i];
-
-      info.bcastA.resize(D);
-      info.bcastB.resize(D);
-      for (std::size_t d = 0; d < D; d++) {
-         info.bcastA[d] = !info.dimA[d].isParam && info.dimA[d].dim == 1;
-         info.bcastB[d] = !info.dimB[d].isParam && info.dimB[d].dim == 1;
-         if (!info.bcastA[d]) info.isAScalar = false;
-         if (!info.bcastB[d]) info.isBScalar = false;
-         if (info.dimA[d].GetVal() != fDimShapeY[d].GetVal()) info.isAContiguous = false;
-         if (info.dimB[d].GetVal() != fDimShapeY[d].GetVal()) info.isBContiguous = false;
-      }
-      bool generalA = !info.isAScalar && !info.isAContiguous;
-      bool generalB = !info.isBScalar && !info.isBContiguous;
-      info.needCoords = generalA || generalB;
-      if (!info.needCoords)
-         return info;
-
-      UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(fDimShapeY), info.dynParams);
-      if (generalA) UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(info.dimA), info.dynParams);
-      if (generalB) UTILITY::CollectDimParams(UTILITY::ComputeStrideFromShape(info.dimB), info.dynParams);
-      return info;
+   // fDimShapeA/fDimShapeB are rank-padded to fDimShapeY by Initialize, so a broadcast
+   // dim is a literal 1. An input is either fully broadcast (scalar, all dims 1), not
+   // broadcast (same shape as the output), or partially broadcast - only the last case
+   // needs per-dim index decomposition in the kernel.
+   bool IsPartialBroadcast(const std::vector<Dim> &shape) const {
+      return ConvertDimShapeToLength(shape) != "1" && !UTILITY::AreSameShape(shape, fDimShapeY);
    }
 
    std::string Generate_GPU_Kernel_ALPAKA(std::string opName) {
@@ -508,44 +468,45 @@ public:
       if (fDimShapeY.empty())
          throw std::runtime_error("SOFIE Operator Basic Binary called to Generate without being initialized first");
 
-      auto info = GetGPUBroadcastInfo();
       const std::size_t D = fDimShapeY.size();
       auto stridesY = UTILITY::ComputeStrideFromShape(fDimShapeY);
-      auto stridesA = UTILITY::ComputeStrideFromShape(info.dimA);
-      auto stridesB = UTILITY::ComputeStrideFromShape(info.dimB);
-      bool generalA = !info.isAScalar && !info.isAContiguous;
-      bool generalB = !info.isBScalar && !info.isBContiguous;
+      auto stridesA = UTILITY::ComputeStrideFromShape(fDimShapeA);
+      auto stridesB = UTILITY::ComputeStrideFromShape(fDimShapeB);
+      bool isAScalar = ConvertDimShapeToLength(fDimShapeA) == "1";
+      bool isBScalar = ConvertDimShapeToLength(fDimShapeB) == "1";
+      bool isAPartialBroadcast = IsPartialBroadcast(fDimShapeA);
+      bool isBPartialBroadcast = IsPartialBroadcast(fDimShapeB);
 
       std::string op;
       op = "\n//------ "+opName+"_"+BinaryOperatorTrait<T, Op>::Name()+"_KERNEL_ALPAKA\n";
       op += SP + "struct Binary"+opName+BinaryOperatorTrait<T, Op>::Name()+"Kernel {\n";
       op += SP + SP + "template<typename TAcc, typename T>\n";
       op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * A, T const * B, T * C";
-      for (auto &p : info.dynParams)
+      for (auto &p : GetGPUDynParams())
          op += ", std::size_t const " + p;
       op += ", std::size_t const totalElements) const {\n";
       op += SP + SP + SP + "auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
       op += SP + SP + SP + "if (idx < totalElements) {\n";
 
       // decompose idx into output coords, skipping broadcast dims (stride 0)
-      if (info.needCoords) {
+      if (isAPartialBroadcast || isBPartialBroadcast) {
          op += SP + SP + SP + SP + "std::size_t remaining = idx;\n";
          op += SP + SP + SP + SP + "std::size_t coord;\n";
-         if (generalA) op += SP + SP + SP + SP + "std::size_t idxA = 0;\n";
-         if (generalB) op += SP + SP + SP + SP + "std::size_t idxB = 0;\n";
+         if (isAPartialBroadcast) op += SP + SP + SP + SP + "std::size_t idxA = 0;\n";
+         if (isBPartialBroadcast) op += SP + SP + SP + SP + "std::size_t idxB = 0;\n";
          for (std::size_t d = 0; d < D; d++) {
             std::string sY = "(" + stridesY[d].GetVal() + ")";
             op += SP + SP + SP + SP + "coord = remaining / " + sY + ";\n";
             if (d + 1 < D)
                op += SP + SP + SP + SP + "remaining -= coord * " + sY + ";\n";
-            if (generalA && !info.bcastA[d])
+            if (isAPartialBroadcast && fDimShapeA[d].GetVal() != "1")
                op += SP + SP + SP + SP + "idxA += coord * (" + stridesA[d].GetVal() + ");\n";
-            if (generalB && !info.bcastB[d])
+            if (isBPartialBroadcast && fDimShapeB[d].GetVal() != "1")
                op += SP + SP + SP + SP + "idxB += coord * (" + stridesB[d].GetVal() + ");\n";
          }
       }
-      std::string indexA = info.isAScalar ? "0" : (info.isAContiguous ? "idx" : "idxA");
-      std::string indexB = info.isBScalar ? "0" : (info.isBContiguous ? "idx" : "idxB");
+      std::string indexA = isAScalar ? "0" : (isAPartialBroadcast ? "idxA" : "idx");
+      std::string indexB = isBScalar ? "0" : (isBPartialBroadcast ? "idxB" : "idx");
       op += SP + SP + SP + SP + "C[idx] = " + BinaryOperatorTrait<T, Op>::Op("A["+indexA+"]", "B["+indexB+"]") + ";\n";
       op += SP + SP + SP + "}\n";
       op += SP + SP + "}\n";
@@ -569,7 +530,6 @@ public:
       }
       std::stringstream out;
       auto length = ConvertDimShapeToLength(fDimShapeY);
-      auto info = GetGPUBroadcastInfo();
       out << "\n//------ "+OpName+"_ALPAKA\n";
       out << SP << "auto const elementsPerThread_"<<fNY<<" = Vec::all(static_cast<Idx>(1));\n";
       out << SP << "auto const elementsPerGrid_"<<fNY<<" = Vec::all(Idx{"<< length << "});\n";
@@ -577,7 +537,7 @@ public:
       out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNY
          << ", binary" << OpName << "Kernel, alpaka::getPtrNative(deviceBuf_" << fNA
          << "), alpaka::getPtrNative(deviceBuf_" << fNB << "), alpaka::getPtrNative(deviceBuf_" << fNY << ")";
-      for (auto &p : info.dynParams)
+      for (auto &p : GetGPUDynParams())
          out << ", static_cast<std::size_t>(" << p << ")";
       out << ", static_cast<Idx>(" << length << "));\n";
       out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";
