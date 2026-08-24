@@ -243,7 +243,7 @@ public:
       op += SP + SP + SP + "for (std::size_t l = tid; l < axis_size; l += " + bs + "u) {\n";
       op += SP + SP + SP + SP + "T x = X[row_base + l * inner_stride];\n";
       op += SP + SP + SP + SP + "T m_new = (x > m) ? x : m;\n";
-      op += SP + SP + SP + SP + "d = d * alpaka::math::exp(acc, m - m_new) + alpaka::math::exp(acc, x - m_new);\n";
+      op += SP + SP + SP + SP + "d = d * exp(acc, m - m_new) + exp(acc, x - m_new);\n";
       op += SP + SP + SP + SP + "m = m_new;\n";
       op += SP + SP + SP + "}\n";
       op += SP + SP + SP + "smax[tid] = m;\n";
@@ -257,7 +257,7 @@ public:
       op += SP + SP + SP + SP + SP + "T m_a = smax[tid];\n";
       op += SP + SP + SP + SP + SP + "T m_b = smax[tid + s];\n";
       op += SP + SP + SP + SP + SP + "T m_r = (m_b > m_a) ? m_b : m_a;\n";
-      op += SP + SP + SP + SP + SP + "ssum[tid] = ssum[tid] * alpaka::math::exp(acc, m_a - m_r) + ssum[tid + s] * alpaka::math::exp(acc, m_b - m_r);\n";
+      op += SP + SP + SP + SP + SP + "ssum[tid] = ssum[tid] * exp(acc, m_a - m_r) + ssum[tid + s] * exp(acc, m_b - m_r);\n";
       op += SP + SP + SP + SP + SP + "smax[tid] = m_r;\n";
       op += SP + SP + SP + SP + "}\n";
       op += SP + SP + SP + SP + "alpaka::syncBlockThreads(acc);\n";
@@ -270,10 +270,10 @@ public:
       op += SP + SP + SP + "T const inv = static_cast<T>(1) / sum;\n";
       op += SP + SP + SP + "for (std::size_t l = tid; l < axis_size; l += " + bs + "u) {\n";
       op += SP + SP + SP + SP + "std::size_t const idx = row_base + l * inner_stride;\n";
-      op += SP + SP + SP + SP + "T e = alpaka::math::exp(acc, X[idx] - vmax) * inv;\n";
+      op += SP + SP + SP + SP + "T e = exp(acc, X[idx] - vmax) * inv;\n";
       op += SP + SP + SP + SP + "Y[idx] = e;\n";
       if (fLogSoftmax)
-         op += SP + SP + SP + SP + "Y[idx] = alpaka::math::log(acc, e);\n";
+         op += SP + SP + SP + SP + "Y[idx] = log(acc, e);\n";
       op += SP + SP + SP + "}\n";
 
       op += SP + SP + "}\n";
