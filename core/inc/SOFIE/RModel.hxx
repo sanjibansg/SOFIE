@@ -8,6 +8,10 @@
 
 namespace SOFIE {
 
+/// Session member holding the construction-time value of a shape parameter (N -> fN);
+/// shared by the CPU and GPU session generators
+std::string memberNameForDimShape(std::string name);
+
 class RModel final : public RModel_Base {
 
    friend class RModelProfiler;

@@ -22,6 +22,13 @@ private:
    std::vector<Dim> fShape;
    std::string fType;
 
+   // element count computed at run time from the three scalar inputs, read through host
+   // pointers named tensor_<input>; shared by the CPU loop and the GPU launch
+   std::string RuntimeSizeExpr() const {
+      return "static_cast<size_t>(std::max(std::ceil((static_cast<float>(*tensor_" + fNLimit +
+             ") - static_cast<float>(*tensor_" + fNStart + ")) / static_cast<float>(*tensor_" + fNDelta + ")), 0.0f))";
+   }
+
 public:
    ROperator_Range(){}
 
@@ -161,8 +168,7 @@ public:
       std::string outputSize = fShape[0].param;
       if (outputSize.find("range_size") != std::string::npos) {
          outputSizeVar = outputSize;
-         outputSize = "static_cast<size_t>(std::max(std::ceil((static_cast<float>(*tensor_" + fNLimit +
-                ") - static_cast<float>(*tensor_" + fNStart + ")) / static_cast<float>(*tensor_" + fNDelta + ")), 0.0f))";
+         outputSize = RuntimeSizeExpr();
       } else {
          outputSizeVar = "range_" + opName;
       }
@@ -204,15 +210,42 @@ public:
          throw std::runtime_error("SOFIE Range operator called to Generate without being initialized first");
       }
 
+      opName = "op_" + opName;
       std::string outputSize = fShape[0].param;
       if (outputSize.find("range_size") != std::string::npos) {
-         // the size expression dereferences the scalar inputs on the host, which on GPU
-         // would need a device->host read; not supported yet, so skip GPU codegen here
-         out << SP << "// Range: fully run-time size not supported on alpaka backend (op skipped)\n";
-         return out.str();
+         /*
+          * Run-time size: start, limit and delta are produced by other operators, so their values
+          * exist only on the device during inference. The generated code copies the three scalars
+          * to the host, computes the element count with the same expression the CPU code uses, and
+          * declares it under the name the downstream launches already reference. The output buffer
+          * was allocated in the constructor from the value passed there under that same name, so
+          * the count is checked against it before the kernel runs.
+          */
+         std::vector<std::string> inputs;
+         for (auto &in : {fNStart, fNLimit, fNDelta}) {
+            if (std::find(inputs.begin(), inputs.end(), in) == inputs.end())
+               inputs.push_back(in);
+         }
+         std::string sizeMember = memberNameForDimShape(outputSize);
+
+         out << SP << "size_t " << outputSize << ";\n";
+         out << SP << "{\n";
+         for (auto &in : inputs) {
+            out << SP << SP << "auto host_" << in << " = alpaka::allocBuf<" << fType << ", Idx>(host, Ext1D::all(Idx{1}));\n";
+            out << SP << SP << "alpaka::memcpy(queue, host_" << in << ", deviceBuf_" << in << ");\n";
+         }
+         out << SP << SP << "alpaka::wait(queue);\n";
+         for (auto &in : inputs) {
+            out << SP << SP << "const " << fType << "* tensor_" << in << " = alpaka::getPtrNative(host_" << in << ");\n";
+         }
+         out << SP << SP << outputSize << " = " << RuntimeSizeExpr() << ";\n";
+         out << SP << "}\n";
+         out << SP << "if (" << outputSize << " > " << sizeMember << ") {\n";
+         out << SP << SP << "throw std::runtime_error(\"SOFIE Range " << opName
+             << ": run-time size exceeds the size given at construction (" << outputSize << ")\");\n";
+         out << SP << "}\n";
       }
 
-      opName = "op_" + opName;
       out << SP << "{\n";
       out << SP << SP << "auto const elementsPerGrid_" << opName << " = Vec::all(Idx{" << outputSize << "});\n";
       out << SP << SP << "auto const workDiv_" << opName << " = sofie_workdiv(elementsPerGrid_" << opName << ");\n";

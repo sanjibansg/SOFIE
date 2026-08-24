@@ -86,7 +86,8 @@ public:
          auto ax = fAttrAxes;
          std::sort(ax.begin(), ax.end());
          for (size_t j = 0; j < ax.size(); j++) {
-            if (outputShape.size() > 0) {
+            // erase reduced dimensions, but keep last one
+            if (outputShape.size() > 1) {
                outputShape.erase(outputShape.begin() + ax[j]);
                for (size_t k = j+1; k < ax.size(); k++)
                   ax[k] -= 1;

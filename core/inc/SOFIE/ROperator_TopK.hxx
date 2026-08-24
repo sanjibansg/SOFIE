@@ -153,8 +153,8 @@ public:
       if (fShapeX.empty())
          throw std::runtime_error("SOFIE Operator TopK called to Generate without being initialized first");
 
-      // register buffers need a compile-time size: the requested k (the runtime clamp
-      // only limits how many elements are scanned into them)
+      // register buffers need a compile-time size: the requested k; topKCount = min(k, n)
+      // bounds the fill/scan/store loops at runtime, matching the clamped output shape
       std::string K   = std::to_string(fTopKCount.isParam ? fRequestedK : fTopKCount.dim);
       std::string CMP = fAttrLargest ? ">" : "<";
       std::string kname = "TopKKernel_" + fNVal;
@@ -183,18 +183,19 @@ public:
       op += SP + SP + SP + "std::size_t const j = slice % nAfter;\n";
       op += SP + SP + SP + "std::size_t const xbase = i * strideXBefore + j;\n";
       op += SP + SP + SP + "std::size_t const ybase = i * strideYBefore + j;\n\n";
+      op += SP + SP + SP + "std::size_t const topKCount = nElAxis < " + K + " ? nElAxis : " + K + ";\n\n";
 
       op += SP + SP + SP + "T bestV[" + K + "];\n";
       op += SP + SP + SP + "int64_t bestI[" + K + "];\n\n";
 
-      op += SP + SP + SP + "for (int64_t l = 0; l < " + K + "; ++l) {\n";
+      op += SP + SP + SP + "for (int64_t l = 0; l < (int64_t)topKCount; ++l) {\n";
       op += SP + SP + SP + SP + "T v = x[xbase + strideXAxis * (std::size_t)l];\n";
       op += SP + SP + SP + SP + "int64_t p = l;\n";
       op += SP + SP + SP + SP + "while (p > 0 && v " + CMP + " bestV[p-1]) { bestV[p] = bestV[p-1]; bestI[p] = bestI[p-1]; --p; }\n";
       op += SP + SP + SP + SP + "bestV[p] = v; bestI[p] = l;\n";
       op += SP + SP + SP + "}\n\n";
 
-      op += SP + SP + SP + "for (int64_t l = " + K + "; l < (int64_t)nElAxis; ++l) {\n";
+      op += SP + SP + SP + "for (int64_t l = (int64_t)topKCount; l < (int64_t)nElAxis; ++l) {\n";
       op += SP + SP + SP + SP + "T v = x[xbase + strideXAxis * (std::size_t)l];\n";
       op += SP + SP + SP + SP + "if (v " + CMP + " bestV[" + K + "-1]) {\n";
       op += SP + SP + SP + SP + SP + "int64_t p = " + K + "-1;\n";
@@ -203,7 +204,7 @@ public:
       op += SP + SP + SP + SP + "}\n";
       op += SP + SP + SP + "}\n\n";
 
-      op += SP + SP + SP + "for (int64_t s = 0; s < " + K + "; ++s) {\n";
+      op += SP + SP + SP + "for (int64_t s = 0; s < (int64_t)topKCount; ++s) {\n";
       op += SP + SP + SP + SP + "vals[ybase + strideYAxis * (std::size_t)s] = bestV[s];\n";
       op += SP + SP + SP + SP + "inds[ybase + strideYAxis * (std::size_t)s] = bestI[s];\n";
       op += SP + SP + SP + "}\n";

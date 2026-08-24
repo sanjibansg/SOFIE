@@ -346,6 +346,16 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    fGC += "void _infer_impl(";
    fGC += GenerateImplSignature_GPU_ALPAKA();
    fGC += "){\n";
+   // device buffers were sized in the ctor from its shape params; refuse larger ones
+   // (same check and message as the CPU session)
+   ForEachInferArg_GPU_ALPAKA(
+      [&](const std::string &p) {
+         fGC += SP + "if (" + p + " > " + memberNameForDimShape(p) + ") {\n";
+         fGC += SP + SP + "throw std::runtime_error(\"sofie: dynamic input tensor shape parameter " + p +
+                " exceeds the initialized maximum allowed shape.\");\n";
+         fGC += SP + "}\n";
+      },
+      [](const std::string &) {});
 
    // GPU profiling: _infer_impl is a member of Session, so fProfilingResults
    // is directly accessible without any alias.
@@ -515,7 +525,6 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       SOFIE::OperatorKind::RELU,
       SOFIE::OperatorKind::SIGMOID,
       SOFIE::OperatorKind::TANH,
-      SOFIE::OperatorKind::SOFTMAX,
       SOFIE::OperatorKind::LEAKYRELU,
       SOFIE::OperatorKind::EINSUM,
       SOFIE::OperatorKind::ELU,
@@ -674,24 +683,39 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          }
          fGC += "\nalpaka::wait(queue);\n";
 
-         std::string ctorBody = fGC;
+         /*
+          * Constructor shape parameters: first the ones the infer signature introduces, in that
+          * order, so positional constructor arguments cannot permute on multi-symbol models; then
+          * the ones an operator registered itself (for example the run-time size of a Range
+          * output). The same list drives the constructor signature, the Session members that keep
+          * the construction-time values, and their assignment at the top of the constructor body.
+          */
+         std::vector<std::string> ctorParamNames;
+         ForEachInferArg_GPU_ALPAKA(
+            [&](const std::string &p) { ctorParamNames.push_back(p); },
+            [](const std::string &) {});
+         for (auto &p : fShapeParams) {
+            if (std::find(ctorParamNames.begin(), ctorParamNames.end(), p.first) == ctorParamNames.end())
+               ctorParamNames.push_back(p.first);
+         }
+
+         std::string ctorBody;
+         for (auto &p : ctorParamNames)
+            ctorBody += SP + memberNameForDimShape(p) + " = " + p + ";\n";
+         ctorBody += fGC;
          fGC = savedGC;
 
-         // shape params in declaration order matching the infer signature, so positional
-         // ctor args cannot permute on multi-symbol models
          std::string ctorParams;
-         if (!fShapeParams.empty()) {
-            std::unordered_map<std::string, int> seenParam;
-            ForEachInferArg_GPU_ALPAKA(
-               [&](const std::string &p) {
-                  seenParam[p] = 1;
-                  ctorParams += ",\n        size_t " + p + " = " + fShapeParams[p];
-               },
-               [](const std::string &) {});
-            for (auto &p : fShapeParams)
-               if (seenParam.count(p.first) == 0)
-                  ctorParams += ",\n        size_t " + p.first + " = " + p.second;
-         }
+         for (auto &p : ctorParamNames)
+            ctorParams += ",\n        size_t " + p + " = " + fShapeParams[p];
+
+         /*
+          * One Session member per shape parameter, the same members the CPU session declares.
+          * The infer arguments are checked against them at the top of _infer_impl; a parameter
+          * registered by an operator is checked by that operator.
+          */
+         for (auto &p : ctorParamNames)
+            fGC += "size_t " + memberNameForDimShape(p) + ";\n";
 
          // ---- public constructors with inlined body ----
          fGC += "public:\n";
