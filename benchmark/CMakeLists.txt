@@ -25,6 +25,8 @@ option(SOFIE_BENCHMARK_TRT "Enable TensorRT benchmark comparison" OFF)
 
 option(SOFIE_BENCHMARK_AOT "Enable PyTorch AOTInductor benchmark comparison" OFF)
 
+option(SOFIE_BENCHMARK_MAMBA_AOT "Enable Mamba custom-op support for AOTInductor" OFF)
+
 option(SOFIE_BENCHMARK_PROFILE
     "Enable per-operator GPU profiling (per-op timing + memory breakdown). \
 Mutually exclusive with throughput benchmarking — rebuild without this flag \
@@ -254,6 +256,11 @@ set(BENCHMARK_MODEL_CU_SRCS        "")
 foreach(ONNX_FILE ${BENCHMARK_ONNX_MODELS})
     get_filename_component(MODEL_NAME "${ONNX_FILE}" NAME_WE)
 
+    set(MODEL_AOT_ENABLED TRUE)
+    if(MODEL_NAME MATCHES "^mambav2_" AND NOT SOFIE_BENCHMARK_MAMBA_AOT)
+        set(MODEL_AOT_ENABLED FALSE)
+    endif()
+
     string(REGEX REPLACE "[^A-Za-z0-9]" "_" MODEL_CPPNAME "${MODEL_NAME}")
 
     set(GEN_HXX      "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_GPU_ALPAKA.hxx")
@@ -288,12 +295,21 @@ foreach(ONNX_FILE ${BENCHMARK_ONNX_MODELS})
         "        if (run_trt)\n"
         "            BenchmarkTRT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations, profile);\n"
         "#endif\n"
-        "#ifdef SOFIE_BENCHMARK_AOT\n"
-        "        if (run_aot)\n"
-        "            BenchmarkAOT_GPU(\"${BENCHMARK_MODEL_DIR}/aot_models/${MODEL_NAME}.pt2\", \"${MODEL_NAME}\", GetAOTInputSpecs_${MODEL_CPPNAME}(), warmup, iterations, profile);\n"
-        "#endif\n"
-        "        return 0;\n"
-        "    }\n"
+    )
+
+    if(MODEL_AOT_ENABLED)
+        string(APPEND BENCHMARK_SINGLE_MODEL_CASES
+                "#ifdef SOFIE_BENCHMARK_AOT\n"
+                "        if (run_aot)\n"
+                "            BenchmarkAOT_GPU(\"${BENCHMARK_MODEL_DIR}/aot_models/${MODEL_NAME}.pt2\","
+                " \"${MODEL_NAME}\", GetAOTInputSpecs_${MODEL_CPPNAME}(), warmup, iterations, profile);\n"
+                "#endif\n"
+        )
+    endif()
+
+    string(APPEND BENCHMARK_SINGLE_MODEL_CASES
+            "        return 0;\n"
+            "    }\n"
     )
 
     # Subprocess spawn: run this binary as a child with --single-model <name>.
@@ -356,12 +372,18 @@ foreach(ONNX_FILE ${BENCHMARK_ONNX_MODELS})
             "        if (run_trt)\n"
             "            RunBackend(\"--trt-only\", \"tensorrt\");\n"
             "#endif\n"
-            "#ifdef SOFIE_BENCHMARK_AOT\n"
-            "        if (run_aot)\n"
-            "            RunBackend(\"--aot-only\", \"pytorch_aot\");\n"
-            "#endif\n"
-            "    }\n"
     )
+
+    if(MODEL_AOT_ENABLED)
+        string(APPEND BENCHMARK_SPAWN_CALLS
+                "#ifdef SOFIE_BENCHMARK_AOT\n"
+                "        if (run_aot)\n"
+                "            RunBackend(\"--aot-only\", \"pytorch_aot\");\n"
+                "#endif\n"
+        )
+    endif()
+
+    string(APPEND BENCHMARK_SPAWN_CALLS "    }\n")
 
     # Per-model compilation unit: include one bench.hxx → one .cu file
     set(_model_cu "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_bench.cu")
@@ -443,6 +465,39 @@ set_source_files_properties("${RUNNER_SRC}" PROPERTIES LANGUAGE CXX)
 
 add_executable(sofie_benchmark "${RUNNER_SRC}" ${BENCHMARK_MODEL_CU_SRCS})
 
+if(SOFIE_BENCHMARK_MAMBA_AOT)
+    if(NOT SOFIE_BENCHMARK_AOT)
+        message(FATAL_ERROR "SOFIE_BENCHMARK_MAMBA_AOT requires SOFIE_BENCHMARK_AOT=ON")
+    endif()
+
+    find_package(Python3 COMPONENTS Interpreter Development.Embed REQUIRED)
+
+    target_sources(sofie_benchmark PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/MambaAOTCustomOps.cxx")
+
+    get_filename_component(_torch_cmake_dir "${Torch_DIR}" DIRECTORY)
+    get_filename_component(_torch_share_dir "${_torch_cmake_dir}" DIRECTORY)
+    get_filename_component(_torch_package_dir "${_torch_share_dir}" DIRECTORY)
+    get_filename_component(_torch_site_packages "${_torch_package_dir}" DIRECTORY)
+
+    file(GLOB MAMBA_SELECTIVE_SCAN_LIBS "${_torch_site_packages}/selective_scan_cuda*${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    list(LENGTH MAMBA_SELECTIVE_SCAN_LIBS _mamba_selective_scan_count)
+
+    if(NOT _mamba_selective_scan_count EQUAL 1)
+        message(FATAL_ERROR "SOFIE Benchmark: expected exactly one selective_scan_cuda library next to PyTorch, found ${_mamba_selective_scan_count}")
+    endif()
+
+    list(GET MAMBA_SELECTIVE_SCAN_LIBS 0 MAMBA_SELECTIVE_SCAN_LIB)
+    get_filename_component(MAMBA_SELECTIVE_SCAN_DIR "${MAMBA_SELECTIVE_SCAN_LIB}" DIRECTORY)
+    get_filename_component(MAMBA_SELECTIVE_SCAN_NAME "${MAMBA_SELECTIVE_SCAN_LIB}" NAME)
+
+    target_link_directories(sofie_benchmark PRIVATE "${MAMBA_SELECTIVE_SCAN_DIR}")
+    target_link_libraries(sofie_benchmark PRIVATE "-Wl,-l:${MAMBA_SELECTIVE_SCAN_NAME}")
+    set_property(TARGET sofie_benchmark APPEND PROPERTY BUILD_RPATH "${MAMBA_SELECTIVE_SCAN_DIR};${_torch_package_dir}/lib")
+
+    message(STATUS "SOFIE Benchmark: Mamba AOT custom-op support enabled")
+    message(STATUS "SOFIE Benchmark: selective_scan_cuda = ${MAMBA_SELECTIVE_SCAN_LIB}")
+endif()
+
 add_dependencies(sofie_benchmark sofie_benchmark_headers)
 
 target_include_directories(sofie_benchmark PRIVATE
@@ -512,6 +567,7 @@ target_link_libraries(sofie_benchmark PRIVATE
     $<$<BOOL:${SOFIE_BENCHMARK_TRT}>:${NVONNXPARSER_LIBRARY}>
     $<$<BOOL:${SOFIE_BENCHMARK_TRT}>:${NVINFER_PLUGIN_LIBRARY}>
     $<$<BOOL:${SOFIE_BENCHMARK_AOT}>:${TORCH_LIBRARIES}>
+    $<$<BOOL:${SOFIE_BENCHMARK_MAMBA_AOT}>:Python3::Python>
 )
 if(SOFIE_ORT_FOUND)
     message(STATUS "SOFIE Benchmark: target 'sofie_benchmark' configured "
