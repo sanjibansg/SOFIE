@@ -530,7 +530,13 @@ public:
 
       const std::string flattened_index_A = buildBroadcastIndex(fShapeA, stridesA, isAScalar, isAContiguous);
       const std::string flattened_index_B = buildBroadcastIndex(fShapeB, stridesB, isBScalar, isBContiguous);
-      op += "C[idx] = " + BinaryOperatorTrait<T, Op>::Op("A[" + flattened_index_A + "]", "B[" + flattened_index_B + "]") + ";\n";
+      if constexpr (Op == EBasicBinaryOperator::Pow) {
+         const std::string a = "A[" + flattened_index_A + "]";
+         const std::string b = "B[" + flattened_index_B + "]";
+         op += "C[idx] = (" + b + " == static_cast<T>(2)) ? " + a + " * " + a + " : std::pow(" + a + "," + b + ");\n";
+      } else {
+         op += "C[idx] = " + BinaryOperatorTrait<T, Op>::Op("A[" + flattened_index_A + "]", "B[" + flattened_index_B + "]") + ";\n";
+      }
       op += "}\n}\n};\n";
       return op;
    }
@@ -594,6 +600,10 @@ public:
       if (fIsOutputConstant || inputs.size() != 2) return "";
       const auto mapping = GetFusionMappingType();
       if (mapping != EFusionMappingType::OneToOne && mapping != EFusionMappingType::OneToMany) return "";
+
+      if constexpr (Op == EBasicBinaryOperator::Pow)
+         return "((" + inputs[1] + " == static_cast<T>(2)) ? (" + inputs[0] + " * " + inputs[0] + ") : std::pow(" + inputs[0] + "," + inputs[1] + "))";
+
       return BinaryOperatorTrait<T, Op>::Op(inputs[0], inputs[1]);
    }
 
