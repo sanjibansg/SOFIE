@@ -128,6 +128,104 @@ public:
       fInitialized = true;
    }
 
+   EFusionMappingType GetFusionMappingType() const override
+   {
+      return fInitialized ? EFusionMappingType::ManyToMany : EFusionMappingType::Unsupported;
+   }
+
+   std::vector<size_t> GetFusionDataInputIndices() const override
+   {
+      return {0};
+   }
+
+   bool IsFusionReduction() const override { return fInitialized; }
+
+   std::string GetFusionReductionInitExpr() const override
+   {
+      if (fReduceOpMode == ReduceProd)
+         return "static_cast<T>(1)";
+      if (fReduceOpMode == ReduceMax)
+         return "std::numeric_limits<T>::lowest()";
+      return "static_cast<T>(0)";
+   }
+
+   std::string GetFusionReductionAccumulateExpr(const std::string &accumulator, const std::string &value) const override
+   {
+      if (fReduceOpMode == ReduceProd)
+         return "((" + accumulator + ") * (" + value + "))";
+      if (fReduceOpMode == ReduceSumSquare || fReduceOpMode == ReduceL2)
+         return "((" + accumulator + ") + (" + value + ") * (" + value + "))";
+      if (fReduceOpMode == ReduceMax)
+         return "((" + value + ") > (" + accumulator + ") ? (" + value + ") : (" + accumulator + "))";
+      return "((" + accumulator + ") + (" + value + "))";
+   }
+
+   std::string GetFusionReductionCombineExpr(const std::string &left, const std::string &right) const override
+   {
+      if (fReduceOpMode == ReduceProd)
+         return "((" + left + ") * (" + right + "))";
+      if (fReduceOpMode == ReduceMax)
+         return "((" + right + ") > (" + left + ") ? (" + right + ") : (" + left + "))";
+      return "((" + left + ") + (" + right + "))";
+   }
+
+   std::string GetFusionReductionFinalizeExpr(const std::string &accumulator, size_t reducedLength) const override
+   {
+      if (fReduceOpMode == ReduceMean)
+         return "((" + accumulator + ") / static_cast<T>(" + std::to_string(reducedLength) + "u))";
+      if (fReduceOpMode == ReduceL2)
+         return "std::sqrt(" + accumulator + ")";
+      return accumulator;
+   }
+
+   std::string GetFusionReductionInputIndexExpr(const std::string &outputIndex, const std::string &reductionIndex,
+      const std::vector<size_t> &inputShape, const std::vector<size_t> &outputShape) const override
+   {
+      if (!fInitialized || inputShape != fShapeX || outputShape != fShapeY)
+         return "";
+
+      const auto inputStrides = UTILITY::ComputeStrideFromShape(fShapeX);
+      const auto outputStrides = UTILITY::ComputeStrideFromShape(fShapeYNotPruned);
+      std::vector<size_t> reducedAxes;
+
+      for (size_t dim = 0; dim < fShapeX.size(); ++dim) {
+         if (std::find(fAttrAxes.begin(), fAttrAxes.end(), static_cast<int64_t>(dim)) != fAttrAxes.end())
+            reducedAxes.push_back(dim);
+      }
+
+      if (reducedAxes.empty())
+         return "";
+
+      std::vector<size_t> reductionStrides(reducedAxes.size(), 1);
+      for (int axisIdx = static_cast<int>(reducedAxes.size()) - 2; axisIdx >= 0; --axisIdx)
+         reductionStrides[axisIdx] = reductionStrides[axisIdx + 1] * fShapeX[reducedAxes[axisIdx + 1]];
+
+      std::string expression;
+
+      for (size_t dim = 0; dim < fShapeX.size(); ++dim) {
+         const auto reducedIt = std::find(reducedAxes.begin(), reducedAxes.end(), dim);
+         std::string coordinate;
+
+         if (reducedIt != reducedAxes.end()) {
+            const size_t reducedIdx = static_cast<size_t>(std::distance(reducedAxes.begin(), reducedIt));
+            coordinate = "((" + reductionIndex + " / " + std::to_string(reductionStrides[reducedIdx]) + "u) % " +
+                         std::to_string(fShapeX[dim]) + "u)";
+         } else {
+            coordinate = "((" + outputIndex + " / " + std::to_string(outputStrides[dim]) + "u) % " +
+                         std::to_string(fShapeYNotPruned[dim]) + "u)";
+         }
+
+         if (!expression.empty())
+            expression += " + ";
+
+         expression += coordinate;
+         if (inputStrides[dim] != 1)
+            expression += " * " + std::to_string(inputStrides[dim]) + "u";
+      }
+
+      return expression;
+   }
+
    std::string Generate(std::string opName) override {
       opName = "op_" + opName;
       if (!fInitialized) {

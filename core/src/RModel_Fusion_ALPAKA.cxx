@@ -155,16 +155,58 @@ bool RModel::IsValidFusionCandidate(const FusionCandidate &candidate, const Fusi
          return false;
 
       const auto outputs = fOperators[opIdx]->GetOpOutputTensors();
+      const auto mappingType = fOperators[opIdx]->GetFusionMappingType();
 
-      if (outputs.size() != 1)
+      if (outputs.empty())
          return false;
 
-      std::vector<size_t> outputShape;
+      if (outputs.size() > 1 && mappingType != EFusionMappingType::OneToMany)
+         return false;
 
       try {
-         outputShape = GetTensorShape(std::string(outputs[0]));
+         for (const auto &output : outputs)
+            GetTensorShape(std::string(output));
       } catch (...) {
          return false;
+      }
+   }
+
+   std::vector<size_t> reductionOps;
+
+   for (const size_t opIdx : candidate.opIndices) {
+      if (fOperators[opIdx]->IsFusionReduction())
+         reductionOps.push_back(opIdx);
+   }
+
+   if (reductionOps.size() > 1)
+      return false;
+
+   if (reductionOps.size() == 1) {
+      const size_t reductionOpIdx = reductionOps[0];
+      const auto &reductionOp = fOperators[reductionOpIdx];
+      const auto reductionInputs = reductionOp->GetOpInputTensors();
+      const auto reductionOutputs = reductionOp->GetOpOutputTensors();
+      const auto reductionDataInputs = reductionOp->GetFusionDataInputIndices();
+
+      if (reductionDataInputs.size() != 1 || reductionOutputs.size() != 1)
+         return false;
+
+      const auto reductionInputShape = GetTensorShape(std::string(reductionInputs[reductionDataInputs[0]]));
+      const auto reductionOutputShape = GetTensorShape(std::string(reductionOutputs[0]));
+
+      for (const auto &outputName : candidate.materializedOutputs) {
+         const auto outputShape = GetTensorShape(outputName);
+         if (outputShape != reductionInputShape && outputShape != reductionOutputShape)
+            return false;
+      }
+
+      for (const size_t opIdx : candidate.opIndices) {
+         if (opIdx == reductionOpIdx)
+            continue;
+
+         const auto mappingType = fOperators[opIdx]->GetFusionMappingType();
+         if (mappingType != EFusionMappingType::OneToOne && mappingType != EFusionMappingType::OneToMany)
+            return false;
       }
    }
 
@@ -563,6 +605,9 @@ std::vector<RModel::FusionCandidate> RModel::EnumerateSpecialFusionCandidates(co
       if (!IsSupportedFusionOperator(firstOpIdx, true, false))
          continue;
 
+      if (fOperators[firstOpIdx]->GetOpOutputTensors().size() != 1)
+         continue;
+
       FusionBuildState state = InitializeFusionBuildState(firstOpIdx);
 
       while (TryExtendFusionBuildState(state, tensorUses, nullptr)) {
@@ -719,7 +764,10 @@ std::vector<RModel::FusionCandidate> RModel::EnumerateLinearFusionCandidates(con
    std::set<std::pair<std::vector<size_t>, size_t>> emitted;
 
    for (size_t firstOpIdx = 0; firstOpIdx < fOperators.size(); ++firstOpIdx) {
-      if (!IsSupportedFusionOperator(firstOpIdx, false, false))
+      if (!IsSupportedFusionOperator(firstOpIdx, true, false))
+         continue;
+
+      if (fOperators[firstOpIdx]->GetOpOutputTensors().size() != 1)
          continue;
 
       FusionBuildState state = InitializeFusionBuildState(firstOpIdx);
@@ -823,8 +871,56 @@ bool RModel::IsSupportedFusionOperator(size_t opIdx, bool allowShuffle, bool all
    const auto outputs = op->GetOpOutputTensors();
    const auto dataInputIndices = op->GetFusionDataInputIndices();
 
-   if (dataInputIndices.empty() || outputs.size() != 1)
+   if (dataInputIndices.empty() || outputs.empty())
       return false;
+
+   const bool multiOutputOneToMany =
+      mappingType == EFusionMappingType::OneToMany && outputs.size() > 1;
+
+   if (outputs.size() > 1 && !multiOutputOneToMany)
+      return false;
+
+   for (const size_t inputIdx : dataInputIndices) {
+      if (inputIdx >= inputs.size())
+         return false;
+   }
+
+   if (multiOutputOneToMany) {
+      std::vector<ETensorType> inputTypes;
+
+      try {
+         for (const size_t inputIdx : dataInputIndices)
+            inputTypes.push_back(GetTensorType(std::string(inputs[inputIdx])));
+
+         for (size_t outputIdx = 0; outputIdx < outputs.size(); ++outputIdx) {
+            const std::string outputName(outputs[outputIdx]);
+
+            if (IsAliasTensor(outputName))
+               return false;
+
+            const auto outputShape = GetTensorShape(outputName);
+            const auto outputType = GetTensorType(outputName);
+
+            if (!op->SupportsFusionTypes(inputTypes, outputType))
+               return false;
+
+            for (const size_t inputIdx : dataInputIndices) {
+               const auto inputShape = GetTensorShape(std::string(inputs[inputIdx]));
+
+               if (op->GetFusionInputIndexExprForOutput(inputIdx, outputIdx, "idx", inputShape, outputShape).empty())
+                  return false;
+            }
+         }
+      } catch (...) {
+         return false;
+      }
+
+      std::vector<std::string> testInputs;
+      for (size_t inputIdx = 0; inputIdx < dataInputIndices.size(); ++inputIdx)
+         testInputs.push_back("x" + std::to_string(inputIdx));
+
+      return !op->GetFusionExpr(testInputs).empty();
+   }
 
    for (const size_t inputIdx : dataInputIndices) {
       if (inputIdx >= inputs.size())
@@ -854,6 +950,35 @@ bool RModel::IsSupportedFusionOperator(size_t opIdx, bool allowShuffle, bool all
       return false;
 
    if (manyToMany) {
+      if (op->IsFusionReduction()) {
+         if (dataInputIndices.size() != 1)
+            return false;
+
+         std::vector<size_t> inputShape;
+
+         try {
+            inputShape = GetTensorShape(std::string(inputs[dataInputIndices[0]]));
+         } catch (...) {
+            return false;
+         }
+
+         const size_t inputLength = ConvertShapeToLength(inputShape);
+         const size_t outputLength = ConvertShapeToLength(outputShape);
+
+         if (outputLength == 0 || inputLength % outputLength != 0)
+            return false;
+
+         const size_t reducedLength = inputLength / outputLength;
+         if (op->GetFusionReductionInitExpr().empty() ||
+             op->GetFusionReductionAccumulateExpr("acc", "value").empty() ||
+             op->GetFusionReductionCombineExpr("left", "right").empty() ||
+             op->GetFusionReductionFinalizeExpr("acc", reducedLength).empty() ||
+             op->GetFusionReductionInputIndexExpr("out_idx", "r", inputShape, outputShape).empty())
+            return false;
+
+         return true;
+      }
+
       if (dataInputIndices.size() < 2)
          return false;
 
@@ -1157,6 +1282,10 @@ RModel::EltwiseFusionGroup RModel::BuildEltwiseFusionGroup(const FusionCandidate
          return true;
 
       const auto outputs = fOperators[opIdx]->GetOpOutputTensors();
+
+      if (outputs.size() > 1)
+         return true;
+
       return outputs.size() == 1 && GetTensorShape(std::string(outputs[0])) != iterationShape;
    });
 

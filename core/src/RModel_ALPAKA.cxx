@@ -381,6 +381,11 @@ std::string RModel::GenerateImplSignature_GPU_ALPAKA(bool isdecl) {
 
 std::string RModel::GenerateFusedEltwiseLaunch_GPU_ALPAKA(const EltwiseFusionGroup &group) const
 {
+   for (const size_t opIdx : group.opIndices) {
+      if (fOperators[opIdx]->IsFusionReduction())
+         return GenerateFusedReductionLaunch_GPU_ALPAKA(group, opIdx);
+   }
+
    const std::string suffix = group.suffix();
    const std::string kernelName = "fusedEltwiseKernel" + suffix;
    std::string launchCode;
@@ -410,6 +415,71 @@ std::string RModel::GenerateFusedEltwiseLaunch_GPU_ALPAKA(const EltwiseFusionGro
    std::string profiledCode;
 
    profiledCode += "   // -- GPU Profiling fused group: " + fusedName + " --\n";
+   profiledCode += "   tp_start = std::chrono::steady_clock::now();\n";
+   profiledCode += launchCode;
+   profiledCode += "   alpaka::wait(queue);\n";
+   profiledCode += "   fProfilingResults[\"" + fusedName + "\"].push_back(\n";
+   profiledCode += "      std::chrono::duration_cast<std::chrono::duration<double, std::micro>>(\n";
+   profiledCode += "         std::chrono::steady_clock::now() - tp_start).count());\n\n";
+
+   return profiledCode;
+}
+
+std::string RModel::GenerateFusedReductionLaunch_GPU_ALPAKA(const EltwiseFusionGroup &group, size_t reductionOpIdx) const
+{
+   const auto reductionOutputs = fOperators[reductionOpIdx]->GetOpOutputTensors();
+
+   if (reductionOutputs.size() != 1)
+      throw std::runtime_error("Fused reduction must have exactly one output");
+
+   const auto reductionInputs = fOperators[reductionOpIdx]->GetOpInputTensors();
+   const auto dataInputIndices = fOperators[reductionOpIdx]->GetFusionDataInputIndices();
+
+   if (dataInputIndices.size() != 1)
+      throw std::runtime_error("Fused reduction must have exactly one data input");
+
+   const size_t inputLength = ConvertShapeToLength(GetTensorShape(std::string(reductionInputs[dataInputIndices[0]])));
+   const size_t outputLength = ConvertShapeToLength(GetTensorShape(std::string(reductionOutputs[0])));
+
+   if (outputLength == 0 || inputLength % outputLength != 0)
+      throw std::runtime_error("Invalid fused reduction shape");
+
+   const size_t reducedLength = inputLength / outputLength;
+
+   size_t blockSize = 32;
+   while (blockSize < reducedLength && blockSize < 256)
+      blockSize *= 2;
+
+   const std::string suffix = group.suffix();
+
+   const std::string kernelName = "fusedEltwiseKernel" + suffix;
+   std::string launchCode;
+
+   launchCode += "\n//------ FUSED_REDUCTION_GPU_ALPAKA" + suffix + "\n";
+   launchCode += SP + "{\n";
+   launchCode += SP + SP + "alpaka::WorkDivMembers<Dim, Idx> workDiv_fused" + suffix + "(\n";
+   launchCode += SP + SP + SP + "Vec::all(Idx{" + std::to_string(outputLength) + "u}),\n";
+   launchCode += SP + SP + SP + "Vec::all(Idx{" + std::to_string(blockSize) + "u}),\n";
+   launchCode += SP + SP + SP + "Vec::all(Idx{1u}));\n";
+   launchCode += SP + SP + "auto task_fused" + suffix + " = alpaka::createTaskKernel<Acc>(workDiv_fused" + suffix + ", " + kernelName;
+
+   for (const auto &externalInput : group.externalInputs)
+      launchCode += ", alpaka::getPtrNative(deviceBuf_" + externalInput.tensorName + ")";
+
+   for (const auto &outputName : group.outputTensors)
+      launchCode += ", alpaka::getPtrNative(deviceBuf_" + outputName + ")";
+
+   launchCode += ");\n";
+   launchCode += SP + SP + "alpaka::enqueue(queue, task_fused" + suffix + ");\n";
+   launchCode += SP + "}\n";
+
+   if (!fProfile)
+      return launchCode;
+
+   const std::string fusedName = "FusedReduction" + suffix;
+   std::string profiledCode;
+
+   profiledCode += "   // -- GPU Profiling fused reduction group: " + fusedName + " --\n";
    profiledCode += "   tp_start = std::chrono::steady_clock::now();\n";
    profiledCode += launchCode;
    profiledCode += "   alpaka::wait(queue);\n";
@@ -1163,8 +1233,14 @@ std::string RModel::GenerateFusionInputIndex(const std::string &inputName, const
    return indexExpression.empty() ? "0" : indexExpression;
 }
 
-std::string RModel::GenerateFusionValueAtIndex(const EltwiseFusionGroup &group, const std::string &tensorName, const std::string &logicalIndex, const std::unordered_map<std::string, size_t> &groupProducers, const std::unordered_map<std::string, size_t> &externalInputIndices, std::unordered_map<std::string, std::string> &valueCache, std::string &kernelCode, size_t &valueCounter) const
+std::string RModel::GenerateFusionValueAtIndex(const EltwiseFusionGroup &group, const std::string &tensorName, const std::string &logicalIndex, const std::unordered_map<std::string, size_t> &groupProducers, const std::unordered_map<std::string, size_t> &externalInputIndices, std::unordered_map<std::string, std::string> &valueCache, std::string &kernelCode, size_t &valueCounter, const std::unordered_map<std::string, std::string> *valueOverrides) const
 {
+   if (valueOverrides != nullptr) {
+      const auto overrideIt = valueOverrides->find(tensorName);
+      if (overrideIt != valueOverrides->end())
+         return overrideIt->second;
+   }
+
    const std::string cacheKey = tensorName + "@" + logicalIndex;
    const auto cacheIt = valueCache.find(cacheKey);
 
@@ -1189,8 +1265,14 @@ std::string RModel::GenerateFusionValueAtIndex(const EltwiseFusionGroup &group, 
    const auto &op = fOperators[opIdx];
    const auto outputs = op->GetOpOutputTensors();
 
-   if (outputs.size() != 1 || std::string(outputs[0]) != tensorName)
+   const auto outputIt = std::find_if(outputs.begin(), outputs.end(), [&](const auto &output) {
+      return std::string(output) == tensorName;
+   });
+
+   if (outputIt == outputs.end())
       throw std::runtime_error("Invalid fused producer for tensor " + tensorName);
+
+   const size_t outputTensorIndex = static_cast<size_t>(std::distance(outputs.begin(), outputIt));
 
    const auto outputShape = GetTensorShape(tensorName);
    const auto opInputs = op->GetOpInputTensors();
@@ -1222,7 +1304,7 @@ std::string RModel::GenerateFusionValueAtIndex(const EltwiseFusionGroup &group, 
          std::unordered_map<std::string, std::string> branchCache = valueCache;
          std::string branchCode;
          const std::string branchValue = GenerateFusionValueAtIndex(group, inputName, inputIndex, groupProducers,
-            externalInputIndices, branchCache, branchCode, valueCounter);
+            externalInputIndices, branchCache, branchCode, valueCounter, valueOverrides);
 
          if (dataIdx == 0)
             kernelCode += SP + SP + SP + "if (" + condition + ") {\n";
@@ -1251,6 +1333,11 @@ std::string RModel::GenerateFusionValueAtIndex(const EltwiseFusionGroup &group, 
 
          if (inputIndex.empty())
             throw std::runtime_error("Missing Shuffle index expression for operator " + std::to_string(opIdx));
+      } else if (mappingType == EFusionMappingType::OneToMany && outputs.size() > 1) {
+         inputIndex = op->GetFusionInputIndexExprForOutput(inputIdx, outputTensorIndex, logicalIndex, inputShape, outputShape);
+
+         if (inputIndex.empty())
+            throw std::runtime_error("Missing OneToMany output index expression for operator " + std::to_string(opIdx));
       } else if (mappingType == EFusionMappingType::Reorganize) {
          if (ConvertShapeToLength(inputShape) != ConvertShapeToLength(outputShape))
             throw std::runtime_error("Invalid Reorganize mapping for operator " + std::to_string(opIdx));
@@ -1260,7 +1347,7 @@ std::string RModel::GenerateFusionValueAtIndex(const EltwiseFusionGroup &group, 
          inputIndex = GenerateFusionInputIndex(inputName, outputShape, logicalIndex);
       }
 
-      inputExpressions.push_back(GenerateFusionValueAtIndex(group, inputName, inputIndex, groupProducers, externalInputIndices, valueCache, kernelCode, valueCounter));
+      inputExpressions.push_back(GenerateFusionValueAtIndex(group, inputName, inputIndex, groupProducers, externalInputIndices, valueCache, kernelCode, valueCounter, valueOverrides));
    }
 
    const std::string expression = op->GetFusionExpr(inputExpressions);
@@ -1275,8 +1362,152 @@ std::string RModel::GenerateFusionValueAtIndex(const EltwiseFusionGroup &group, 
    return localName;
 }
 
+std::string RModel::GenerateFusedReductionKernel_GPU_ALPAKA(const EltwiseFusionGroup &group, size_t reductionOpIdx) const
+{
+   const auto &reductionOp = fOperators[reductionOpIdx];
+   const auto reductionInputs = reductionOp->GetOpInputTensors();
+   const auto reductionOutputs = reductionOp->GetOpOutputTensors();
+   const auto reductionDataInputs = reductionOp->GetFusionDataInputIndices();
+
+   if (reductionDataInputs.size() != 1 || reductionOutputs.size() != 1)
+      throw std::runtime_error("Fused reduction must have one data input and one output");
+
+   const std::string reductionInputName(reductionInputs[reductionDataInputs[0]]);
+   const std::string reductionOutputName(reductionOutputs[0]);
+   const auto reductionInputShape = GetTensorShape(reductionInputName);
+   const auto reductionOutputShape = GetTensorShape(reductionOutputName);
+   const size_t inputLength = ConvertShapeToLength(reductionInputShape);
+   const size_t outputLength = ConvertShapeToLength(reductionOutputShape);
+
+   if (outputLength == 0 || inputLength % outputLength != 0)
+      throw std::runtime_error("Invalid fused reduction shape");
+
+   const size_t reducedLength = inputLength / outputLength;
+
+   size_t blockSize = 32;
+   while (blockSize < reducedLength && blockSize < 256)
+      blockSize *= 2;
+
+   const std::string inputIndexExpression =
+      reductionOp->GetFusionReductionInputIndexExpr("out_idx", "r", reductionInputShape, reductionOutputShape);
+
+   if (inputIndexExpression.empty())
+      throw std::runtime_error("Fused reduction does not provide an input index expression");
+
+   std::unordered_map<std::string, size_t> groupProducers;
+   std::unordered_map<std::string, size_t> externalInputIndices;
+
+   for (const size_t opIdx : group.opIndices) {
+      const auto outputs = fOperators[opIdx]->GetOpOutputTensors();
+      if (outputs.size() != 1)
+         throw std::runtime_error("Fused operator " + std::to_string(opIdx) + " must have exactly one output");
+      groupProducers[std::string(outputs[0])] = opIdx;
+   }
+
+   for (size_t inputIdx = 0; inputIdx < group.externalInputs.size(); ++inputIdx)
+      externalInputIndices[group.externalInputs[inputIdx].tensorName] = inputIdx;
+
+   const std::string suffix = group.suffix();
+   std::string kernelCode;
+
+   kernelCode += "\n//------ FUSED_REDUCTION_KERNEL" + suffix + "\n";
+   kernelCode += "struct FusedEltwiseKernel" + suffix + " {\n";
+   kernelCode += SP + "template<typename TAcc";
+
+   for (size_t inputIdx = 0; inputIdx < group.externalInputs.size(); ++inputIdx)
+      kernelCode += ", typename TInput" + std::to_string(inputIdx);
+
+   for (size_t outputIdx = 0; outputIdx < group.outputTensors.size(); ++outputIdx)
+      kernelCode += ", typename TOutput" + std::to_string(outputIdx);
+
+   kernelCode += ">\n";
+   kernelCode += SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc";
+
+   for (size_t inputIdx = 0; inputIdx < group.externalInputs.size(); ++inputIdx)
+      kernelCode += ", TInput" + std::to_string(inputIdx) + " const* __restrict__ input" + std::to_string(inputIdx);
+
+   for (size_t outputIdx = 0; outputIdx < group.outputTensors.size(); ++outputIdx)
+      kernelCode += ", TOutput" + std::to_string(outputIdx) + "* __restrict__ out" + std::to_string(outputIdx);
+
+   kernelCode += ") const {\n";
+   kernelCode += SP + SP + "using T = TOutput0;\n";
+   kernelCode += SP + SP + "auto& shmem = alpaka::declareSharedVar<T[" + std::to_string(blockSize) + "], __COUNTER__>(acc);\n";
+   kernelCode += SP + SP + "const auto out_idx = alpaka::getIdx<alpaka::Grid, alpaka::Blocks>(acc)[0];\n";
+   kernelCode += SP + SP + "const auto thread_id = alpaka::getIdx<alpaka::Block, alpaka::Threads>(acc)[0];\n";
+   kernelCode += SP + SP + "if (out_idx >= " + std::to_string(outputLength) + "u) return;\n";
+   kernelCode += SP + SP + "T partial = " + reductionOp->GetFusionReductionInitExpr() + ";\n";
+   kernelCode += SP + SP + "for (std::size_t r = thread_id; r < " + std::to_string(reducedLength) + "u; r += " + std::to_string(blockSize) + "u) {\n";
+   kernelCode += SP + SP + SP + "const std::size_t in_idx = " + inputIndexExpression + ";\n";
+
+   std::unordered_map<std::string, std::string> reductionInputCache;
+   std::string reductionInputCode;
+   size_t valueCounter = 0;
+   const std::string reductionInputValue = GenerateFusionValueAtIndex(group, reductionInputName, "in_idx", groupProducers,
+      externalInputIndices, reductionInputCache, reductionInputCode, valueCounter);
+
+   kernelCode += reductionInputCode;
+   kernelCode += SP + SP + SP + "partial = " + reductionOp->GetFusionReductionAccumulateExpr("partial", reductionInputValue) + ";\n";
+   kernelCode += SP + SP + "}\n";
+   kernelCode += SP + SP + "shmem[thread_id] = partial;\n";
+   kernelCode += SP + SP + "alpaka::syncBlockThreads(acc);\n";
+   kernelCode += SP + SP + "for (std::size_t s = " + std::to_string(blockSize / 2) + "u; s > 0u; s >>= 1u) {\n";
+   kernelCode += SP + SP + SP + "if (thread_id < s) shmem[thread_id] = " +
+      reductionOp->GetFusionReductionCombineExpr("shmem[thread_id]", "shmem[thread_id + s]") + ";\n";
+   kernelCode += SP + SP + SP + "alpaka::syncBlockThreads(acc);\n";
+   kernelCode += SP + SP + "}\n";
+   kernelCode += SP + SP + "if (thread_id == 0u) shmem[0] = " +
+      reductionOp->GetFusionReductionFinalizeExpr("shmem[0]", reducedLength) + ";\n";
+   kernelCode += SP + SP + "alpaka::syncBlockThreads(acc);\n";
+   kernelCode += SP + SP + "const T reduction_value = shmem[0];\n";
+
+   const std::unordered_map<std::string, std::string> valueOverrides{{reductionOutputName, "reduction_value"}};
+
+   for (size_t outputIdx = 0; outputIdx < group.outputTensors.size(); ++outputIdx) {
+      const std::string &outputName = group.outputTensors[outputIdx];
+      const auto outputShape = GetTensorShape(outputName);
+
+      if (outputShape == reductionOutputShape) {
+         std::unordered_map<std::string, std::string> outputCache;
+         std::string outputCode;
+         const std::string outputValue = GenerateFusionValueAtIndex(group, outputName, "out_idx", groupProducers,
+            externalInputIndices, outputCache, outputCode, valueCounter, &valueOverrides);
+
+         kernelCode += SP + SP + "if (thread_id == 0u) {\n";
+         kernelCode += outputCode;
+         kernelCode += SP + SP + SP + "out" + std::to_string(outputIdx) + "[out_idx] = " + outputValue + ";\n";
+         kernelCode += SP + SP + "}\n";
+         continue;
+      }
+
+      if (outputShape != reductionInputShape)
+         throw std::runtime_error("Fused reduction output must match the reduction input or output shape");
+
+      kernelCode += SP + SP + "for (std::size_t r = thread_id; r < " + std::to_string(reducedLength) + "u; r += " + std::to_string(blockSize) + "u) {\n";
+      kernelCode += SP + SP + SP + "const std::size_t element_idx = " + inputIndexExpression + ";\n";
+
+      std::unordered_map<std::string, std::string> outputCache;
+      std::string outputCode;
+      const std::string outputValue = GenerateFusionValueAtIndex(group, outputName, "element_idx", groupProducers,
+         externalInputIndices, outputCache, outputCode, valueCounter, &valueOverrides);
+
+      kernelCode += outputCode;
+      kernelCode += SP + SP + SP + "out" + std::to_string(outputIdx) + "[element_idx] = " + outputValue + ";\n";
+      kernelCode += SP + SP + "}\n";
+   }
+
+   kernelCode += SP + "}\n";
+   kernelCode += "};\n";
+
+   return kernelCode;
+}
+
 std::string RModel::GenerateFusedEltwiseKernel_GPU_ALPAKA(const EltwiseFusionGroup &group) const
 {
+   for (const size_t opIdx : group.opIndices) {
+      if (fOperators[opIdx]->IsFusionReduction())
+         return GenerateFusedReductionKernel_GPU_ALPAKA(group, opIdx);
+   }
+
    const std::string suffix = group.suffix();
    std::string kernelCode;
 
@@ -1310,10 +1541,11 @@ std::string RModel::GenerateFusedEltwiseKernel_GPU_ALPAKA(const EltwiseFusionGro
    for (const size_t opIdx : group.opIndices) {
       const auto outputs = fOperators[opIdx]->GetOpOutputTensors();
 
-      if (outputs.size() != 1)
-         throw std::runtime_error("Fused operator " + std::to_string(opIdx) + " must have exactly one output");
+      if (outputs.empty())
+         throw std::runtime_error("Fused operator " + std::to_string(opIdx) + " has no outputs");
 
-      groupProducers[std::string(outputs[0])] = opIdx;
+      for (const auto &output : outputs)
+         groupProducers[std::string(output)] = opIdx;
    }
 
    for (size_t inputIdx = 0; inputIdx < group.externalInputs.size(); ++inputIdx)

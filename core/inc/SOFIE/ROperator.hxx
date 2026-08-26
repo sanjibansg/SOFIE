@@ -173,13 +173,35 @@ public:
    }
 
    virtual std::string GetFusionInputIndexExpr(size_t /*inputIndex*/, const std::string &/*outputIndex*/,
-                                            const std::vector<size_t> &/*inputShape*/,
-                                            const std::vector<size_t> &/*outputShape*/) const
+                                                const std::vector<size_t> &/*inputShape*/,
+                                                const std::vector<size_t> &/*outputShape*/) const
    {
       return "";
    }
 
+   virtual std::string GetFusionInputIndexExprForOutput(size_t inputIndex, size_t /*outputTensorIndex*/,
+                                                         const std::string &outputIndex,
+                                                         const std::vector<size_t> &inputShape,
+                                                         const std::vector<size_t> &outputShape) const
+   {
+      return GetFusionInputIndexExpr(inputIndex, outputIndex, inputShape, outputShape);
+   }
+
    virtual std::string GetFusionInputConditionExpr(size_t /*inputIndex*/, const std::string &/*outputIndex*/,
+      const std::vector<size_t> &/*inputShape*/, const std::vector<size_t> &/*outputShape*/) const
+   {
+      return "";
+   }
+
+   // Optional aggregation semantics for ManyToMany operators such as reductions.
+   // The mapping category remains ManyToMany; these methods describe how the
+   // many input values are accumulated when fused into a cooperative kernel.
+   virtual bool IsFusionReduction() const { return false; }
+   virtual std::string GetFusionReductionInitExpr() const { return ""; }
+   virtual std::string GetFusionReductionAccumulateExpr(const std::string &/*accumulator*/, const std::string &/*value*/) const { return ""; }
+   virtual std::string GetFusionReductionCombineExpr(const std::string &/*left*/, const std::string &/*right*/) const { return ""; }
+   virtual std::string GetFusionReductionFinalizeExpr(const std::string &/*accumulator*/, size_t /*reducedLength*/) const { return ""; }
+   virtual std::string GetFusionReductionInputIndexExpr(const std::string &/*outputIndex*/, const std::string &/*reductionIndex*/,
       const std::vector<size_t> &/*inputShape*/, const std::vector<size_t> &/*outputShape*/) const
    {
       return "";

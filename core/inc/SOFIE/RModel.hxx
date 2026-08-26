@@ -214,10 +214,14 @@ private:
 
    std::string GenerateFusedEltwiseKernel_GPU_ALPAKA(const EltwiseFusionGroup &group) const;
 
+   std::string GenerateFusedReductionLaunch_GPU_ALPAKA(const EltwiseFusionGroup &group, size_t reductionOpIdx) const;
+
+   std::string GenerateFusedReductionKernel_GPU_ALPAKA(const EltwiseFusionGroup &group, size_t reductionOpIdx) const;
+
    std::string GenerateFusionValueAtIndex(const EltwiseFusionGroup &group, const std::string &tensorName,
       const std::string &logicalIndex, const std::unordered_map<std::string, size_t> &groupProducers,
       const std::unordered_map<std::string, size_t> &externalInputIndices, std::unordered_map<std::string, std::string> &valueCache,
-      std::string &kernelCode, size_t &valueCounter) const;
+      std::string &kernelCode, size_t &valueCounter, const std::unordered_map<std::string, std::string> *valueOverrides = nullptr) const;
    std::string GenerateFusionInputIndex(const std::string &inputName, const std::vector<size_t> &outputShape, const std::string &outputIndex) const;
 
    std::string GenerateKernelFusionLaunch_GPU_ALPAKA(const KernelFusionGroup &group) const;
