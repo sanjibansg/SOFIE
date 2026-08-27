@@ -194,6 +194,8 @@ private:
 
    static size_t ComputeDefaultFusionReductionBlockSize(size_t reducedLength);
 
+   bool IsRuntimeSelectableFusionGroup(const EltwiseFusionGroup &group) const;
+
    size_t ComputeFusionLiveRangeExtensionByteSteps(const FusionCandidate &candidate, const FusionTensorUseGraph &tensorUses) const;
 
    size_t ComputeFusionPlanLiveRangeExtensionByteSteps(const std::vector<size_t> &candidateIndices, const std::vector<FusionCandidate> &candidates) const;

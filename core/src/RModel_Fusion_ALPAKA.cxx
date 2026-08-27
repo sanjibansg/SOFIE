@@ -105,6 +105,29 @@ std::vector<RModel::FusionExecutionSchedule> RModel::ComputeFusionExecutionSched
    return schedules;
 }
 
+   bool RModel::IsRuntimeSelectableFusionGroup(const EltwiseFusionGroup &group) const
+{
+   if (!group.isFused() || group.executionSchedules.empty())
+      return false;
+
+   for (const size_t opIdx : group.opIndices) {
+      if (fOpToKernelFusionGroupIdx.find(opIdx) != fOpToKernelFusionGroupIdx.end())
+         return false;
+
+      for (const auto &inputName : fOperators[opIdx]->GetOpInputTensors()) {
+         if (IsAliasTensor(std::string(inputName)))
+            return false;
+      }
+
+      for (const auto &outputName : fOperators[opIdx]->GetOpOutputTensors()) {
+         if (IsAliasTensor(std::string(outputName)))
+            return false;
+      }
+   }
+
+   return true;
+}
+
 RModel::FusionTensorUseGraph RModel::BuildFusionTensorUseGraph() const
 {
    FusionTensorUseGraph graph;

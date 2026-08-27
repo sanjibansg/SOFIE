@@ -448,25 +448,58 @@ std::string RModel::GenerateFusedReductionLaunch_GPU_ALPAKA(const EltwiseFusionG
       throw std::runtime_error("Fused reduction group has no execution schedules");
 
    const std::string suffix = group.suffix();
-   const std::string selectedName = "selectedFusedReductionThreads" + suffix;
    std::string launchCode;
 
    launchCode += "\n//------ FUSED_REDUCTION_GPU_ALPAKA" + suffix + "\n";
    launchCode += SP + "{\n";
-   launchCode += SP + SP + "switch (" + selectedName + ") {\n";
 
-   for (const auto &schedule : group.executionSchedules) {
+   if (IsRuntimeSelectableFusionGroup(group)) {
+      const std::string selectedName = "selectedFusionSchedule" + suffix;
+
+      launchCode += SP + SP + "switch (" + selectedName + ") {\n";
+
+      for (size_t scheduleIdx = 0; scheduleIdx < group.executionSchedules.size(); ++scheduleIdx) {
+         const auto &schedule = group.executionSchedules[scheduleIdx];
+         const std::string threads = std::to_string(schedule.resources.threadsPerBlock);
+         const std::string selection = std::to_string(scheduleIdx + 1);
+         const std::string workDivName = "workDiv_fused" + suffix + "_" + threads;
+         const std::string taskName = "task_fused" + suffix + "_" + threads;
+         const std::string kernelName = "fusedEltwiseKernel" + suffix + "_" + threads;
+
+         launchCode += SP + SP + "case " + selection + "u: {\n";
+         launchCode += SP + SP + SP + "alpaka::WorkDivMembers<Dim, Idx> " + workDivName + "(\n";
+         launchCode += SP + SP + SP + SP + "Vec::all(Idx{" + std::to_string(outputLength) + "u}),\n";
+         launchCode += SP + SP + SP + SP + "Vec::all(Idx{" + threads + "u}),\n";
+         launchCode += SP + SP + SP + SP + "Vec::all(Idx{1u}));\n";
+         launchCode += SP + SP + SP + "auto " + taskName + " = alpaka::createTaskKernel<Acc>(" + workDivName + ", " + kernelName;
+
+         for (const auto &externalInput : group.externalInputs)
+            launchCode += ", alpaka::getPtrNative(deviceBuf_" + externalInput.tensorName + ")";
+
+         for (const auto &outputName : group.outputTensors)
+            launchCode += ", alpaka::getPtrNative(deviceBuf_" + outputName + ")";
+
+         launchCode += ");\n";
+         launchCode += SP + SP + SP + "alpaka::enqueue(queue, " + taskName + ");\n";
+         launchCode += SP + SP + SP + "break;\n";
+         launchCode += SP + SP + "}\n";
+      }
+
+      launchCode += SP + SP + "default:\n";
+      launchCode += SP + SP + SP + "throw std::runtime_error(\"Invalid selected fusion schedule\");\n";
+      launchCode += SP + SP + "}\n";
+   } else {
+      const auto &schedule = group.executionSchedules.back();
       const std::string threads = std::to_string(schedule.resources.threadsPerBlock);
-      const std::string workDivName = "workDiv_fused" + suffix + "_" + threads;
-      const std::string taskName = "task_fused" + suffix + "_" + threads;
+      const std::string workDivName = "workDiv_fused" + suffix;
+      const std::string taskName = "task_fused" + suffix;
       const std::string kernelName = "fusedEltwiseKernel" + suffix + "_" + threads;
 
-      launchCode += SP + SP + "case " + threads + "u: {\n";
-      launchCode += SP + SP + SP + "alpaka::WorkDivMembers<Dim, Idx> " + workDivName + "(\n";
-      launchCode += SP + SP + SP + SP + "Vec::all(Idx{" + std::to_string(outputLength) + "u}),\n";
-      launchCode += SP + SP + SP + SP + "Vec::all(Idx{" + threads + "u}),\n";
-      launchCode += SP + SP + SP + SP + "Vec::all(Idx{1u}));\n";
-      launchCode += SP + SP + SP + "auto " + taskName + " = alpaka::createTaskKernel<Acc>(" + workDivName + ", " + kernelName;
+      launchCode += SP + SP + "alpaka::WorkDivMembers<Dim, Idx> " + workDivName + "(\n";
+      launchCode += SP + SP + SP + "Vec::all(Idx{" + std::to_string(outputLength) + "u}),\n";
+      launchCode += SP + SP + SP + "Vec::all(Idx{" + threads + "u}),\n";
+      launchCode += SP + SP + SP + "Vec::all(Idx{1u}));\n";
+      launchCode += SP + SP + "auto " + taskName + " = alpaka::createTaskKernel<Acc>(" + workDivName + ", " + kernelName;
 
       for (const auto &externalInput : group.externalInputs)
          launchCode += ", alpaka::getPtrNative(deviceBuf_" + externalInput.tensorName + ")";
@@ -475,14 +508,9 @@ std::string RModel::GenerateFusedReductionLaunch_GPU_ALPAKA(const EltwiseFusionG
          launchCode += ", alpaka::getPtrNative(deviceBuf_" + outputName + ")";
 
       launchCode += ");\n";
-      launchCode += SP + SP + SP + "alpaka::enqueue(queue, " + taskName + ");\n";
-      launchCode += SP + SP + SP + "break;\n";
-      launchCode += SP + SP + "}\n";
+      launchCode += SP + SP + "alpaka::enqueue(queue, " + taskName + ");\n";
    }
 
-   launchCode += SP + SP + "default:\n";
-   launchCode += SP + SP + SP + "throw std::runtime_error(\"Invalid selected fused reduction schedule\");\n";
-   launchCode += SP + SP + "}\n";
    launchCode += SP + "}\n";
 
    if (!fProfile)
@@ -663,12 +691,9 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
 
       if (inFusedGroup) {
          const auto &group = fEltwiseFusionGroups[gIdx];
-         const bool hasReduction = std::any_of(group.opIndices.begin(), group.opIndices.end(), [&](size_t groupOpIdx) {
-            return fOperators[groupOpIdx]->IsFusionReduction();
-         });
 
-         if (hasReduction) {
-            const std::string selectedName = "selectedFusedReductionThreads" + group.suffix();
+         if (IsRuntimeSelectableFusionGroup(group)) {
+            const std::string selectedName = "selectedFusionSchedule" + group.suffix();
 
             fGC += "\nif (" + selectedName + " == 0) {\n";
 
@@ -1834,11 +1859,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
                fusedGroupsEmitted.insert(gIdx);
             }
 
-            const bool hasReduction = std::any_of(group.opIndices.begin(), group.opIndices.end(), [&](size_t opIdx) {
-               return fOperators[opIdx]->IsFusionReduction();
-            });
-
-            if (hasReduction)
+            if (IsRuntimeSelectableFusionGroup(group))
                GenerateStandaloneKernel(id);
          } else {
             GenerateStandaloneKernel(id);
@@ -1927,12 +1948,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       const auto groupIt = fOpToFusionGroupIdx.find(op_idx);
       bool keepFusionIntermediates = false;
 
-      if (groupIt != fOpToFusionGroupIdx.end()) {
-         const auto &group = fEltwiseFusionGroups[groupIt->second];
-         keepFusionIntermediates = group.isFused() && std::any_of(group.opIndices.begin(), group.opIndices.end(), [&](size_t groupOpIdx) {
-            return fOperators[groupOpIdx]->IsFusionReduction();
-         });
-      }
+      if (groupIt != fOpToFusionGroupIdx.end())
+         keepFusionIntermediates = IsRuntimeSelectableFusionGroup(fEltwiseFusionGroups[groupIt->second]);
 
       intermediate_memory_alloc_string += AllocateIntermediateMemory_GPU_ALPAKA(fOperators[op_idx]->GetOpOutputTensors(), keepFusionIntermediates);
 
@@ -2033,25 +2050,25 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          fGC += "effectiveMaxIntermediateDRAMBytes = sessionOptions.maxIntermediateDRAMBytes == 0 || sessionOptions.maxIntermediateDRAMBytes > hardwareGlobalMemoryBytes ? hardwareGlobalMemoryBytes : sessionOptions.maxIntermediateDRAMBytes;\n\n";
 
          for (const auto &group : fEltwiseFusionGroups) {
-            if (!group.isFused() || group.executionSchedules.empty())
-               continue;
-
-            const bool hasReduction = std::any_of(group.opIndices.begin(), group.opIndices.end(), [&](size_t opIdx) {
-               return fOperators[opIdx]->IsFusionReduction();
-            });
-
-            if (!hasReduction)
+            if (!IsRuntimeSelectableFusionGroup(group))
                continue;
 
             const std::string sfx = group.suffix();
-            const std::string selectedName = "selectedFusedReductionThreads" + sfx;
+            const std::string selectedName = "selectedFusionSchedule" + sfx;
 
             fGC += selectedName + " = 0;\n";
 
-            for (const auto &schedule : group.executionSchedules) {
+            for (size_t scheduleIdx = 0; scheduleIdx < group.executionSchedules.size(); ++scheduleIdx) {
+               const auto &schedule = group.executionSchedules[scheduleIdx];
                const std::string threads = std::to_string(schedule.resources.threadsPerBlock);
                const std::string sharedMemory = std::to_string(schedule.resources.sharedMemoryPerBlockBytes);
-               fGC += "if (" + threads + "u <= effectiveMaxFusionThreadsPerBlock && " + sharedMemory + "u <= effectiveMaxFusionSharedMemoryPerBlockBytes) " + selectedName + " = " + threads + "u;\n";
+               const std::string selection = std::to_string(scheduleIdx + 1);
+               std::string condition = threads + "u <= effectiveMaxFusionThreadsPerBlock";
+
+               if (schedule.resources.sharedMemoryPerBlockBytes != 0)
+                  condition += " && " + sharedMemory + "u <= effectiveMaxFusionSharedMemoryPerBlockBytes";
+
+               fGC += "if (" + condition + ") " + selectedName + " = " + selection + "u;\n";
             }
          }
 
@@ -2163,6 +2180,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
             const bool hasReduction = std::any_of(group.opIndices.begin(), group.opIndices.end(), [&](size_t opIdx) {
                return fOperators[opIdx]->IsFusionReduction();
             });
+            const bool runtimeSelectable = IsRuntimeSelectableFusionGroup(group);
 
             if (group.opIndices[0] == id && !fusedGroupsEmitted.count(gIdx)) {
                const std::string sfx = group.suffix();
@@ -2175,16 +2193,17 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
                      const std::string threads = std::to_string(schedule.resources.threadsPerBlock);
                      fGC += SP + "FusedEltwiseKernel" + sfx + "<" + threads + "> fusedEltwiseKernel" + sfx + "_" + threads + ";\n";
                   }
-
-                  fGC += SP + "Idx selectedFusedReductionThreads" + sfx + " = " + std::to_string(group.executionSchedules.back().resources.threadsPerBlock) + ";\n";
                } else {
                   fGC += SP + "FusedEltwiseKernel" + sfx + " fusedEltwiseKernel" + sfx + ";\n";
                }
 
+               if (runtimeSelectable)
+                  fGC += SP + "Idx selectedFusionSchedule" + sfx + " = 0;\n";
+
                fusedGroupsEmitted.insert(gIdx);
             }
 
-            if (hasReduction)
+            if (runtimeSelectable)
                GenerateStandaloneKernelDeclaration(id);
          } else {
             GenerateStandaloneKernelDeclaration(id);
@@ -2209,30 +2228,42 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    }
 
    if (fUseSession) {
-      fGC += "\nstruct FusedReductionScheduleSelection {\n";
+      fGC += "\nstruct FusionScheduleSelection {\n";
       fGC += SP + "const char *group;\n";
+      fGC += SP + "Idx scheduleIndex;\n";
       fGC += SP + "Idx threadsPerBlock;\n";
+      fGC += SP + "std::size_t sharedMemoryPerBlockBytes;\n";
       fGC += "};\n";
 
-      fGC += "\nstd::vector<FusedReductionScheduleSelection> GetSelectedFusedReductionSchedules() const {\n";
-      fGC += SP + "return {\n";
+      fGC += "\nstd::vector<FusionScheduleSelection> GetSelectedFusionSchedules() const {\n";
+      fGC += SP + "std::vector<FusionScheduleSelection> selections;\n";
 
       for (const auto &group : fEltwiseFusionGroups) {
-         if (!group.isFused() || group.executionSchedules.empty())
-            continue;
-
-         const bool hasReduction = std::any_of(group.opIndices.begin(), group.opIndices.end(), [&](size_t opIdx) {
-            return fOperators[opIdx]->IsFusionReduction();
-         });
-
-         if (!hasReduction)
+         if (!IsRuntimeSelectableFusionGroup(group))
             continue;
 
          const std::string sfx = group.suffix();
-         fGC += SP + SP + "{\"" + sfx + "\", selectedFusedReductionThreads" + sfx + "},\n";
+         const std::string selectedName = "selectedFusionSchedule" + sfx;
+
+         fGC += SP + "{\n";
+         fGC += SP + SP + "FusionScheduleSelection selection{\"" + sfx + "\", " + selectedName + ", 0, 0};\n";
+         fGC += SP + SP + "switch (" + selectedName + ") {\n";
+
+         for (size_t scheduleIdx = 0; scheduleIdx < group.executionSchedules.size(); ++scheduleIdx) {
+            const auto &schedule = group.executionSchedules[scheduleIdx];
+            const std::string selection = std::to_string(scheduleIdx + 1);
+            const std::string threads = std::to_string(schedule.resources.threadsPerBlock);
+            const std::string sharedMemory = std::to_string(schedule.resources.sharedMemoryPerBlockBytes);
+            fGC += SP + SP + "case " + selection + "u: selection.threadsPerBlock = " + threads + "u; selection.sharedMemoryPerBlockBytes = " + sharedMemory + "u; break;\n";
+         }
+
+         fGC += SP + SP + "default: break;\n";
+         fGC += SP + SP + "}\n";
+         fGC += SP + SP + "selections.push_back(selection);\n";
+         fGC += SP + "}\n";
       }
 
-      fGC += SP + "};\n";
+      fGC += SP + "return selections;\n";
       fGC += "}\n";
    }
    // inject GPU profiling utility functions and memory report inside Session struct

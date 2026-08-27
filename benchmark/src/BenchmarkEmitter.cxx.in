@@ -253,9 +253,9 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         << "    SOFIE_" << cppName
         << "::Session<AccTag> session(weightFile, sessionOptions);\n"
         << "    if (showResourcePlan) {\n"
-        << "        const auto selections = session.GetSelectedFusedReductionSchedules();\n"
+        << "        const auto selections = session.GetSelectedFusionSchedules();\n"
         << "        std::fprintf(stderr, \"[SOFIE resource plan]\");\n"
-        << "        if (selections.empty()) std::fprintf(stderr, \" no fused reductions\");\n"
+        << "        if (selections.empty()) std::fprintf(stderr, \" no runtime-selectable fusion groups\");\n"
         << "        for (const auto &selection : selections) std::fprintf(stderr, \" %s=%zu threads\", selection.group, static_cast<size_t>(selection.threadsPerBlock));\n"
         << "        std::fprintf(stderr, \"\\n\");\n"
         << "    }\n"
