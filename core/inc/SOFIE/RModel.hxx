@@ -77,10 +77,14 @@ private:
       std::string customIndexExpression;
    };
 
+   struct FusionResourceRequirements {
+      size_t threadsPerBlock = 0;
+      size_t sharedMemoryPerBlockBytes = 0;
+   };
+
    struct FusionExecutionSchedule {
       size_t blocksPerGrid = 0;
-      size_t threadsPerBlock = 0;
-      size_t sharedMemoryBytes = 0;
+      FusionResourceRequirements resources;
       size_t maxElementsPerThread = 0;
       size_t treeReductionStages = 0;
       size_t synchronizationPoints = 0;

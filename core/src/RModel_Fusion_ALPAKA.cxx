@@ -47,8 +47,24 @@ std::vector<RModel::FusionExecutionSchedule> RModel::ComputeFusionExecutionSched
       reductionOpIdx = opIdx;
    }
 
-   if (reductionOpIdx == fOperators.size())
-      return {};
+   if (reductionOpIdx == fOperators.size()) {
+      if (candidate.materializedOutputs.empty())
+         return {};
+
+      const size_t outputLength = ConvertShapeToLength(GetTensorShape(candidate.materializedOutputs.front()));
+
+      if (outputLength == 0)
+         return {};
+
+      constexpr size_t defaultThreadsPerBlock = 256;
+
+      FusionExecutionSchedule schedule;
+      schedule.blocksPerGrid = (outputLength + defaultThreadsPerBlock - 1) / defaultThreadsPerBlock;
+      schedule.resources.threadsPerBlock = defaultThreadsPerBlock;
+      schedule.resources.sharedMemoryPerBlockBytes = 0;
+      schedule.maxElementsPerThread = 1;
+      return {schedule};
+   }
 
    const auto &reductionOp = fOperators[reductionOpIdx];
    const auto inputs = reductionOp->GetOpInputTensors();
@@ -78,8 +94,8 @@ std::vector<RModel::FusionExecutionSchedule> RModel::ComputeFusionExecutionSched
 
       FusionExecutionSchedule schedule;
       schedule.blocksPerGrid = outputLength;
-      schedule.threadsPerBlock = threads;
-      schedule.sharedMemoryBytes = threads * elementSize;
+      schedule.resources.threadsPerBlock = threads;
+      schedule.resources.sharedMemoryPerBlockBytes = threads * elementSize;
       schedule.maxElementsPerThread = (reducedLength + threads - 1) / threads;
       schedule.treeReductionStages = treeReductionStages;
       schedule.synchronizationPoints = treeReductionStages + 2;

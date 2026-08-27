@@ -456,7 +456,7 @@ std::string RModel::GenerateFusedReductionLaunch_GPU_ALPAKA(const EltwiseFusionG
    launchCode += SP + SP + "switch (" + selectedName + ") {\n";
 
    for (const auto &schedule : group.executionSchedules) {
-      const std::string threads = std::to_string(schedule.threadsPerBlock);
+      const std::string threads = std::to_string(schedule.resources.threadsPerBlock);
       const std::string workDivName = "workDiv_fused" + suffix + "_" + threads;
       const std::string taskName = "task_fused" + suffix + "_" + threads;
       const std::string kernelName = "fusedEltwiseKernel" + suffix + "_" + threads;
@@ -1448,7 +1448,7 @@ std::string RModel::GenerateFusedReductionKernel_GPU_ALPAKA(const EltwiseFusionG
    if (!group.executionSchedules.empty()) {
       kernelCode += "// Available reduction schedules:";
       for (const auto &schedule : group.executionSchedules) {
-         kernelCode += " [blocks=" + std::to_string(schedule.blocksPerGrid) + ", threads=" + std::to_string(schedule.threadsPerBlock) + ", shared=" + std::to_string(schedule.sharedMemoryBytes) + "B, max-values/thread=" + std::to_string(schedule.maxElementsPerThread) + ", tree-stages=" + std::to_string(schedule.treeReductionStages) + ", syncs=" + std::to_string(schedule.synchronizationPoints) + "]";
+         kernelCode += " [blocks=" + std::to_string(schedule.blocksPerGrid) + ", threads=" + std::to_string(schedule.resources.threadsPerBlock) + ", shared=" + std::to_string(schedule.resources.sharedMemoryPerBlockBytes) + "B, max-values/thread=" + std::to_string(schedule.maxElementsPerThread) + ", tree-stages=" + std::to_string(schedule.treeReductionStages) + ", syncs=" + std::to_string(schedule.synchronizationPoints) + "]";
       }
       kernelCode += "\n";
    }
@@ -2049,8 +2049,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
             fGC += selectedName + " = 0;\n";
 
             for (const auto &schedule : group.executionSchedules) {
-               const std::string threads = std::to_string(schedule.threadsPerBlock);
-               const std::string sharedMemory = std::to_string(schedule.sharedMemoryBytes);
+               const std::string threads = std::to_string(schedule.resources.threadsPerBlock);
+               const std::string sharedMemory = std::to_string(schedule.resources.sharedMemoryPerBlockBytes);
                fGC += "if (" + threads + "u <= effectiveMaxFusionThreadsPerBlock && " + sharedMemory + "u <= effectiveMaxFusionSharedMemoryPerBlockBytes) " + selectedName + " = " + threads + "u;\n";
             }
          }
@@ -2172,11 +2172,11 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
                      throw std::runtime_error("Fused reduction group has no execution schedules");
 
                   for (const auto &schedule : group.executionSchedules) {
-                     const std::string threads = std::to_string(schedule.threadsPerBlock);
+                     const std::string threads = std::to_string(schedule.resources.threadsPerBlock);
                      fGC += SP + "FusedEltwiseKernel" + sfx + "<" + threads + "> fusedEltwiseKernel" + sfx + "_" + threads + ";\n";
                   }
 
-                  fGC += SP + "Idx selectedFusedReductionThreads" + sfx + " = " + std::to_string(group.executionSchedules.back().threadsPerBlock) + ";\n";
+                  fGC += SP + "Idx selectedFusedReductionThreads" + sfx + " = " + std::to_string(group.executionSchedules.back().resources.threadsPerBlock) + ";\n";
                } else {
                   fGC += SP + "FusedEltwiseKernel" + sfx + " fusedEltwiseKernel" + sfx + ";\n";
                }
