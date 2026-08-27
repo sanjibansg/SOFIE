@@ -2158,6 +2158,34 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       fGC += SP + "alpaka::wait(queue);\n";
       fGC += "}\n";
    }
+
+   if (fUseSession) {
+      fGC += "\nstruct FusedReductionScheduleSelection {\n";
+      fGC += SP + "const char *group;\n";
+      fGC += SP + "Idx threadsPerBlock;\n";
+      fGC += "};\n";
+
+      fGC += "\nstd::vector<FusedReductionScheduleSelection> GetSelectedFusedReductionSchedules() const {\n";
+      fGC += SP + "return {\n";
+
+      for (const auto &group : fEltwiseFusionGroups) {
+         if (!group.isFused() || group.executionSchedules.empty())
+            continue;
+
+         const bool hasReduction = std::any_of(group.opIndices.begin(), group.opIndices.end(), [&](size_t opIdx) {
+            return fOperators[opIdx]->IsFusionReduction();
+         });
+
+         if (!hasReduction)
+            continue;
+
+         const std::string sfx = group.suffix();
+         fGC += SP + SP + "{\"" + sfx + "\", selectedFusedReductionThreads" + sfx + "},\n";
+      }
+
+      fGC += SP + "};\n";
+      fGC += "}\n";
+   }
    // inject GPU profiling utility functions and memory report inside Session struct
    if (fProfile && fUseSession) {
       fGC += RModelProfilerGPU::GenerateUtilityFunctions();

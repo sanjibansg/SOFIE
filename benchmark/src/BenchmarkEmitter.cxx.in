@@ -203,7 +203,7 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         // here would require all 32 models to share one translation unit
         // which OOM-kills the CUDA compiler.
         << "void Benchmark_" << cppName
-        << "(int warmup, int iterations, const std::string& weightsDir, bool profile) {\n"
+        << "(int warmup, int iterations, const std::string& weightsDir, bool profile, size_t maxThreadsPerBlock, size_t maxSharedMemoryPerBlockBytes, bool showResourcePlan) {\n"
         << "    using namespace sofie_bench;\n\n"
         << "    // ---- Device/host setup (mirrors unit-test pattern) ----\n"
         << "    alpaka::PlatformCpu hostPlatform{};\n"
@@ -247,8 +247,18 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         << "    // ---- Create session (loads weights) ----\n"
         << "    std::string weightFile = weightsDir + \"/"
         << modelName << "_GPU_ALPAKA.dat\";\n"
+        << "    SOFIE_" << cppName << "::SessionOptions sessionOptions;\n"
+        << "    sessionOptions.maxThreadsPerBlock = maxThreadsPerBlock;\n"
+        << "    sessionOptions.maxSharedMemoryPerBlockBytes = maxSharedMemoryPerBlockBytes;\n"
         << "    SOFIE_" << cppName
-        << "::Session<AccTag> session(weightFile);\n"
+        << "::Session<AccTag> session(weightFile, sessionOptions);\n"
+        << "    if (showResourcePlan) {\n"
+        << "        const auto selections = session.GetSelectedFusedReductionSchedules();\n"
+        << "        std::fprintf(stderr, \"[SOFIE resource plan]\");\n"
+        << "        if (selections.empty()) std::fprintf(stderr, \" no fused reductions\");\n"
+        << "        for (const auto &selection : selections) std::fprintf(stderr, \" %s=%zu threads\", selection.group, static_cast<size_t>(selection.threadsPerBlock));\n"
+        << "        std::fprintf(stderr, \"\\n\");\n"
+        << "    }\n"
         << "    double sofie_pool_mem_mb = "
         << "static_cast<double>(session.GetIntermediateMemoryPoolSize()) / (1024.0 * 1024.0);\n"
 

@@ -52,7 +52,10 @@ static int run_single_model(const std::string& model,
                             bool run_sofie,
                             bool run_ort,
                             bool run_trt,
-                            bool run_aot)
+                            bool run_aot,
+                            size_t maxThreadsPerBlock,
+                            size_t maxSharedMemoryPerBlockBytes,
+                            bool showResourcePlan)
 {
 @BENCHMARK_SINGLE_MODEL_CASES@
     std::fprintf(stderr, "Unknown model: %s\n", model.c_str());
@@ -63,6 +66,9 @@ int main(int argc, char *argv[]) {
     int warmup     = 10;
     int iterations = 100;
     std::string weightsDir = ".";
+    size_t maxThreadsPerBlock = 0;
+    size_t maxSharedMemoryPerBlockBytes = 0;
+    bool showResourcePlan = false;
     bool run_ort   = false;
     bool run_trt   = false;
     bool run_sofie = true;
@@ -77,11 +83,14 @@ int main(int argc, char *argv[]) {
         else if ((a == "--iterations"    || a == "-n") && i + 1 < argc) iterations = std::stoi(argv[++i]);
         else if  (a == "--weights-dir"                 && i + 1 < argc) weightsDir = argv[++i];
         else if  (a == "--single-model"                && i + 1 < argc) singleModel = argv[++i];
+        else if  (a == "--max-threads-per-block"       && i + 1 < argc) maxThreadsPerBlock = std::stoull(argv[++i]);
+        else if  (a == "--max-shared-memory-per-block" && i + 1 < argc) maxSharedMemoryPerBlockBytes = std::stoull(argv[++i]);
+        else if  (a == "--show-resource-plan")                          showResourcePlan = true;
         else if  (a == "--onnxruntime"   || a == "--ort")               run_ort    = true;
-        else if (a == "--tensorrt" || a == "--trt")                     run_trt = true;
-        else if (a == "--pytorch-aot" || a == "--aot")                  run_aot = true;
-        else if (a == "--profile")                                      profile = true;
-        else if (a == "--ncu" && i + 1 < argc)                          ncuPath = argv[++i];
+        else if  (a == "--tensorrt" || a == "--trt")                    run_trt = true;
+        else if  (a == "--pytorch-aot" || a == "--aot")                 run_aot = true;
+        else if  (a == "--profile")                                     profile = true;
+        else if  (a == "--ncu" && i + 1 < argc)                         ncuPath = argv[++i];
         else if  (a == "--help"          || a == "-h") {
 #ifdef SOFIE_BENCHMARK_PROFILE
             std::cout <<
@@ -92,6 +101,9 @@ int main(int argc, char *argv[]) {
                 "  --warmup,      -w <N>   Warmup iterations  (default: 10)\n"
                 "  --iterations,  -n <N>   Profiling runs      (default: 100)\n"
                 "  --weights-dir    <DIR>  SOFIE .dat files    (default: .)\n"
+                "  --max-threads-per-block <N>       Maximum SOFIE threads/block (0 = hardware limit)\n"
+                "  --max-shared-memory-per-block <B> Maximum SOFIE shared memory/block in bytes (0 = hardware limit)\n"
+                "  --show-resource-plan                   Print SOFIE's selected runtime resource plan\n"
                 "  --single-model   <N>   Run one model (internal)\n"
                 ;
 #else
@@ -100,6 +112,9 @@ int main(int argc, char *argv[]) {
                 "  --warmup,      -w <N>   Warmup iterations       (default: 10)\n"
                 "  --iterations,  -n <N>   Timed iterations         (default: 100)\n"
                 "  --weights-dir    <DIR>  SOFIE .dat weight files  (default: .)\n"
+                "  --max-threads-per-block <N>       Maximum SOFIE threads/block (0 = hardware limit)\n"
+                "  --max-shared-memory-per-block <B> Maximum SOFIE shared memory/block in bytes (0 = hardware limit)\n"
+                "  --show-resource-plan                   Print SOFIE's selected runtime resource plan\n"
 #ifdef SOFIE_BENCHMARK_ORT
                 "  --onnxruntime, --ort    Also run ONNX Runtime GPU comparison\n"
 #else
@@ -177,7 +192,7 @@ int main(int argc, char *argv[]) {
     // All GPU memory is freed when this process exits.
     // -----------------------------------------------------------------------
     if (!singleModel.empty())
-        return run_single_model(singleModel, warmup, iterations, weightsDir, profile, run_sofie, run_ort, run_trt, run_aot);
+        return run_single_model(singleModel, warmup, iterations, weightsDir, profile, run_sofie, run_ort, run_trt, run_aot, maxThreadsPerBlock, maxSharedMemoryPerBlockBytes, showResourcePlan);
 
     // -----------------------------------------------------------------------
     // Orchestrator mode: spawn one child process per model so every model
@@ -414,6 +429,15 @@ int main(int argc, char *argv[]) {
            << " -n " << iterations
            << " --weights-dir \"" << weightsDir << "\"";
 
+    if (maxThreadsPerBlock > 0)
+        common << " --max-threads-per-block " << maxThreadsPerBlock;
+
+    if (maxSharedMemoryPerBlockBytes > 0)
+        common << " --max-shared-memory-per-block " << maxSharedMemoryPerBlockBytes;
+
+    if (showResourcePlan)
+        common << " --show-resource-plan";
+        
     if (profile) common << " --profile";
     if (!ncuPath.empty()) common << " --ncu \"" << ncuPath << "\"";
 
