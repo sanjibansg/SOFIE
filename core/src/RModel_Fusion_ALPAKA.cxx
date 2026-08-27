@@ -24,6 +24,70 @@ namespace {
 
 } // anonymous
 
+size_t RModel::ComputeDefaultFusionReductionBlockSize(size_t reducedLength)
+{
+   size_t blockSize = 32;
+   while (blockSize < reducedLength && blockSize < 256)
+      blockSize *= 2;
+
+   return blockSize;
+}
+
+std::vector<RModel::FusionExecutionSchedule> RModel::ComputeFusionExecutionSchedules(const FusionCandidate &candidate) const
+{
+   size_t reductionOpIdx = fOperators.size();
+
+   for (const size_t opIdx : candidate.opIndices) {
+      if (!fOperators[opIdx]->IsFusionReduction())
+         continue;
+
+      if (reductionOpIdx != fOperators.size())
+         return {};
+
+      reductionOpIdx = opIdx;
+   }
+
+   if (reductionOpIdx == fOperators.size())
+      return {};
+
+   const auto &reductionOp = fOperators[reductionOpIdx];
+   const auto inputs = reductionOp->GetOpInputTensors();
+   const auto outputs = reductionOp->GetOpOutputTensors();
+   const auto dataInputIndices = reductionOp->GetFusionDataInputIndices();
+
+   if (dataInputIndices.size() != 1 || outputs.size() != 1 || dataInputIndices[0] >= inputs.size())
+      return {};
+
+   const std::string inputName(inputs[dataInputIndices[0]]);
+   const std::string outputName(outputs[0]);
+   const size_t inputLength = ConvertShapeToLength(GetTensorShape(inputName));
+   const size_t outputLength = ConvertShapeToLength(GetTensorShape(outputName));
+
+   if (outputLength == 0 || inputLength % outputLength != 0)
+      return {};
+
+   const size_t reducedLength = inputLength / outputLength;
+   const size_t defaultBlockSize = ComputeDefaultFusionReductionBlockSize(reducedLength);
+   const size_t elementSize = GetTypeSize(GetTensorType(outputName));
+   std::vector<FusionExecutionSchedule> schedules;
+
+   for (size_t threads = 32; threads <= defaultBlockSize; threads *= 2) {
+      size_t treeReductionStages = 0;
+      for (size_t stride = threads / 2; stride > 0; stride >>= 1)
+         ++treeReductionStages;
+
+      FusionExecutionSchedule schedule;
+      schedule.blocksPerGrid = outputLength;
+      schedule.threadsPerBlock = threads;
+      schedule.sharedMemoryBytes = threads * elementSize;
+      schedule.maxElementsPerThread = (reducedLength + threads - 1) / threads;
+      schedule.treeReductionStages = treeReductionStages;
+      schedule.synchronizationPoints = treeReductionStages + 2;
+      schedules.push_back(schedule);
+   }
+
+   return schedules;
+}
 
 RModel::FusionTensorUseGraph RModel::BuildFusionTensorUseGraph() const
 {
@@ -644,6 +708,7 @@ std::vector<RModel::FusionCandidate> RModel::EnumerateSpecialFusionCandidates(co
          candidate.internalTensors = group.internalTensors;
          candidate.launchOpIndex = group.launchOpIndex;
          candidate.prebuiltGroup = std::move(group);
+         candidate.executionSchedules = ComputeFusionExecutionSchedules(candidate);
          candidate.score = ComputeFusionStructuralScore(candidate, tensorUses);
          candidates.push_back(std::move(candidate));
       }
@@ -724,6 +789,7 @@ std::vector<RModel::FusionCandidate> RModel::EnumerateFusionCandidates(const Fus
                for (const size_t launchOpIdx : launchIndices) {
                   FusionCandidate option = candidate;
                   option.launchOpIndex = launchOpIdx;
+                  option.executionSchedules = ComputeFusionExecutionSchedules(option);
                   option.score = ComputeFusionStructuralScore(option, tensorUses);
                   candidates.push_back(std::move(option));
                }
@@ -786,6 +852,7 @@ std::vector<RModel::FusionCandidate> RModel::EnumerateLinearFusionCandidates(con
 
             FusionCandidate option = candidate;
             option.launchOpIndex = launchOpIdx;
+            option.executionSchedules = ComputeFusionExecutionSchedules(option);
             option.score = ComputeFusionStructuralScore(option, tensorUses);
             candidates.push_back(std::move(option));
          }
@@ -1258,6 +1325,7 @@ RModel::EltwiseFusionGroup RModel::BuildEltwiseFusionGroup(const FusionCandidate
 {
    if (candidate.prebuiltGroup) {
       EltwiseFusionGroup group = *candidate.prebuiltGroup;
+      group.executionSchedules = candidate.executionSchedules;
       group.usesIndexedEvaluation = true;
       return group;
    }
@@ -1269,6 +1337,7 @@ RModel::EltwiseFusionGroup RModel::BuildEltwiseFusionGroup(const FusionCandidate
    group.opIndices = candidate.opIndices;
    group.outputTensors = candidate.materializedOutputs;
    group.internalTensors = candidate.internalTensors;
+   group.executionSchedules = candidate.executionSchedules;
    group.outputTensor = group.outputTensors.front();
    group.launchOpIndex = candidate.launchOpIndex;
 

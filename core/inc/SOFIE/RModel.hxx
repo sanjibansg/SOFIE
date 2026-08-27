@@ -77,6 +77,15 @@ private:
       std::string customIndexExpression;
    };
 
+   struct FusionExecutionSchedule {
+      size_t blocksPerGrid = 0;
+      size_t threadsPerBlock = 0;
+      size_t sharedMemoryBytes = 0;
+      size_t maxElementsPerThread = 0;
+      size_t treeReductionStages = 0;
+      size_t synchronizationPoints = 0;
+   };
+
    // GPU ALPAKA elementwise kernel fusion state (transient, computed in GenerateGPU_ALPAKA)
    struct EltwiseFusionGroup {
       std::vector<size_t> opIndices; ///< dependency-chain operator indices forming this group
@@ -84,6 +93,7 @@ private:
       std::string outputTensor; ///< tensor defining the fused iteration domain
       std::vector<std::string> outputTensors; ///< tensors materialized by the fused kernel
       std::vector<std::string> internalTensors; ///< tensors kept only as local fused values
+      std::vector<FusionExecutionSchedule> executionSchedules; ///< available cooperative execution schedules
       size_t numElements = 0;
       size_t launchOpIndex = 0;
       bool usesIndexedEvaluation = false;
@@ -140,6 +150,7 @@ private:
       std::vector<std::string> externalInputs;
       std::vector<std::string> materializedOutputs;
       std::vector<std::string> internalTensors;
+      std::vector<FusionExecutionSchedule> executionSchedules;
       FusionStructuralScore score;
       size_t launchOpIndex = 0;
       std::optional<EltwiseFusionGroup> prebuiltGroup;
@@ -174,6 +185,10 @@ private:
    std::vector<FusionCandidate> EnumerateLinearFusionCandidates(const FusionTensorUseGraph &tensorUses) const;
 
    FusionStructuralScore ComputeFusionStructuralScore(const FusionCandidate &candidate, const FusionTensorUseGraph &tensorUses) const;
+
+   std::vector<FusionExecutionSchedule> ComputeFusionExecutionSchedules(const FusionCandidate &candidate) const;
+
+   static size_t ComputeDefaultFusionReductionBlockSize(size_t reducedLength);
 
    size_t ComputeFusionLiveRangeExtensionByteSteps(const FusionCandidate &candidate, const FusionTensorUseGraph &tensorUses) const;
 

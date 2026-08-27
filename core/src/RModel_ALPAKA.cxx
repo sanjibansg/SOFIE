@@ -446,9 +446,9 @@ std::string RModel::GenerateFusedReductionLaunch_GPU_ALPAKA(const EltwiseFusionG
 
    const size_t reducedLength = inputLength / outputLength;
 
-   size_t blockSize = 32;
-   while (blockSize < reducedLength && blockSize < 256)
-      blockSize *= 2;
+   const size_t blockSize = group.executionSchedules.empty()
+      ? ComputeDefaultFusionReductionBlockSize(reducedLength)
+      : group.executionSchedules.back().threadsPerBlock;
 
    const std::string suffix = group.suffix();
 
@@ -1384,9 +1384,9 @@ std::string RModel::GenerateFusedReductionKernel_GPU_ALPAKA(const EltwiseFusionG
 
    const size_t reducedLength = inputLength / outputLength;
 
-   size_t blockSize = 32;
-   while (blockSize < reducedLength && blockSize < 256)
-      blockSize *= 2;
+   const size_t blockSize = group.executionSchedules.empty()
+         ? ComputeDefaultFusionReductionBlockSize(reducedLength)
+         : group.executionSchedules.back().threadsPerBlock;
 
    const std::string inputIndexExpression =
       reductionOp->GetFusionReductionInputIndexExpr("out_idx", "r", reductionInputShape, reductionOutputShape);
@@ -1411,6 +1411,15 @@ std::string RModel::GenerateFusedReductionKernel_GPU_ALPAKA(const EltwiseFusionG
    std::string kernelCode;
 
    kernelCode += "\n//------ FUSED_REDUCTION_KERNEL" + suffix + "\n";
+
+   if (!group.executionSchedules.empty()) {
+      kernelCode += "// Available reduction schedules:";
+      for (const auto &schedule : group.executionSchedules) {
+         kernelCode += " [blocks=" + std::to_string(schedule.blocksPerGrid) + ", threads=" + std::to_string(schedule.threadsPerBlock) + ", shared=" + std::to_string(schedule.sharedMemoryBytes) + "B, max-values/thread=" + std::to_string(schedule.maxElementsPerThread) + ", tree-stages=" + std::to_string(schedule.treeReductionStages) + ", syncs=" + std::to_string(schedule.synchronizationPoints) + "]";
+      }
+      kernelCode += "\n";
+   }
+
    kernelCode += "struct FusedEltwiseKernel" + suffix + " {\n";
    kernelCode += SP + "template<typename TAcc";
 
