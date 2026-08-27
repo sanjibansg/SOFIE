@@ -1803,8 +1803,16 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    if (fKernelOnly)
       return;
 
+   if (fUseSession) {
+      fGC += "\nstruct SessionOptions {\n";
+      fGC += SP + "std::size_t maxThreadsPerBlock = 0;\n";
+      fGC += SP + "std::size_t maxSharedMemoryPerBlockBytes = 0;\n";
+      fGC += SP + "std::size_t maxIntermediateDRAMBytes = 0;\n";
+      fGC += "};\n";
+   }
+
    // define the Session struct (for GNN this is generated in RModel_GNN)
-  fGC += "\n\ntemplate <typename tagAcc>\n";
+   fGC += "\n\ntemplate <typename tagAcc>\n";
    if (fUseSession) {
       fGC += "struct Session {\n\n";
    }
@@ -1839,6 +1847,18 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
     fGC += "alpaka::DevCpu hostAcc = alpaka::getDevByIdx(platformHost, 0);\n";
     fGC += "QueueAcc queue{devAcc};\n";
     fGC += "Idx threadsPerBlock = 256;\n";
+
+    if (fUseSession) {
+       fGC += "\nSessionOptions sessionOptions{};\n";
+       fGC += "Idx hardwareMaxThreadsPerBlock = 0;\n";
+       fGC += "std::size_t hardwareMaxSharedMemoryPerBlockBytes = 0;\n";
+       fGC += "std::size_t hardwareGlobalMemoryBytes = 0;\n";
+       fGC += "Idx hardwareMultiProcessorCount = 0;\n";
+       fGC += "Idx effectiveMaxThreadsPerBlock = 0;\n";
+       fGC += "std::size_t effectiveMaxSharedMemoryPerBlockBytes = 0;\n";
+       fGC += "std::size_t effectiveMaxIntermediateDRAMBytes = 0;\n";
+    }
+
     fGC += "\nusing Ext1D = alpaka::Vec<Dim, Idx>;\n";
     fGC += "using Vec = alpaka::Vec<Dim, Idx>;\n";
     if (OpNeedsBlas) {
@@ -1946,6 +1966,16 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          std::string savedGC = fGC;
          fGC.clear();
 
+         fGC += "sessionOptions = options;\n";
+         fGC += "const auto deviceProperties = alpaka::getAccDevProps<Acc>(devAcc);\n";
+         fGC += "hardwareMaxThreadsPerBlock = deviceProperties.m_blockThreadCountMax < deviceProperties.m_blockThreadExtentMax[0] ? deviceProperties.m_blockThreadCountMax : deviceProperties.m_blockThreadExtentMax[0];\n";
+         fGC += "hardwareMaxSharedMemoryPerBlockBytes = deviceProperties.m_sharedMemSizeBytes;\n";
+         fGC += "hardwareGlobalMemoryBytes = deviceProperties.m_globalMemSizeBytes;\n";
+         fGC += "hardwareMultiProcessorCount = deviceProperties.m_multiProcessorCount;\n";
+         fGC += "effectiveMaxThreadsPerBlock = sessionOptions.maxThreadsPerBlock == 0 || sessionOptions.maxThreadsPerBlock > hardwareMaxThreadsPerBlock ? hardwareMaxThreadsPerBlock : sessionOptions.maxThreadsPerBlock;\n";
+         fGC += "effectiveMaxSharedMemoryPerBlockBytes = sessionOptions.maxSharedMemoryPerBlockBytes == 0 || sessionOptions.maxSharedMemoryPerBlockBytes > hardwareMaxSharedMemoryPerBlockBytes ? hardwareMaxSharedMemoryPerBlockBytes : sessionOptions.maxSharedMemoryPerBlockBytes;\n";
+         fGC += "effectiveMaxIntermediateDRAMBytes = sessionOptions.maxIntermediateDRAMBytes == 0 || sessionOptions.maxIntermediateDRAMBytes > hardwareGlobalMemoryBytes ? hardwareGlobalMemoryBytes : sessionOptions.maxIntermediateDRAMBytes;\n\n";
+
          GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA();
          if (fUseWeightFile) {
             fGC += "\n//--- reading weights from file\n";
@@ -1972,7 +2002,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          // ---- public constructors with inlined body ----
          fGC += "public:\n";
 
-         // (1) default-queue constructor
+         // default-queue constructor
          if (fUseWeightFile)
             fGC += "\n\n" + sessionName + "(std::string filename = \"" + fileName + "\"";
          else
@@ -1981,11 +2011,12 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
             fGC += ",\n";
             fGC += "        size_t " + p.first + " = " + p.second;
          }
+         fGC += ",\n        SessionOptions options = {}";
          fGC += ") {\n";
          fGC += ctorBody;
          fGC += "}\n\n";
 
-         // (2) external-queue constructor
+         // external-queue constructor
          if (fUseWeightFile)
             fGC += sessionName + "(QueueAcc& extQueue, std::string filename = \"" + fileName + "\"";
          else
@@ -1994,6 +2025,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
             fGC += ",\n";
             fGC += "        size_t " + p.first + " = " + p.second;
          }
+         fGC += ",\n        SessionOptions options = {}";
          fGC += ")\n    : queue(extQueue)";
          if (OpNeedsBlas)
             fGC += ", blas(queue)";
