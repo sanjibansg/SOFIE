@@ -167,6 +167,14 @@ private:
       FusionStructuralScore score;
    };
 
+   struct FusionPlanComponent {
+      std::vector<size_t> candidateIndices;
+   };
+
+   std::vector<FusionCandidate> fFusionCandidates; ///< legal elementwise fusion candidates retained for runtime plan selection
+   std::vector<FusionPlanComponent> fFusionPlanComponents; ///< independent candidate interaction components
+   FusionPlan fDefaultFusionPlan; ///< compile-time best plan, retained as the default runtime plan
+
    std::vector<EltwiseFusionGroup> fEltwiseFusionGroups; ///<!
    std::vector<KernelFusionGroup> fKernelFusionGroups; ///< horizontally fused kernel groups
    std::unordered_map<size_t, size_t> fOpToFusionGroupIdx; ///<!  op_idx -> fusion group index
@@ -201,6 +209,9 @@ private:
    size_t ComputeFusionPlanLiveRangeExtensionByteSteps(const std::vector<size_t> &candidateIndices, const std::vector<FusionCandidate> &candidates) const;
 
    bool FusionCandidatesConflict(const FusionCandidate &left, const FusionCandidate &right, const FusionTensorUseGraph &tensorUses) const;
+
+   std::vector<FusionPlanComponent> BuildFusionPlanComponents(const std::vector<FusionCandidate> &candidates,
+                                                              const FusionTensorUseGraph &tensorUses) const;
 
    FusionPlan SelectFusionPlan(const std::vector<FusionCandidate> &candidates, const FusionTensorUseGraph &tensorUses) const;
 

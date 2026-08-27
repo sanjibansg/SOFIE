@@ -495,6 +495,87 @@ bool RModel::FusionCandidatesConflict(const FusionCandidate &left, const FusionC
    return HasOrderingConflict(left, right) || HasOrderingConflict(right, left);
 }
 
+std::vector<RModel::FusionPlanComponent> RModel::BuildFusionPlanComponents(
+const std::vector<FusionCandidate> &candidates, const FusionTensorUseGraph &tensorUses) const
+{
+   std::vector<FusionPlanComponent> components;
+
+   if (candidates.empty())
+      return components;
+
+   std::vector<std::vector<size_t>> componentNeighbors(candidates.size());
+
+   for (size_t leftIdx = 0; leftIdx < candidates.size(); ++leftIdx) {
+      for (size_t rightIdx = leftIdx + 1; rightIdx < candidates.size(); ++rightIdx) {
+         if (!FusionCandidatesConflict(candidates[leftIdx], candidates[rightIdx], tensorUses))
+            continue;
+
+         componentNeighbors[leftIdx].push_back(rightIdx);
+         componentNeighbors[rightIdx].push_back(leftIdx);
+      }
+   }
+
+   std::unordered_map<std::string, std::vector<size_t>> lifetimeUsers;
+
+   for (size_t candidateIdx = 0; candidateIdx < candidates.size(); ++candidateIdx) {
+      for (const auto &externalInputName : candidates[candidateIdx].externalInputs) {
+         const std::string tensorName = ResolveAliasTensor(externalInputName);
+         const auto frequencyIt = fIntermediateTensorFrequencyLookup.find(tensorName);
+
+         if (frequencyIt == fIntermediateTensorFrequencyLookup.end() ||
+             candidates[candidateIdx].launchOpIndex <= frequencyIt->second)
+            continue;
+
+         lifetimeUsers[tensorName].push_back(candidateIdx);
+      }
+   }
+
+   for (auto &[tensorName, users] : lifetimeUsers) {
+      std::sort(users.begin(), users.end());
+      users.erase(std::unique(users.begin(), users.end()), users.end());
+
+      for (size_t idx = 1; idx < users.size(); ++idx) {
+         componentNeighbors[users.front()].push_back(users[idx]);
+         componentNeighbors[users[idx]].push_back(users.front());
+      }
+   }
+
+   for (auto &neighbors : componentNeighbors) {
+      std::sort(neighbors.begin(), neighbors.end());
+      neighbors.erase(std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
+   }
+
+   std::vector<bool> visited(candidates.size(), false);
+
+   for (size_t seedIdx = 0; seedIdx < candidates.size(); ++seedIdx) {
+      if (visited[seedIdx])
+         continue;
+
+      FusionPlanComponent component;
+      std::vector<size_t> pending{seedIdx};
+      visited[seedIdx] = true;
+
+      while (!pending.empty()) {
+         const size_t candidateIdx = pending.back();
+         pending.pop_back();
+         component.candidateIndices.push_back(candidateIdx);
+
+         for (const size_t neighborIdx : componentNeighbors[candidateIdx]) {
+            if (visited[neighborIdx])
+               continue;
+
+            visited[neighborIdx] = true;
+            pending.push_back(neighborIdx);
+         }
+      }
+
+      std::sort(component.candidateIndices.begin(), component.candidateIndices.end());
+      components.push_back(std::move(component));
+   }
+
+   return components;
+}
+
 RModel::FusionPlan RModel::SelectFusionPlan(const std::vector<FusionCandidate> &candidates, const FusionTensorUseGraph &tensorUses) const
 {
    FusionPlan plan;
@@ -1750,6 +1831,10 @@ std::vector<RModel::KernelFusionGroup> RModel::SelectKernelFusionGroups(std::vec
 
 void RModel::ComputeEltwiseFusionGroups()
 {
+   fFusionCandidates.clear();
+   fFusionPlanComponents.clear();
+   fDefaultFusionPlan = {};
+
    fEltwiseFusionGroups.clear();
    fKernelFusionGroups.clear();
    fOpToFusionGroupIdx.clear();
@@ -1761,13 +1846,14 @@ void RModel::ComputeEltwiseFusionGroups()
    auto specialCandidates = EnumerateSpecialFusionCandidates(tensorUses);
    auto dagCandidates = EnumerateFusionCandidates(tensorUses);
    auto linearCandidates = EnumerateLinearFusionCandidates(tensorUses);
-   std::vector<FusionCandidate> candidates;
    std::set<std::pair<std::vector<size_t>, size_t>> seenCandidates;
 
    auto AddCandidates = [&](std::vector<FusionCandidate> &source) {
       for (auto &candidate : source) {
-         if (!seenCandidates.insert({candidate.opIndices, candidate.launchOpIndex}).second) continue;
-         candidates.push_back(std::move(candidate));
+         if (!seenCandidates.insert({candidate.opIndices, candidate.launchOpIndex}).second)
+            continue;
+
+         fFusionCandidates.push_back(std::move(candidate));
       }
    };
 
@@ -1775,10 +1861,26 @@ void RModel::ComputeEltwiseFusionGroups()
    AddCandidates(dagCandidates);
    AddCandidates(linearCandidates);
 
-   const FusionPlan plan = SelectFusionPlan(candidates, tensorUses);
+   fFusionPlanComponents = BuildFusionPlanComponents(fFusionCandidates, tensorUses);
+   fDefaultFusionPlan = SelectFusionPlan(fFusionCandidates, tensorUses);
 
-   for (const size_t candidateIdx : plan.candidateIndices)
-      fEltwiseFusionGroups.push_back(BuildEltwiseFusionGroup(candidates[candidateIdx]));
+   if (fVerbose) {
+      std::cout << "[SOFIE resource-aware fusion] retained " << fFusionCandidates.size()
+                << " candidate(s) in " << fFusionPlanComponents.size()
+                << " interaction component(s)" << std::endl;
+
+      for (size_t componentIdx = 0; componentIdx < fFusionPlanComponents.size(); ++componentIdx) {
+         std::cout << "  component " << componentIdx << ":";
+
+         for (const size_t candidateIdx : fFusionPlanComponents[componentIdx].candidateIndices)
+            std::cout << " " << candidateIdx;
+
+         std::cout << std::endl;
+      }
+   }
+
+   for (const size_t candidateIdx : fDefaultFusionPlan.candidateIndices)
+      fEltwiseFusionGroups.push_back(BuildEltwiseFusionGroup(fFusionCandidates[candidateIdx]));
 
    std::sort(fEltwiseFusionGroups.begin(), fEltwiseFusionGroups.end(), [](const EltwiseFusionGroup &left,
          const EltwiseFusionGroup &right) { return left.opIndices.front() < right.opIndices.front(); });
