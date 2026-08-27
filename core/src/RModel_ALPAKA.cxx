@@ -444,33 +444,45 @@ std::string RModel::GenerateFusedReductionLaunch_GPU_ALPAKA(const EltwiseFusionG
    if (outputLength == 0 || inputLength % outputLength != 0)
       throw std::runtime_error("Invalid fused reduction shape");
 
-   const size_t reducedLength = inputLength / outputLength;
-
-   const size_t blockSize = group.executionSchedules.empty()
-      ? ComputeDefaultFusionReductionBlockSize(reducedLength)
-      : group.executionSchedules.back().threadsPerBlock;
+   if (group.executionSchedules.empty())
+      throw std::runtime_error("Fused reduction group has no execution schedules");
 
    const std::string suffix = group.suffix();
-
-   const std::string kernelName = "fusedEltwiseKernel" + suffix + "_" + std::to_string(blockSize);
+   const std::string selectedName = "selectedFusedReductionThreads" + suffix;
    std::string launchCode;
 
    launchCode += "\n//------ FUSED_REDUCTION_GPU_ALPAKA" + suffix + "\n";
    launchCode += SP + "{\n";
-   launchCode += SP + SP + "alpaka::WorkDivMembers<Dim, Idx> workDiv_fused" + suffix + "(\n";
-   launchCode += SP + SP + SP + "Vec::all(Idx{" + std::to_string(outputLength) + "u}),\n";
-   launchCode += SP + SP + SP + "Vec::all(Idx{" + std::to_string(blockSize) + "u}),\n";
-   launchCode += SP + SP + SP + "Vec::all(Idx{1u}));\n";
-   launchCode += SP + SP + "auto task_fused" + suffix + " = alpaka::createTaskKernel<Acc>(workDiv_fused" + suffix + ", " + kernelName;
+   launchCode += SP + SP + "switch (" + selectedName + ") {\n";
 
-   for (const auto &externalInput : group.externalInputs)
-      launchCode += ", alpaka::getPtrNative(deviceBuf_" + externalInput.tensorName + ")";
+   for (const auto &schedule : group.executionSchedules) {
+      const std::string threads = std::to_string(schedule.threadsPerBlock);
+      const std::string workDivName = "workDiv_fused" + suffix + "_" + threads;
+      const std::string taskName = "task_fused" + suffix + "_" + threads;
+      const std::string kernelName = "fusedEltwiseKernel" + suffix + "_" + threads;
 
-   for (const auto &outputName : group.outputTensors)
-      launchCode += ", alpaka::getPtrNative(deviceBuf_" + outputName + ")";
+      launchCode += SP + SP + "case " + threads + "u: {\n";
+      launchCode += SP + SP + SP + "alpaka::WorkDivMembers<Dim, Idx> " + workDivName + "(\n";
+      launchCode += SP + SP + SP + SP + "Vec::all(Idx{" + std::to_string(outputLength) + "u}),\n";
+      launchCode += SP + SP + SP + SP + "Vec::all(Idx{" + threads + "u}),\n";
+      launchCode += SP + SP + SP + SP + "Vec::all(Idx{1u}));\n";
+      launchCode += SP + SP + SP + "auto " + taskName + " = alpaka::createTaskKernel<Acc>(" + workDivName + ", " + kernelName;
 
-   launchCode += ");\n";
-   launchCode += SP + SP + "alpaka::enqueue(queue, task_fused" + suffix + ");\n";
+      for (const auto &externalInput : group.externalInputs)
+         launchCode += ", alpaka::getPtrNative(deviceBuf_" + externalInput.tensorName + ")";
+
+      for (const auto &outputName : group.outputTensors)
+         launchCode += ", alpaka::getPtrNative(deviceBuf_" + outputName + ")";
+
+      launchCode += ");\n";
+      launchCode += SP + SP + SP + "alpaka::enqueue(queue, " + taskName + ");\n";
+      launchCode += SP + SP + SP + "break;\n";
+      launchCode += SP + SP + "}\n";
+   }
+
+   launchCode += SP + SP + "default:\n";
+   launchCode += SP + SP + SP + "throw std::runtime_error(\"Invalid selected fused reduction schedule\");\n";
+   launchCode += SP + SP + "}\n";
    launchCode += SP + "}\n";
 
    if (!fProfile)
@@ -1976,6 +1988,33 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          fGC += "effectiveMaxSharedMemoryPerBlockBytes = sessionOptions.maxSharedMemoryPerBlockBytes == 0 || sessionOptions.maxSharedMemoryPerBlockBytes > hardwareMaxSharedMemoryPerBlockBytes ? hardwareMaxSharedMemoryPerBlockBytes : sessionOptions.maxSharedMemoryPerBlockBytes;\n";
          fGC += "effectiveMaxIntermediateDRAMBytes = sessionOptions.maxIntermediateDRAMBytes == 0 || sessionOptions.maxIntermediateDRAMBytes > hardwareGlobalMemoryBytes ? hardwareGlobalMemoryBytes : sessionOptions.maxIntermediateDRAMBytes;\n\n";
 
+         for (const auto &group : fEltwiseFusionGroups) {
+            if (!group.isFused() || group.executionSchedules.empty())
+               continue;
+
+            const bool hasReduction = std::any_of(group.opIndices.begin(), group.opIndices.end(), [&](size_t opIdx) {
+               return fOperators[opIdx]->IsFusionReduction();
+            });
+
+            if (!hasReduction)
+               continue;
+
+            const std::string sfx = group.suffix();
+            const std::string selectedName = "selectedFusedReductionThreads" + sfx;
+
+            fGC += selectedName + " = 0;\n";
+
+            for (const auto &schedule : group.executionSchedules) {
+               const std::string threads = std::to_string(schedule.threadsPerBlock);
+               const std::string sharedMemory = std::to_string(schedule.sharedMemoryBytes);
+               fGC += "if (" + threads + "u <= effectiveMaxThreadsPerBlock && " + sharedMemory + "u <= effectiveMaxSharedMemoryPerBlockBytes) " + selectedName + " = " + threads + "u;\n";
+            }
+
+            fGC += "if (" + selectedName + " == 0) throw std::runtime_error(\"No feasible execution schedule for fused reduction" + sfx + "\");\n";
+         }
+
+         fGC += "\n";
+
          GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA();
          if (fUseWeightFile) {
             fGC += "\n//--- reading weights from file\n";
@@ -2079,6 +2118,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
                      const std::string threads = std::to_string(schedule.threadsPerBlock);
                      fGC += SP + "FusedEltwiseKernel" + sfx + "<" + threads + "> fusedEltwiseKernel" + sfx + "_" + threads + ";\n";
                   }
+
+                  fGC += SP + "Idx selectedFusedReductionThreads" + sfx + " = " + std::to_string(group.executionSchedules.back().threadsPerBlock) + ";\n";
                } else {
                   fGC += SP + "FusedEltwiseKernel" + sfx + " fusedEltwiseKernel" + sfx + ";\n";
                }
