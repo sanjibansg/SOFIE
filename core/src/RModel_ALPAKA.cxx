@@ -452,7 +452,7 @@ std::string RModel::GenerateFusedReductionLaunch_GPU_ALPAKA(const EltwiseFusionG
 
    const std::string suffix = group.suffix();
 
-   const std::string kernelName = "fusedEltwiseKernel" + suffix;
+   const std::string kernelName = "fusedEltwiseKernel" + suffix + "_" + std::to_string(blockSize);
    std::string launchCode;
 
    launchCode += "\n//------ FUSED_REDUCTION_GPU_ALPAKA" + suffix + "\n";
@@ -1384,10 +1384,6 @@ std::string RModel::GenerateFusedReductionKernel_GPU_ALPAKA(const EltwiseFusionG
 
    const size_t reducedLength = inputLength / outputLength;
 
-   const size_t blockSize = group.executionSchedules.empty()
-         ? ComputeDefaultFusionReductionBlockSize(reducedLength)
-         : group.executionSchedules.back().threadsPerBlock;
-
    const std::string inputIndexExpression =
       reductionOp->GetFusionReductionInputIndexExpr("out_idx", "r", reductionInputShape, reductionOutputShape);
 
@@ -1420,6 +1416,7 @@ std::string RModel::GenerateFusedReductionKernel_GPU_ALPAKA(const EltwiseFusionG
       kernelCode += "\n";
    }
 
+   kernelCode += "template <std::size_t BlockSize>\n";
    kernelCode += "struct FusedEltwiseKernel" + suffix + " {\n";
    kernelCode += SP + "template<typename TAcc";
 
@@ -1440,12 +1437,12 @@ std::string RModel::GenerateFusedReductionKernel_GPU_ALPAKA(const EltwiseFusionG
 
    kernelCode += ") const {\n";
    kernelCode += SP + SP + "using T = TOutput0;\n";
-   kernelCode += SP + SP + "auto& shmem = alpaka::declareSharedVar<T[" + std::to_string(blockSize) + "], __COUNTER__>(acc);\n";
+   kernelCode += SP + SP + "auto& shmem = alpaka::declareSharedVar<T[BlockSize], __COUNTER__>(acc);\n";
    kernelCode += SP + SP + "const auto out_idx = alpaka::getIdx<alpaka::Grid, alpaka::Blocks>(acc)[0];\n";
    kernelCode += SP + SP + "const auto thread_id = alpaka::getIdx<alpaka::Block, alpaka::Threads>(acc)[0];\n";
    kernelCode += SP + SP + "if (out_idx >= " + std::to_string(outputLength) + "u) return;\n";
    kernelCode += SP + SP + "T partial = " + reductionOp->GetFusionReductionInitExpr() + ";\n";
-   kernelCode += SP + SP + "for (std::size_t r = thread_id; r < " + std::to_string(reducedLength) + "u; r += " + std::to_string(blockSize) + "u) {\n";
+   kernelCode += SP + SP + "for (std::size_t r = thread_id; r < " + std::to_string(reducedLength) + "u; r += BlockSize) {\n";
    kernelCode += SP + SP + SP + "const std::size_t in_idx = " + inputIndexExpression + ";\n";
 
    std::unordered_map<std::string, std::string> reductionInputCache;
@@ -1459,7 +1456,7 @@ std::string RModel::GenerateFusedReductionKernel_GPU_ALPAKA(const EltwiseFusionG
    kernelCode += SP + SP + "}\n";
    kernelCode += SP + SP + "shmem[thread_id] = partial;\n";
    kernelCode += SP + SP + "alpaka::syncBlockThreads(acc);\n";
-   kernelCode += SP + SP + "for (std::size_t s = " + std::to_string(blockSize / 2) + "u; s > 0u; s >>= 1u) {\n";
+   kernelCode += SP + SP + "for (std::size_t s = BlockSize / 2u; s > 0u; s >>= 1u) {\n";
    kernelCode += SP + SP + SP + "if (thread_id < s) shmem[thread_id] = " +
       reductionOp->GetFusionReductionCombineExpr("shmem[thread_id]", "shmem[thread_id + s]") + ";\n";
    kernelCode += SP + SP + SP + "alpaka::syncBlockThreads(acc);\n";
@@ -1491,7 +1488,7 @@ std::string RModel::GenerateFusedReductionKernel_GPU_ALPAKA(const EltwiseFusionG
       if (outputShape != reductionInputShape)
          throw std::runtime_error("Fused reduction output must match the reduction input or output shape");
 
-      kernelCode += SP + SP + "for (std::size_t r = thread_id; r < " + std::to_string(reducedLength) + "u; r += " + std::to_string(blockSize) + "u) {\n";
+kernelCode += SP + SP + "for (std::size_t r = thread_id; r < " + std::to_string(reducedLength) + "u; r += BlockSize) {\n";
       kernelCode += SP + SP + SP + "const std::size_t element_idx = " + inputIndexExpression + ";\n";
 
       std::unordered_map<std::string, std::string> outputCache;
@@ -2034,9 +2031,26 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          bool inFusedGroup = (gIdx != SIZE_MAX) && fEltwiseFusionGroups[gIdx].isFused();
 
          if (inFusedGroup) {
-            if (fEltwiseFusionGroups[gIdx].opIndices[0] == id && !fusedGroupsEmitted.count(gIdx)) {
-               const std::string sfx = fEltwiseFusionGroups[gIdx].suffix();
-               fGC += SP + "FusedEltwiseKernel" + sfx + " fusedEltwiseKernel" + sfx + ";\n";
+            const auto &group = fEltwiseFusionGroups[gIdx];
+
+            if (group.opIndices[0] == id && !fusedGroupsEmitted.count(gIdx)) {
+               const std::string sfx = group.suffix();
+               const bool hasReduction = std::any_of(group.opIndices.begin(), group.opIndices.end(), [&](size_t opIdx) {
+                  return fOperators[opIdx]->IsFusionReduction();
+               });
+
+               if (hasReduction) {
+                  if (group.executionSchedules.empty())
+                     throw std::runtime_error("Fused reduction group has no execution schedules");
+
+                  for (const auto &schedule : group.executionSchedules) {
+                     const std::string threads = std::to_string(schedule.threadsPerBlock);
+                     fGC += SP + "FusedEltwiseKernel" + sfx + "<" + threads + "> fusedEltwiseKernel" + sfx + "_" + threads + ";\n";
+                  }
+               } else {
+                  fGC += SP + "FusedEltwiseKernel" + sfx + " fusedEltwiseKernel" + sfx + ";\n";
+               }
+
                fusedGroupsEmitted.insert(gIdx);
             }
          } else {
