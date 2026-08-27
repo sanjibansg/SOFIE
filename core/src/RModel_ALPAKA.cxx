@@ -2049,7 +2049,14 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          fGC += "effectiveMaxFusionSharedMemoryPerBlockBytes = sessionOptions.maxFusionSharedMemoryPerBlockBytes == 0 || sessionOptions.maxFusionSharedMemoryPerBlockBytes > hardwareMaxSharedMemoryPerBlockBytes ? hardwareMaxSharedMemoryPerBlockBytes : sessionOptions.maxFusionSharedMemoryPerBlockBytes;\n";
          fGC += "effectiveMaxIntermediateDRAMBytes = sessionOptions.maxIntermediateDRAMBytes == 0 || sessionOptions.maxIntermediateDRAMBytes > hardwareGlobalMemoryBytes ? hardwareGlobalMemoryBytes : sessionOptions.maxIntermediateDRAMBytes;\n\n";
 
-         for (const auto &group : fEltwiseFusionGroups) {
+         for (const size_t candidateIdx : fDefaultFusionPlan.candidateIndices) {
+            const auto groupIt = fFusionCandidateToGroupIdx.find(candidateIdx);
+
+            if (groupIt == fFusionCandidateToGroupIdx.end())
+               throw std::runtime_error("Default fusion candidate has no materialized fusion group");
+
+            const auto &group = fEltwiseFusionGroups[groupIt->second];
+
             if (!IsRuntimeSelectableFusionGroup(group))
                continue;
 
@@ -2238,7 +2245,14 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       fGC += "\nstd::vector<FusionScheduleSelection> GetSelectedFusionSchedules() const {\n";
       fGC += SP + "std::vector<FusionScheduleSelection> selections;\n";
 
-      for (const auto &group : fEltwiseFusionGroups) {
+      for (const size_t candidateIdx : fDefaultFusionPlan.candidateIndices) {
+         const auto groupIt = fFusionCandidateToGroupIdx.find(candidateIdx);
+
+         if (groupIt == fFusionCandidateToGroupIdx.end())
+            throw std::runtime_error("Default fusion candidate has no materialized fusion group");
+
+         const auto &group = fEltwiseFusionGroups[groupIt->second];
+
          if (!IsRuntimeSelectableFusionGroup(group))
             continue;
 

@@ -1855,6 +1855,7 @@ void RModel::ComputeEltwiseFusionGroups()
    fFusionCandidates.clear();
    fFusionPlanComponents.clear();
    fDefaultFusionPlan = {};
+   fFusionCandidateToGroupIdx.clear();
 
    fEltwiseFusionGroups.clear();
    fKernelFusionGroups.clear();
@@ -1980,13 +1981,31 @@ void RModel::ComputeEltwiseFusionGroups()
       }
    }
 
+   std::set<size_t> compiledCandidateIndices;
+
+   for (const auto &component : fFusionPlanComponents) {
+      for (const auto &alternative : component.alternatives) {
+         for (const size_t candidateIdx : alternative.candidateIndices)
+            compiledCandidateIndices.insert(candidateIdx);
+      }
+   }
+
    for (const size_t candidateIdx : fDefaultFusionPlan.candidateIndices)
+      compiledCandidateIndices.insert(candidateIdx);
+
+   for (const size_t candidateIdx : compiledCandidateIndices) {
+      const size_t groupIdx = fEltwiseFusionGroups.size();
       fEltwiseFusionGroups.push_back(BuildEltwiseFusionGroup(fFusionCandidates[candidateIdx]));
+      fFusionCandidateToGroupIdx[candidateIdx] = groupIdx;
+   }
 
-   std::sort(fEltwiseFusionGroups.begin(), fEltwiseFusionGroups.end(), [](const EltwiseFusionGroup &left,
-         const EltwiseFusionGroup &right) { return left.opIndices.front() < right.opIndices.front(); });
+   for (const size_t candidateIdx : fDefaultFusionPlan.candidateIndices) {
+      const auto groupIt = fFusionCandidateToGroupIdx.find(candidateIdx);
 
-   for (size_t groupIdx = 0; groupIdx < fEltwiseFusionGroups.size(); ++groupIdx) {
+      if (groupIt == fFusionCandidateToGroupIdx.end())
+         throw std::runtime_error("Default fusion candidate was not compiled");
+
+      const size_t groupIdx = groupIt->second;
       auto &group = fEltwiseFusionGroups[groupIdx];
 
       for (const size_t opIdx : group.opIndices)
@@ -1997,19 +2016,37 @@ void RModel::ComputeEltwiseFusionGroups()
 
       if (fVerbose) {
          std::cout << "[SOFIE elementwise fusion] operators";
-         for (const size_t opIdx : group.opIndices) std::cout << " " << opIdx;
+         for (const size_t opIdx : group.opIndices)
+            std::cout << " " << opIdx;
+
          std::cout << " ->";
-         for (const auto &outputName : group.outputTensors) std::cout << " " << outputName;
+
+         for (const auto &outputName : group.outputTensors)
+            std::cout << " " << outputName;
+
          std::cout << " with " << group.externalInputs.size() << " external input(s)" << std::endl;
       }
    }
 
-   // A nonconsecutive fused kernel executes at launchOpIndex, so every external input must remain alive until then.
-   for (const auto &group : fEltwiseFusionGroups) {
+   for (const size_t candidateIdx : fDefaultFusionPlan.candidateIndices) {
+      const size_t groupIdx = fFusionCandidateToGroupIdx.at(candidateIdx);
+      const auto &group = fEltwiseFusionGroups[groupIdx];
+
       for (const auto &externalInput : group.externalInputs) {
          const std::string tensorName = ResolveAliasTensor(externalInput.tensorName);
          const auto frequencyIt = fIntermediateTensorFrequencyLookup.find(tensorName);
-         if (frequencyIt != fIntermediateTensorFrequencyLookup.end()) frequencyIt->second = std::max(frequencyIt->second, group.launchOpIndex);
+
+         if (frequencyIt != fIntermediateTensorFrequencyLookup.end())
+            frequencyIt->second = std::max(frequencyIt->second, group.launchOpIndex);
+      }
+   }
+
+   for (const auto &component : fFusionPlanComponents) {
+      for (const auto &alternative : component.alternatives) {
+         for (const size_t candidateIdx : alternative.candidateIndices) {
+            if (fFusionCandidateToGroupIdx.find(candidateIdx) == fFusionCandidateToGroupIdx.end())
+               throw std::runtime_error("Fusion plan alternative references an unmaterialized candidate");
+         }
       }
    }
 
