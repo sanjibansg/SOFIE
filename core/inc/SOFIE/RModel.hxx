@@ -212,6 +212,8 @@ private:
 
    bool IsRuntimeSelectableFusionGroup(const EltwiseFusionGroup &group) const;
 
+   bool IsRuntimeSelectableFusionPlanComponent(const FusionPlanComponent &component) const;
+
    size_t ComputeFusionLiveRangeExtensionByteSteps(const FusionCandidate &candidate, const FusionTensorUseGraph &tensorUses) const;
 
    size_t ComputeFusionPlanLiveRangeExtensionByteSteps(const std::vector<size_t> &candidateIndices, const std::vector<FusionCandidate> &candidates) const;

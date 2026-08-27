@@ -251,14 +251,31 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         << "    sessionOptions.maxFusionThreadsPerBlock = maxFusionThreadsPerBlock;\n"
         << "    sessionOptions.maxFusionSharedMemoryPerBlockBytes = maxFusionSharedMemoryPerBlockBytes;\n"
         << "    SOFIE_" << cppName
-        << "::Session<AccTag> session(weightFile, sessionOptions);\n"
+        << "::Session<AccTag> session(weightFile, sessionOptions);\n";
+
+    bench
         << "    if (showResourcePlan) {\n"
-        << "        const auto selections = session.GetSelectedFusionSchedules();\n"
-        << "        std::fprintf(stderr, \"[SOFIE resource plan]\");\n"
-        << "        if (selections.empty()) std::fprintf(stderr, \" no runtime-selectable fusion groups\");\n"
-        << "        for (const auto &selection : selections) std::fprintf(stderr, \" %s=%zu threads\", selection.group, static_cast<size_t>(selection.threadsPerBlock));\n"
-        << "        std::fprintf(stderr, \"\\n\");\n"
-        << "    }\n"
+        << "        const auto planSelections = session.GetSelectedFusionPlans();\n"
+        << "        const auto scheduleSelections = session.GetSelectedFusionSchedules();\n"
+        << "        std::cout << \"[SOFIE fusion plans]\";\n"
+        << "        if (planSelections.empty()) {\n"
+        << "            std::cout << \" none\";\n"
+        << "        } else {\n"
+        << "            for (const auto &selection : planSelections)\n"
+        << "                std::cout << \" component\" << selection.componentIndex << \"=alternative\" << selection.alternativeIndex;\n"
+        << "        }\n"
+        << "        std::cout << \"\\n\";\n"
+        << "        std::cout << \"[SOFIE resource plan]\";\n"
+        << "        if (scheduleSelections.empty()) {\n"
+        << "            std::cout << \" no runtime-selectable fused groups\";\n"
+        << "        } else {\n"
+        << "            for (const auto &selection : scheduleSelections)\n"
+        << "                std::cout << \" \" << selection.group << \"=\" << selection.threadsPerBlock << \" threads\";\n"
+        << "        }\n"
+        << "        std::cout << \"\\n\";\n"
+        << "    }\n";
+
+    bench
         << "    double sofie_pool_mem_mb = "
         << "static_cast<double>(session.GetIntermediateMemoryPoolSize()) / (1024.0 * 1024.0);\n"
 

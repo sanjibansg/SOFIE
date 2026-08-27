@@ -664,6 +664,42 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
 
    std::set<size_t> fusedGroupsLaunched;
    std::set<size_t> kernelFusionGroupsLaunched;
+
+   std::unordered_map<size_t, std::string> runtimeCandidateConditions;
+   std::unordered_map<size_t, std::vector<size_t>> runtimeCandidatesByOp;
+
+   for (size_t componentIdx = 0; componentIdx < fFusionPlanComponents.size(); ++componentIdx) {
+      const auto &component = fFusionPlanComponents[componentIdx];
+
+      if (!IsRuntimeSelectableFusionPlanComponent(component))
+         continue;
+
+      const std::string componentSelector = "selectedFusionPlanComponent" + std::to_string(componentIdx);
+
+      for (size_t alternativeIdx = 0; alternativeIdx < component.alternatives.size(); ++alternativeIdx) {
+         const auto &alternative = component.alternatives[alternativeIdx];
+
+         for (const size_t candidateIdx : alternative.candidateIndices) {
+            std::string &condition = runtimeCandidateConditions[candidateIdx];
+
+            if (!condition.empty())
+               condition += " || ";
+
+            condition += componentSelector + " == " + std::to_string(alternativeIdx + 1) + "u";
+         }
+      }
+   }
+
+   for (const auto &[candidateIdx, condition] : runtimeCandidateConditions) {
+      for (const size_t opIdx : fFusionCandidates[candidateIdx].opIndices)
+         runtimeCandidatesByOp[opIdx].push_back(candidateIdx);
+   }
+
+   for (auto &[opIdx, candidateIndices] : runtimeCandidatesByOp) {
+      std::sort(candidateIndices.begin(), candidateIndices.end());
+      candidateIndices.erase(std::unique(candidateIndices.begin(), candidateIndices.end()), candidateIndices.end());
+   }
+
    for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
       if (fVerbose)
          std::cout << "Generating code for operator .... " << op_idx << std::endl;
@@ -682,6 +718,43 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
             kernelFusionGroupsLaunched.insert(kIdx);
          }
 
+         continue;
+      }
+
+      const auto runtimeCandidatesIt = runtimeCandidatesByOp.find(op_idx);
+
+      if (runtimeCandidatesIt != runtimeCandidatesByOp.end()) {
+         bool firstCandidate = true;
+
+         for (const size_t candidateIdx : runtimeCandidatesIt->second) {
+            const auto conditionIt = runtimeCandidateConditions.find(candidateIdx);
+
+            if (conditionIt == runtimeCandidateConditions.end())
+               throw std::runtime_error("Runtime fusion candidate has no activation condition");
+
+            const size_t groupIdx = fFusionCandidateToGroupIdx.at(candidateIdx);
+            const auto &group = fEltwiseFusionGroups[groupIdx];
+
+            if (firstCandidate)
+               fGC += "\nif (" + conditionIt->second + ") {\n";
+            else
+               fGC += "else if (" + conditionIt->second + ") {\n";
+
+            if (group.launchOpIndex == op_idx)
+               fGC += GenerateFusedEltwiseLaunch_GPU_ALPAKA(group);
+
+            fGC += "}\n";
+            firstCandidate = false;
+         }
+
+         fGC += "else {\n";
+
+         if (fProfile)
+            fGC += RModelProfilerGPU::GenerateOperatorCode(*fOperators[op_idx], op_idx);
+         else
+            fGC += fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx));
+
+         fGC += "}\n";
          continue;
       }
 
@@ -2059,7 +2132,180 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          fGC += "effectiveMaxFusionSharedMemoryPerBlockBytes = sessionOptions.maxFusionSharedMemoryPerBlockBytes == 0 || sessionOptions.maxFusionSharedMemoryPerBlockBytes > hardwareMaxSharedMemoryPerBlockBytes ? hardwareMaxSharedMemoryPerBlockBytes : sessionOptions.maxFusionSharedMemoryPerBlockBytes;\n";
          fGC += "effectiveMaxIntermediateDRAMBytes = sessionOptions.maxIntermediateDRAMBytes == 0 || sessionOptions.maxIntermediateDRAMBytes > hardwareGlobalMemoryBytes ? hardwareGlobalMemoryBytes : sessionOptions.maxIntermediateDRAMBytes;\n\n";
 
+         std::set<std::string> declaredFusionScheduleSuffixes;
+
+         for (const auto &component : fFusionPlanComponents) {
+            if (!IsRuntimeSelectableFusionPlanComponent(component))
+               continue;
+
+            for (const auto &alternative : component.alternatives) {
+               for (const size_t candidateIdx : alternative.candidateIndices) {
+                  const auto groupIt = fFusionCandidateToGroupIdx.find(candidateIdx);
+
+                  if (groupIt == fFusionCandidateToGroupIdx.end())
+                     throw std::runtime_error("Fusion plan candidate has no materialized fusion group");
+
+                  const auto &group = fEltwiseFusionGroups[groupIt->second];
+
+                  if (IsRuntimeSelectableFusionGroup(group))
+                     declaredFusionScheduleSuffixes.insert(group.suffix());
+               }
+            }
+         }
+
          for (const size_t candidateIdx : fDefaultFusionPlan.candidateIndices) {
+            const auto groupIt = fFusionCandidateToGroupIdx.find(candidateIdx);
+
+            if (groupIt == fFusionCandidateToGroupIdx.end())
+               throw std::runtime_error("Default fusion candidate has no materialized fusion group");
+
+            const auto &group = fEltwiseFusionGroups[groupIt->second];
+
+            if (IsRuntimeSelectableFusionGroup(group))
+               declaredFusionScheduleSuffixes.insert(group.suffix());
+         }
+
+         for (const auto &sfx : declaredFusionScheduleSuffixes)
+            fGC += "selectedFusionSchedule" + sfx + " = 0;\n";
+
+         for (size_t componentIdx = 0; componentIdx < fFusionPlanComponents.size(); ++componentIdx) {
+            const auto &component = fFusionPlanComponents[componentIdx];
+
+            if (!IsRuntimeSelectableFusionPlanComponent(component))
+               continue;
+
+            const std::string componentSelector = "selectedFusionPlanComponent" + std::to_string(componentIdx);
+
+            fGC += componentSelector + " = 0;\n";
+
+            std::vector<size_t> alternativeOrder(component.alternatives.size());
+
+            for (size_t alternativeIdx = 0; alternativeIdx < component.alternatives.size(); ++alternativeIdx)
+               alternativeOrder[alternativeIdx] = alternativeIdx;
+
+            std::sort(alternativeOrder.begin(), alternativeOrder.end(), [&](size_t leftIdx, size_t rightIdx) {
+               const auto &left = component.alternatives[leftIdx];
+               const auto &right = component.alternatives[rightIdx];
+
+               if (IsBetterFusionStructuralScore(left.score, right.score))
+                  return true;
+
+               if (IsBetterFusionStructuralScore(right.score, left.score))
+                  return false;
+
+               return left.candidateIndices < right.candidateIndices;
+            });
+
+            for (const size_t alternativeIdx : alternativeOrder) {
+               const auto &alternative = component.alternatives[alternativeIdx];
+
+               if (alternative.candidateIndices.empty())
+                  continue;
+
+               std::string planCondition;
+
+               for (const size_t candidateIdx : alternative.candidateIndices) {
+                  const auto groupIt = fFusionCandidateToGroupIdx.find(candidateIdx);
+
+                  if (groupIt == fFusionCandidateToGroupIdx.end())
+                     throw std::runtime_error("Fusion plan candidate has no materialized fusion group");
+
+                  const auto &group = fEltwiseFusionGroups[groupIt->second];
+                  std::string candidateCondition;
+
+                  for (const auto &schedule : group.executionSchedules) {
+                     const std::string threads = std::to_string(schedule.resources.threadsPerBlock);
+                     const std::string sharedMemory = std::to_string(schedule.resources.sharedMemoryPerBlockBytes);
+                     std::string scheduleCondition = threads + "u <= effectiveMaxFusionThreadsPerBlock";
+
+                     if (schedule.resources.sharedMemoryPerBlockBytes != 0)
+                        scheduleCondition += " && " + sharedMemory + "u <= effectiveMaxFusionSharedMemoryPerBlockBytes";
+
+                     if (!candidateCondition.empty())
+                        candidateCondition += " || ";
+
+                     candidateCondition += "(" + scheduleCondition + ")";
+                  }
+
+                  if (candidateCondition.empty()) {
+                     planCondition.clear();
+                     break;
+                  }
+
+                  if (!planCondition.empty())
+                     planCondition += " && ";
+
+                  planCondition += "(" + candidateCondition + ")";
+               }
+
+               if (planCondition.empty())
+                  continue;
+
+               fGC += "if (" + componentSelector + " == 0 && " + planCondition + ") " + componentSelector + " = " +
+                      std::to_string(alternativeIdx + 1) + "u;\n";
+            }
+         }
+
+         for (size_t componentIdx = 0; componentIdx < fFusionPlanComponents.size(); ++componentIdx) {
+            const auto &component = fFusionPlanComponents[componentIdx];
+
+            if (!IsRuntimeSelectableFusionPlanComponent(component))
+               continue;
+
+            const std::string componentSelector = "selectedFusionPlanComponent" + std::to_string(componentIdx);
+
+            for (size_t alternativeIdx = 0; alternativeIdx < component.alternatives.size(); ++alternativeIdx) {
+               const auto &alternative = component.alternatives[alternativeIdx];
+
+               if (alternative.candidateIndices.empty())
+                  continue;
+
+               fGC += "if (" + componentSelector + " == " + std::to_string(alternativeIdx + 1) + "u) {\n";
+
+               std::set<std::string> assignedSuffixes;
+
+               for (const size_t candidateIdx : alternative.candidateIndices) {
+                  const size_t groupIdx = fFusionCandidateToGroupIdx.at(candidateIdx);
+                  const auto &group = fEltwiseFusionGroups[groupIdx];
+                  const std::string sfx = group.suffix();
+
+                  if (!assignedSuffixes.insert(sfx).second)
+                     continue;
+
+                  const std::string selectedName = "selectedFusionSchedule" + sfx;
+
+                  for (size_t scheduleIdx = 0; scheduleIdx < group.executionSchedules.size(); ++scheduleIdx) {
+                     const auto &schedule = group.executionSchedules[scheduleIdx];
+                     const std::string threads = std::to_string(schedule.resources.threadsPerBlock);
+                     const std::string sharedMemory = std::to_string(schedule.resources.sharedMemoryPerBlockBytes);
+                     const std::string selection = std::to_string(scheduleIdx + 1);
+                     std::string condition = threads + "u <= effectiveMaxFusionThreadsPerBlock";
+
+                     if (schedule.resources.sharedMemoryPerBlockBytes != 0)
+                        condition += " && " + sharedMemory + "u <= effectiveMaxFusionSharedMemoryPerBlockBytes";
+
+                     fGC += "if (" + condition + ") " + selectedName + " = " + selection + "u;\n";
+                  }
+               }
+
+               fGC += "}\n";
+            }
+         }
+
+         std::set<size_t> runtimePlannedDefaultCandidates;
+
+         for (const auto &component : fFusionPlanComponents) {
+            if (!IsRuntimeSelectableFusionPlanComponent(component))
+               continue;
+
+            for (const size_t candidateIdx : component.candidateIndices)
+               runtimePlannedDefaultCandidates.insert(candidateIdx);
+         }
+
+         for (const size_t candidateIdx : fDefaultFusionPlan.candidateIndices) {
+            if (runtimePlannedDefaultCandidates.count(candidateIdx))
+               continue;
+
             const auto groupIt = fFusionCandidateToGroupIdx.find(candidateIdx);
 
             if (groupIt == fFusionCandidateToGroupIdx.end())
@@ -2072,8 +2318,6 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
             const std::string sfx = group.suffix();
             const std::string selectedName = "selectedFusionSchedule" + sfx;
-
-            fGC += selectedName + " = 0;\n";
 
             for (size_t scheduleIdx = 0; scheduleIdx < group.executionSchedules.size(); ++scheduleIdx) {
                const auto &schedule = group.executionSchedules[scheduleIdx];
@@ -2194,7 +2438,42 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       }
    }
 
+   for (size_t componentIdx = 0; componentIdx < fFusionPlanComponents.size(); ++componentIdx) {
+      if (!IsRuntimeSelectableFusionPlanComponent(fFusionPlanComponents[componentIdx]))
+         continue;
+
+      fGC += SP + "Idx selectedFusionPlanComponent" + std::to_string(componentIdx) + " = 0;\n";
+   }
+
    std::set<std::string> selectedFusionScheduleSuffixes;
+
+   for (size_t componentIdx = 0; componentIdx < fFusionPlanComponents.size(); ++componentIdx) {
+      const auto &component = fFusionPlanComponents[componentIdx];
+
+      if (!IsRuntimeSelectableFusionPlanComponent(component))
+         continue;
+
+      for (const auto &alternative : component.alternatives) {
+         for (const size_t candidateIdx : alternative.candidateIndices) {
+            const auto groupIt = fFusionCandidateToGroupIdx.find(candidateIdx);
+
+            if (groupIt == fFusionCandidateToGroupIdx.end())
+               throw std::runtime_error("Fusion plan candidate has no materialized fusion group");
+
+            const auto &group = fEltwiseFusionGroups[groupIt->second];
+
+            if (!IsRuntimeSelectableFusionGroup(group))
+               continue;
+
+            const std::string sfx = group.suffix();
+
+            if (!selectedFusionScheduleSuffixes.insert(sfx).second)
+               continue;
+
+            fGC += SP + "Idx selectedFusionSchedule" + sfx + " = 0;\n";
+         }
+      }
+   }
 
    for (const size_t candidateIdx : fDefaultFusionPlan.candidateIndices) {
       const auto groupIt = fFusionCandidateToGroupIdx.find(candidateIdx);
@@ -2265,7 +2544,26 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       fGC += "}\n";
    }
 
+
    if (fUseSession) {
+      fGC += "\nstruct FusionPlanSelection {\n";
+      fGC += SP + "Idx componentIndex;\n";
+      fGC += SP + "Idx alternativeIndex;\n";
+      fGC += "};\n";
+
+      fGC += "\nstd::vector<FusionPlanSelection> GetSelectedFusionPlans() const {\n";
+      fGC += SP + "std::vector<FusionPlanSelection> selections;\n";
+
+      for (size_t componentIdx = 0; componentIdx < fFusionPlanComponents.size(); ++componentIdx) {
+         if (!IsRuntimeSelectableFusionPlanComponent(fFusionPlanComponents[componentIdx]))
+            continue;
+
+         fGC += SP + "selections.push_back({" + std::to_string(componentIdx) + "u, selectedFusionPlanComponent" +
+                std::to_string(componentIdx) + "});\n";
+      }
+
+      fGC += SP + "return selections;\n";
+      fGC += "}\n";
       fGC += "\nstruct FusionScheduleSelection {\n";
       fGC += SP + "const char *group;\n";
       fGC += SP + "Idx scheduleIndex;\n";

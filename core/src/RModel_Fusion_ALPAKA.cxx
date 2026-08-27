@@ -106,7 +106,7 @@ std::vector<RModel::FusionExecutionSchedule> RModel::ComputeFusionExecutionSched
    return schedules;
 }
 
-   bool RModel::IsRuntimeSelectableFusionGroup(const EltwiseFusionGroup &group) const
+bool RModel::IsRuntimeSelectableFusionGroup(const EltwiseFusionGroup &group) const
 {
    if (!group.isFused() || group.executionSchedules.empty())
       return false;
@@ -154,6 +154,40 @@ RModel::FusionTensorUseGraph RModel::BuildFusionTensorUseGraph() const
    }
 
    return graph;
+}
+
+bool RModel::IsRuntimeSelectableFusionPlanComponent(const FusionPlanComponent &component) const
+{
+   bool hasSelectableCandidate = false;
+
+   for (const auto &alternative : component.alternatives) {
+      for (const size_t candidateIdx : alternative.candidateIndices) {
+         const auto groupIt = fFusionCandidateToGroupIdx.find(candidateIdx);
+
+         if (groupIt == fFusionCandidateToGroupIdx.end())
+            return false;
+
+         if (!IsRuntimeSelectableFusionGroup(fEltwiseFusionGroups[groupIt->second]))
+            return false;
+
+         hasSelectableCandidate = true;
+      }
+   }
+
+   for (const size_t candidateIdx : fDefaultFusionPlan.candidateIndices) {
+      if (std::find(component.candidateIndices.begin(), component.candidateIndices.end(), candidateIdx) == component.candidateIndices.end())
+         continue;
+
+      const auto groupIt = fFusionCandidateToGroupIdx.find(candidateIdx);
+
+      if (groupIt == fFusionCandidateToGroupIdx.end())
+         return false;
+
+      if (!IsRuntimeSelectableFusionGroup(fEltwiseFusionGroups[groupIt->second]))
+         return false;
+   }
+
+   return hasSelectableCandidate;
 }
 
 RModel::FusionCandidate RModel::BuildFusionCandidate(const std::vector<size_t> &opIndices, const FusionTensorUseGraph &tensorUses) const
@@ -1523,12 +1557,12 @@ std::vector<RModel::EltwiseFusionGroup> RModel::BuildKernelFusionLaunchUnits(con
    std::set<size_t> coveredOps;
 
    for (const auto &group : fEltwiseFusionGroups) {
-   for (const size_t opIdx : group.opIndices)
-      coveredOps.insert(opIdx);
+      for (const size_t opIdx : group.opIndices)
+         coveredOps.insert(opIdx);
 
-   if (!group.usesIndexedEvaluation)
-      units.push_back(group);
-}
+      if (!group.usesIndexedEvaluation)
+         units.push_back(group);
+   }
 
    for (size_t opIdx = 0; opIdx < fOperators.size(); ++opIdx) {
       if (coveredOps.count(opIdx) || fSkipOperators.count(opIdx))
@@ -2028,7 +2062,22 @@ void RModel::ComputeEltwiseFusionGroups()
       }
    }
 
-   for (const size_t candidateIdx : fDefaultFusionPlan.candidateIndices) {
+   std::set<size_t> lifetimeCandidateIndices;
+
+   for (const auto &component : fFusionPlanComponents) {
+      if (!IsRuntimeSelectableFusionPlanComponent(component))
+         continue;
+
+      for (const auto &alternative : component.alternatives) {
+         for (const size_t candidateIdx : alternative.candidateIndices)
+            lifetimeCandidateIndices.insert(candidateIdx);
+      }
+   }
+
+   for (const size_t candidateIdx : fDefaultFusionPlan.candidateIndices)
+      lifetimeCandidateIndices.insert(candidateIdx);
+
+   for (const size_t candidateIdx : lifetimeCandidateIndices) {
       const size_t groupIdx = fFusionCandidateToGroupIdx.at(candidateIdx);
       const auto &group = fEltwiseFusionGroups[groupIdx];
 
