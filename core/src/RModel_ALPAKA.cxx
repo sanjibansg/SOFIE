@@ -1785,7 +1785,8 @@ std::string RModel::GenerateKernelFusionKernel_GPU_ALPAKA(const KernelFusionGrou
 
 void RModel::GenerateSessionCode_GPU_ALPAKA() {
    std::set<SOFIE::OperatorKind> registered_operators;
-   std::set<size_t> fusedGroupsEmitted; // tracks which fusion groups have had their struct/decl emitted
+   std::set<std::string> fusedKernelSuffixesEmitted;
+   std::set<std::string> fusedMemberSuffixesEmitted;
    std::set<size_t> kernelFusionGroupsEmitted;
 
    std::set<SOFIE::OperatorKind> single_initialized_operators = {
@@ -1829,6 +1830,20 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    };
 
    fGC += "\n//--- ALPAKA Kernels\n";
+
+   for (const auto &group : fEltwiseFusionGroups) {
+      if (!group.isFused())
+         continue;
+
+      const std::string sfx = group.suffix();
+
+      if (!fusedKernelSuffixesEmitted.insert(sfx).second)
+         continue;
+
+      fGC += GenerateFusedEltwiseKernel_GPU_ALPAKA(group);
+   }
+
+
    for (size_t id = 0; id < fOperators.size(); id++) {
       if(fOperators[id]->GetKind() == OperatorKind::GEMM || fOperators[id]->GetKind() == OperatorKind::CONV) {
          OpNeedsBlas = true;
@@ -1853,11 +1868,6 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
          if (inFusedGroup) {
             const auto &group = fEltwiseFusionGroups[gIdx];
-
-            if (group.opIndices[0] == id && !fusedGroupsEmitted.count(gIdx)) {
-               fGC += GenerateFusedEltwiseKernel_GPU_ALPAKA(group);
-               fusedGroupsEmitted.insert(gIdx);
-            }
 
             if (IsRuntimeSelectableFusionGroup(group))
                GenerateStandaloneKernel(id);
@@ -2141,7 +2151,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    }
 
    registered_operators.clear();
-   fusedGroupsEmitted.clear();
+   fusedMemberSuffixesEmitted.clear();
    kernelFusionGroupsEmitted.clear();
 
    auto GenerateStandaloneKernelDeclaration = [&](size_t id) {
@@ -2158,6 +2168,52 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
       }
    };
+
+   for (const auto &group : fEltwiseFusionGroups) {
+      if (!group.isFused())
+         continue;
+
+      const std::string sfx = group.suffix();
+
+      if (!fusedMemberSuffixesEmitted.insert(sfx).second)
+         continue;
+
+      const bool hasReduction = std::any_of(group.opIndices.begin(), group.opIndices.end(),
+         [&](size_t opIdx) { return fOperators[opIdx]->IsFusionReduction(); });
+
+      if (hasReduction) {
+         if (group.executionSchedules.empty())
+            throw std::runtime_error("Fused reduction group has no execution schedules");
+
+         for (const auto &schedule : group.executionSchedules) {
+            const std::string threads = std::to_string(schedule.resources.threadsPerBlock);
+            fGC += SP + "FusedEltwiseKernel" + sfx + "<" + threads + "> fusedEltwiseKernel" + sfx + "_" + threads + ";\n";
+         }
+      } else {
+         fGC += SP + "FusedEltwiseKernel" + sfx + " fusedEltwiseKernel" + sfx + ";\n";
+      }
+   }
+
+   std::set<std::string> selectedFusionScheduleSuffixes;
+
+   for (const size_t candidateIdx : fDefaultFusionPlan.candidateIndices) {
+      const auto groupIt = fFusionCandidateToGroupIdx.find(candidateIdx);
+
+      if (groupIt == fFusionCandidateToGroupIdx.end())
+         throw std::runtime_error("Default fusion candidate has no materialized fusion group");
+
+      const auto &group = fEltwiseFusionGroups[groupIt->second];
+
+      if (!IsRuntimeSelectableFusionGroup(group))
+         continue;
+
+      const std::string sfx = group.suffix();
+
+      if (!selectedFusionScheduleSuffixes.insert(sfx).second)
+         continue;
+
+      fGC += SP + "Idx selectedFusionSchedule" + sfx + " = 0;\n";
+   }
 
    for (size_t id = 0; id < fOperators.size(); id++) {
       // Same as the kernel-struct loop above: fused activation ops must still
@@ -2184,33 +2240,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
          if (inFusedGroup) {
             const auto &group = fEltwiseFusionGroups[gIdx];
-            const bool hasReduction = std::any_of(group.opIndices.begin(), group.opIndices.end(), [&](size_t opIdx) {
-               return fOperators[opIdx]->IsFusionReduction();
-            });
-            const bool runtimeSelectable = IsRuntimeSelectableFusionGroup(group);
 
-            if (group.opIndices[0] == id && !fusedGroupsEmitted.count(gIdx)) {
-               const std::string sfx = group.suffix();
-
-               if (hasReduction) {
-                  if (group.executionSchedules.empty())
-                     throw std::runtime_error("Fused reduction group has no execution schedules");
-
-                  for (const auto &schedule : group.executionSchedules) {
-                     const std::string threads = std::to_string(schedule.resources.threadsPerBlock);
-                     fGC += SP + "FusedEltwiseKernel" + sfx + "<" + threads + "> fusedEltwiseKernel" + sfx + "_" + threads + ";\n";
-                  }
-               } else {
-                  fGC += SP + "FusedEltwiseKernel" + sfx + " fusedEltwiseKernel" + sfx + ";\n";
-               }
-
-               if (runtimeSelectable)
-                  fGC += SP + "Idx selectedFusionSchedule" + sfx + " = 0;\n";
-
-               fusedGroupsEmitted.insert(gIdx);
-            }
-
-            if (runtimeSelectable)
+            if (IsRuntimeSelectableFusionGroup(group))
                GenerateStandaloneKernelDeclaration(id);
          } else {
             GenerateStandaloneKernelDeclaration(id);
