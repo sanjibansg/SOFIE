@@ -167,8 +167,15 @@ private:
       FusionStructuralScore score;
    };
 
+   struct FusionPlanAlternative {
+      std::vector<size_t> candidateIndices;
+      FusionStructuralScore score;
+      FusionResourceRequirements resourceLimit;
+   };
+
    struct FusionPlanComponent {
       std::vector<size_t> candidateIndices;
+      std::vector<FusionPlanAlternative> alternatives;
    };
 
    std::vector<FusionCandidate> fFusionCandidates; ///< legal elementwise fusion candidates retained for runtime plan selection
@@ -211,9 +218,12 @@ private:
    bool FusionCandidatesConflict(const FusionCandidate &left, const FusionCandidate &right, const FusionTensorUseGraph &tensorUses) const;
 
    std::vector<FusionPlanComponent> BuildFusionPlanComponents(const std::vector<FusionCandidate> &candidates,
-                                                              const FusionTensorUseGraph &tensorUses) const;
+                                                           const FusionTensorUseGraph &tensorUses) const;
 
-   FusionPlan SelectFusionPlan(const std::vector<FusionCandidate> &candidates, const FusionTensorUseGraph &tensorUses) const;
+   bool IsFusionCandidateFeasible(const FusionCandidate &candidate, const FusionResourceRequirements &resourceLimit) const;
+
+   FusionPlan SelectFusionPlan(const std::vector<FusionCandidate> &candidates, const FusionTensorUseGraph &tensorUses,
+                               const std::optional<FusionResourceRequirements> &resourceLimit = std::nullopt) const;
 
    static bool IsBetterFusionStructuralScore(const FusionStructuralScore &left, const FusionStructuralScore &right);
 

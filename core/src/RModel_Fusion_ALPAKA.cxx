@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <functional>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -576,12 +577,32 @@ const std::vector<FusionCandidate> &candidates, const FusionTensorUseGraph &tens
    return components;
 }
 
-RModel::FusionPlan RModel::SelectFusionPlan(const std::vector<FusionCandidate> &candidates, const FusionTensorUseGraph &tensorUses) const
+bool RModel::IsFusionCandidateFeasible(const FusionCandidate &candidate, const FusionResourceRequirements &resourceLimit) const
+{
+   if (candidate.executionSchedules.empty())
+      return false;
+
+   return std::any_of(candidate.executionSchedules.begin(), candidate.executionSchedules.end(),
+      [&](const FusionExecutionSchedule &schedule) {
+         return schedule.resources.threadsPerBlock <= resourceLimit.threadsPerBlock &&
+                schedule.resources.sharedMemoryPerBlockBytes <= resourceLimit.sharedMemoryPerBlockBytes;
+      });
+}
+
+RModel::FusionPlan RModel::SelectFusionPlan(const std::vector<FusionCandidate> &candidates, const FusionTensorUseGraph &tensorUses,
+                                            const std::optional<FusionResourceRequirements> &resourceLimit) const
 {
    FusionPlan plan;
 
    if (candidates.empty())
       return plan;
+
+   std::vector<bool> candidateEnabled(candidates.size(), true);
+
+   if (resourceLimit.has_value()) {
+      for (size_t candidateIdx = 0; candidateIdx < candidates.size(); ++candidateIdx)
+         candidateEnabled[candidateIdx] = IsFusionCandidateFeasible(candidates[candidateIdx], *resourceLimit);
+   }
 
    std::vector<std::vector<size_t>> conflicts(candidates.size());
 
@@ -645,7 +666,7 @@ RModel::FusionPlan RModel::SelectFusionPlan(const std::vector<FusionCandidate> &
    std::vector<bool> componentVisited(candidates.size(), false);
 
    for (size_t seedIdx = 0; seedIdx < candidates.size(); ++seedIdx) {
-      if (componentVisited[seedIdx])
+      if (componentVisited[seedIdx] || !candidateEnabled[seedIdx])
          continue;
 
       std::vector<size_t> component;
@@ -658,7 +679,7 @@ RModel::FusionPlan RModel::SelectFusionPlan(const std::vector<FusionCandidate> &
          component.push_back(candidateIdx);
 
          for (const size_t neighborIdx : componentNeighbors[candidateIdx]) {
-            if (componentVisited[neighborIdx])
+            if (componentVisited[neighborIdx] || !candidateEnabled[neighborIdx])
                continue;
 
             componentVisited[neighborIdx] = true;
@@ -1864,7 +1885,87 @@ void RModel::ComputeEltwiseFusionGroups()
    fFusionPlanComponents = BuildFusionPlanComponents(fFusionCandidates, tensorUses);
    fDefaultFusionPlan = SelectFusionPlan(fFusionCandidates, tensorUses);
 
+   std::vector<size_t> fusionThreadLimits{1};
+   std::vector<size_t> fusionSharedMemoryLimits{0};
+
+   for (const auto &candidate : fFusionCandidates) {
+      for (const auto &schedule : candidate.executionSchedules) {
+         fusionThreadLimits.push_back(schedule.resources.threadsPerBlock);
+         fusionSharedMemoryLimits.push_back(schedule.resources.sharedMemoryPerBlockBytes);
+      }
+   }
+
+   std::sort(fusionThreadLimits.begin(), fusionThreadLimits.end());
+   fusionThreadLimits.erase(std::unique(fusionThreadLimits.begin(), fusionThreadLimits.end()), fusionThreadLimits.end());
+
+   std::sort(fusionSharedMemoryLimits.begin(), fusionSharedMemoryLimits.end());
+   fusionSharedMemoryLimits.erase(std::unique(fusionSharedMemoryLimits.begin(), fusionSharedMemoryLimits.end()), fusionSharedMemoryLimits.end());
+
+
+   for (auto &component : fFusionPlanComponents) {
+      component.alternatives.clear();
+
+      std::set<std::vector<size_t>> seenSelections;
+
+      for (const size_t threads : fusionThreadLimits) {
+         for (const size_t sharedMemory : fusionSharedMemoryLimits) {
+            FusionResourceRequirements resourceLimit;
+            resourceLimit.threadsPerBlock = threads;
+            resourceLimit.sharedMemoryPerBlockBytes = sharedMemory;
+
+            std::vector<FusionCandidate> componentCandidates;
+            std::vector<size_t> componentCandidateIndices;
+
+            for (const size_t candidateIdx : component.candidateIndices) {
+               componentCandidates.push_back(fFusionCandidates[candidateIdx]);
+               componentCandidateIndices.push_back(candidateIdx);
+            }
+
+            const FusionPlan localPlan = SelectFusionPlan(componentCandidates, tensorUses, resourceLimit);
+
+            std::vector<size_t> globalSelection;
+            globalSelection.reserve(localPlan.candidateIndices.size());
+
+            for (const size_t localCandidateIdx : localPlan.candidateIndices)
+               globalSelection.push_back(componentCandidateIndices[localCandidateIdx]);
+
+            std::sort(globalSelection.begin(), globalSelection.end());
+
+            if (!seenSelections.insert(globalSelection).second)
+               continue;
+
+            FusionPlanAlternative alternative;
+            alternative.candidateIndices = std::move(globalSelection);
+            alternative.score = localPlan.score;
+            alternative.resourceLimit = resourceLimit;
+            component.alternatives.push_back(std::move(alternative));
+         }
+      }
+   }
+
    if (fVerbose) {
+      for (size_t componentIdx = 0; componentIdx < fFusionPlanComponents.size(); ++componentIdx) {
+         const auto &component = fFusionPlanComponents[componentIdx];
+
+         std::cout << "[SOFIE resource-aware fusion] component " << componentIdx
+                   << " retained " << component.alternatives.size()
+                   << " plan alternative(s)" << std::endl;
+
+         for (size_t alternativeIdx = 0; alternativeIdx < component.alternatives.size(); ++alternativeIdx) {
+            const auto &alternative = component.alternatives[alternativeIdx];
+
+            std::cout << "  alternative " << alternativeIdx
+                      << " limit=(" << alternative.resourceLimit.threadsPerBlock
+                      << " threads, " << alternative.resourceLimit.sharedMemoryPerBlockBytes
+                      << " shared bytes) candidates:";
+
+            for (const size_t candidateIdx : alternative.candidateIndices)
+               std::cout << " " << candidateIdx;
+
+            std::cout << std::endl;
+         }
+      }
+
       std::cout << "[SOFIE resource-aware fusion] retained " << fFusionCandidates.size()
                 << " candidate(s) in " << fFusionPlanComponents.size()
                 << " interaction component(s)" << std::endl;
