@@ -280,13 +280,13 @@ foreach(ONNX_FILE ${BENCHMARK_ONNX_MODELS})
 
     # Forward declaration for the main TU (function defined in per-model .cu)
     string(APPEND BENCHMARK_FWD_DECLS
-            "void Benchmark_${MODEL_CPPNAME}(int warmup, int iterations, const std::string& weightsDir, bool profile, size_t maxThreadsPerBlock, size_t maxSharedMemoryPerBlockBytes, bool showResourcePlan);\n")
+            "void Benchmark_${MODEL_CPPNAME}(int warmup, int iterations, const std::string& weightsDir, bool profile, size_t maxFusionThreadsPerBlock, size_t maxFusionSharedMemoryPerBlockBytes, bool showResourcePlan);\n")
 
     # Single-model dispatch: one if-branch per model (used in --single-model mode)
     string(APPEND BENCHMARK_SINGLE_MODEL_CASES
         "    if (model == \"${MODEL_CPPNAME}\") {\n"
         "        if (run_sofie)\n"
-        "            Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir, profile, maxThreadsPerBlock, maxSharedMemoryPerBlockBytes, showResourcePlan);\n"
+        "            Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir, profile, maxFusionThreadsPerBlock, maxFusionSharedMemoryPerBlockBytes, showResourcePlan);\n"
         "#ifdef SOFIE_BENCHMARK_ORT\n"
         "        if (run_ort)\n"
         "            BenchmarkORT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations, profile);\n"
@@ -683,12 +683,12 @@ if(SOFIE_BENCHMARK_LARGE)
             string(APPEND LARGE_EMIT_CAPTURES "${_ec}")
 
             string(APPEND BENCHMARK_FWD_DECLS
-                    "void Benchmark_${MODEL_CPPNAME}(int warmup, int iterations, const std::string& weightsDir, bool profile, size_t maxThreadsPerBlock, size_t maxSharedMemoryPerBlockBytes, bool showResourcePlan);\n")
+                    "void Benchmark_${MODEL_CPPNAME}(int warmup, int iterations, const std::string& weightsDir, bool profile, size_t maxFusionThreadsPerBlock, size_t maxFusionSharedMemoryPerBlockBytes, bool showResourcePlan);\n")
 
             string(APPEND LARGE_SINGLE_MODEL_CASES
                 "    if (model == \"${MODEL_CPPNAME}\") {\n"
                 "        if (run_sofie)\n"
-                "            Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir, profile, maxThreadsPerBlock, maxSharedMemoryPerBlockBytes, showResourcePlan);\n"
+                "            Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir, profile, maxFusionThreadsPerBlock, maxFusionSharedMemoryPerBlockBytes, showResourcePlan);\n"
                 "#ifdef SOFIE_BENCHMARK_ORT\n"
                 "        if (run_ort) BenchmarkORT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations);\n"
                 "#endif\n"

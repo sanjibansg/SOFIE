@@ -662,9 +662,34 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
       bool inFusedGroup = (gIdx != SIZE_MAX) && fEltwiseFusionGroups[gIdx].isFused();
 
       if (inFusedGroup) {
-         if (fEltwiseFusionGroups[gIdx].launchOpIndex == op_idx && !fusedGroupsLaunched.count(gIdx)) {
-            fGC += GenerateFusedEltwiseLaunch_GPU_ALPAKA(fEltwiseFusionGroups[gIdx]);
-            fusedGroupsLaunched.insert(gIdx);
+         const auto &group = fEltwiseFusionGroups[gIdx];
+         const bool hasReduction = std::any_of(group.opIndices.begin(), group.opIndices.end(), [&](size_t groupOpIdx) {
+            return fOperators[groupOpIdx]->IsFusionReduction();
+         });
+
+         if (hasReduction) {
+            const std::string selectedName = "selectedFusedReductionThreads" + group.suffix();
+
+            fGC += "\nif (" + selectedName + " == 0) {\n";
+
+            if (fProfile)
+               fGC += RModelProfilerGPU::GenerateOperatorCode(*fOperators[op_idx], op_idx);
+            else
+               fGC += fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx));
+
+            fGC += "}\n";
+
+            if (group.launchOpIndex == op_idx && !fusedGroupsLaunched.count(gIdx)) {
+               fGC += "else {\n";
+               fGC += GenerateFusedEltwiseLaunch_GPU_ALPAKA(group);
+               fGC += "}\n";
+               fusedGroupsLaunched.insert(gIdx);
+            }
+         } else {
+            if (group.launchOpIndex == op_idx && !fusedGroupsLaunched.count(gIdx)) {
+               fGC += GenerateFusedEltwiseLaunch_GPU_ALPAKA(group);
+               fusedGroupsLaunched.insert(gIdx);
+            }
          }
       } else {
          if (fProfile)
@@ -815,7 +840,7 @@ void CheckGPUStacks(const MemoryPoolInfoGPU& info) {
    }
 }
 
-std::string RModel::AllocateIntermediateMemory_GPU_ALPAKA(std::span<const std::string> op_output_tensors) {
+   std::string RModel::AllocateIntermediateMemory_GPU_ALPAKA(std::span<const std::string> op_output_tensors, bool keepFusionIntermediates) {
    std::stringstream code;
 
    if (fVerbose) {
@@ -888,7 +913,7 @@ std::string RModel::AllocateIntermediateMemory_GPU_ALPAKA(std::span<const std::s
           fDynamicTensorInfos.find(name) != fDynamicTensorInfos.end())
          continue;
 
-      if (fFusionIntermediateTensors.count(name))
+      if (fFusionIntermediateTensors.count(name) && !keepFusionIntermediates)
          continue;
 
       if (IsAliasTensor(name))
@@ -1763,6 +1788,21 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
    bool OpNeedsBlas = false;
 
+   auto GenerateStandaloneKernel = [&](size_t id) {
+      if (single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
+         if (registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+            if (fVerbose)
+               std::cout << "Generating ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
+            fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
+            registered_operators.insert(fOperators[id]->GetKind());
+         }
+      } else {
+         if (fVerbose)
+            std::cout << "Generating ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
+         fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
+      }
+   };
+
    fGC += "\n//--- ALPAKA Kernels\n";
    for (size_t id = 0; id < fOperators.size(); id++) {
       if(fOperators[id]->GetKind() == OperatorKind::GEMM || fOperators[id]->GetKind() == OperatorKind::CONV) {
@@ -1793,19 +1833,15 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
                fGC += GenerateFusedEltwiseKernel_GPU_ALPAKA(group);
                fusedGroupsEmitted.insert(gIdx);
             }
+
+            const bool hasReduction = std::any_of(group.opIndices.begin(), group.opIndices.end(), [&](size_t opIdx) {
+               return fOperators[opIdx]->IsFusionReduction();
+            });
+
+            if (hasReduction)
+               GenerateStandaloneKernel(id);
          } else {
-            if (single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
-               if (registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
-                  if (fVerbose)
-                     std::cout << "Generating ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
-                  fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
-                  registered_operators.insert(fOperators[id]->GetKind());
-               }
-            } else {
-               if (fVerbose)
-                  std::cout << "Generating ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
-               fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
-            }
+            GenerateStandaloneKernel(id);
          }
       }
    }
@@ -1817,8 +1853,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
    if (fUseSession) {
       fGC += "\nstruct SessionOptions {\n";
-      fGC += SP + "std::size_t maxThreadsPerBlock = 0;\n";
-      fGC += SP + "std::size_t maxSharedMemoryPerBlockBytes = 0;\n";
+      fGC += SP + "std::size_t maxFusionThreadsPerBlock = 0;\n";
+      fGC += SP + "std::size_t maxFusionSharedMemoryPerBlockBytes = 0;\n";
       fGC += SP + "std::size_t maxIntermediateDRAMBytes = 0;\n";
       fGC += "};\n";
    }
@@ -1866,8 +1902,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
        fGC += "std::size_t hardwareMaxSharedMemoryPerBlockBytes = 0;\n";
        fGC += "std::size_t hardwareGlobalMemoryBytes = 0;\n";
        fGC += "Idx hardwareMultiProcessorCount = 0;\n";
-       fGC += "Idx effectiveMaxThreadsPerBlock = 0;\n";
-       fGC += "std::size_t effectiveMaxSharedMemoryPerBlockBytes = 0;\n";
+       fGC += "Idx effectiveMaxFusionThreadsPerBlock = 0;\n";
+       fGC += "std::size_t effectiveMaxFusionSharedMemoryPerBlockBytes = 0;\n";
        fGC += "std::size_t effectiveMaxIntermediateDRAMBytes = 0;\n";
     }
 
@@ -1888,11 +1924,19 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
       if (fSkipOperators.count(op_idx)) continue;
 
-      intermediate_memory_alloc_string += AllocateIntermediateMemory_GPU_ALPAKA(fOperators[op_idx]->GetOpOutputTensors());
+      const auto groupIt = fOpToFusionGroupIdx.find(op_idx);
+      bool keepFusionIntermediates = false;
+
+      if (groupIt != fOpToFusionGroupIdx.end()) {
+         const auto &group = fEltwiseFusionGroups[groupIt->second];
+         keepFusionIntermediates = group.isFused() && std::any_of(group.opIndices.begin(), group.opIndices.end(), [&](size_t groupOpIdx) {
+            return fOperators[groupOpIdx]->IsFusionReduction();
+         });
+      }
+
+      intermediate_memory_alloc_string += AllocateIntermediateMemory_GPU_ALPAKA(fOperators[op_idx]->GetOpOutputTensors(), keepFusionIntermediates);
 
       CheckAndFlushIntermediateMemory_GPU_ALPAKA(fOperators[op_idx]->GetOpInputTensors(), op_idx);
-
-      const auto groupIt = fOpToFusionGroupIdx.find(op_idx);
 
       if (groupIt != fOpToFusionGroupIdx.end()) {
          const auto &group = fEltwiseFusionGroups[groupIt->second];
@@ -1984,8 +2028,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          fGC += "hardwareMaxSharedMemoryPerBlockBytes = deviceProperties.m_sharedMemSizeBytes;\n";
          fGC += "hardwareGlobalMemoryBytes = deviceProperties.m_globalMemSizeBytes;\n";
          fGC += "hardwareMultiProcessorCount = deviceProperties.m_multiProcessorCount;\n";
-         fGC += "effectiveMaxThreadsPerBlock = sessionOptions.maxThreadsPerBlock == 0 || sessionOptions.maxThreadsPerBlock > hardwareMaxThreadsPerBlock ? hardwareMaxThreadsPerBlock : sessionOptions.maxThreadsPerBlock;\n";
-         fGC += "effectiveMaxSharedMemoryPerBlockBytes = sessionOptions.maxSharedMemoryPerBlockBytes == 0 || sessionOptions.maxSharedMemoryPerBlockBytes > hardwareMaxSharedMemoryPerBlockBytes ? hardwareMaxSharedMemoryPerBlockBytes : sessionOptions.maxSharedMemoryPerBlockBytes;\n";
+         fGC += "effectiveMaxFusionThreadsPerBlock = sessionOptions.maxFusionThreadsPerBlock == 0 || sessionOptions.maxFusionThreadsPerBlock > hardwareMaxThreadsPerBlock ? hardwareMaxThreadsPerBlock : sessionOptions.maxFusionThreadsPerBlock;\n";
+         fGC += "effectiveMaxFusionSharedMemoryPerBlockBytes = sessionOptions.maxFusionSharedMemoryPerBlockBytes == 0 || sessionOptions.maxFusionSharedMemoryPerBlockBytes > hardwareMaxSharedMemoryPerBlockBytes ? hardwareMaxSharedMemoryPerBlockBytes : sessionOptions.maxFusionSharedMemoryPerBlockBytes;\n";
          fGC += "effectiveMaxIntermediateDRAMBytes = sessionOptions.maxIntermediateDRAMBytes == 0 || sessionOptions.maxIntermediateDRAMBytes > hardwareGlobalMemoryBytes ? hardwareGlobalMemoryBytes : sessionOptions.maxIntermediateDRAMBytes;\n\n";
 
          for (const auto &group : fEltwiseFusionGroups) {
@@ -2007,10 +2051,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
             for (const auto &schedule : group.executionSchedules) {
                const std::string threads = std::to_string(schedule.threadsPerBlock);
                const std::string sharedMemory = std::to_string(schedule.sharedMemoryBytes);
-               fGC += "if (" + threads + "u <= effectiveMaxThreadsPerBlock && " + sharedMemory + "u <= effectiveMaxSharedMemoryPerBlockBytes) " + selectedName + " = " + threads + "u;\n";
+               fGC += "if (" + threads + "u <= effectiveMaxFusionThreadsPerBlock && " + sharedMemory + "u <= effectiveMaxFusionSharedMemoryPerBlockBytes) " + selectedName + " = " + threads + "u;\n";
             }
-
-            fGC += "if (" + selectedName + " == 0) throw std::runtime_error(\"No feasible execution schedule for fused reduction" + sfx + "\");\n";
          }
 
          fGC += "\n";
@@ -2078,6 +2120,21 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    fusedGroupsEmitted.clear();
    kernelFusionGroupsEmitted.clear();
 
+   auto GenerateStandaloneKernelDeclaration = [&](size_t id) {
+      if (single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
+         if (registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+            if (fVerbose)
+               std::cout << "Declaring ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
+            fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
+            registered_operators.insert(fOperators[id]->GetKind());
+         }
+      } else {
+         if (fVerbose)
+            std::cout << "Declaring ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
+         fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
+      }
+   };
+
    for (size_t id = 0; id < fOperators.size(); id++) {
       // Same as the kernel-struct loop above: fused activation ops must still
       // declare their member variable (e.g. `leakyReluKernel`) even though
@@ -2103,12 +2160,12 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
          if (inFusedGroup) {
             const auto &group = fEltwiseFusionGroups[gIdx];
+            const bool hasReduction = std::any_of(group.opIndices.begin(), group.opIndices.end(), [&](size_t opIdx) {
+               return fOperators[opIdx]->IsFusionReduction();
+            });
 
             if (group.opIndices[0] == id && !fusedGroupsEmitted.count(gIdx)) {
                const std::string sfx = group.suffix();
-               const bool hasReduction = std::any_of(group.opIndices.begin(), group.opIndices.end(), [&](size_t opIdx) {
-                  return fOperators[opIdx]->IsFusionReduction();
-               });
 
                if (hasReduction) {
                   if (group.executionSchedules.empty())
@@ -2126,19 +2183,11 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
                fusedGroupsEmitted.insert(gIdx);
             }
+
+            if (hasReduction)
+               GenerateStandaloneKernelDeclaration(id);
          } else {
-            if (single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
-               if (registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
-                  if (fVerbose)
-                     std::cout << "Declaring ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
-                  fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
-                  registered_operators.insert(fOperators[id]->GetKind());
-               }
-            } else {
-               if (fVerbose)
-                  std::cout << "Declaring ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
-               fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
-            }
+            GenerateStandaloneKernelDeclaration(id);
          }
       }
    }

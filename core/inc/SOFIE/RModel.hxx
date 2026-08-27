@@ -406,7 +406,7 @@ public:
 
 
    // GPU memory allocation
-   std::string AllocateIntermediateMemory_GPU_ALPAKA(std::span<const std::string> op_output_tensors);
+   std::string AllocateIntermediateMemory_GPU_ALPAKA(std::span<const std::string> op_output_tensors, bool keepFusionIntermediates = false);
 
    void CheckAndFlushIntermediateMemory_GPU_ALPAKA(std::span<const std::string> op_input_tensors,
                                                    const size_t& op_idx);
