@@ -60,7 +60,7 @@ configure_file(EmitFromONNX.cxx.in EmitFromONNX_all.cxx @ONLY)
 set(ALPAKA_CAPTURES "${ALL_CAPTURES}")
 
 file(GLOB ALPAKA_ONLY_ONNX_FILES
-        "${CMAKE_CURRENT_SOURCE_DIR}/alpaka_input_models/*.onnx"
+        "${CMAKE_CURRENT_SOURCE_DIR}/input_models/*.onnx"
 )
 
 foreach(onnx_file ${ALPAKA_ONLY_ONNX_FILES})
@@ -195,17 +195,10 @@ if (ENABLE_ALPAKA_TESTS)
       ${CMAKE_CURRENT_SOURCE_DIR}
     )
 
-    if(CMAKE_CUDA_ARCHITECTURES)
-        set(_cuda_archs "${CMAKE_CUDA_ARCHITECTURES}")
-    else()
-        set(_cuda_archs "70;80;86")
-    endif()
-
     set_target_properties(
             TestCustomModelsFromONNXForAlpakaCuda
             PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF
-            CUDA_ARCHITECTURES "${_cuda_archs}"
             CUDA_STANDARD 20
             CUDA_STANDARD_REQUIRED ON
     )
