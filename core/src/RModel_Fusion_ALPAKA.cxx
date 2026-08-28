@@ -1551,12 +1551,19 @@ RModel::EltwiseFusionGroup RModel::BuildEltwiseFusionGroup(const FusionCandidate
    return group;
 }
 
-std::vector<RModel::EltwiseFusionGroup> RModel::BuildKernelFusionLaunchUnits(const FusionTensorUseGraph &tensorUses) const
+   std::vector<RModel::EltwiseFusionGroup> RModel::BuildKernelFusionLaunchUnits(const FusionTensorUseGraph &tensorUses) const
 {
    std::vector<EltwiseFusionGroup> units;
    std::set<size_t> coveredOps;
 
-   for (const auto &group : fEltwiseFusionGroups) {
+   for (const size_t candidateIdx : fDefaultFusionPlan.candidateIndices) {
+      const auto groupIt = fFusionCandidateToGroupIdx.find(candidateIdx);
+
+      if (groupIt == fFusionCandidateToGroupIdx.end())
+         throw std::runtime_error("Default fusion candidate has no materialized fusion group");
+
+      const auto &group = fEltwiseFusionGroups[groupIt->second];
+
       for (const size_t opIdx : group.opIndices)
          coveredOps.insert(opIdx);
 
@@ -1888,6 +1895,7 @@ void RModel::ComputeEltwiseFusionGroups()
 {
    fFusionCandidates.clear();
    fFusionPlanComponents.clear();
+   fFusionPlanAlternatives.clear();
    fDefaultFusionPlan = {};
    fFusionCandidateToGroupIdx.clear();
 
@@ -1976,9 +1984,7 @@ void RModel::ComputeEltwiseFusionGroups()
             component.alternatives.push_back(std::move(alternative));
          }
       }
-   }
 
-   if (fVerbose) {
       for (size_t componentIdx = 0; componentIdx < fFusionPlanComponents.size(); ++componentIdx) {
          const auto &component = fFusionPlanComponents[componentIdx];
 
@@ -2004,15 +2010,6 @@ void RModel::ComputeEltwiseFusionGroups()
       std::cout << "[SOFIE resource-aware fusion] retained " << fFusionCandidates.size()
                 << " candidate(s) in " << fFusionPlanComponents.size()
                 << " interaction component(s)" << std::endl;
-
-      for (size_t componentIdx = 0; componentIdx < fFusionPlanComponents.size(); ++componentIdx) {
-         std::cout << "  component " << componentIdx << ":";
-
-         for (const size_t candidateIdx : fFusionPlanComponents[componentIdx].candidateIndices)
-            std::cout << " " << candidateIdx;
-
-         std::cout << std::endl;
-      }
    }
 
    std::set<size_t> compiledCandidateIndices;
@@ -2117,6 +2114,116 @@ void RModel::ComputeEltwiseFusionGroups()
             if (frequencyIt != fIntermediateTensorFrequencyLookup.end())
                frequencyIt->second = std::max(frequencyIt->second, group.launchOpIndex);
          }
+      }
+   }
+
+   std::set<size_t> runtimePlannedCandidateIndices;
+
+   for (const auto &component : fFusionPlanComponents) {
+      if (!IsRuntimeSelectableFusionPlanComponent(component))
+         continue;
+
+      for (const size_t candidateIdx : component.candidateIndices)
+         runtimePlannedCandidateIndices.insert(candidateIdx);
+   }
+
+   std::vector<size_t> fixedDefaultCandidateIndices;
+
+   for (const size_t candidateIdx : fDefaultFusionPlan.candidateIndices) {
+      if (!runtimePlannedCandidateIndices.count(candidateIdx))
+         fixedDefaultCandidateIndices.push_back(candidateIdx);
+   }
+
+   std::set<std::vector<size_t>> seenGlobalSelections;
+
+   for (const size_t threads : fusionThreadLimits) {
+      for (const size_t sharedMemory : fusionSharedMemoryLimits) {
+         FusionResourceRequirements resourceLimit;
+         resourceLimit.threadsPerBlock = threads;
+         resourceLimit.sharedMemoryPerBlockBytes = sharedMemory;
+
+         std::vector<size_t> globalSelection = fixedDefaultCandidateIndices;
+
+         for (const auto &component : fFusionPlanComponents) {
+            if (!IsRuntimeSelectableFusionPlanComponent(component))
+               continue;
+
+            std::vector<size_t> alternativeOrder(component.alternatives.size());
+
+            for (size_t alternativeIdx = 0; alternativeIdx < component.alternatives.size(); ++alternativeIdx)
+               alternativeOrder[alternativeIdx] = alternativeIdx;
+
+            std::sort(alternativeOrder.begin(), alternativeOrder.end(), [&](size_t leftIdx, size_t rightIdx) {
+               const auto &left = component.alternatives[leftIdx];
+               const auto &right = component.alternatives[rightIdx];
+
+               if (IsBetterFusionStructuralScore(left.score, right.score))
+                  return true;
+
+               if (IsBetterFusionStructuralScore(right.score, left.score))
+                  return false;
+
+               return left.candidateIndices < right.candidateIndices;
+            });
+
+            for (const size_t alternativeIdx : alternativeOrder) {
+               const auto &alternative = component.alternatives[alternativeIdx];
+               bool feasible = true;
+
+               for (const size_t candidateIdx : alternative.candidateIndices) {
+                  if (!IsFusionCandidateFeasible(fFusionCandidates[candidateIdx], resourceLimit)) {
+                     feasible = false;
+                     break;
+                  }
+               }
+
+               if (!feasible)
+                  continue;
+
+               globalSelection.insert(globalSelection.end(), alternative.candidateIndices.begin(), alternative.candidateIndices.end());
+               break;
+            }
+         }
+
+         std::sort(globalSelection.begin(), globalSelection.end());
+         globalSelection.erase(std::unique(globalSelection.begin(), globalSelection.end()), globalSelection.end());
+
+         if (!seenGlobalSelections.insert(globalSelection).second)
+            continue;
+
+         FusionPlanAlternative alternative;
+         alternative.candidateIndices = std::move(globalSelection);
+         alternative.resourceLimit = resourceLimit;
+
+         for (const size_t candidateIdx : alternative.candidateIndices) {
+            const auto &score = fFusionCandidates[candidateIdx].score;
+            alternative.score.launchesRemoved += score.launchesRemoved;
+            alternative.score.liveRangeExtensionByteSteps += score.liveRangeExtensionByteSteps;
+            alternative.score.eliminatedBytes += score.eliminatedBytes;
+            alternative.score.materializedOutputs += score.materializedOutputs;
+            alternative.score.externalInputs += score.externalInputs;
+         }
+
+         fFusionPlanAlternatives.push_back(std::move(alternative));
+      }
+   }
+
+   if (fVerbose) {
+      std::cout << "[SOFIE resource-aware fusion] retained " << fFusionPlanAlternatives.size()
+                << " distinct global plan alternative(s)" << std::endl;
+
+      for (size_t alternativeIdx = 0; alternativeIdx < fFusionPlanAlternatives.size(); ++alternativeIdx) {
+         const auto &alternative = fFusionPlanAlternatives[alternativeIdx];
+
+         std::cout << "  global alternative " << alternativeIdx
+                   << " limit=(" << alternative.resourceLimit.threadsPerBlock
+                   << " threads, " << alternative.resourceLimit.sharedMemoryPerBlockBytes
+                   << " shared bytes) candidates:";
+
+         for (const size_t candidateIdx : alternative.candidateIndices)
+            std::cout << " " << candidateIdx;
+
+         std::cout << std::endl;
       }
    }
 }

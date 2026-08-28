@@ -180,6 +180,7 @@ private:
 
    std::vector<FusionCandidate> fFusionCandidates; ///< legal elementwise fusion candidates retained for runtime plan selection
    std::vector<FusionPlanComponent> fFusionPlanComponents; ///< independent candidate interaction components
+   std::vector<FusionPlanAlternative> fFusionPlanAlternatives; ///< distinct global plans retained across resource tiers
    FusionPlan fDefaultFusionPlan; ///< compile-time best plan, retained as the default runtime plan
    std::unordered_map<size_t, size_t> fFusionCandidateToGroupIdx; ///< fusion candidate index -> compiled fusion group index
 

@@ -255,16 +255,9 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
 
     bench
         << "    if (showResourcePlan) {\n"
-        << "        const auto planSelections = session.GetSelectedFusionPlans();\n"
+        << "        const auto globalPlanSelection = session.GetSelectedGlobalFusionPlan();\n"
         << "        const auto scheduleSelections = session.GetSelectedFusionSchedules();\n"
-        << "        std::cout << \"[SOFIE fusion plans]\";\n"
-        << "        if (planSelections.empty()) {\n"
-        << "            std::cout << \" none\";\n"
-        << "        } else {\n"
-        << "            for (const auto &selection : planSelections)\n"
-        << "                std::cout << \" component\" << selection.componentIndex << \"=alternative\" << selection.alternativeIndex;\n"
-        << "        }\n"
-        << "        std::cout << \"\\n\";\n"
+        << "        std::cout << \"[SOFIE global fusion plan] alternative\" << globalPlanSelection << \"\\n\";\n"
         << "        std::cout << \"[SOFIE resource plan]\";\n"
         << "        if (scheduleSelections.empty()) {\n"
         << "            std::cout << \" no runtime-selectable fused groups\";\n"
