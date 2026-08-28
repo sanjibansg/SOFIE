@@ -372,9 +372,23 @@ def markdown_table(headers: List[str], rows: List[List[str]]) -> str:
     lines.extend("| " + " | ".join(row) + " |" for row in rows)
     return "\n".join(lines)
 
+def common_model_names(
+        backend_model_data: Dict[str, List[Tuple[ModelSummary, List[KernelRecord]]]]
+) -> set[str]:
+    model_sets = [
+        {summary.model for summary, _ in model_data}
+        for model_data in backend_model_data.values()
+        if model_data
+    ]
 
-def write_markdown(root: Path, summaries: List[BackendSummary], warnings: List[str]) -> Path:
-    output = root / "profile_summary.md"
+    if not model_sets:
+        return set()
+
+    return set.intersection(*model_sets)
+
+
+def write_markdown(root: Path, summaries: List[BackendSummary], warnings: List[str], filename: str = "profile_summary.md") -> Path:
+    output = root / filename
     lines = ["# Nsight Compute profile summary", "", f"Source directory: `{root}`", ""]
     if warnings:
         lines.extend(["## Parse warnings", ""])
@@ -482,12 +496,11 @@ def write_markdown(root: Path, summaries: List[BackendSummary], warnings: List[s
     return output
 
 
-def write_json(root: Path, summaries: List[BackendSummary], warnings: List[str]) -> Path:
-    output = root / "profile_summary.json"
+def write_json(root: Path, summaries: List[BackendSummary], warnings: List[str], filename: str = "profile_summary.json") -> Path:
+    output = root / filename
     payload = {"root": str(root), "warnings": warnings, "backends": [asdict(summary) for summary in summaries]}
     output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return output
-
 
 def find_profile_csvs(backend_dir: Path) -> List[Path]:
     result = []
@@ -500,9 +513,10 @@ def find_profile_csvs(backend_dir: Path) -> List[Path]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Summarize Nsight Compute CSV reports for SOFIE, ONNX Runtime, and TensorRT.")
-    parser.add_argument("root", type=Path, help="Benchmark run directory containing sofie/, ort/, and/or tensorrt/.")
+    parser = argparse.ArgumentParser(description="Summarize Nsight Compute CSV reports for SOFIE, ONNX Runtime, TensorRT, and PyTorch AOT.")
+    parser.add_argument("root", type=Path, help="Benchmark run directory containing backend subdirectories.")
     args = parser.parse_args()
+
     root = args.root.expanduser().resolve()
     if not root.is_dir():
         print(f"error: directory does not exist: {root}", file=sys.stderr)
@@ -510,27 +524,35 @@ def main() -> int:
 
     summaries: List[BackendSummary] = []
     warnings: List[str] = []
+    backend_model_data: Dict[str, List[Tuple[ModelSummary, List[KernelRecord]]]] = {}
 
     for backend in BACKENDS:
         backend_dir = root / backend
         if not backend_dir.is_dir():
             continue
+
         csv_files = find_profile_csvs(backend_dir)
         if not csv_files:
             warnings.append(f"{backend}: no Nsight Compute CSV files found.")
             continue
+
         model_data: List[Tuple[ModelSummary, List[KernelRecord]]] = []
+
         for path in csv_files:
             try:
                 records = read_ncu_csv(path)
             except Exception as error:
                 warnings.append(f"{backend}/{path.name}: {error}")
                 continue
+
             if not records:
                 warnings.append(f"{backend}/{path.name}: no kernel rows found.")
                 continue
+
             model_data.append((summarize_model(path, records), records))
+
         if model_data:
+            backend_model_data[backend] = model_data
             summaries.append(summarize_backend(backend, model_data))
 
     if not summaries:
@@ -541,11 +563,34 @@ def main() -> int:
 
     markdown_path = write_markdown(root, summaries, warnings)
     json_path = write_json(root, summaries, warnings)
-
     print(f"Wrote {markdown_path}")
     print(f"Wrote {json_path}")
+
+    common_models = common_model_names(backend_model_data)
+    common_summaries: List[BackendSummary] = []
+
+    if common_models:
+        for backend in BACKENDS:
+            model_data = backend_model_data.get(backend)
+            if not model_data:
+                continue
+
+            filtered_model_data = [(summary, records) for summary, records in model_data if summary.model in common_models]
+
+            if filtered_model_data:
+                common_summaries.append(summarize_backend(backend, filtered_model_data))
+
+        common_markdown_path = write_markdown(root, common_summaries, warnings, filename="profile_summary_common.md")
+        common_json_path = write_json(root, common_summaries, warnings, filename="profile_summary_common.json")
+        print(f"Wrote {common_markdown_path}")
+        print(f"Wrote {common_json_path}")
+        print(f"Common models ({len(common_models)}): " + ", ".join(sorted(common_models)))
+    else:
+        print("warning: no models are common to all usable backends; common summary files were not created.", file=sys.stderr)
+
     for warning in warnings:
         print(f"warning: {warning}", file=sys.stderr)
+
     return 0
 
 

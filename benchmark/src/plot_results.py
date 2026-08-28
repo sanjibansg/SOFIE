@@ -326,10 +326,7 @@ def plot_geometric_mean_comparison(df: pd.DataFrame, out_dir: Path) -> None:
     latency = df.pivot(index="Model", columns="backend", values="infer_ms")
     memory = df.pivot(index="Model", columns="backend", values="gpu_peak_mem_mb")
 
-    # Only compare models that exist for every backend.
-    common_models = latency.dropna(subset=backends).index.intersection(
-        memory.dropna(subset=backends).index
-    )
+    common_models = latency.dropna(subset=backends).index.intersection(memory.dropna(subset=backends).index)
 
     if len(common_models) == 0:
         return
@@ -341,49 +338,88 @@ def plot_geometric_mean_comparison(df: pd.DataFrame, out_dir: Path) -> None:
     sofie_memory = memory["SOFIE"]
 
     speed_ratios = latency.apply(lambda column: sofie_latency / column)
-    memory_efficiency_ratios = memory.apply(lambda column: sofie_memory / column)
+    memory_improvement_ratios = memory.apply(lambda column: sofie_memory / column)
 
     geometric_speed = np.exp(np.log(speed_ratios).mean(axis=0))
-    geometric_memory_efficiency = np.exp(np.log(memory_efficiency_ratios).mean(axis=0))
+    geometric_memory = np.exp(np.log(memory_improvement_ratios).mean(axis=0))
 
-    labels = [backend_short_name(backend) for backend in backends]
+    comparison_backends = [backend for backend in backends if backend != "SOFIE"]
+    labels = [backend_short_name(backend) for backend in comparison_backends]
 
-    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2))
+    speed_values = geometric_speed[comparison_backends]
+    memory_values = geometric_memory[comparison_backends]
 
-    speed_bars = axes[0].bar(labels, geometric_speed.values)
-    axes[0].axhline(1.0, linestyle=":", linewidth=1)
-    axes[0].set_ylabel("Geometric mean speed vs SOFIE (×)")
-    axes[0].set_title("Geometric Mean Inference Speed")
+    fig, axes = plt.subplots(1, 2, figsize=(13.0, 4.2))
+    fig.subplots_adjust(wspace=0.42)
+
+    speed_bars = axes[0].bar(labels, speed_values.values)
+    axes[0].axhline(1.0, color="red", linestyle="--", linewidth=1.5)
+    axes[0].set_ylabel("Relative inference speedup over SOFIE (×)", fontsize=9, fontweight="bold")
+    axes[0].set_title("Geometric Mean Inference Speedup", fontsize=14, fontweight="bold")
     axes[0].grid(True, axis="y", alpha=0.3)
 
-    for bar, value in zip(speed_bars, geometric_speed.values):
-        axes[0].text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height(),
-            f"{value:.2f}×",
-            ha="center",
-            va="bottom",
-            fontsize=8,
-            )
+    for bar, value in zip(speed_bars, speed_values.values):
+        axes[0].text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{value:.2f}×", ha="center", va="bottom", fontsize=10, fontweight="bold")
 
-    memory_bars = axes[1].bar(labels, geometric_memory_efficiency.values)
-    axes[1].axhline(1.0, linestyle=":", linewidth=1)
-    axes[1].set_ylabel("Geometric mean memory efficiency vs SOFIE (×)")
-    axes[1].set_title("Geometric Mean Memory Efficiency")
+    memory_bars = axes[1].bar(labels, memory_values.values)
+    axes[1].axhline(1.0, color="red", linestyle="--", linewidth=1.5)
+    axes[1].set_ylabel("Relative memory efficiency over SOFIE (×)", fontsize=9, fontweight="bold")
+    axes[1].set_title("Geometric Mean Peak GPU Memory Improvement", fontsize=14, fontweight="bold")
     axes[1].grid(True, axis="y", alpha=0.3)
 
-    for bar, value in zip(memory_bars, geometric_memory_efficiency.values):
-        axes[1].text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height(),
-            f"{value:.2f}×",
-            ha="center",
-            va="bottom",
-            fontsize=8,
-            )
+    for bar, value in zip(memory_bars, memory_values.values):
+        axes[1].text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{value:.2f}×", ha="center", va="bottom", fontsize=10, fontweight="bold")
 
-    fig.suptitle(f"Common models across all backends (n={len(common_models)})", fontsize=10)
+    for ax in axes:
+        ax.tick_params(axis="both", labelsize=10)
+
+        for label in ax.get_xticklabels():
+            label.set_fontweight("bold")
+
     save_figure(fig, out_dir, "geometric_mean_baseline_comparison")
+
+def write_geometric_mean_summary(df: pd.DataFrame, out_dir: Path) -> None:
+    backends = backend_labels()
+
+    latency = df.pivot(index="Model", columns="backend", values="infer_ms")
+    throughput = df.pivot(index="Model", columns="backend", values="throughput_inf_s")
+    memory = df.pivot(index="Model", columns="backend", values="gpu_peak_mem_mb")
+
+    # Only use models that are available for every backend and every metric.
+    common_models = (
+        latency.dropna(subset=backends).index
+        .intersection(throughput.dropna(subset=backends).index)
+        .intersection(memory.dropna(subset=backends).index)
+    )
+
+    if len(common_models) == 0:
+        return
+
+    latency = latency.loc[common_models, backends]
+    throughput = throughput.loc[common_models, backends]
+    memory = memory.loc[common_models, backends]
+
+    rows = []
+
+    for backend in backends:
+        geometric_time = np.exp(np.log(latency[backend]).mean())
+        geometric_throughput = np.exp(np.log(throughput[backend]).mean())
+        geometric_memory = np.exp(np.log(memory[backend]).mean())
+
+        rows.append(
+            {
+                "Backend": backend,
+                "Geometric_mean_infer_ms": geometric_time,
+                "Geometric_mean_throughput_inf_s": geometric_throughput,
+                "Geometric_mean_peak_gpu_memory_mb": geometric_memory,
+                "Common_models": len(common_models),
+            }
+        )
+
+    pd.DataFrame(rows).to_csv(
+        out_dir / "geometric_mean_summary.csv",
+        index=False,
+        )
 
 def write_summary(df: pd.DataFrame, out_dir: Path) -> None:
     pivot_latency = df.pivot(index="Model", columns="backend", values="infer_ms")
@@ -432,7 +468,9 @@ def main() -> None:
 
     df = enrich(load_results(inputs))
     df.to_csv(out_dir / "aggregated_results.csv", index=False)
+
     write_summary(df, out_dir)
+    write_geometric_mean_summary(df, out_dir)
 
     plot_family_scaling(df, out_dir)
     plot_speedup_vs_reference(df, out_dir)
