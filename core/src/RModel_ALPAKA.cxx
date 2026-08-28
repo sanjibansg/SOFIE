@@ -652,26 +652,17 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
 
    fGC += "\n\n";
 
-   fGC += "void _infer_impl(";
-   fGC += GenerateImplSignature_GPU_ALPAKA();
-   fGC += "){\n";
+   auto GenerateInferencePlan = [&](const std::string &planName, const std::vector<size_t> &candidateIndices) {
+      fGC += "void " + planName + "(";
+      fGC += GenerateImplSignature_GPU_ALPAKA();
+      fGC += "){\n";
 
-   // GPU profiling: _infer_impl is a member of Session, so fProfilingResults
-   // is directly accessible without any alias.
-   if (fProfile) {
-      fGC += RModelProfilerGPU::GenerateBeginInferCode();
-   }
+      if (fProfile)
+         fGC += RModelProfilerGPU::GenerateBeginInferCode();
 
-   std::set<size_t> fusedGroupsLaunched;
-   std::set<size_t> kernelFusionGroupsLaunched;
+      std::unordered_map<size_t, size_t> activeCandidateByOp;
 
-   std::unordered_map<size_t, std::string> runtimeCandidateConditions;
-   std::unordered_map<size_t, std::vector<size_t>> runtimeCandidatesByOp;
-
-   for (size_t alternativeIdx = 0; alternativeIdx < fFusionPlanAlternatives.size(); ++alternativeIdx) {
-      const auto &alternative = fFusionPlanAlternatives[alternativeIdx];
-
-      for (const size_t candidateIdx : alternative.candidateIndices) {
+      for (const size_t candidateIdx : candidateIndices) {
          const auto groupIt = fFusionCandidateToGroupIdx.find(candidateIdx);
 
          if (groupIt == fFusionCandidateToGroupIdx.end())
@@ -682,128 +673,119 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
          if (!IsRuntimeSelectableFusionGroup(group))
             continue;
 
-         std::string &condition = runtimeCandidateConditions[candidateIdx];
-
-         if (!condition.empty())
-            condition += " || ";
-
-         condition += "selectedGlobalFusionPlan == " + std::to_string(alternativeIdx + 1) + "u";
+         for (const size_t opIdx : group.opIndices) {
+            if (!activeCandidateByOp.emplace(opIdx, candidateIdx).second)
+               throw std::runtime_error("Global fusion plan contains overlapping runtime fusion candidates");
+         }
       }
-   }
 
-   for (const auto &[candidateIdx, condition] : runtimeCandidateConditions) {
-      for (const size_t opIdx : fFusionCandidates[candidateIdx].opIndices)
-         runtimeCandidatesByOp[opIdx].push_back(candidateIdx);
-   }
+      for (size_t opIdx = 0; opIdx < fOperators.size(); ++opIdx) {
+         if (fVerbose)
+            std::cout << "Generating code for operator .... " << opIdx << " in " << planName << std::endl;
 
-   for (auto &[opIdx, candidateIndices] : runtimeCandidatesByOp) {
-      std::sort(candidateIndices.begin(), candidateIndices.end());
-      candidateIndices.erase(std::unique(candidateIndices.begin(), candidateIndices.end()), candidateIndices.end());
-   }
+         if (fSkipOperators.count(opIdx))
+            continue;
 
-   for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
-      if (fVerbose)
-         std::cout << "Generating code for operator .... " << op_idx << std::endl;
+         const auto kernelFusionIt = fOpToKernelFusionGroupIdx.find(opIdx);
 
-      if (fSkipOperators.count(op_idx)) continue;
+         if (kernelFusionIt != fOpToKernelFusionGroupIdx.end()) {
+            const auto &group = fKernelFusionGroups[kernelFusionIt->second];
 
-      auto kIt = fOpToKernelFusionGroupIdx.find(op_idx);
-      size_t kIdx = (kIt != fOpToKernelFusionGroupIdx.end()) ? kIt->second : SIZE_MAX;
-      bool inKernelFusionGroup = (kIdx != SIZE_MAX) && fKernelFusionGroups[kIdx].isFused();
+            if (group.isFused() && group.launchOpIndex == opIdx)
+               fGC += GenerateKernelFusionLaunch_GPU_ALPAKA(group);
 
-      if (inKernelFusionGroup) {
-         const auto &group = fKernelFusionGroups[kIdx];
-
-         if (group.launchOpIndex == op_idx && !kernelFusionGroupsLaunched.count(kIdx)) {
-            fGC += GenerateKernelFusionLaunch_GPU_ALPAKA(group);
-            kernelFusionGroupsLaunched.insert(kIdx);
+            continue;
          }
 
-         continue;
-      }
+         const auto activeCandidateIt = activeCandidateByOp.find(opIdx);
 
-      const auto runtimeCandidatesIt = runtimeCandidatesByOp.find(op_idx);
-
-      if (runtimeCandidatesIt != runtimeCandidatesByOp.end()) {
-         bool firstCandidate = true;
-
-         for (const size_t candidateIdx : runtimeCandidatesIt->second) {
-            const auto conditionIt = runtimeCandidateConditions.find(candidateIdx);
-
-            if (conditionIt == runtimeCandidateConditions.end())
-               throw std::runtime_error("Runtime fusion candidate has no activation condition");
-
+         if (activeCandidateIt != activeCandidateByOp.end()) {
+            const size_t candidateIdx = activeCandidateIt->second;
             const size_t groupIdx = fFusionCandidateToGroupIdx.at(candidateIdx);
             const auto &group = fEltwiseFusionGroups[groupIdx];
 
-            if (firstCandidate)
-               fGC += "\nif (" + conditionIt->second + ") {\n";
-            else
-               fGC += "else if (" + conditionIt->second + ") {\n";
-
-            if (group.launchOpIndex == op_idx)
+            if (group.launchOpIndex == opIdx)
                fGC += GenerateFusedEltwiseLaunch_GPU_ALPAKA(group);
 
-            fGC += "}\n";
-            firstCandidate = false;
+            continue;
          }
 
-         fGC += "else {\n";
+         const auto defaultGroupIt = fOpToFusionGroupIdx.find(opIdx);
+
+         if (defaultGroupIt != fOpToFusionGroupIdx.end()) {
+            const auto &group = fEltwiseFusionGroups[defaultGroupIt->second];
+
+            if (!IsRuntimeSelectableFusionGroup(group)) {
+               if (group.launchOpIndex == opIdx)
+                  fGC += GenerateFusedEltwiseLaunch_GPU_ALPAKA(group);
+
+               continue;
+            }
+         }
+
+         bool scopeOperator = true;
+
+         for (const auto &outputNameView : fOperators[opIdx]->GetOpOutputTensors()) {
+            const std::string outputName(outputNameView);
+
+            if (IsAliasTensor(outputName) || fDynamicTensorInfos.count(outputName)) {
+               scopeOperator = false;
+               break;
+            }
+         }
+
+         if (scopeOperator)
+            fGC += SP + "{\n";
 
          if (fProfile)
-            fGC += RModelProfilerGPU::GenerateOperatorCode(*fOperators[op_idx], op_idx);
+            fGC += RModelProfilerGPU::GenerateOperatorCode(*fOperators[opIdx], opIdx);
          else
-            fGC += fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx));
+            fGC += fOperators[opIdx]->Generate_GPU_ALPAKA(std::to_string(opIdx));
 
-         fGC += "}\n";
+         if (scopeOperator)
+            fGC += SP + "}\n";
+      }
+
+      fGC += "\n\n   alpaka::wait(queue);\n";
+
+      if (fProfile)
+         fGC += RModelProfilerGPU::GenerateEndInferCode();
+
+      fGC += "}\n\n";
+   };
+
+   GenerateInferencePlan("_infer_impl_plan0", {});
+
+   for (size_t alternativeIdx = 0; alternativeIdx < fFusionPlanAlternatives.size(); ++alternativeIdx) {
+      const auto &alternative = fFusionPlanAlternatives[alternativeIdx];
+
+      if (alternative.candidateIndices.empty())
          continue;
-      }
 
-      auto gIt = fOpToFusionGroupIdx.find(op_idx);
-      size_t gIdx = (gIt != fOpToFusionGroupIdx.end()) ? gIt->second : SIZE_MAX;
-      bool inFusedGroup = (gIdx != SIZE_MAX) && fEltwiseFusionGroups[gIdx].isFused();
-
-      if (inFusedGroup) {
-         const auto &group = fEltwiseFusionGroups[gIdx];
-
-         if (IsRuntimeSelectableFusionGroup(group)) {
-            const std::string selectedName = "selectedFusionSchedule" + group.suffix();
-
-            fGC += "\nif (" + selectedName + " == 0) {\n";
-
-            if (fProfile)
-               fGC += RModelProfilerGPU::GenerateOperatorCode(*fOperators[op_idx], op_idx);
-            else
-               fGC += fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx));
-
-            fGC += "}\n";
-
-            if (group.launchOpIndex == op_idx && !fusedGroupsLaunched.count(gIdx)) {
-               fGC += "else {\n";
-               fGC += GenerateFusedEltwiseLaunch_GPU_ALPAKA(group);
-               fGC += "}\n";
-               fusedGroupsLaunched.insert(gIdx);
-            }
-         } else {
-            if (group.launchOpIndex == op_idx && !fusedGroupsLaunched.count(gIdx)) {
-               fGC += GenerateFusedEltwiseLaunch_GPU_ALPAKA(group);
-               fusedGroupsLaunched.insert(gIdx);
-            }
-         }
-      } else {
-         if (fProfile)
-            fGC += RModelProfilerGPU::GenerateOperatorCode(*fOperators[op_idx], op_idx);
-         else
-            fGC += fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx));
-      }
-   }
-   // Final wait (no-op when profiling since each op already syncs)
-   fGC += "\n\n   alpaka::wait(queue);\n";
-
-   if (fProfile) {
-      fGC += RModelProfilerGPU::GenerateEndInferCode();
+      GenerateInferencePlan("_infer_impl_plan" + std::to_string(alternativeIdx + 1), alternative.candidateIndices);
    }
 
+   fGC += "void _infer_impl(";
+   fGC += GenerateImplSignature_GPU_ALPAKA();
+   fGC += "){\n";
+   fGC += SP + "switch (selectedGlobalFusionPlan) {\n";
+   fGC += SP + "case 0u:\n";
+   fGC += SP + SP + "_infer_impl_plan0(" + GenerateImplSignature_GPU_ALPAKA(false) + ");\n";
+   fGC += SP + SP + "break;\n";
+
+   for (size_t alternativeIdx = 0; alternativeIdx < fFusionPlanAlternatives.size(); ++alternativeIdx) {
+      if (fFusionPlanAlternatives[alternativeIdx].candidateIndices.empty())
+         continue;
+
+      const std::string selection = std::to_string(alternativeIdx + 1);
+      fGC += SP + "case " + selection + "u:\n";
+      fGC += SP + SP + "_infer_impl_plan" + selection + "(" + GenerateImplSignature_GPU_ALPAKA(false) + ");\n";
+      fGC += SP + SP + "break;\n";
+   }
+
+   fGC += SP + "default:\n";
+   fGC += SP + SP + "throw std::runtime_error(\"Invalid selected global fusion plan\");\n";
+   fGC += SP + "}\n";
    fGC += "}\n\n";
 
 
