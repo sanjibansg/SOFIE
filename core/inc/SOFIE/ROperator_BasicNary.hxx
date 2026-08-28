@@ -198,7 +198,7 @@ public:
       return acc_v + " = " + acc_v + " + " + val + ";"; // Sum and Mean both accumulate
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA(std::string OpName) override {
+   std::string Generate_GPU_Kernel_ALPAKA(std::string OpName, const std::vector<std::string> &dynParamNames) override {
       OpName = "op_" + OpName;
       size_t nIn = fNInputs.size();
       const std::size_t D = fShapeY.size();
@@ -227,7 +227,7 @@ public:
       for (size_t i = 0; i < nIn; i++)
          op += ", Tin" + std::to_string(i) + " const* in" + std::to_string(i);
       op += ", TOut* out";
-      for (auto &p : GetGPUDynParams())
+      for (auto &p : dynParamNames)
          op += ", std::size_t const " + p;
       op += ", std::size_t n) const {\n";
       op += SP + SP + SP + "auto const idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
@@ -272,7 +272,7 @@ public:
       return SP + "BasicNaryKernel_" + OpName + " basicNaryKernel_" + OpName + ";\n";
    }
 
-   std::string Generate_GPU_ALPAKA(std::string OpName) override {
+   std::string Generate_GPU_ALPAKA(std::string OpName, const std::vector<std::string> &dynParamNames) override {
       if (fShapeY.empty())
          throw std::runtime_error("SOFIE BasicNary Op called to Generate without being initialized first");
       OpName = "op_" + OpName;
@@ -286,7 +286,7 @@ public:
       for (auto &in : fNInputs)
          out << ", alpaka::getPtrNative(deviceBuf_" << in << ")";
       out << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")";
-      for (auto &p : GetGPUDynParams())
+      for (auto &p : dynParamNames)
          out << ", static_cast<std::size_t>(" << p << ")";
       out << ", static_cast<std::size_t>(" << length << "));\n";
       out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";

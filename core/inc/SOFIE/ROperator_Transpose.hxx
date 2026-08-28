@@ -172,7 +172,7 @@ public:
    }
 
 
-   std::string Generate_GPU_Kernel_ALPAKA(std::string OpName) override {
+   std::string Generate_GPU_Kernel_ALPAKA(std::string OpName, const std::vector<std::string> &dynParamNames) override {
       if (fIsOutputConstant) return "";
       std::string op;
       OpName = "op_" + OpName;
@@ -180,7 +180,7 @@ public:
       op += SP + "struct TransposeKernel_" + OpName + " {\n";
       op += SP + SP + "template<typename TAcc, typename T>\n";
       op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const& acc, T const* input, T* output,";
-      for (auto &p : GetGPUDynParams())
+      for (auto &p : dynParamNames)
          op += "const std::size_t " + p + ",";
       op += "const std::size_t totalElements) const {\n";
       op += SP + SP + SP + SP + "auto const idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
@@ -213,7 +213,7 @@ public:
       return SP + "TransposeKernel_op_" + OpName + " transposeKernel_" + OpName + ";\n";
    }
 
-   std::string Generate_GPU_ALPAKA(std::string OpName) override {
+   std::string Generate_GPU_ALPAKA(std::string OpName, const std::vector<std::string> &dynParamNames) override {
       if (fIsOutputConstant) return "";
       if (fDimShapeOutput.empty()) {
          throw std::runtime_error("SOFIE Operator Transpose called to Generate without being initialized first");
@@ -228,7 +228,7 @@ public:
       out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNOutput
          << ", transposeKernel_" << OpName << ", alpaka::getPtrNative(deviceBuf_" << fNData
          << "), alpaka::getPtrNative(deviceBuf_" << fNOutput << ")";
-      for (auto &p : GetGPUDynParams())
+      for (auto &p : dynParamNames)
          out << ", static_cast<std::size_t>(" << p << ")";
       out << ", static_cast<Idx>(" << length << "));\n";
       out << SP <<"alpaka::enqueue(queue, task_" << OpName << ");\n";

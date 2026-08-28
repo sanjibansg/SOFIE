@@ -155,7 +155,7 @@ public:
    }
 
 
-   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName, const std::vector<std::string> &dynParamNames) override {
       opName = "op_" + opName;
       if (fShapeX.empty())
          throw std::runtime_error("SOFIE BatchNormalization called to Generate without being initialized first");
@@ -174,7 +174,7 @@ public:
       op += SP + SP + SP + "T const* __restrict__ bias,\n";
       op += SP + SP + SP + "T const* __restrict__ mean,\n";
       op += SP + SP + SP + "T* __restrict__ Y,\n";
-      for (auto &p : GetGPUDynParams())
+      for (auto &p : dynParamNames)
          op += SP + SP + SP + "std::size_t const " + p + ",\n";
       op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
 
@@ -202,7 +202,7 @@ public:
       return SP + kname + " batchNormKernel_" + opName + ";\n";
    }
 
-   std::string Generate_GPU_ALPAKA(std::string opName) override {
+   std::string Generate_GPU_ALPAKA(std::string opName, const std::vector<std::string> &dynParamNames) override {
       opName = "op_" + opName;
       if (fShapeX.empty())
          throw std::runtime_error("SOFIE BatchNormalization called to Generate without being initialized first");
@@ -211,7 +211,7 @@ public:
       std::string kname = "batchNormKernel_" + opName;
 
       std::string dynArgs;
-      for (auto &p : GetGPUDynParams()) dynArgs += ", static_cast<std::size_t>(" + p + ")";
+      for (auto &p : dynParamNames) dynArgs += ", static_cast<std::size_t>(" + p + ")";
 
       std::stringstream out;
       out << "\n//------ BATCHNORM_GPU_ALPAKA\n";

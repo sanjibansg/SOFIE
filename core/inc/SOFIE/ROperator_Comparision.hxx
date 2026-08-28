@@ -371,7 +371,7 @@ public:
       return out.str();
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName, const std::vector<std::string> &dynParamNames) override {
       if (fIsOutputConstant) return "";
       opName = "op_" + opName;
       if (fDimShapeY.empty())
@@ -400,7 +400,7 @@ public:
       op += SP + SP + SP + type1 + " const* __restrict__ x1,\n";
       op += SP + SP + SP + type2 + " const* __restrict__ x2,\n";
       op += SP + SP + SP + "uint8_t* __restrict__ output,\n";
-      for (auto &p : GetGPUDynParams())
+      for (auto &p : dynParamNames)
          op += SP + SP + SP + "std::size_t const " + p + ",\n";
       op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
 
@@ -450,7 +450,7 @@ public:
       return SP + kname + " comparisonKernel_" + opName + ";\n";
    }
 
-   std::string Generate_GPU_ALPAKA(std::string opName) override {
+   std::string Generate_GPU_ALPAKA(std::string opName, const std::vector<std::string> &dynParamNames) override {
       if (fIsOutputConstant) return "";
       opName = "op_" + opName;
       if (fDimShapeY.empty())
@@ -469,7 +469,7 @@ public:
          << ", alpaka::getPtrNative(deviceBuf_" << fNX1 << ")"
          << ", alpaka::getPtrNative(deviceBuf_" << fNX2 << ")"
          << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")";
-      for (auto &p : GetGPUDynParams())
+      for (auto &p : dynParamNames)
          out << ", static_cast<std::size_t>(" << p << ")";
       out << ", static_cast<Idx>(" << totalElements << "));\n";
       out << SP << "alpaka::enqueue(queue, task_" << opName << ");\n";

@@ -293,7 +293,7 @@ public:
       return out.str();
    }
 
-std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+std::string Generate_GPU_Kernel_ALPAKA(std::string opName, const std::vector<std::string> &dynParamNames) override {
     if (fIsOutputConstant || fIsOutputParamShape) return "";
     opName = "op_" + opName;
     if (fShapeY.empty())
@@ -317,7 +317,7 @@ std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
     op += SP + SP + SP + "T const* __restrict__ input,\n";
     op += SP + SP + SP + "int64_t const* __restrict__ indices,\n";
     op += SP + SP + SP + "T* __restrict__ output,\n";
-    for (auto &p : GetGPUDynParams())
+    for (auto &p : dynParamNames)
         op += SP + SP + SP + "std::size_t const " + p + ",\n";
     op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
 
@@ -383,7 +383,7 @@ std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override 
     return SP + kname + " gatherKernel_" + opName + ";\n";
 }
 
-std::string Generate_GPU_ALPAKA(std::string opName) override {
+std::string Generate_GPU_ALPAKA(std::string opName, const std::vector<std::string> &dynParamNames) override {
     if (fIsOutputConstant) return "";
     if (fIsOutputParamShape) {
         std::stringstream out;
@@ -413,7 +413,7 @@ std::string Generate_GPU_ALPAKA(std::string opName) override {
         << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
         << ", alpaka::getPtrNative(deviceBuf_" << fNIndices << ")"
         << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")";
-    for (auto &p : GetGPUDynParams())
+    for (auto &p : dynParamNames)
         out << ", static_cast<std::size_t>(" << p << ")";
     out << ", static_cast<Idx>(" << totalElements << "));\n";
     out << SP << "alpaka::enqueue(queue, task_" << opName << ");\n";

@@ -409,9 +409,9 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
          // Chain followers: skip — their logic is inside the fused kernel
       } else {
          if (fProfile) {
-            fGC += RModelProfilerGPU::GenerateOperatorCode(*fOperators[op_idx], op_idx);
+            fGC += RModelProfilerGPU::GenerateOperatorCode(*fOperators[op_idx], op_idx, dynParamNames);
          } else {
-            fGC += fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx));
+            fGC += fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx), dynParamNames);
          }
       }
    }
@@ -508,15 +508,10 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
 
 void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
-   // hand every operator the model's dynamic shape parameters in infer-argument order;
-   // kernel signatures and launches iterate this one list
-   {
-      std::vector<std::string> dynParams;
-      ForEachInferArg_GPU_ALPAKA([&](const std::string &p) { dynParams.push_back(p); },
-                                 [](const std::string &) {});
-      for (auto &op : fOperators)
-         op->SetGPUDynParams(dynParams);
-   }
+   // the model's dynamic shape parameters in infer-argument order
+   std::vector<std::string> dynParamNames;
+   ForEachInferArg_GPU_ALPAKA([&](const std::string &p) { dynParamNames.push_back(p); },
+                              [](const std::string &) {});
 
    std::set<SOFIE::OperatorKind> registered_operators;
    std::set<size_t> fusedGroupsEmitted; // tracks which fusion groups have had their struct/decl emitted
@@ -578,13 +573,13 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
             if (registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
                if (fVerbose)
                   std::cout << "Generating ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
-               fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
+               fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id), dynParamNames);
                registered_operators.insert(fOperators[id]->GetKind());
             }
          } else {
             if (fVerbose)
                std::cout << "Generating ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
-            fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
+            fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id), dynParamNames);
          }
       }
    }

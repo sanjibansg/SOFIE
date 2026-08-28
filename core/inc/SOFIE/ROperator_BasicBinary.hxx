@@ -462,7 +462,7 @@ public:
       return ConvertDimShapeToLength(shape) != "1" && !UTILITY::AreSameShape(shape, fDimShapeY);
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) {
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName, const std::vector<std::string> &dynParamNames) override {
       if (fIsOutputConstant)
          return "";
       if (fDimShapeY.empty())
@@ -482,7 +482,7 @@ public:
       op += SP + "struct Binary"+opName+BinaryOperatorTrait<T, Op>::Name()+"Kernel {\n";
       op += SP + SP + "template<typename TAcc, typename T>\n";
       op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * A, T const * B, T * C";
-      for (auto &p : GetGPUDynParams())
+      for (auto &p : dynParamNames)
          op += ", std::size_t const " + p;
       op += ", std::size_t const totalElements) const {\n";
       op += SP + SP + SP + "auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
@@ -521,7 +521,7 @@ public:
       return SP + "Binary"+OpName+BinaryOperatorTrait<T, Op>::Name()+"Kernel binary" + OpName + "Kernel;\n";
    }
 
-   std::string Generate_GPU_ALPAKA(std::string OpName) {
+   std::string Generate_GPU_ALPAKA(std::string OpName, const std::vector<std::string> &dynParamNames) override {
       if (fIsOutputConstant)
          return "";
 
@@ -537,7 +537,7 @@ public:
       out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNY
          << ", binary" << OpName << "Kernel, alpaka::getPtrNative(deviceBuf_" << fNA
          << "), alpaka::getPtrNative(deviceBuf_" << fNB << "), alpaka::getPtrNative(deviceBuf_" << fNY << ")";
-      for (auto &p : GetGPUDynParams())
+      for (auto &p : dynParamNames)
          out << ", static_cast<std::size_t>(" << p << ")";
       out << ", static_cast<Idx>(" << length << "));\n";
       out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";

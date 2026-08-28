@@ -116,7 +116,8 @@ public:
    }
 
    // function returning output shape given input
-   std::vector<Dim> DoShapeInference(const std::vector<Dim> & input, const std::vector<size_t> & weight) {
+   using ROperator::ShapeInference;
+   std::vector<Dim> ShapeInference(const std::vector<Dim> & input, const std::vector<size_t> & weight) {
       // shape of convolution input has to be (according to ONNX): N x C x H x W
       // Where N : batch size, C : input  channels, H : input height, W : input width
 
@@ -279,7 +280,7 @@ public:
          std::cout << fNW << " : " << ConvertShapeToString(fShapeW) << std::endl;
          throw std::runtime_error("TMVA SOFIE Conv Op input weight tensor" + fNW + " is not of 3,4 or 5 dimensions");
       }
-      fShapeY = DoShapeInference(fShapeX, fShapeW);
+      fShapeY = ShapeInference(fShapeX, fShapeW);
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShapeY);
       if (fNB != "") {
          if (!model.CheckIfTensorAlreadyExist(fNB)) {

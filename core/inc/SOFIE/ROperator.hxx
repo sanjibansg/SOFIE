@@ -77,6 +77,10 @@ public:
    virtual void Initialize(RModel&) = 0;
    virtual std::string Generate(std::string OpName) = 0;  //expect unique opName for each operator within the same RModel
    virtual std::string Generate_GPU_ALPAKA(std::string OpName){ return "";} //expect unique opName for each operator within the same RModel
+   //dynParamNames: the model's shape parameters in infer-argument order
+   virtual std::string Generate_GPU_ALPAKA(std::string OpName, const std::vector<std::string> & /*dynParamNames*/) {
+      return Generate_GPU_ALPAKA(OpName);
+   }
    // generate initialization code for session constructor
    virtual std::string GenerateInitCode() { return "";}
    virtual std::string GenerateInitCode_GPU_ALPAKA() { return "";};
@@ -87,6 +91,9 @@ public:
    // generate session data members specific to operator
    virtual std::string GenerateSessionMembersCode(std::string /*opName*/) { return ""; }
    virtual std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) { return ""; }
+   virtual std::string Generate_GPU_Kernel_ALPAKA(std::string opName, const std::vector<std::string> & /*dynParamNames*/) {
+      return Generate_GPU_Kernel_ALPAKA(opName);
+   }
    virtual std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) { return ""; }
    virtual std::string Header() { return "";}
    virtual std::string GetFusableOutputTensorName() { return "";}
@@ -114,13 +121,6 @@ public:
    std::string fName = "UnnamedOperator";
    const std::string &Name() const { return fName; }
 
-   /// model dynamic shape parameters (e.g. N), in infer-argument order; set once by
-   /// RModel before GPU codegen. Kernels receive them all as size_t arguments so the
-   /// emitted index expressions can reference any of them, and the kernel signature and
-   /// launch loops read the same list so the two cannot drift apart.
-   void SetGPUDynParams(std::vector<std::string> params) { fGPUDynParams = std::move(params); }
-   const std::vector<std::string> &GetGPUDynParams() const { return fGPUDynParams; }
-
 protected:
    OperatorKind fKind = OperatorKind::UNDEFINED;
    size_t fOpOrder = 0;
@@ -131,8 +131,6 @@ protected:
 
    mutable std::vector<std::string> fInputTensorNames;
    mutable std::vector<std::string> fOutputTensorNames;
-
-   std::vector<std::string> fGPUDynParams;  ///< model dynamic shape params, see SetGPUDynParams
 
 public:
    std::span<const std::string> GetOpInputTensors() const {

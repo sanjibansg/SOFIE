@@ -375,7 +375,7 @@
             return out.str();
          }
 
-   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName, const std::vector<std::string> &dynParamNames) override {
       if (fIsOutputConstant || fIsOutputParamShape) return "";
       opName = "op_" + opName;
       if (fOutputShape.empty())
@@ -404,7 +404,7 @@
       op += SP + SP + SP + "TAcc const& acc,\n";
       op += SP + SP + SP + "std::array<T const*, " + std::to_string(Nin) + "> inputs,\n";
       op += SP + SP + SP + "T* output,\n";
-      for (auto &p : GetGPUDynParams())
+      for (auto &p : dynParamNames)
          op += SP + SP + SP + "std::size_t const " + p + ",\n";
       op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
 
@@ -469,7 +469,7 @@
       return SP + "ConcatKernel_" + opName + " concatKernel_" + opName + ";\n";
    }
 
-   std::string Generate_GPU_ALPAKA(std::string OpName) override {
+   std::string Generate_GPU_ALPAKA(std::string OpName, const std::vector<std::string> &dynParamNames) override {
       if (fIsOutputConstant || fIsOutputParamShape) return "";
       OpName = "op_" + OpName;
       if (fOutputShape.empty()) {
@@ -497,7 +497,7 @@
       out << SP << "auto const workDiv_" << OpName << " = sofie_workdiv(elementsPerGrid_" << OpName << ");\n";
       out << SP << "auto task_" << OpName << " = alpaka::createTaskKernel<Acc>(workDiv_" << OpName
          << ", concatKernel_" << OpName << ", input_ptrs_" << OpName << ", alpaka::getPtrNative(deviceBuf_" << fOutput << ")";
-      for (auto &p : GetGPUDynParams())
+      for (auto &p : dynParamNames)
          out << ", static_cast<std::size_t>(" << p << ")";
       out << ", static_cast<Idx>(" << length << "));\n";
       out << SP << "alpaka::enqueue(queue, task_" << OpName << ");\n";

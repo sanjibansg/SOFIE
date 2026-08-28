@@ -72,7 +72,8 @@ public:
    }
 
    // shape of output tensors given input tensors
-   std::vector<Dim> DoShapeInference(const std::vector<Dim> & input) {
+   using ROperator::ShapeInference;
+   std::vector<Dim> ShapeInference(const std::vector<Dim> & input) {
       auto ret = input;
       auto & outputShape = ret;
       for (size_t j = 0; j < fAttrAxes.size(); j++) {
@@ -122,7 +123,7 @@ public:
             fAttrAxes[i] = i;
       }
       // find shape of Y and add it in the list of intermediate tensors
-      fShapeY = DoShapeInference(fShapeX);
+      fShapeY = ShapeInference(fShapeX);
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShapeY);
       if (model.Verbose()){
          std::cout << Name() << " : " << fNX << " -> " << fNY << " shape " << ConvertDimShapeToString(fShapeY) << std::endl;
@@ -324,7 +325,7 @@ public:
    // This replaces the previous naive "one thread per output element" approach
    // which serialised the entire reduction loop inside a single thread.
    // ---------------------------------------------------------------------------
-   std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) override {
+   std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/, const std::vector<std::string> &dynParamNames) override {
       if (fShapeX.empty() || fShapeY.empty())
          throw std::runtime_error("SOFIE Reduce Op called to Generate without being initialized first");
 
@@ -359,7 +360,7 @@ public:
       op += SP + SP + SP + "T* __restrict__ output,\n";
       op += SP + SP + SP + "std::size_t const reducedLength,\n";
       op += SP + SP + SP + "std::size_t const outputLength";
-      for (auto &p : GetGPUDynParams())
+      for (auto &p : dynParamNames)
          op += ",\n" + SP + SP + SP + "std::size_t const " + p;
       op += ") const {\n\n";
 
@@ -455,7 +456,7 @@ public:
       return SP + kname + " reduceKernel_" + Name() + "_" + fNY + ";\n";
    }
 
-   std::string Generate_GPU_ALPAKA(std::string /*opName*/) override {
+   std::string Generate_GPU_ALPAKA(std::string /*opName*/, const std::vector<std::string> &dynParamNames) override {
       if (fShapeX.empty() || fShapeY.empty())
          throw std::runtime_error("SOFIE Reduce Op called to Generate without being initialized first");
 
@@ -464,7 +465,7 @@ public:
       std::string kname = "reduceKernel_" + Name() + "_" + fNY;
 
       std::string dynArgs;
-      for (auto &p : GetGPUDynParams()) dynArgs += ", static_cast<std::size_t>(" + p + ")";
+      for (auto &p : dynParamNames) dynArgs += ", static_cast<std::size_t>(" + p + ")";
 
       std::stringstream out;
       out << "\n//------ " << Name() << "_GPU_ALPAKA\n";

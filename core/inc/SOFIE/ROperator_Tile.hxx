@@ -36,7 +36,8 @@ public:
       return input;
    }
 
-   std::vector<Dim> DoShapeInference(const std::vector<Dim> & input, const std::vector<size_t> repeat)  {
+   using ROperator::ShapeInference;
+   std::vector<Dim> ShapeInference(const std::vector<Dim> & input, const std::vector<size_t> repeat)  {
       std::vector<Dim> ret = input;
       for(size_t i=0; i < repeat.size(); i++) {
          if (repeat[i] != 1) {
@@ -76,7 +77,7 @@ public:
       std::vector<size_t> repeats_vector(num_elements);
       std::copy(repeats_data, repeats_data + num_elements, repeats_vector.begin());
 
-      fShapeY = DoShapeInference(fShapeInput, repeats_vector);
+      fShapeY = ShapeInference(fShapeInput, repeats_vector);
 
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNInput), fShapeY);
 
@@ -134,7 +135,7 @@ public:
       return out.str();
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName, const std::vector<std::string> &dynParamNames) override {
       opName = "op_" + opName;
       if (fShapeInput.empty() || fShapeY.empty())
          throw std::runtime_error("SOFIE Operator Tile called to Generate without being initialized first");
@@ -154,7 +155,7 @@ public:
       op += SP + SP + SP + "TAcc const& acc,\n";
       op += SP + SP + SP + "T const* __restrict__ input,\n";
       op += SP + SP + SP + "T* __restrict__ output,\n";
-      for (auto &p : GetGPUDynParams())
+      for (auto &p : dynParamNames)
          op += SP + SP + SP + "std::size_t const " + p + ",\n";
       op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
 
@@ -190,7 +191,7 @@ public:
       return SP + kname + " tileKernel_" + opName + ";\n";
    }
 
-   std::string Generate_GPU_ALPAKA(std::string opName) override {
+   std::string Generate_GPU_ALPAKA(std::string opName, const std::vector<std::string> &dynParamNames) override {
       opName = "op_" + opName;
       if (fShapeInput.empty() || fShapeY.empty())
          throw std::runtime_error("SOFIE Operator Tile called to Generate without being initialized first");
@@ -201,7 +202,7 @@ public:
       std::string args =
           "alpaka::getPtrNative(deviceBuf_" + fNInput + "), "
           + "alpaka::getPtrNative(deviceBuf_" + fNY + ")";
-      for (auto &p : GetGPUDynParams())
+      for (auto &p : dynParamNames)
          args += ", static_cast<std::size_t>(" + p + ")";
       args += ", static_cast<Idx>(" + totalElements + ")";
 
