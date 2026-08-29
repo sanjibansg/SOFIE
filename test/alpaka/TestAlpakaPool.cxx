@@ -1,5 +1,7 @@
 #include "TestAlpakaCommon.h"
 
+#include <iterator>
+
 #include "MaxPool1d_FromONNX_GPU_ALPAKA.hxx"
 #include "input_models/references/MaxPool1d.ref.hxx"
 #include "MaxPool2d_FromONNX_GPU_ALPAKA.hxx"
@@ -15,6 +17,24 @@
 #include "GlobalAvgPool2d_FromONNX_GPU_ALPAKA.hxx"
 #include "input_models/references/GlobalAvgPool2d.ref.hxx"
 
+template <typename Session, typename T = float, typename TBuf>
+static alpaka::Buf<alpaka::DevCpu, T, Dim, Idx>
+runPoolSession(alpaka::DevCpu const& host,
+               alpaka::Queue<alpaka::DevCudaRt, alpaka::NonBlocking>& queue,
+               const char* datFile, TBuf& input, std::size_t nOut)
+{
+   auto result_h = alpaka::allocBuf<T, Idx>(host, Ext1D::all(Idx{nOut}));
+   {
+      Session session(datFile);
+      auto result = session.infer(input);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+   return result_h;
+}
+
 TEST_F(SofieAlpakaTest, MaxPool2d)
 {
    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
@@ -27,30 +47,15 @@ TEST_F(SofieAlpakaTest, MaxPool2d)
       -0.9398, -0.2065, -0.9499, -0.9739, -0.1288, -0.1375, -1.2612,  0.8810,  0.8506,  0.4455
    });
 
-   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
-   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
-   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
-
-   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
-   alpaka::memcpy(queue, input_d, input_h);
-   alpaka::wait(queue);
-
-   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(MaxPool2d_ExpectedOutput::output) / sizeof(float)}));
-
-   {
-      SOFIE_MaxPool2d::Session<alpaka::TagGpuCudaRt> session("MaxPool2d_FromONNX_GPU_ALPAKA.dat");
-      auto result = session.infer(input_d);
-      alpaka::wait(queue);
-      cudaDeviceSynchronize();
-      alpaka::memcpy(queue, result_h, result);
-      alpaka::wait(queue);
-   }
+   constexpr std::size_t nOut = std::size(MaxPool2d_ExpectedOutput::output);
+   auto input_d = makeDeviceBuf<float>(host, device, queue, input.data(), input.size());
+   auto result_h = runPoolSession<SOFIE_MaxPool2d::Session<alpaka::TagGpuCudaRt>>(
+      host, queue, "MaxPool2d_FromONNX_GPU_ALPAKA.dat", input_d, nOut);
 
    float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
    float* correct = MaxPool2d_ExpectedOutput::output;
-   constexpr size_t nOut_maxpool2d = sizeof(MaxPool2d_ExpectedOutput::output) / sizeof(float);
 
-   for (size_t i = 0; i < nOut_maxpool2d; ++i) {
+   for (size_t i = 0; i < nOut; ++i) {
       EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
    }
 }
@@ -68,28 +73,15 @@ TEST_F(SofieAlpakaTest, MaxPool1d)
       -0.1657,  0.0649, -1.6066,  0.4162, -1.1525, -0.8184,  1.1324, -1.1086,  0.1061,  1.0071
    }); // took from reference output
 
-   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
-   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
-   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
-   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
-   alpaka::memcpy(queue, input_d, input_h);
-   alpaka::wait(queue);
-
-   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(MaxPool1d_ExpectedOutput::output) / sizeof(float)}));
-
-   {
-      SOFIE_MaxPool1d::Session<alpaka::TagGpuCudaRt> session("MaxPool1d_FromONNX_GPU_ALPAKA.dat");
-      auto result = session.infer(input_d);
-      alpaka::wait(queue);
-      cudaDeviceSynchronize();
-      alpaka::memcpy(queue, result_h, result);
-      alpaka::wait(queue);
-   }
+   constexpr std::size_t nOut = std::size(MaxPool1d_ExpectedOutput::output);
+   auto input_d = makeDeviceBuf<float>(host, device, queue, input.data(), input.size());
+   auto result_h = runPoolSession<SOFIE_MaxPool1d::Session<alpaka::TagGpuCudaRt>>(
+      host, queue, "MaxPool1d_FromONNX_GPU_ALPAKA.dat", input_d, nOut);
 
    float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
    float* correct = MaxPool1d_ExpectedOutput::output;
-   constexpr size_t nOut_maxpool1d = sizeof(MaxPool1d_ExpectedOutput::output) / sizeof(float);
-   for (size_t i = 0; i < nOut_maxpool1d; ++i) {
+
+   for (size_t i = 0; i < nOut; ++i) {
       EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
    }
 }
@@ -104,29 +96,15 @@ TEST_F(SofieAlpakaTest, MaxPool3d)
        1.3833,  0.1101,  0.2039, -0.5477,  0.2341,  0.9181,  0.3842,  0.2428,  1.7924
    });// took from reference output
 
-   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
-   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
-   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
-   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
-   alpaka::memcpy(queue, input_d, input_h);
-   alpaka::wait(queue);
-
-   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(MaxPool3d_ExpectedOutput::output) / sizeof(float)}));
-
-   {
-      SOFIE_MaxPool3d::Session<alpaka::TagGpuCudaRt> session("MaxPool3d_FromONNX_GPU_ALPAKA.dat");
-      auto result = session.infer(input_d);
-      alpaka::wait(queue);
-      cudaDeviceSynchronize();
-      alpaka::memcpy(queue, result_h, result);
-      alpaka::wait(queue);
-   }
+   constexpr std::size_t nOut = std::size(MaxPool3d_ExpectedOutput::output);
+   auto input_d = makeDeviceBuf<float>(host, device, queue, input.data(), input.size());
+   auto result_h = runPoolSession<SOFIE_MaxPool3d::Session<alpaka::TagGpuCudaRt>>(
+      host, queue, "MaxPool3d_FromONNX_GPU_ALPAKA.dat", input_d, nOut);
 
    float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
    float* correct = MaxPool3d_ExpectedOutput::output;
-   constexpr size_t nOut_maxpool3d = sizeof(MaxPool3d_ExpectedOutput::output) / sizeof(float);
 
-   for (size_t i = 0; i < nOut_maxpool3d; ++i) {
+   for (size_t i = 0; i < nOut; ++i) {
       EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
    }
 }
@@ -150,29 +128,15 @@ TEST_F(SofieAlpakaTest, AvgPool)
             0.2385,  0.3783, -1.0500
    });
 
-   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
-   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
-   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
-   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
-   alpaka::memcpy(queue, input_d, input_h);
-   alpaka::wait(queue);
-
-   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(AvgPool_ExpectedOutput::output) / sizeof(float)}));
-
-   {
-      SOFIE_AvgPool::Session<alpaka::TagGpuCudaRt> session("AvgPool_FromONNX_GPU_ALPAKA.dat");
-      auto result = session.infer(input_d);
-      alpaka::wait(queue);
-      cudaDeviceSynchronize();
-      alpaka::memcpy(queue, result_h, result);
-      alpaka::wait(queue);
-   }
+   constexpr std::size_t nOut = std::size(AvgPool_ExpectedOutput::output);
+   auto input_d = makeDeviceBuf<float>(host, device, queue, input.data(), input.size());
+   auto result_h = runPoolSession<SOFIE_AvgPool::Session<alpaka::TagGpuCudaRt>>(
+      host, queue, "AvgPool_FromONNX_GPU_ALPAKA.dat", input_d, nOut);
 
    float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
    float* correct = AvgPool_ExpectedOutput::output;
-   constexpr size_t nOut_avgpool = sizeof(AvgPool_ExpectedOutput::output) / sizeof(float);
 
-   for (size_t i = 0; i < nOut_avgpool; ++i) {
+   for (size_t i = 0; i < nOut; ++i) {
       EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
    }
 }
@@ -186,29 +150,15 @@ TEST_F(SofieAlpakaTest, AvgPoolPad)
    std::vector<float> input(16);
    for (size_t i = 0; i < input.size(); ++i) input[i] = float(i);
 
-   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
-   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
-   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
-   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
-   alpaka::memcpy(queue, input_d, input_h);
-   alpaka::wait(queue);
-
-   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(AvgPoolPad_ExpectedOutput::output) / sizeof(float)}));
-
-   {
-      SOFIE_AvgPoolPad::Session<alpaka::TagGpuCudaRt> session("AvgPoolPad_FromONNX_GPU_ALPAKA.dat");
-      auto result = session.infer(input_d);
-      alpaka::wait(queue);
-      cudaDeviceSynchronize();
-      alpaka::memcpy(queue, result_h, result);
-      alpaka::wait(queue);
-   }
+   constexpr std::size_t nOut = std::size(AvgPoolPad_ExpectedOutput::output);
+   auto input_d = makeDeviceBuf<float>(host, device, queue, input.data(), input.size());
+   auto result_h = runPoolSession<SOFIE_AvgPoolPad::Session<alpaka::TagGpuCudaRt>>(
+      host, queue, "AvgPoolPad_FromONNX_GPU_ALPAKA.dat", input_d, nOut);
 
    float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
    float* correct = AvgPoolPad_ExpectedOutput::output;
-   constexpr size_t nOut_avgpoolpad = sizeof(AvgPoolPad_ExpectedOutput::output) / sizeof(float);
 
-   for (size_t i = 0; i < nOut_avgpoolpad; ++i) {
+   for (size_t i = 0; i < nOut; ++i) {
       EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
    }
 }
@@ -223,29 +173,15 @@ TEST_F(SofieAlpakaTest, AvgPoolCountIncludePad)
    std::vector<float> input(16);
    for (size_t i = 0; i < input.size(); ++i) input[i] = float(i);
 
-   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
-   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
-   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
-   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
-   alpaka::memcpy(queue, input_d, input_h);
-   alpaka::wait(queue);
-
-   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(AvgPoolCountIncludePad_ExpectedOutput::output) / sizeof(float)}));
-
-   {
-      SOFIE_AvgPoolCountIncludePad::Session<alpaka::TagGpuCudaRt> session("AvgPoolCountIncludePad_FromONNX_GPU_ALPAKA.dat");
-      auto result = session.infer(input_d);
-      alpaka::wait(queue);
-      cudaDeviceSynchronize();
-      alpaka::memcpy(queue, result_h, result);
-      alpaka::wait(queue);
-   }
+   constexpr std::size_t nOut = std::size(AvgPoolCountIncludePad_ExpectedOutput::output);
+   auto input_d = makeDeviceBuf<float>(host, device, queue, input.data(), input.size());
+   auto result_h = runPoolSession<SOFIE_AvgPoolCountIncludePad::Session<alpaka::TagGpuCudaRt>>(
+      host, queue, "AvgPoolCountIncludePad_FromONNX_GPU_ALPAKA.dat", input_d, nOut);
 
    float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
    float* correct = AvgPoolCountIncludePad_ExpectedOutput::output;
-   constexpr size_t nOut_avgpoolinc = sizeof(AvgPoolCountIncludePad_ExpectedOutput::output) / sizeof(float);
 
-   for (size_t i = 0; i < nOut_avgpoolinc; ++i) {
+   for (size_t i = 0; i < nOut; ++i) {
       EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
    }
 }
@@ -260,29 +196,15 @@ TEST_F(SofieAlpakaTest, GlobalAvgPool2d)
    std::vector<float> input(18);
    for (size_t i = 0; i < input.size(); ++i) input[i] = float(i);
 
-   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
-   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
-   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
-   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
-   alpaka::memcpy(queue, input_d, input_h);
-   alpaka::wait(queue);
-
-   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(GlobalAvgPool2d_ExpectedOutput::output) / sizeof(float)}));
-
-   {
-      SOFIE_GlobalAvgPool2d::Session<alpaka::TagGpuCudaRt> session("GlobalAvgPool2d_FromONNX_GPU_ALPAKA.dat");
-      auto result = session.infer(input_d);
-      alpaka::wait(queue);
-      cudaDeviceSynchronize();
-      alpaka::memcpy(queue, result_h, result);
-      alpaka::wait(queue);
-   }
+   constexpr std::size_t nOut = std::size(GlobalAvgPool2d_ExpectedOutput::output);
+   auto input_d = makeDeviceBuf<float>(host, device, queue, input.data(), input.size());
+   auto result_h = runPoolSession<SOFIE_GlobalAvgPool2d::Session<alpaka::TagGpuCudaRt>>(
+      host, queue, "GlobalAvgPool2d_FromONNX_GPU_ALPAKA.dat", input_d, nOut);
 
    float* res_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
    float* correct = GlobalAvgPool2d_ExpectedOutput::output;
-   constexpr size_t nOut_globalavg = sizeof(GlobalAvgPool2d_ExpectedOutput::output) / sizeof(float);
 
-   for (size_t i = 0; i < nOut_globalavg; ++i) {
+   for (size_t i = 0; i < nOut; ++i) {
       EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
    }
 }
