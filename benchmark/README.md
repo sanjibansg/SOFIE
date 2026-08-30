@@ -1,103 +1,468 @@
 # SOFIE Benchmark for Inference on Heterogeneous Architectures
 
-Measures **inference latency and throughput** for ONNX models compiled by SOFIE and
-executed via [Alpaka](https://github.com/alpaka-group/alpaka).  Optionally runs the
-same models through **ONNX Runtime GPU** for a side-by-side comparison.
+The benchmark toolkit measures **inference latency, throughput, transfer time, GPU memory usage, and GPU utilisation** for ONNX models compiled by SOFIE and executed through Alpaka.
+
+The same models can optionally be benchmarked with **ONNX Runtime GPU**, **TensorRT**, and **PyTorch AOTInductor** for comparison.
 
 ---
 
-## Supported Backends
+## Supported Accelerator Backends
 
 | Backend | CMake value | Status |
-|---------|-------------|--------|
-| NVIDIA CUDA | `CUDA` (default) | Supported |
-| AMD HIP/ROCm | `HIP` | Planned |  
+|---|---|---|
+| NVIDIA CUDA | `CUDA` | Supported |
+| AMD HIP/ROCm | `HIP` | Planned |
 
+The target accelerator backend is selected with `-DSOFIE_BENCHMARK_BACKEND=<value>`.
 
-The target architecture is selected with `-DSOFIE_BENCHMARK_BACKEND=<value>` at
-configure time.
-
-The generated inference code and timing harness are backend-agnostic: they use
-`sofie_bench::AccTag`, `sofie_bench::Platform`, `sofie_bench::Queue`, and the
-`SOFIE_BENCH_DEVICE_SYNC()` macro defined in `src/BenchmarkBackend.hxx`.  Only the
-low-level toolkit (CUDA vs HIP) needs to be swapped to add a new backend.
+The generated SOFIE inference code and timing harness use the backend abstractions defined in `src/BenchmarkBackend.hxx`.
 
 ---
 
-## Quick Start
+## Prerequisites
 
-### 1. Add your models
+The CUDA benchmark requires:
 
-```
+- CMake 3.18 or newer;
+- a C++20 compiler;
+- an NVIDIA CUDA toolkit and compatible driver;
+- NVML for GPU-utilisation sampling.
+
+The comparison backends are optional and only need to be installed when their corresponding CMake option is enabled.
+
+---
+
+## Benchmark Models
+
+By default, ONNX models are read from:
+
+```text
 benchmark/models/
-  GNN_model.onnx
-  simple_transformer.onnx
-  resnet50.onnx
-  ...
 ```
 
-Re-run CMake after adding or removing files (it globs `models/*.onnx`).
+For example:
 
-### 2. Configure
+```text
+benchmark/models/
+├── GNN_model.onnx
+├── simple_transformer.onnx
+├── resnet50.onnx
+└── ...
+```
+
+Re-run CMake after adding or removing ONNX files because model discovery happens at configure time.
+
+A different model directory can be selected with:
 
 ```bash
-# SOFIE inference only — CUDA backend (default)
-cmake -B build -DSOFIE_BENCHMARK=ON /path/to/SOFIE
+-DSOFIE_BENCHMARK_MODEL_DIR=<path>
+```
 
-# Explicitly name the backend 
-cmake -B build -DSOFIE_BENCHMARK=ON -DSOFIE_BENCHMARK_BACKEND=CUDA /path/to/SOFIE
+Relative paths are resolved relative to `benchmark/`:
 
-# With ONNX Runtime GPU comparison
-cmake -B build \
+```bash
+-DSOFIE_BENCHMARK_MODEL_DIR=models
+```
+
+Absolute paths are also accepted:
+
+```bash
+-DSOFIE_BENCHMARK_MODEL_DIR=/data/sofie/models
+```
+
+When PyTorch AOTInductor is enabled, the corresponding AOT packages must be stored under an `aot_models/` directory inside the selected model directory:
+
+```text
+<model-dir>/
+├── model_a.onnx
+├── model_b.onnx
+└── aot_models/
+    ├── model_a.pt2
+    └── model_b.pt2
+```
+
+The `.onnx` and `.pt2` files must use the same model basename.
+
+---
+
+## Optional Comparison Backends
+
+### ONNX Runtime GPU
+
+Enable ONNX Runtime with:
+
+```bash
+-DSOFIE_BENCHMARK_ORT=ON
+```
+
+If ONNX Runtime is installed in a non-system location, specify its installation root:
+
+```bash
+-DONNXRUNTIME_ROOT=/path/to/onnxruntime
+```
+
+The directory should contain the ONNX Runtime headers and libraries, typically:
+
+```text
+/path/to/onnxruntime/
+├── include/
+└── lib/
+```
+
+If the runtime linker cannot locate `libonnxruntime.so`, add the library directory to `LD_LIBRARY_PATH` before running:
+
+```bash
+export LD_LIBRARY_PATH=/path/to/onnxruntime/lib:$LD_LIBRARY_PATH
+```
+
+---
+
+### TensorRT
+
+Enable TensorRT with:
+
+```bash
+-DSOFIE_BENCHMARK_TRT=ON
+```
+
+A system TensorRT installation is detected automatically.
+
+For a TensorRT installation in a custom location, use:
+
+```bash
+-DTENSORRT_ROOT=/path/to/TensorRT
+```
+
+The TensorRT root should contain its headers and libraries, typically:
+
+```text
+/path/to/TensorRT/
+├── include/
+└── lib/
+```
+
+For a TensorRT tar installation, also make its libraries visible at runtime:
+
+```bash
+export LD_LIBRARY_PATH=/path/to/TensorRT/lib:$LD_LIBRARY_PATH
+```
+
+TensorRT engines are generated on first use and cached for later runs.
+
+---
+
+### PyTorch AOTInductor
+
+Enable the PyTorch AOTInductor comparison with:
+
+```bash
+-DSOFIE_BENCHMARK_AOT=ON
+```
+
+The benchmark links directly against the PyTorch C++ libraries and loads `.pt2` AOTInductor packages using `AOTIModelPackageLoader`.
+
+Install a CUDA-enabled PyTorch build first and verify it:
+
+```bash
+python3 -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
+```
+
+CMake must be able to locate the PyTorch CMake package. The recommended configuration is:
+
+```bash
+-DCMAKE_PREFIX_PATH="$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)')"
+```
+
+Alternatively, `Torch_DIR` can be supplied directly if required.
+
+The repository contains family-specific AOT export scripts:
+
+```text
+benchmark/models/export_aot_gnn.py
+benchmark/models/export_aot_gnn_large.py
+benchmark/models/export_aot_transformer.py
+benchmark/models/export_aot_punet.py
+benchmark/models/export_aot_mambav2.py
+```
+
+Run the exporters required for the models being benchmarked before running the AOT comparison.
+
+For example:
+
+```bash
+python3 benchmark/models/export_aot_gnn.py
+python3 benchmark/models/export_aot_gnn_large.py
+python3 benchmark/models/export_aot_transformer.py
+```
+
+The PUNet exporter additionally requires the corresponding TICL repository:
+
+```bash
+python3 benchmark/models/export_aot_punet.py \
+  --ticl-repo /path/to/TICL-GNN-Trackster-Linking
+```
+
+The resulting `.pt2` packages must be present in:
+
+```text
+<model-dir>/aot_models/
+```
+
+If a custom `SOFIE_BENCHMARK_MODEL_DIR` is used, ensure the generated `.pt2` packages are copied or generated under that directory's `aot_models/` subdirectory.
+
+---
+
+### Mamba AOTInductor Models
+
+The Mamba models require additional setup because their AOTInductor packages contain the custom operator:
+
+```text
+mamba_bench::selective_scan_fwd
+```
+
+The benchmark registers this operator in `src/MambaAOTCustomOps.cxx` and forwards it to Mamba's CUDA `selective_scan_cuda` implementation.
+
+Install Mamba with the CUDA selective-scan extension enabled:
+
+```bash
+MAMBA_KEEP_CUDA_BUILD=TRUE \
+python3 -m pip install mamba-ssm --no-build-isolation
+```
+
+If a local CUDA build must be forced:
+
+```bash
+MAMBA_FORCE_BUILD=TRUE \
+MAMBA_KEEP_CUDA_BUILD=TRUE \
+python3 -m pip install mamba-ssm --no-build-isolation
+```
+
+Verify that the CUDA extension is available:
+
+```bash
+python3 -c "import selective_scan_cuda; print(selective_scan_cuda.__file__)"
+```
+
+Generate the Mamba AOT package using:
+
+```bash
+python3 benchmark/models/export_aot_mambav2.py
+```
+
+Then configure the benchmark with both:
+
+```text
+-DSOFIE_BENCHMARK_AOT=ON
+-DSOFIE_BENCHMARK_MAMBA_AOT=ON
+```
+
+CMake first tries to locate `selective_scan_cuda` automatically beside the PyTorch installation.
+
+If automatic detection fails, specify the library explicitly:
+
+```bash
+-DMAMBA_SELECTIVE_SCAN_LIBRARY=/path/to/selective_scan_cuda.so
+```
+
+The exact installed path can be obtained with:
+
+```bash
+python3 -c "import selective_scan_cuda; print(selective_scan_cuda.__file__)"
+```
+
+`SOFIE_BENCHMARK_MAMBA_AOT=ON` requires `SOFIE_BENCHMARK_AOT=ON`.
+
+Without Mamba AOT support enabled, `mambav2_*` models are skipped only for the PyTorch AOTInductor comparison.
+
+---
+
+## Configure
+
+### SOFIE only
+
+From the SOFIE repository root:
+
+```bash
+cmake -B benchmark/build \
+  -DSOFIE_BENCHMARK=ON \
+  -DSOFIE_BENCHMARK_BACKEND=CUDA \
+  .
+```
+
+### SOFIE + ONNX Runtime
+
+```bash
+cmake -B benchmark/build \
   -DSOFIE_BENCHMARK=ON \
   -DSOFIE_BENCHMARK_ORT=ON \
   -DONNXRUNTIME_ROOT=/path/to/onnxruntime \
-  /path/to/SOFIE
-
-# Override the CUDA SM architecture (default: native GPU or sm_75)
-cmake -B build -DSOFIE_BENCHMARK=ON -DSOFIE_BENCHMARK_CUDA_ARCH="86" /path/to/SOFIE
+  .
 ```
 
-| CMake flag | Default | Description |
+### SOFIE + TensorRT
+
+```bash
+cmake -B benchmark/build \
+  -DSOFIE_BENCHMARK=ON \
+  -DSOFIE_BENCHMARK_TRT=ON \
+  -DTENSORRT_ROOT=/path/to/TensorRT \
+  .
+```
+
+`TENSORRT_ROOT` can be omitted for a system installation.
+
+### SOFIE + PyTorch AOTInductor
+
+```bash
+cmake -B benchmark/build \
+  -DSOFIE_BENCHMARK=ON \
+  -DSOFIE_BENCHMARK_AOT=ON \
+  -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)')" \
+  .
+```
+
+### All comparison backends
+
+```bash
+cmake -B benchmark/build \
+  -DSOFIE_BENCHMARK=ON \
+  -DSOFIE_BENCHMARK_BACKEND=CUDA \
+  -DSOFIE_BENCHMARK_ORT=ON \
+  -DONNXRUNTIME_ROOT=/path/to/onnxruntime \
+  -DSOFIE_BENCHMARK_TRT=ON \
+  -DTENSORRT_ROOT=/path/to/TensorRT \
+  -DSOFIE_BENCHMARK_AOT=ON \
+  -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)')" \
+  .
+```
+
+To additionally benchmark Mamba with AOTInductor:
+
+```bash
+cmake -B benchmark/build \
+  -DSOFIE_BENCHMARK=ON \
+  -DSOFIE_BENCHMARK_ORT=ON \
+  -DONNXRUNTIME_ROOT=/path/to/onnxruntime \
+  -DSOFIE_BENCHMARK_TRT=ON \
+  -DTENSORRT_ROOT=/path/to/TensorRT \
+  -DSOFIE_BENCHMARK_AOT=ON \
+  -DSOFIE_BENCHMARK_MAMBA_AOT=ON \
+  -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)')" \
+  .
+```
+
+If required, append:
+
+```bash
+-DMAMBA_SELECTIVE_SCAN_LIBRARY=/path/to/selective_scan_cuda.so
+```
+
+### CMake Options
+
+| CMake option | Default | Description |
 |---|---|---|
-| `-DSOFIE_BENCHMARK=ON` | — | Enable the benchmark suite |
-| `-DSOFIE_BENCHMARK_BACKEND=<val>` | `CUDA` | Target accelerator backend |
-| `-DSOFIE_BENCHMARK_CUDA_ARCH=<sm>` | native / `75` | CUDA SM architecture(s), e.g. `86` for RTX 30xx, `80` for A100 |
-| `-DSOFIE_BENCHMARK_ORT=ON` | `OFF` | Also benchmark ONNX Runtime GPU |
-| `-DONNXRUNTIME_ROOT=<path>` | — | Path for ORT headers/library |
-| `-DSOFIE_BENCHMARK_PROFILE=ON` | `OFF` | Enable per-operator GPU profiling instead of throughput benchmarking (see [Profiling](#profiling)) |
-| `-DSOFIE_BENCHMARK_LARGE=ON` | `OFF` | Build `sofie_benchmark_large` for cluster GPUs (A100/H100, ≥40 GB VRAM) |
-| `-DSOFIE_BENCHMARK_LARGE_CUDA_ARCH=<sm>` | `80` | CUDA SM architecture for the large-input benchmark |
+| `SOFIE_BENCHMARK` | — | Enable the benchmark suite |
+| `SOFIE_BENCHMARK_BACKEND` | `CUDA` | Accelerator backend |
+| `SOFIE_BENCHMARK_MODEL_DIR` | `models` | ONNX model directory; relative to `benchmark/` or absolute |
+| `SOFIE_BENCHMARK_CUDA_ARCH` | `CMAKE_CUDA_ARCHITECTURES` / `75` | CUDA architecture |
+| `SOFIE_BENCHMARK_ORT` | `OFF` | Enable ONNX Runtime GPU comparison |
+| `ONNXRUNTIME_ROOT` | empty | Optional ONNX Runtime installation root |
+| `SOFIE_BENCHMARK_TRT` | `OFF` | Enable TensorRT comparison |
+| `TENSORRT_ROOT` | empty | Optional TensorRT installation root |
+| `SOFIE_BENCHMARK_AOT` | `OFF` | Enable PyTorch AOTInductor comparison |
+| `CMAKE_PREFIX_PATH` | — | Can be used to locate the installed PyTorch CMake package |
+| `SOFIE_BENCHMARK_MAMBA_AOT` | `OFF` | Enable Mamba custom-op support for AOTInductor |
+| `MAMBA_SELECTIVE_SCAN_LIBRARY` | auto | Optional explicit path to `selective_scan_cuda` |
+| `SOFIE_BENCHMARK_LOWRANK` | `OFF` | Enable SOFIE low-rank factorization |
+| `SOFIE_BENCHMARK_LOWRANK_RATIO` | `0.5` | Low-rank factorization ratio |
+| `SOFIE_BENCHMARK_PROFILE` | `OFF` | Enable internal SOFIE per-operator profiling instead of throughput benchmarking |
+| `SOFIE_BENCHMARK_LARGE` | `OFF` | Build the large-input benchmark |
+| `SOFIE_BENCHMARK_LARGE_CUDA_ARCH` | `80` | CUDA architecture for the large-input benchmark |
 
-> **Tested with ONNX Runtime 1.22.0 GPU**
-> (`onnxruntime-linux-x64-gpu-1.22.0`).  The CMake config bundled with some ORT
-> installations may reference an incorrect `lib64/` path — this toolkit uses manual
-> header/library detection to avoid that.
+---
 
-### 3. Build
+## Build
+
+Build the normal benchmark with:
 
 ```bash
-cmake --build build --target sofie_benchmark -j$(nproc)
+cmake --build benchmark/build --target sofie_benchmark -j$(nproc)
 ```
 
-This automatically:
-1. Builds **`sofie_benchmark_emitter`** — parses each `.onnx` and emits:
-   - `<Model>_GPU_ALPAKA.hxx` — SOFIE Alpaka inference code
-   - `<Model>_GPU_ALPAKA.dat` — serialized weights
-   - `<Model>_bench.hxx`      — timing wrapper `Benchmark_<Model>()`
-2. Builds **`sofie_benchmark`** — compiles all generated code and links the timing loop.
+The build first creates `sofie_benchmark_emitter`, which parses each selected ONNX model and generates:
 
-### 4. Run
+```text
+<Model>_GPU_ALPAKA.hxx
+<Model>_GPU_ALPAKA.dat
+<Model>_bench.hxx
+<Model>_aot_meta.hxx
+```
+
+It then compiles the generated model code into `sofie_benchmark`.
+
+---
+
+## Run
+
+Move to the benchmark build directory:
 
 ```bash
-cd build/benchmark
+cd benchmark/build/benchmark
+```
 
-# SOFIE only (no ORT needed at runtime)
+SOFIE only:
+
+```bash
 ./sofie_benchmark
+```
 
-# SOFIE + ONNX Runtime GPU comparison
-LD_LIBRARY_PATH=/path/to/onnxruntime/lib:$LD_LIBRARY_PATH \
+SOFIE + ONNX Runtime:
+
+```bash
 ./sofie_benchmark --onnxruntime
+```
+
+SOFIE + TensorRT:
+
+```bash
+./sofie_benchmark --tensorrt
+```
+
+SOFIE + PyTorch AOTInductor:
+
+```bash
+./sofie_benchmark --aot
+```
+
+All available comparison backends:
+
+```bash
+./sofie_benchmark \
+  --onnxruntime \
+  --tensorrt \
+  --aot
+```
+
+Each model/backend is run in a separate subprocess so that it starts with a fresh CUDA context.
+
+A timestamped result directory is created under:
+
+```text
+benchmark/results/benchmark_<YYYYMMDD_HHMMSS>/
+```
+
+Depending on the enabled runtime comparisons it contains:
+
+```text
+benchmark_<timestamp>/
+├── sofie/
+│   └── benchmark.csv
+├── ort/
+│   └── benchmark.csv
+├── tensorrt/
+│   └── benchmark.csv
+└── pytorch_aot/
+    └── benchmark.csv
 ```
 
 ---
@@ -157,12 +522,27 @@ efficiently was each kernel using the SM".
 ## Runtime Options
 
 | Flag | Default | Description |
-|------|---------|-------------|
-| `--warmup,     -w <N>` | 10  | Warm-up iterations (not timed) |
-| `--iterations, -n <N>` | 100 | Timed iterations |
-| `--weights-dir <path>` | `.` | Directory containing `.dat` weight files |
-| `--onnxruntime, --ort` | off | Run ONNX Runtime GPU benchmark after each SOFIE model |
-| `--help,       -h`     |     | Print this help and exit |
+|---|---|---|
+| `--warmup, -w <N>` | `10` | Warm-up iterations |
+| `--iterations, -n <N>` | `100` | Timed iterations |
+| `--weights-dir <path>` | `.` | Directory containing SOFIE `.dat` weight files |
+| `--onnxruntime, --ort` | off | Run ONNX Runtime GPU comparison |
+| `--tensorrt, --trt` | off | Run TensorRT comparison |
+| `--pytorch-aot, --aot` | off | Run PyTorch AOTInductor comparison |
+| `--profile` | off | Run Nsight Compute cross-backend profiling |
+| `--ncu <path>` | — | Path to the Nsight Compute executable; required with `--profile` |
+| `--sofie-only` | off | Run only SOFIE |
+| `--ort-only` | off | Run only ONNX Runtime |
+| `--trt-only` | off | Run only TensorRT |
+| `--aot-only` | off | Run only PyTorch AOTInductor |
+| `--help, -h` | — | Print command-line help |
+
+`--single-model <name>` is an internal option used by the parent benchmark process to isolate each model/backend execution in its own subprocess.
+
+The runtime `--profile` option is **not** the same as the CMake option `SOFIE_BENCHMARK_PROFILE`.
+
+- `SOFIE_BENCHMARK_PROFILE=ON` enables SOFIE's internal per-operator profiler.
+- `--profile --ncu <path>` launches the separate Nsight Compute cross-backend profiling workflow.
 
 ---
 
@@ -201,7 +581,7 @@ cmake --build build --target sofie_benchmark -j$(nproc)
 cd build/benchmark && ./sofie_benchmark
 ```
 
-After the normal throughput table, each model will print two additional blocks:
+In an internal profiling build, each model prints two profiling blocks:
 
 **GPU Profiling Results** — per-operator wall-clock time (microseconds) measured
 with `std::chrono` and an `alpaka::wait(queue)` synchronisation point after every
@@ -233,11 +613,252 @@ cmake --build build --target sofie_benchmark_large -j$(nproc)
 
 ---
 
-## Re-running after adding models
+
+## Nsight Compute Cross-Backend Profiling
+
+Nsight Compute can profile **SOFIE, ONNX Runtime GPU, TensorRT, and PyTorch AOTInductor** using the same benchmark models.
+
+This is separate from the internal SOFIE profiler described above.
+
+For Nsight Compute profiling, configure with:
+
+```text
+SOFIE_BENCHMARK_PROFILE=OFF
+```
+
+The runtime `--profile` flag starts the Nsight Compute workflow. Each backend is run in a separate subprocess and one steady-state inference is captured.
+
+### 1. Configure and build
+
+For all comparison backends:
 
 ```bash
-cmake build
-cmake --build build --target sofie_benchmark -j$(nproc)
+cmake -B benchmark/build \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+  -DSOFIE_BENCHMARK=ON \
+  -DSOFIE_BENCHMARK_ORT=ON \
+  -DONNXRUNTIME_ROOT=/path/to/onnxruntime \
+  -DSOFIE_BENCHMARK_TRT=ON \
+  -DTENSORRT_ROOT=/path/to/TensorRT \
+  -DSOFIE_BENCHMARK_AOT=ON \
+  -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)')" \
+  -DSOFIE_BENCHMARK_PROFILE=OFF \
+  -DSOFIE_BENCHMARK_CUDA_ARCH=<sm> \
+  .
+```
+
+Replace `<sm>` with the CUDA architecture for the target GPU.
+
+Build:
+
+```bash
+cmake --build benchmark/build --target sofie_benchmark -j$(nproc)
+```
+
+If Mamba should also be profiled through AOTInductor, add:
+
+```bash
+-DSOFIE_BENCHMARK_MAMBA_AOT=ON
+```
+
+and, if automatic selective-scan detection fails:
+
+```bash
+-DMAMBA_SELECTIVE_SCAN_LIBRARY=/path/to/selective_scan_cuda.so
+```
+
+All required AOT `.pt2` packages must already exist before starting profiling.
+
+### 2. Generate TensorRT engines before profiling
+
+TensorRT engine construction should not be performed inside Nsight Compute because engine generation itself executes GPU work that Nsight may instrument and replay.
+
+Run TensorRT once normally:
+
+```bash
+cd benchmark/build/benchmark
+./sofie_benchmark --tensorrt
+```
+
+This creates the serialized TensorRT engine cache.
+
+Subsequent profiling runs load the cached plans instead of rebuilding them.
+
+### 3. Run Nsight Compute
+
+Nsight Compute may require administrator privileges to access GPU performance counters.
+
+From `benchmark/build/benchmark`:
+
+```bash
+sudo ./sofie_benchmark \
+  --profile \
+  --onnxruntime \
+  --tensorrt \
+  --aot \
+  --ncu /usr/local/cuda/bin/ncu
+```
+
+Use the actual path to `ncu` if it is installed elsewhere.
+
+The benchmark uses:
+
+```text
+--profile-from-start off
+```
+
+so backend/model initialisation and the priming inference are excluded from the captured kernel statistics.
+
+### 4. Profiling output
+
+Each run creates:
+
+```text
+benchmark/results/benchmark_<YYYYMMDD_HHMMSS>/
+```
+
+A full four-backend run has the following layout:
+
+```text
+benchmark_<timestamp>/
+├── sofie/
+│   ├── benchmark.csv
+│   ├── <model>.ncu-rep
+│   └── <model>.csv
+├── ort/
+│   ├── benchmark.csv
+│   ├── <model>.ncu-rep
+│   └── <model>.csv
+├── tensorrt/
+│   ├── benchmark.csv
+│   ├── <model>.ncu-rep
+│   └── <model>.csv
+└── pytorch_aot/
+    ├── benchmark.csv
+    ├── <model>.ncu-rep
+    └── <model>.csv
+```
+
+The `.ncu-rep` files contain the full Nsight Compute reports.
+
+The per-model `.csv` files contain the exported metrics consumed by the profiling-summary script.
+
+### 5. Generate the profiling summary
+
+From the SOFIE repository root:
+
+```bash
+python3 benchmark/src/summarize_profile.py \
+  benchmark/results/benchmark_<YYYYMMDD_HHMMSS>
+```
+
+The script generates:
+
+```text
+benchmark/results/benchmark_<timestamp>/profile_summary.md
+benchmark/results/benchmark_<timestamp>/profile_summary.json
+```
+
+The summary includes:
+
+- kernel-launch counts;
+- unique kernel counts;
+- total GPU kernel time;
+- average and maximum kernel duration;
+- register usage;
+- achieved occupancy;
+- shared-memory usage;
+- DRAM throughput and bandwidth;
+- L1 and L2 hit rates;
+- spilling detection;
+- Tensor Core activity;
+- likely memory-bound and compute-bound launches;
+- per-model summaries;
+- slowest kernels;
+- highest-register kernels;
+- lowest-occupancy kernels.
+
+The JSON file contains the same information in machine-readable form.
+
+### 6. Important measurement note
+
+Do not use latency, throughput, transfer-time, or peak-memory values from an Nsight Compute run as normal benchmark measurements.
+
+Nsight Compute instruments and may replay kernels, so the wall-clock execution time is intentionally distorted.
+
+Use a normal benchmark run for end-to-end performance:
+
+```bash
+./sofie_benchmark \
+  --onnxruntime \
+  --tensorrt \
+  --aot
+```
+
+Use a separate Nsight run for kernel-level statistics:
+
+```bash
+sudo ./sofie_benchmark \
+  --profile \
+  --onnxruntime \
+  --tensorrt \
+  --aot \
+  --ncu /usr/local/cuda/bin/ncu
+```
+
+The total GPU time reported in the Nsight summary is the sum of captured kernel durations and is not necessarily equal to end-to-end inference latency.
+
+---
+
+## Plotting Benchmark Results
+
+Normal benchmark runs can be plotted with:
+
+```bash
+python3 benchmark/src/plot_results.py \
+  benchmark/results/benchmark_<YYYYMMDD_HHMMSS>
+```
+
+The plotting script reads the backend `benchmark.csv` files and writes its output to:
+
+```text
+benchmark/results/benchmark_<timestamp>/plots/
+```
+
+It generates PNG and PDF figures together with:
+
+```text
+aggregated_results.csv
+comparison_summary.csv
+```
+
+The plotting code recognises:
+
+```text
+sofie
+ort
+tensorrt
+pytorch_aot
+```
+
+Multiple benchmark runs can be supplied to average their results and compute standard deviations:
+
+```bash
+python3 benchmark/src/plot_results.py \
+  benchmark/results/benchmark_<run1> \
+  benchmark/results/benchmark_<run2> \
+  benchmark/results/benchmark_<run3>
+```
+
+---
+
+## Re-running After Adding Models
+
+Because model discovery happens during CMake configuration, re-run CMake after adding or removing ONNX models:
+
+```bash
+cmake -S . -B benchmark/build
+cmake --build benchmark/build --target sofie_benchmark -j$(nproc)
 ```
 
 ---

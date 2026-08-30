@@ -31,6 +31,17 @@
 *.out
 *.app
 
+# Clion
+.idea
+
 # Build 
-build/
+build*/
 install/
+
+# Benchmark results
+benchmark/results/
+benchmark/cache/
+benchmark/build-profile
+benchmark/benchmark
+
+benchmark/models/aot_models/

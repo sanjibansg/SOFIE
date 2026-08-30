@@ -39,16 +39,48 @@ enum class OperatorKind {
    UNARY_ABS=23,
    CLIP=24,
    NOT=25,
-   POOL=26,
-   SELU=27,
-   RMSNORM=28,
-   GROUPNORM=29,
-   CUMSUM=30,
-   SDPA=31,
-   MAMBA_SCAN=32,
-   RWKV_WKV6=33,
-   GRIFFIN_RGLRU=34
+   UNARY_SOFTPLUS=26,
+   UNARY_ATAN=27,
+   UNARY_FLOOR=28,
+   L2NORMALIZATION=29,
+   POOL=30,
+   SELU=31,
+   RMSNORM=32,
+   GROUPNORM=33,
+   CUMSUM=34,
+   SDPA=35,
+   MAMBA_SCAN=36,
+   RWKV_WKV6=37,
+   GRIFFIN_RGLRU=38
 };
+
+enum class EFusionMappingType {
+   OneToOne,
+   OneToMany,
+   ManyToMany,
+   Reorganize,
+   Shuffle,
+   Unsupported
+};
+
+inline const char *toString(EFusionMappingType type)
+{
+   switch (type) {
+      case EFusionMappingType::OneToOne:
+         return "OneToOne";
+      case EFusionMappingType::OneToMany:
+         return "OneToMany";
+      case EFusionMappingType::ManyToMany:
+         return "ManyToMany";
+      case EFusionMappingType::Reorganize:
+         return "Reorganize";
+      case EFusionMappingType::Shuffle:
+         return "Shuffle";
+      case EFusionMappingType::Unsupported:
+         return "Unsupported";
+   }
+   return "Unsupported";
+}
 
 inline const char* toString(OperatorKind kind) {
    switch (kind) {
@@ -59,7 +91,11 @@ inline const char* toString(OperatorKind kind) {
        case OperatorKind::CONSTANTOFSHAPE: return "CONSTANTOFSHAPE";
        case OperatorKind::BATCHNORM:       return "BATCHNORM";  
        case OperatorKind::CONV:       return "CONV";
+       case OperatorKind::UNARY_SOFTPLUS: return "UNARY_SOFTPLUS";
+       case OperatorKind::UNARY_ATAN:     return "UNARY_ATAN";
+       case OperatorKind::UNARY_FLOOR:    return "UNARY_FLOOR";
        case OperatorKind::UNDEFINED:  return "UNDEFINED";
+       case OperatorKind::L2NORMALIZATION: return "L2NORMALIZATION";
        default:                       return "UNKNOWN";
    }
 }
@@ -82,6 +118,7 @@ public:
    virtual std::string GenerateInitCode_GPU_ALPAKA() { return "";};
    // generate code to reset recurrent/stateful buffers (called once per file boundary)
    virtual std::string GenerateResetStateCode_GPU_ALPAKA() { return ""; }
+   virtual std::vector<std::string> GetPersistentTensorNames_GPU_ALPAKA() const { return {}; }
    // generate some specific declaration code for Session
    virtual std::string GenerateDeclCode() { return "";}
    // generate session data members specific to operator
@@ -107,6 +144,79 @@ public:
    // Returns the C++ expression applying this op to inputVar (a local T variable) for fused kernel generation
    virtual std::string GetElementwiseExpr(const std::string& /*inputVar*/) const { return ""; }
 
+   // DNNFusion-style input/output mapping classification.
+   // One-To-One, One-To-Many, Many-To-Many, Reorganize, Shuffle
+   virtual EFusionMappingType GetFusionMappingType() const
+   {
+      return IsElementwise() ? EFusionMappingType::OneToOne : EFusionMappingType::Unsupported;
+   }
+
+   // Returns the expression produced by this operator from its input
+   // expressions. The default implementation adapts the existing unary
+   // GetElementwiseExpr interface.
+   virtual std::string GetFusionExpr(const std::vector<std::string> &inputs) const
+   {
+      if (inputs.size() != 1)
+         return "";
+
+      return GetElementwiseExpr(inputs[0]);
+   }
+
+   virtual bool SupportsFusionTypes(const std::vector<ETensorType> &inputTypes, ETensorType outputType) const
+   {
+      if (outputType != ETensorType::FLOAT)
+         return false;
+
+      return std::all_of(inputTypes.begin(), inputTypes.end(), [](ETensorType type) {
+         return type == ETensorType::FLOAT;
+      });
+   }
+
+   virtual std::string GetFusionInputIndexExpr(size_t /*inputIndex*/, const std::string &/*outputIndex*/,
+                                                const std::vector<size_t> &/*inputShape*/,
+                                                const std::vector<size_t> &/*outputShape*/) const
+   {
+      return "";
+   }
+
+   virtual std::string GetFusionInputIndexExprForOutput(size_t inputIndex, size_t /*outputTensorIndex*/,
+                                                         const std::string &outputIndex,
+                                                         const std::vector<size_t> &inputShape,
+                                                         const std::vector<size_t> &outputShape) const
+   {
+      return GetFusionInputIndexExpr(inputIndex, outputIndex, inputShape, outputShape);
+   }
+
+   virtual std::string GetFusionInputConditionExpr(size_t /*inputIndex*/, const std::string &/*outputIndex*/,
+      const std::vector<size_t> &/*inputShape*/, const std::vector<size_t> &/*outputShape*/) const
+   {
+      return "";
+   }
+
+   // Optional aggregation semantics for ManyToMany operators such as reductions.
+   // The mapping category remains ManyToMany; these methods describe how the
+   // many input values are accumulated when fused into a cooperative kernel.
+   virtual bool IsFusionReduction() const { return false; }
+   virtual std::string GetFusionReductionInitExpr() const { return ""; }
+   virtual std::string GetFusionReductionAccumulateExpr(const std::string &/*accumulator*/, const std::string &/*value*/) const { return ""; }
+   virtual std::string GetFusionReductionCombineExpr(const std::string &/*left*/, const std::string &/*right*/) const { return ""; }
+   virtual std::string GetFusionReductionFinalizeExpr(const std::string &/*accumulator*/, size_t /*reducedLength*/) const { return ""; }
+   virtual std::string GetFusionReductionInputIndexExpr(const std::string &/*outputIndex*/, const std::string &/*reductionIndex*/,
+      const std::vector<size_t> &/*inputShape*/, const std::vector<size_t> &/*outputShape*/) const
+   {
+      return "";
+   }
+
+   virtual std::vector<size_t> GetFusionDataInputIndices() const
+   {
+      std::vector<size_t> indices;
+      indices.reserve(fInputTensorNames.size());
+
+      for (size_t i = 0; i < fInputTensorNames.size(); ++i)
+         indices.push_back(i);
+
+      return indices;
+   }
    //virtual void Forward_reference() = 0;
    //virtual void Forward_blas() = 0;
    virtual ~ROperator(){}

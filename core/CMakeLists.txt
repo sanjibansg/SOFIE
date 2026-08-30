@@ -45,6 +45,7 @@ set(sources_headers
    SOFIE/ROperator_Cast.hxx
    SOFIE/ROperator_Custom.hxx
    SOFIE/ROperator_LayerNormalization.hxx
+   SOFIE/ROperator_L2Normalization.hxx
    SOFIE/ROperator_Expand.hxx
    SOFIE/ROperator_Erf.hxx
    SOFIE/ROperator_Swish.hxx
@@ -81,6 +82,7 @@ set(sources_cxx
     src/RModelProfiler.cxx
     src/RModelProfilerGPU.cxx
     src/RModel_ALPAKA.cxx
+    src/RModel_Fusion_ALPAKA.cxx
     src/RModel_GNN.cxx
     src/RModel_GraphIndependent.cxx
     src/RFunction.cxx

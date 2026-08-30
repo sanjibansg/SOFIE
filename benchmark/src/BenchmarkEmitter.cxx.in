@@ -58,18 +58,28 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
 
     // Collect input metadata before code generation
     struct TensorMeta {
+        ETensorType type;
         std::string cppType;
         size_t numElements;
+        std::vector<size_t> shape;
     };
     std::vector<TensorMeta> inputs;
     for (const auto &n : inputNames) {
         TensorMeta m;
-        try { m.cppType = tensorTypeToCpp(model.GetTensorType(n)); }
-        catch (...) { m.cppType = "float"; }
+        try {
+            m.type = model.GetTensorType(n);
+            m.cppType = tensorTypeToCpp(m.type);
+        } catch (...) {
+            m.type = ETensorType::FLOAT;
+            m.cppType = "float";
+        }
         m.numElements = 1;
         try {
-            for (const auto &d : model.GetDimTensorShape(n))
-                m.numElements *= resolveDim(d);
+            for (const auto &d : model.GetDimTensorShape(n)) {
+                const size_t dim = resolveDim(d);
+                m.shape.push_back(dim);
+                m.numElements *= dim;
+            }
         } catch (...) {}
         inputs.push_back(m);
     }
@@ -78,15 +88,8 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
     // which runs shape inference on all operators.  Output tensor shapes are only
     // available *after* Initialize(), so we must call GenerateGPU_ALPAKA() before
     // querying output metadata.
-#ifdef SOFIE_BENCHMARK_LOWRANK
-    model.SetLowRankRatio(SOFIE_BENCHMARK_LOWRANK_RATIO);
-#endif
-#if defined(SOFIE_BENCHMARK_PROFILE) && defined(SOFIE_BENCHMARK_LOWRANK)
-    model.GenerateGPU_ALPAKA(Options::kProfile | Options::kLowRankFactorize);
-#elif defined(SOFIE_BENCHMARK_PROFILE)
+#ifdef SOFIE_BENCHMARK_PROFILE
     model.GenerateGPU_ALPAKA(Options::kProfile);
-#elif defined(SOFIE_BENCHMARK_LOWRANK)
-    model.GenerateGPU_ALPAKA(Options::kLowRankFactorize);
 #else
     model.GenerateGPU_ALPAKA();
 #endif
@@ -96,18 +99,27 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
     std::vector<TensorMeta> outputs;
     for (const auto &n : outputNames) {
         TensorMeta m;
-        try { m.cppType = tensorTypeToCpp(model.GetTensorType(n)); }
-        catch (...) { m.cppType = "float"; }
+        try {
+            m.type = model.GetTensorType(n);
+            m.cppType = tensorTypeToCpp(m.type);
+        } catch (...) {
+            m.type = ETensorType::FLOAT;
+            m.cppType = "float";
+        }
         m.numElements = 1;
         try {
-            for (const auto &d : model.GetDimTensorShape(n))
-                m.numElements *= resolveDim(d);
+            for (const auto &d : model.GetDimTensorShape(n)) {
+                const size_t dim = resolveDim(d);
+                m.shape.push_back(dim);
+                m.numElements *= dim;
+            }
         } catch (...) {}
         outputs.push_back(m);
     }
 
     std::string hxxPath  = outDir + "/" + modelName + "_GPU_ALPAKA.hxx";
     std::string benchPath = outDir + "/" + modelName + "_bench.hxx";
+    std::string aotMetaPath = outDir + "/" + modelName + "_aot_meta.hxx";
 
     model.OutputGenerated(hxxPath);
 
@@ -115,6 +127,46 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
     std::string cppName = modelName;
     for (char &c : cppName)
         if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
+
+    std::ofstream aotMeta(aotMetaPath);
+    if (!aotMeta.is_open()) {
+        std::cerr << "[ERROR] Cannot open " << aotMetaPath << "\n";
+        return 1;
+    }
+
+    aotMeta << "#pragma once\n\n";
+    aotMeta << "#include \"AOTInductorBenchmark.hxx\"\n\n";
+    aotMeta << "inline std::vector<AOTInputSpec> GetAOTInputSpecs_" << cppName << "() {\n";
+    aotMeta << "    return {\n";
+
+    for (const auto &input : inputs) {
+        aotMeta << "        {AOTDataType::";
+
+        switch (input.type) {
+            case ETensorType::FLOAT:  aotMeta << "Float32"; break;
+            case ETensorType::DOUBLE: aotMeta << "Float64"; break;
+            case ETensorType::INT32:  aotMeta << "Int32"; break;
+            case ETensorType::INT64:  aotMeta << "Int64"; break;
+            case ETensorType::UINT8:  aotMeta << "UInt8"; break;
+            case ETensorType::INT8:   aotMeta << "Int8"; break;
+            case ETensorType::INT16:  aotMeta << "Int16"; break;
+            case ETensorType::BOOL:   aotMeta << "Bool"; break;
+            default:                  aotMeta << "Unsupported"; break;
+        }
+
+        aotMeta << ", {";
+
+        for (size_t i = 0; i < input.shape.size(); ++i) {
+            if (i)
+                aotMeta << ", ";
+            aotMeta << input.shape[i];
+        }
+
+        aotMeta << "}},\n";
+    }
+
+    aotMeta << "    };\n";
+    aotMeta << "}\n";
 
     // Build "session.infer(input_d_0, input_d_1, ...)"
     std::ostringstream inferCall;
@@ -139,8 +191,10 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         << "#pragma once\n\n"
         << "#include \"" << modelName << "_GPU_ALPAKA.hxx\"\n"
         << "#include \"BenchmarkBackend.hxx\"\n"
-        << "#include \"GpuOccupancy.hxx\"\n"
+        << "#include \"GPUProfiler.hxx\"\n"
+        << "#include \"GPUMemoryMonitor.hxx\"\n"
         << "#include <chrono>\n"
+        << "#include <fstream>\n"
         << "#include <iostream>\n"
         << "#include <random>\n"
         << "#include <string>\n\n"
@@ -149,7 +203,7 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         // here would require all 32 models to share one translation unit
         // which OOM-kills the CUDA compiler.
         << "void Benchmark_" << cppName
-        << "(int warmup, int iterations, const std::string& weightsDir) {\n"
+        << "(int warmup, int iterations, const std::string& weightsDir, bool profile) {\n"
         << "    using namespace sofie_bench;\n\n"
         << "    // ---- Device/host setup (mirrors unit-test pattern) ----\n"
         << "    alpaka::PlatformCpu hostPlatform{};\n"
@@ -194,7 +248,23 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         << "    std::string weightFile = weightsDir + \"/"
         << modelName << "_GPU_ALPAKA.dat\";\n"
         << "    SOFIE_" << cppName
-        << "::Session<AccTag> session(weightFile);\n\n";
+        << "::Session<AccTag> session(weightFile);\n"
+        << "    double sofie_pool_mem_mb = "
+        << "static_cast<double>(session.GetIntermediateMemoryPoolSize()) / (1024.0 * 1024.0);\n"
+
+        << "    double sofie_free_mem_mb = "
+        << "static_cast<double>(session.GetTotalFreeMemory()) / (1024.0 * 1024.0);\n"
+
+        << "    double sofie_largest_free_mb = "
+        << "static_cast<double>(session.GetLargestFreeBlock()) / (1024.0 * 1024.0);\n"
+
+        << "    double sofie_used_mem_mb = "
+        << "sofie_pool_mem_mb - sofie_free_mem_mb;\n"
+
+        << "    double sofie_fragmentation = "
+        << "100.0 * session.GetFragmentation();\n"
+
+        << "    GPUMemoryMonitor gpuMem;\n\n";
 
 
     bench << "    // ---- One priming inference to obtain output buffer handle(s) ----\n"
@@ -213,7 +283,7 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
 
     auto outBufExpr = [&](size_t i) -> std::string {
         if (outputs.size() == 1) return "out_d";
-        return "out_d[" + std::to_string(i) + "]";
+        return "std::get<" + std::to_string(i) + ">(out_d)";
     };
 
     bench << "    // ---- Warmup (not timed) ----\n"
@@ -236,11 +306,15 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
 
     // ---- Profiling path (mutually exclusive with benchmark path) ----
     bench << "#ifdef SOFIE_BENCHMARK_PROFILE\n"
-          << "    // ---- Profiling: reset warmup data, run iterations, print results ----\n"
+          << "    // ---- Profile exactly one steady-state inference ----\n"
           << "    session.ResetProfilingResults();\n"
-          << "    for (int _i = 0; _i < iterations; ++_i)\n"
-          << "        " << inferCall.str() << ";\n"
+          << "    SOFIE_BENCH_DEVICE_SYNC();\n"
+          << "    StartGpuProfiler();\n"
+          << "    auto profiled_out_d = " << inferCall.str() << ";\n"
           << "    alpaka::wait(session.queue);\n"
+          << "    SOFIE_BENCH_DEVICE_SYNC();\n"
+          << "    StopGpuProfiler();\n"
+          << "    (void)profiled_out_d;\n"
           << "    std::printf(\"%s\\n\", std::string(60, '-').c_str());\n"
           << "    std::printf(\"Model: " << modelName << "\\n\");\n"
           << "    session.PrintProfilingResults();\n"
@@ -261,16 +335,22 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
           << "    auto t1_in = std::chrono::high_resolution_clock::now();\n\n";
 
     bench
-        << "    // ---- Timed inference (with GPU occupancy sampling) ----\n"
-        << "    GpuOccupancySampler occSampler(0);\n"
-        << "    occSampler.start();\n"
+        << "    // ---- Timed inference ----\n"
+        << "    gpuMem.Start();\n"
+        << "    if (profile) {\n"
+        << "        SOFIE_BENCH_DEVICE_SYNC();\n"
+        << "        StartGpuProfiler();\n"
+        << "    }\n"
         << "    auto t0_infer = std::chrono::high_resolution_clock::now();\n"
         << "    for (int _i = 0; _i < iterations; ++_i)\n"
         << "        " << inferCall.str() << ";\n"
         << "    alpaka::wait(session.queue);\n"
         << "    SOFIE_BENCH_DEVICE_SYNC();\n"
         << "    auto t1_infer = std::chrono::high_resolution_clock::now();\n"
-        << "    occSampler.stop();\n\n";
+        << "    if (profile)\n"
+        << "        StopGpuProfiler();\n"
+        << "    gpuMem.Stop();\n"
+        << "    double gpu_peak_mem_mb = gpuMem.PeakMB();\n\n";
 
     bench
         << "    // ---- Timed output transfer (D2H: device -> host) ----\n"
@@ -292,20 +372,33 @@ static int EmitBenchmarkModel(const std::string &onnxPath,
         << "    double avg_out_ms    = std::chrono::duration<double, std::milli>"
            "(t1_out   - t0_out  ).count() / iterations;\n"
         << "    double throughput    = (avg_infer_ms > 0.0) ? 1000.0 / avg_infer_ms : 0.0;\n\n"
-        << "    char smAvgStr[16], smPeakStr[16], memAvgStr[16];\n"
-        << "    if (occSampler.available() && occSampler.sampleCount() > 0) {\n"
-        << "        std::snprintf(smAvgStr,  sizeof(smAvgStr),  \"%.1f\", occSampler.avgSmUtilPct());\n"
-        << "        std::snprintf(smPeakStr, sizeof(smPeakStr), \"%u\",   occSampler.peakSmUtilPct());\n"
-        << "        std::snprintf(memAvgStr, sizeof(memAvgStr), \"%.1f\", occSampler.avgMemUtilPct());\n"
-        << "    } else {\n"
-        << "        std::snprintf(smAvgStr,  sizeof(smAvgStr),  \"N/A\");\n"
-        << "        std::snprintf(smPeakStr, sizeof(smPeakStr), \"N/A\");\n"
-        << "        std::snprintf(memAvgStr, sizeof(memAvgStr), \"N/A\");\n"
-        << "    }\n"
-        << "    std::printf(\"%-40s  %12.4f  %14.4f  %15.4f  %16.1f  %10s  %9s  %11s\\n\",\n"
+        << "    std::printf(\"%-50s %12.4f %14.4f %15.4f %16.1f %10.2f %10.2f %10.2f %10.2f %10.2f %12.2f\\n\", "
         << "                \"" << modelName << "\",\n"
-        << "                avg_infer_ms, avg_in_ms, avg_out_ms, throughput,\n"
-        << "                smAvgStr, smPeakStr, memAvgStr);\n"
+        << "                avg_infer_ms,\n"
+        << "                avg_in_ms,\n"
+        << "                avg_out_ms,\n"
+        << "                throughput,\n"
+        << "                sofie_pool_mem_mb,\n"
+        << "                sofie_used_mem_mb,\n"
+        << "                sofie_free_mem_mb,\n"
+        << "                sofie_largest_free_mb,\n"
+        << "                sofie_fragmentation,\n"
+        << "                gpu_peak_mem_mb);\n"
+        << "    {\n"
+        << "        const char *resultsPath = std::getenv(\"SOFIE_BENCHMARK_RESULTS\");\n"
+        << "        std::ofstream results(resultsPath ? resultsPath : \"../../results/benchmark.csv\", std::ios::app);\n"
+        << "        results << \"" << modelName << ",\"\n"
+        << "                << avg_infer_ms << \",\"\n"
+        << "                << avg_in_ms << \",\"\n"
+        << "                << avg_out_ms << \",\"\n"
+        << "                << throughput << \",\"\n"
+        << "                << sofie_pool_mem_mb << \",\"\n"
+        << "                << sofie_used_mem_mb << \",\"\n"
+        << "                << sofie_free_mem_mb << \",\"\n"
+        << "                << sofie_largest_free_mb << \",\"\n"
+        << "                << sofie_fragmentation << \",\"\n"
+        << "                << gpu_peak_mem_mb << \"\\n\";\n"
+        << "    }\n"
         << "#endif  // SOFIE_BENCHMARK_PROFILE\n"
         << "}\n";
 

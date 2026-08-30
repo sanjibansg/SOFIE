@@ -45,6 +45,13 @@ private:
 
    size_t fDim;   // dimension of the convolution
 
+   bool IsDepthwise1D_GPU() const
+   {
+      return fDim == 1 && fShapeX.size() == 3 && fShapeY.size() == 3 &&
+             !fShapeX[1].isParam && !fShapeX[2].isParam && !fShapeY[2].isParam &&
+             fShapeW.size() == 3 && fAttrGroup == fShapeX[1].dim &&
+             fShapeW[0] == fShapeX[1].dim && fShapeW[1] == 1;
+   }
 
 public:
 
@@ -605,6 +612,59 @@ public:
       if (fShapeX.empty() || fShapeW.empty() || fShapeY.empty())
          throw std::runtime_error("TMVA SOFIE Conv Op called to Generate without being initialized first");
 
+      if (IsDepthwise1D_GPU()) {
+         const size_t channels = fShapeW[0];
+         const size_t iWidth = fShapeX[2].dim;
+         const size_t oWidth = fShapeY[2].dim;
+         const size_t kWidth = fShapeW[2];
+         const size_t stride = fAttrStrides[0];
+         const size_t dilation = fAttrDilations[0];
+         const size_t pad = fAttrPads[0];
+
+         std::string op;
+         const std::string kernelName = "DepthwiseConv1DKernel_" + opName;
+
+         op += "\n//------ DEPTHWISE_CONV1D_KERNEL_ALPAKA (Conv " + opName + ")\n";
+         op += SP + "struct " + kernelName + " {\n";
+         op += SP + SP + "template<typename TAcc, typename T>\n";
+         op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
+         op += SP + SP + SP + "TAcc const& acc,\n";
+         op += SP + SP + SP + "T const* __restrict__ input,\n";
+         op += SP + SP + SP + "T const* __restrict__ weight,\n";
+         if (!fNB.empty())
+            op += SP + SP + SP + "T const* __restrict__ bias,\n";
+         op += SP + SP + SP + "T* __restrict__ output,\n";
+         op += SP + SP + SP + "std::size_t const totalElements) const {\n";
+         op += SP + SP + SP + "auto const globalThreadIdx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+         op += SP + SP + SP + "auto const gridThreadExtent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+         op += SP + SP + SP + "for (std::size_t elemIdx = globalThreadIdx; elemIdx < totalElements; elemIdx += gridThreadExtent) {\n";
+         op += SP + SP + SP + SP + "std::size_t const batch = elemIdx / " + std::to_string(channels * oWidth) + "u;\n";
+         op += SP + SP + SP + SP + "std::size_t const rem = elemIdx % " + std::to_string(channels * oWidth) + "u;\n";
+         op += SP + SP + SP + SP + "std::size_t const channel = rem / " + std::to_string(oWidth) + "u;\n";
+         op += SP + SP + SP + SP + "std::size_t const ow = rem % " + std::to_string(oWidth) + "u;\n";
+
+         if (!fNB.empty())
+            op += SP + SP + SP + SP + "T value = bias[channel];\n";
+         else
+            op += SP + SP + SP + SP + "T value = static_cast<T>(0);\n";
+
+         op += SP + SP + SP + SP + "for (std::size_t kw = 0; kw < " + std::to_string(kWidth) + "u; ++kw) {\n";
+         op += SP + SP + SP + SP + SP + "int64_t const iw = static_cast<int64_t>(ow * " + std::to_string(stride) + "u + kw * "
+               + std::to_string(dilation) + "u) - " + std::to_string(pad) + ";\n";
+         op += SP + SP + SP + SP + SP + "if (iw >= 0 && iw < " + std::to_string(iWidth) + ") {\n";
+         op += SP + SP + SP + SP + SP + SP + "std::size_t const inputIdx = batch * " + std::to_string(channels * iWidth) +
+            "u + channel * " + std::to_string(iWidth) + "u + static_cast<std::size_t>(iw);\n";
+         op += SP + SP + SP + SP + SP + SP + "value += input[inputIdx] * weight[channel * " + std::to_string(kWidth) + "u + kw];\n";
+         op += SP + SP + SP + SP + SP + "}\n";
+         op += SP + SP + SP + SP + "}\n";
+         op += SP + SP + SP + SP + "output[elemIdx] = value;\n";
+         op += SP + SP + SP + "}\n";
+         op += SP + SP + "}\n";
+         op += SP + "};\n\n";
+
+         return op;
+      }
+
       size_t oDepth  = (fDim > 2) ? fShapeY[2].dim      : 1;
       size_t oHeight = (fDim > 1) ? fShapeY[fDim].dim   : 1;
       size_t oWidth  = fShapeY[fDim + 1].dim;
@@ -817,6 +877,10 @@ public:
 
    std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
       opName = "op_" + opName;
+
+      if (IsDepthwise1D_GPU())
+         return SP + "DepthwiseConv1DKernel_" + opName + " depthwiseConv1DKernel_" + opName + ";\n";
+
       std::string op;
       op  = SP + "WeightVecKernel_"  + opName + " weightVecKernel_"  + opName + ";\n";
       op += SP + "Im2ColKernel_"     + opName + " im2colKernel_"     + opName + ";\n";
@@ -838,6 +902,28 @@ public:
       size_t iHeight     = (fDim > 1) ? fShapeX[fDim].dim : 1;
       size_t iWidth      = fShapeX[fDim + 1].dim;
       size_t outChannels = fShapeW[0];
+
+      if (IsDepthwise1D_GPU()) {
+         const size_t totalElements = bsize * outChannels * oWidth;
+
+         std::stringstream out;
+         out << "\n//------ DEPTHWISE_CONV1D_GPU_ALPAKA\n";
+         out << SP << "{\n";
+         out << SP << SP << "auto const elementsPerGrid_depthwise = Vec::all(Idx{" << totalElements << "});\n";
+         out << SP << SP << "auto const workDiv_depthwise = sofie_workdiv(elementsPerGrid_depthwise);\n";
+         out << SP << SP << "auto task_depthwise = alpaka::createTaskKernel<Acc>(workDiv_depthwise, depthwiseConv1DKernel_" << opName;
+         out << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")";
+         out << ", alpaka::getPtrNative(deviceBuf_" << fNW << ")";
+         if (!fNB.empty())
+            out << ", alpaka::getPtrNative(deviceBuf_" << fNB << ")";
+         out << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")";
+         out << ", static_cast<Idx>(" << totalElements << "));\n";
+         out << SP << SP << "alpaka::enqueue(queue, task_depthwise);\n";
+         out << SP << "}\n";
+
+         return out.str();
+      }
+
       size_t kernelSize  = fAttrKernelShape[0] * fAttrKernelShape[1] * fAttrKernelShape[2];
       // gemm dimensions computed from shape members
       size_t gemm_n      = outChannels;                   // output channels

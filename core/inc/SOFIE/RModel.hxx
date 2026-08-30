@@ -1,6 +1,8 @@
 #ifndef SOFIE_RMODEL
 #define SOFIE_RMODEL
 
+#include <optional>
+
 #include "SOFIE/RModel_Base.hxx"
 #include "SOFIE/SOFIE_common.hxx"
 #include "SOFIE/ROperator.hxx"
@@ -27,6 +29,12 @@ private:
    size_t fWeightsTensorSize = 0;  // size  (in Bytes) of the allocated weight tensors
    size_t fOtherTensorSize = 0;    // size  (in Bytes) of intermediate tensors which are not managed by the memory pool
 
+   // Fragmentation tracking
+   size_t fPeakAllocatedGPU = 0;
+   size_t fPeakLargestFreeBlockGPU = 0;
+   size_t fPeakTotalFreeMemoryGPU = 0;
+   double fPeakFragmentationGPU = 0.0;
+
    OptimizationLevel fOptimizationLevel = OptimizationLevel::kExtended;
 
    std::unordered_map<std::string, InputTensorInfo> fInputTensorInfos; // input tensors where shape may not fully defined or other graph inputs?
@@ -51,16 +59,35 @@ private:
 
    // memory pool information for intermediate tensors
    MemoryPoolInfo fIntermediateMemoryInfo;    ///<!  intermediate memory info (transient)
+   MemoryPoolInfoGPU fIntermediateMemoryInfoGPU; // For GPU 
    std::unordered_map<std::string_view, size_t> fIntermediateTensorFrequencyLookup;    ///<!  lookup table for intermediate tensor frequency (transient)
 
    std::string fExtraCodeForDimShapes; // extra code needed for initialization of dynamic parameters (e.g. number of non zero elements in NonZero operator)
 
+   enum class EFusionInputAccess {
+      Elementwise,
+      Scalar,
+      Broadcast
+   };
+   
+   struct FusionExternalInput {
+      std::string tensorName;
+      EFusionInputAccess access = EFusionInputAccess::Elementwise;
+      std::vector<size_t> alignedStrides;
+      std::string customIndexExpression;
+   };
+
    // GPU ALPAKA elementwise kernel fusion state (transient, computed in GenerateGPU_ALPAKA)
    struct EltwiseFusionGroup {
-      std::vector<size_t> opIndices; ///< consecutive op indices forming this group
-      std::string inputTensor;       ///< input tensor name of the first op
-      std::string outputTensor;      ///< output tensor name of the last op
+      std::vector<size_t> opIndices; ///< dependency-chain operator indices forming this group
+      std::vector<FusionExternalInput> externalInputs; ///< tensors entering the fusion group from outside
+      std::string outputTensor; ///< tensor defining the fused iteration domain
+      std::vector<std::string> outputTensors; ///< tensors materialized by the fused kernel
+      std::vector<std::string> internalTensors; ///< tensors kept only as local fused values
       size_t numElements = 0;
+      size_t launchOpIndex = 0;
+      bool usesIndexedEvaluation = false;
+
       bool isFused() const { return opIndices.size() > 1; }
       std::string suffix() const {
          std::string s;
@@ -68,14 +95,152 @@ private:
          return s;
       }
    };
+
+   struct KernelFusionGroup {
+      std::vector<size_t> unitIndices;
+      std::vector<EltwiseFusionGroup> branches;
+      size_t numElements = 0;
+      size_t launchOpIndex = 0;
+
+      bool isFused() const { return branches.size() > 1; }
+
+      std::string suffix() const {
+         std::string s;
+         for (const auto &branch : branches)
+            for (const auto opIdx : branch.opIndices)
+               s += "_" + std::to_string(opIdx);
+         return s;
+      }
+   };
+
+   struct FusionTensorUseGraph {
+      std::unordered_map<std::string, std::vector<size_t>> consumers;
+      std::unordered_map<std::string, size_t> producers;
+   };
+
+   struct FusionBuildState {
+      EltwiseFusionGroup group;
+      std::vector<std::string> producedTensors;
+      std::vector<size_t> groupOutputShape;
+      std::vector<size_t> currentLogicalShape;
+      size_t currentOpIdx = 0;
+      bool hasReorganize = false;
+   };
+
+   struct FusionStructuralScore {
+      size_t launchesRemoved = 0;
+      size_t liveRangeExtensionByteSteps = 0;
+      size_t eliminatedBytes = 0;
+      size_t materializedOutputs = 0;
+      size_t externalInputs = 0;
+   };
+
+   struct FusionCandidate {
+      std::vector<size_t> opIndices;
+      std::vector<std::string> externalInputs;
+      std::vector<std::string> materializedOutputs;
+      std::vector<std::string> internalTensors;
+      FusionStructuralScore score;
+      size_t launchOpIndex = 0;
+      std::optional<EltwiseFusionGroup> prebuiltGroup;
+
+      bool isFused() const { return opIndices.size() > 1; }
+   };
+
+   struct FusionPlan {
+      std::vector<size_t> candidateIndices;
+      FusionStructuralScore score;
+   };
+
    std::vector<EltwiseFusionGroup> fEltwiseFusionGroups; ///<!
+   std::vector<KernelFusionGroup> fKernelFusionGroups; ///< horizontally fused kernel groups
    std::unordered_map<size_t, size_t> fOpToFusionGroupIdx; ///<!  op_idx -> fusion group index
+   std::unordered_map<size_t, size_t> fOpToKernelFusionGroupIdx; ///<! op_idx -> horizontal kernel fusion group index
    std::set<std::string> fFusionIntermediateTensors;        ///<!  intermediate tensors whose alloc is skipped
    std::set<size_t>      fSkipOperators;                    ///<!  ops swallowed by a preceding fusion (e.g. GEMM+LeakyReLU)
+
+   FusionTensorUseGraph BuildFusionTensorUseGraph() const;
+
+   FusionCandidate BuildFusionCandidate(const std::vector<size_t> &opIndices, const FusionTensorUseGraph &tensorUses) const;
+
+   bool IsValidFusionCandidate(const FusionCandidate &candidate, const FusionTensorUseGraph &tensorUses) const;
+
+   std::vector<size_t> EnumerateFusionLaunchIndices(const FusionCandidate &candidate, const FusionTensorUseGraph &tensorUses) const;
+
+   std::vector<FusionCandidate> EnumerateSpecialFusionCandidates(const FusionTensorUseGraph &tensorUses) const;
+   
+   std::vector<FusionCandidate> EnumerateFusionCandidates(const FusionTensorUseGraph &tensorUses) const;
+
+   std::vector<FusionCandidate> EnumerateLinearFusionCandidates(const FusionTensorUseGraph &tensorUses) const;
+
+   FusionStructuralScore ComputeFusionStructuralScore(const FusionCandidate &candidate, const FusionTensorUseGraph &tensorUses) const;
+
+   size_t ComputeFusionLiveRangeExtensionByteSteps(const FusionCandidate &candidate, const FusionTensorUseGraph &tensorUses) const;
+
+   size_t ComputeFusionPlanLiveRangeExtensionByteSteps(const std::vector<size_t> &candidateIndices, const std::vector<FusionCandidate> &candidates) const;
+
+   bool FusionCandidatesConflict(const FusionCandidate &left, const FusionCandidate &right, const FusionTensorUseGraph &tensorUses) const;
+
+   FusionPlan SelectFusionPlan(const std::vector<FusionCandidate> &candidates, const FusionTensorUseGraph &tensorUses) const;
+
+   static bool IsBetterFusionStructuralScore(const FusionStructuralScore &left, const FusionStructuralScore &right);
+
+   bool IsFuseSafeIntermediate(const std::string &tensorName, const FusionTensorUseGraph &tensorUses) const;
+
+   FusionBuildState InitializeFusionBuildState(size_t firstOpIdx) const;
+
+   bool TryExtendFusionBuildState(FusionBuildState &state, const FusionTensorUseGraph &tensorUses,
+                              const std::vector<bool> *blockedOps, bool allowReorganize = true) const;
+
+   EltwiseFusionGroup BuildEltwiseFusionGroup(const FusionCandidate &candidate) const;
+
+   std::vector<EltwiseFusionGroup> BuildKernelFusionLaunchUnits(const FusionTensorUseGraph &tensorUses) const;
+   bool CanHorizontallyFuse(const std::vector<EltwiseFusionGroup> &branches, const FusionTensorUseGraph &tensorUses,
+                         size_t &launchOpIndex) const;
+
+   bool GetKernelFusionLaunchWindow(const EltwiseFusionGroup &unit, const FusionTensorUseGraph &tensorUses,
+                                 size_t &earliestLaunchOpIndex, size_t &latestLaunchOpIndex) const;
+
+   std::vector<KernelFusionGroup> EnumerateKernelFusionGroups(const std::vector<EltwiseFusionGroup> &units,
+                                                           const FusionTensorUseGraph &tensorUses) const;
+
    void ComputeEltwiseFusionGroups();
+
+   size_t ComputeKernelFusionLiveRangeExtensionByteSteps(const KernelFusionGroup &candidate) const;
+
+   std::vector<KernelFusionGroup> SelectKernelFusionGroups(std::vector<KernelFusionGroup> candidates) const;
+
+   std::string GenerateFusedEltwiseLaunch_GPU_ALPAKA(const EltwiseFusionGroup &group) const;
+
+   std::string GenerateFusedEltwiseKernel_GPU_ALPAKA(const EltwiseFusionGroup &group) const;
+
+   std::string GenerateFusedReductionLaunch_GPU_ALPAKA(const EltwiseFusionGroup &group, size_t reductionOpIdx) const;
+
+   std::string GenerateFusedReductionKernel_GPU_ALPAKA(const EltwiseFusionGroup &group, size_t reductionOpIdx) const;
+
+   std::string GenerateFusionValueAtIndex(const EltwiseFusionGroup &group, const std::string &tensorName,
+      const std::string &logicalIndex, const std::unordered_map<std::string, size_t> &groupProducers,
+      const std::unordered_map<std::string, size_t> &externalInputIndices, std::unordered_map<std::string, std::string> &valueCache,
+      std::string &kernelCode, size_t &valueCounter, const std::unordered_map<std::string, std::string> *valueOverrides = nullptr) const;
+   std::string GenerateFusionInputIndex(const std::string &inputName, const std::vector<size_t> &outputShape, const std::string &outputIndex) const;
+
+   std::string GenerateKernelFusionLaunch_GPU_ALPAKA(const KernelFusionGroup &group) const;
+   std::string GenerateKernelFusionKernel_GPU_ALPAKA(const KernelFusionGroup &group) const;
+
+   bool ResolveFusionInputAccess(const std::string &tensorName, const std::vector<size_t> &outputShape,
+                              EFusionInputAccess &access, std::vector<size_t> &alignedStrides) const;
+
+   bool IsSupportedFusionOperator(size_t opIdx, bool allowShuffle, bool allowReorganize, bool allowManyToMany = false) const;
+
+   void AddFusionExternalInput(EltwiseFusionGroup &group, const FusionExternalInput &input) const;
+
+   void InitializeFusionGroup(size_t firstOpIdx, EltwiseFusionGroup &group,
+                              std::vector<std::string> &producedTensors, std::vector<size_t> &groupOutputShape) const;
    /// GPU-only pass: fuse GEMM→LeakyReLU (and GEMM→ReLU where not already
    /// handled by the ONNX parser) into a single in-place kernel sequence.
    void FuseGemmActivations_GPU();
+
+   void UpdatePeakAllocatorStats();
 
 public:
    // Rule of five: explicitly define move semantics, disallow copy
@@ -150,6 +315,7 @@ public:
    void AddShapeTensor(const std::string & name, const std::vector<Dim> & shapeValues, bool scalar = false);
    void AddAliasTensor(const std::string & name, const std::string & origin);
    bool IsAliasTensor(const std::string & tensor_name) const;
+   std::string ResolveAliasTensor(const std::string &tensorName) const;
 
    void AddExtraCodeForDimShapes(const std::string & code) { fExtraCodeForDimShapes += code; }
 
@@ -223,6 +389,15 @@ public:
    std::string AllocateIntermediateMemory(std::span<const std::string> op_output_tensors);
    void CheckAndFlushIntermediateMemory(std::span<const std::string> op_output_tensors, const size_t& op_idx);
 
+
+   // GPU memory allocation
+   std::string AllocateIntermediateMemory_GPU_ALPAKA(std::span<const std::string> op_output_tensors);
+
+   void CheckAndFlushIntermediateMemory_GPU_ALPAKA(std::span<const std::string> op_input_tensors,
+                                                   const size_t& op_idx);
+
+   void GenerateIntermediateMemoryPool_GPU_ALPAKA();
+
 protected:
    // internal functions
    // generate code for the initialized tensors
@@ -253,6 +428,7 @@ protected:
    void GenerateSessionCode();
    void GenerateSessionCode_GPU_ALPAKA();
    void GenerateGPU_ALPAKA_Buffers();
+   void GeneratePersistentTensorInfo_GPU_ALPAKA();
 
    void CheckAndFuseOperators();
    bool IsInputTensorShapeParam(std::string const &paramName) const;

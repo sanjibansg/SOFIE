@@ -11,6 +11,8 @@
 
 #include <onnxruntime_cxx_api.h>
 #include <cuda_runtime.h>
+#include "GPUMemoryMonitor.hxx"
+#include "GPUProfiler.hxx"
 
 #include <chrono>
 #include <cstdio>
@@ -19,6 +21,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <fstream>
+#include <cstdlib>
 
 namespace sofie_ort_bench_detail {
 
@@ -53,11 +57,12 @@ inline const char* ortTypeName(ONNXTensorElementDataType t) {
 /// @param device_id    CUDA device index (default 0).
 /// @param verbose      If true, print per-input shape/type information.
 inline void BenchmarkORT_GPU(const std::string& model_path,
-                              const std::string& model_name,
-                              int warmup,
-                              int iterations,
-                              int  device_id = 0,
-                              bool verbose   = false)
+                             const std::string& model_name,
+                             int warmup,
+                             int iterations,
+                             bool profile,
+                             int device_id = 0,
+                             bool verbose = false)
 {
     using namespace sofie_ort_bench_detail;
 
@@ -183,28 +188,79 @@ inline void BenchmarkORT_GPU(const std::string& model_path,
     }
 
     Ort::RunOptions run_opts;
+    GPUMemoryMonitor gpuMonitor;
 
-    for (int w = 0; w < warmup; ++w) {
+    if (profile) {
+        // Unprofiled first run for ORT and CUDA lazy initialization.
         session.Run(run_opts,
-                    input_names_ptr.data(),  input_tensors.data(),  num_inputs,
+                    input_names_ptr.data(), input_tensors.data(), num_inputs,
                     output_names_ptr.data(), num_outputs);
+        cudaDeviceSynchronize();
+    } else {
+        for (int w = 0; w < warmup; ++w) {
+            session.Run(run_opts,
+                        input_names_ptr.data(), input_tensors.data(), num_inputs,
+                        output_names_ptr.data(), num_outputs);
+        }
+        cudaDeviceSynchronize();
     }
-    cudaDeviceSynchronize();
+
+    const int measuredIterations = profile ? 1 : iterations;
+
+    gpuMonitor.Start();
+
+    if (profile)
+        sofie_bench::StartGpuProfiler();
 
     auto t0 = std::chrono::high_resolution_clock::now();
-    for (int it = 0; it < iterations; ++it) {
+
+    for (int it = 0; it < measuredIterations; ++it) {
         session.Run(run_opts,
-                    input_names_ptr.data(),  input_tensors.data(),  num_inputs,
+                    input_names_ptr.data(), input_tensors.data(), num_inputs,
                     output_names_ptr.data(), num_outputs);
     }
+
     cudaDeviceSynchronize();
+
     auto t1 = std::chrono::high_resolution_clock::now();
 
-    double avg_ms   = std::chrono::duration<double, std::milli>(t1 - t0).count()
-                      / iterations;
-    double throughput = (avg_ms > 0.0) ? 1000.0 / avg_ms : 0.0;
+    if (profile)
+        sofie_bench::StopGpuProfiler();
 
-    std::string label = std::string(model_name) + " [ORT-GPU]";
-    std::printf("%-30s  avg %8.4f ms  (%8.1f inf/s)\n",
-                label.c_str(), avg_ms, throughput);
+    gpuMonitor.Stop();
+
+    double avg_ms =
+        std::chrono::duration<double, std::milli>(t1 - t0).count() /
+        measuredIterations;
+    double throughput = (avg_ms > 0.0) ? 1000.0 / avg_ms : 0.0;
+    double peakGpuMB = gpuMonitor.PeakMB();
+
+    std::string label = std::string(model_name);
+
+    std::printf(
+    "%-50s %12.4f %14s %15s %16.1f %10s %10s %10s %10s %10s %12.2f\n",
+    (label + " (ORT-GPU)").c_str(),
+    avg_ms,
+    "-",
+    "-",
+    throughput,
+    "-",
+    "-",
+    "-",
+    "-",
+    "-",
+    peakGpuMB);
+
+    const char* ortResultsFile = std::getenv("SOFIE_ORT_RESULTS");
+
+    if (ortResultsFile) {
+        std::ofstream results(ortResultsFile, std::ios::app);
+
+        results
+            << label << ","
+            << avg_ms << ","
+            << throughput << ","
+            << peakGpuMB
+            << "\n";
+    }
 }

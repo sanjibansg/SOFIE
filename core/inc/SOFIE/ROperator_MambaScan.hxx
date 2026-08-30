@@ -17,6 +17,48 @@ private:
    std::string fB, fD, fL, fN;
    std::string fType;
 
+   bool fNStatic = false;
+   size_t fNValue = 0;
+
+   bool fLStatic = false;
+   size_t fLValue = 0;
+
+   bool UseParallelGPUScan() const
+   {
+      return fNStatic && fNValue > 0 && fNValue <= 256;
+   }
+
+   size_t GetGPUScanBlockSize() const
+   {
+      size_t threads = 32;
+      while (threads < fNValue)
+         threads *= 2;
+      return threads;
+   }
+
+   bool UseSequenceParallelGPUScan() const
+   {
+      return fNStatic && fLStatic && fNValue > 0 && fNValue <= 256 && fLValue > 0;
+   }
+
+   size_t GetGPUSequenceScanThreadCount() const
+   {
+      if (fLValue <= 512)
+         return 32;
+      if (fLValue <= 1024)
+         return 64;
+      return 128;
+   }
+
+   size_t GetGPUSequenceScanItemsPerThread() const
+   {
+      if (fLValue <= 128)
+         return 4;
+      if (fLValue <= 256)
+         return 8;
+      return 16;
+   }
+
 public:
    ROperator_MambaScan() {}
 
@@ -59,9 +101,18 @@ public:
       if (fShapeU.size() != 3)
          throw std::runtime_error("SOFIE MambaScan: u must be rank-3 [B, D, L]");
 
+
       auto shapeA = model.GetDimTensorShape(fNA);
       if (shapeA.size() != 2)
          throw std::runtime_error("SOFIE MambaScan: A must be rank-2 [D, N]");
+
+      fNStatic = !shapeA[1].isParam;
+      if (fNStatic)
+         fNValue = shapeA[1].dim;
+
+      fLStatic = !fShapeU[2].isParam;
+      if (fLStatic)
+         fLValue = fShapeU[2].dim;
 
       fType = ConvertTypeToString(model.GetTensorType(fNU));
       fB = fShapeU[0].GetVal();
@@ -101,6 +152,218 @@ public:
 
    std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
       opName = "op_" + opName;
+
+      if (UseSequenceParallelGPUScan()) {
+         const size_t threadCount = GetGPUSequenceScanThreadCount();
+         const size_t itemsPerThread = GetGPUSequenceScanItemsPerThread();
+         const size_t chunkSize = threadCount * itemsPerThread;
+         const std::string kname = "MambaScanSequenceKernel_" + opName;
+         std::string out;
+
+         out = "\n//------ MAMBA_SCAN_SEQUENCE_KERNEL_ALPAKA\n";
+         out += SP + "struct " + kname + " {\n";
+         out += SP + SP + "template<typename TAcc, typename T>\n";
+         out += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
+         out += SP + SP + SP + "TAcc const& acc,\n";
+         out += SP + SP + SP + "T const* __restrict__ u,\n";
+         out += SP + SP + SP + "T const* __restrict__ delta,\n";
+         out += SP + SP + SP + "T const* __restrict__ A,\n";
+         out += SP + SP + SP + "T const* __restrict__ B,\n";
+         out += SP + SP + SP + "T const* __restrict__ C,\n";
+         out += SP + SP + SP + "T const* __restrict__ D_bias,\n";
+         out += SP + SP + SP + "T* __restrict__ y,\n";
+         out += SP + SP + SP + "T* __restrict__ state,\n";
+         out += SP + SP + SP + "std::size_t const B_dim,\n";
+         out += SP + SP + SP + "std::size_t const D_dim,\n";
+         out += SP + SP + SP + "std::size_t const L,\n";
+         out += SP + SP + SP + "std::size_t const N) const {\n\n";
+
+         out += SP + SP + SP + "constexpr std::size_t kThreads = " + std::to_string(threadCount) + "u;\n";
+         out += SP + SP + SP + "constexpr std::size_t kItems = " + std::to_string(itemsPerThread) + "u;\n";
+         out += SP + SP + SP + "constexpr std::size_t kChunkSize = " + std::to_string(chunkSize) + "u;\n\n";
+
+         out += SP + SP + SP + "auto const block_idx = alpaka::getIdx<alpaka::Grid, alpaka::Blocks>(acc)[0];\n";
+         out += SP + SP + SP + "auto const thread_idx = alpaka::getIdx<alpaka::Block, alpaka::Threads>(acc)[0];\n";
+         out += SP + SP + SP + "if (block_idx >= B_dim * D_dim) return;\n\n";
+
+         out += SP + SP + SP + "std::size_t const b = block_idx / D_dim;\n";
+         out += SP + SP + SP + "std::size_t const d = block_idx % D_dim;\n\n";
+
+         out += SP + SP + SP + "auto& scanA = alpaka::declareSharedVar<T[" + std::to_string(2 * threadCount) + "], 0>(acc);\n";
+         out += SP + SP + SP + "auto& scanB = alpaka::declareSharedVar<T[" + std::to_string(2 * threadCount) + "], 1>(acc);\n\n";
+
+         out += SP + SP + SP + "T dt_vals[kItems];\n";
+         out += SP + SP + SP + "T delta_u_vals[kItems];\n";
+         out += SP + SP + SP + "T out_vals[kItems];\n\n";
+
+         out += SP + SP + SP + "for (std::size_t chunk_start = 0; chunk_start < L; chunk_start += kChunkSize) {\n";
+         out += SP + SP + SP + SP + "for (std::size_t i = 0; i < kItems; ++i) {\n";
+         out += SP + SP + SP + SP + SP + "std::size_t const t = chunk_start + thread_idx * kItems + i;\n";
+         out += SP + SP + SP + SP + SP + "if (t < L) {\n";
+         out += SP + SP + SP + SP + SP + SP + "T const dt = delta[b * D_dim * L + d * L + t];\n";
+         out += SP + SP + SP + SP + SP + SP + "T const u_val = u[b * D_dim * L + d * L + t];\n";
+         out += SP + SP + SP + SP + SP + SP + "dt_vals[i] = dt;\n";
+         out += SP + SP + SP + SP + SP + SP + "delta_u_vals[i] = dt * u_val;\n";
+         out += SP + SP + SP + SP + SP + SP + "out_vals[i] = D_bias[d] * u_val;\n";
+         out += SP + SP + SP + SP + SP + "} else {\n";
+         out += SP + SP + SP + SP + SP + SP + "dt_vals[i] = static_cast<T>(0);\n";
+         out += SP + SP + SP + SP + SP + SP + "delta_u_vals[i] = static_cast<T>(0);\n";
+         out += SP + SP + SP + SP + SP + SP + "out_vals[i] = static_cast<T>(0);\n";
+         out += SP + SP + SP + SP + SP + "}\n";
+         out += SP + SP + SP + SP + "}\n\n";
+
+         out += SP + SP + SP + SP + "for (std::size_t n = 0; n < N; ++n) {\n";
+         out += SP + SP + SP + SP + SP + "T prefixA[kItems];\n";
+         out += SP + SP + SP + SP + SP + "T prefixB[kItems];\n";
+         out += SP + SP + SP + SP + SP + "T localA = static_cast<T>(1);\n";
+         out += SP + SP + SP + SP + SP + "T localB = static_cast<T>(0);\n";
+         out += SP + SP + SP + SP + SP + "T const A_val = A[d * N + n];\n";
+         out += SP + SP + SP + SP + SP + "std::size_t const state_idx = b * D_dim * N + d * N + n;\n";
+         out += SP + SP + SP + SP + SP + "T const initial_state = state[state_idx];\n\n";
+
+         out += SP + SP + SP + SP + SP + "for (std::size_t i = 0; i < kItems; ++i) {\n";
+         out += SP + SP + SP + SP + SP + SP + "std::size_t const t = chunk_start + thread_idx * kItems + i;\n";
+         out += SP + SP + SP + SP + SP + SP + "T stepA = static_cast<T>(1);\n";
+         out += SP + SP + SP + SP + SP + SP + "T stepB = static_cast<T>(0);\n";
+         out += SP + SP + SP + SP + SP + SP + "if (t < L) {\n";
+         out += SP + SP + SP + SP + SP + SP + SP + "stepA = SOFIE_DEVICE_exp(acc, dt_vals[i] * A_val);\n";
+         out += SP + SP + SP + SP + SP + SP + SP + "stepB = B[b * N * L + n * L + t] * delta_u_vals[i];\n";
+         out += SP + SP + SP + SP + SP + SP + "}\n";
+         out += SP + SP + SP + SP + SP + SP + "localB = stepB + stepA * localB;\n";
+         out += SP + SP + SP + SP + SP + SP + "localA = stepA * localA;\n";
+         out += SP + SP + SP + SP + SP + SP + "prefixA[i] = localA;\n";
+         out += SP + SP + SP + SP + SP + SP + "prefixB[i] = localB;\n";
+         out += SP + SP + SP + SP + SP + "}\n\n";
+
+         out += SP + SP + SP + SP + SP + "scanA[thread_idx] = localA;\n";
+         out += SP + SP + SP + SP + SP + "scanB[thread_idx] = localB;\n";
+         out += SP + SP + SP + SP + SP + "alpaka::syncBlockThreads(acc);\n\n";
+
+         out += SP + SP + SP + SP + SP + "std::size_t src = 0;\n";
+         out += SP + SP + SP + SP + SP + "std::size_t dst = kThreads;\n";
+         out += SP + SP + SP + SP + SP + "for (std::size_t offset = 1; offset < kThreads; offset <<= 1) {\n";
+         out += SP + SP + SP + SP + SP + SP + "T const currentA = scanA[src + thread_idx];\n";
+         out += SP + SP + SP + SP + SP + SP + "T const currentB = scanB[src + thread_idx];\n";
+         out += SP + SP + SP + SP + SP + SP + "T nextA = currentA;\n";
+         out += SP + SP + SP + SP + SP + SP + "T nextB = currentB;\n";
+         out += SP + SP + SP + SP + SP + SP + "if (thread_idx >= offset) {\n";
+         out += SP + SP + SP + SP + SP + SP + SP + "T const previousA = scanA[src + thread_idx - offset];\n";
+         out += SP + SP + SP + SP + SP + SP + SP + "T const previousB = scanB[src + thread_idx - offset];\n";
+         out += SP + SP + SP + SP + SP + SP + SP + "nextA = currentA * previousA;\n";
+         out += SP + SP + SP + SP + SP + SP + SP + "nextB = currentB + currentA * previousB;\n";
+         out += SP + SP + SP + SP + SP + SP + "}\n";
+         out += SP + SP + SP + SP + SP + SP + "scanA[dst + thread_idx] = nextA;\n";
+         out += SP + SP + SP + SP + SP + SP + "scanB[dst + thread_idx] = nextB;\n";
+         out += SP + SP + SP + SP + SP + SP + "alpaka::syncBlockThreads(acc);\n";
+         out += SP + SP + SP + SP + SP + SP + "std::size_t const tmp = src;\n";
+         out += SP + SP + SP + SP + SP + SP + "src = dst;\n";
+         out += SP + SP + SP + SP + SP + SP + "dst = tmp;\n";
+         out += SP + SP + SP + SP + SP + "}\n\n";
+
+         out += SP + SP + SP + SP + SP + "T thread_state = initial_state;\n";
+         out += SP + SP + SP + SP + SP + "if (thread_idx > 0) {\n";
+         out += SP + SP + SP + SP + SP + SP + "T const previousA = scanA[src + thread_idx - 1];\n";
+         out += SP + SP + SP + SP + SP + SP + "T const previousB = scanB[src + thread_idx - 1];\n";
+         out += SP + SP + SP + SP + SP + SP + "thread_state = previousA * initial_state + previousB;\n";
+         out += SP + SP + SP + SP + SP + "}\n\n";
+
+         out += SP + SP + SP + SP + SP + "for (std::size_t i = 0; i < kItems; ++i) {\n";
+         out += SP + SP + SP + SP + SP + SP + "std::size_t const t = chunk_start + thread_idx * kItems + i;\n";
+         out += SP + SP + SP + SP + SP + SP + "if (t < L) {\n";
+         out += SP + SP + SP + SP + SP + SP + SP + "T const state_val = prefixA[i] * thread_state + prefixB[i];\n";
+         out += SP + SP + SP + SP + SP + SP + SP + "out_vals[i] += C[b * N * L + n * L + t] * state_val;\n";
+         out += SP + SP + SP + SP + SP + SP + "}\n";
+         out += SP + SP + SP + SP + SP + "}\n\n";
+
+         out += SP + SP + SP + SP + SP + "if (thread_idx == 0) {\n";
+         out += SP + SP + SP + SP + SP + SP + "T const totalA = scanA[src + kThreads - 1];\n";
+         out += SP + SP + SP + SP + SP + SP + "T const totalB = scanB[src + kThreads - 1];\n";
+         out += SP + SP + SP + SP + SP + SP + "state[state_idx] = totalA * initial_state + totalB;\n";
+         out += SP + SP + SP + SP + SP + "}\n";
+         out += SP + SP + SP + SP + SP + "alpaka::syncBlockThreads(acc);\n";
+         out += SP + SP + SP + SP + "}\n\n";
+
+         out += SP + SP + SP + SP + "for (std::size_t i = 0; i < kItems; ++i) {\n";
+         out += SP + SP + SP + SP + SP + "std::size_t const t = chunk_start + thread_idx * kItems + i;\n";
+         out += SP + SP + SP + SP + SP + "if (t < L)\n";
+         out += SP + SP + SP + SP + SP + SP + "y[b * D_dim * L + d * L + t] = out_vals[i];\n";
+         out += SP + SP + SP + SP + "}\n";
+         out += SP + SP + SP + "}\n";
+         out += SP + SP + "}\n";
+         out += SP + "};\n";
+
+         return out;
+      }
+
+      if (UseParallelGPUScan()) {
+         const size_t blockSize = GetGPUScanBlockSize();
+         const std::string kname = "MambaScanParallelKernel_" + opName;
+         std::string out;
+
+         out  = "\n//------ MAMBA_SCAN_PARALLEL_KERNEL_ALPAKA\n";
+         out += SP + "struct " + kname + " {\n";
+         out += SP + SP + "template<typename TAcc, typename T>\n";
+         out += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
+         out += SP + SP + SP + "TAcc const& acc,\n";
+         out += SP + SP + SP + "T const* __restrict__ u,\n";
+         out += SP + SP + SP + "T const* __restrict__ delta,\n";
+         out += SP + SP + SP + "T const* __restrict__ A,\n";
+         out += SP + SP + SP + "T const* __restrict__ B,\n";
+         out += SP + SP + SP + "T const* __restrict__ C,\n";
+         out += SP + SP + SP + "T const* __restrict__ D_bias,\n";
+         out += SP + SP + SP + "T* __restrict__ y,\n";
+         out += SP + SP + SP + "T* __restrict__ state,\n";
+         out += SP + SP + SP + "std::size_t const B_dim,\n";
+         out += SP + SP + SP + "std::size_t const D_dim,\n";
+         out += SP + SP + SP + "std::size_t const L,\n";
+         out += SP + SP + SP + "std::size_t const N) const {\n\n";
+
+         out += SP + SP + SP + "auto const block_idx = alpaka::getIdx<alpaka::Grid, alpaka::Blocks>(acc)[0];\n";
+         out += SP + SP + SP + "auto const thread_idx = alpaka::getIdx<alpaka::Block, alpaka::Threads>(acc)[0];\n";
+         out += SP + SP + SP + "if (block_idx >= B_dim * D_dim) return;\n\n";
+
+         out += SP + SP + SP + "std::size_t const b = block_idx / D_dim;\n";
+         out += SP + SP + SP + "std::size_t const d = block_idx % D_dim;\n";
+         out += SP + SP + SP + "bool const active = thread_idx < N;\n\n";
+
+         out += SP + SP + SP + "auto& reduction = alpaka::declareSharedVar<T[" + std::to_string(blockSize) + "], 0>(acc);\n";
+         out += SP + SP + SP + "std::size_t const state_idx = b * D_dim * N + d * N + thread_idx;\n";
+         out += SP + SP + SP + "T state_val = active ? state[state_idx] : static_cast<T>(0);\n\n";
+
+         out += SP + SP + SP + "for (std::size_t t = 0; t < L; ++t) {\n";
+         out += SP + SP + SP + SP + "T const dt = delta[b * D_dim * L + d * L + t];\n";
+         out += SP + SP + SP + SP + "T const u_val = u[b * D_dim * L + d * L + t];\n";
+         out += SP + SP + SP + SP + "T contribution = static_cast<T>(0);\n\n";
+
+         out += SP + SP + SP + SP + "if (active) {\n";
+         out += SP + SP + SP + SP + SP + "T const dA = SOFIE_DEVICE_exp(acc, dt * A[d * N + thread_idx]);\n";
+         out += SP + SP + SP + SP + SP + "T const dBu = dt * B[b * N * L + thread_idx * L + t] * u_val;\n";
+         out += SP + SP + SP + SP + SP + "state_val = dA * state_val + dBu;\n";
+         out += SP + SP + SP + SP + SP + "contribution = C[b * N * L + thread_idx * L + t] * state_val;\n";
+         out += SP + SP + SP + SP + "}\n\n";
+
+         out += SP + SP + SP + SP + "reduction[thread_idx] = contribution;\n";
+         out += SP + SP + SP + SP + "alpaka::syncBlockThreads(acc);\n\n";
+
+         out += SP + SP + SP + SP + "for (std::size_t stride = " + std::to_string(blockSize / 2) + "u; stride > 0; stride >>= 1) {\n";
+         out += SP + SP + SP + SP + SP + "if (thread_idx < stride)\n";
+         out += SP + SP + SP + SP + SP + SP + "reduction[thread_idx] += reduction[thread_idx + stride];\n";
+         out += SP + SP + SP + SP + SP + "alpaka::syncBlockThreads(acc);\n";
+         out += SP + SP + SP + SP + "}\n\n";
+
+         out += SP + SP + SP + SP + "if (thread_idx == 0)\n";
+         out += SP + SP + SP + SP + SP + "y[b * D_dim * L + d * L + t] = D_bias[d] * u_val + reduction[0];\n";
+
+         out += SP + SP + SP + "}\n\n";
+
+         out += SP + SP + SP + "if (active)\n";
+         out += SP + SP + SP + SP + "state[state_idx] = state_val;\n";
+         out += SP + SP + "}\n";
+         out += SP + "};\n";
+
+         return out;
+      }
+
       std::string kname = "MambaScanKernel_" + opName;
       std::string out;
       out  = "\n//------ MAMBA_SCAN_KERNEL_ALPAKA\n";
@@ -143,6 +406,13 @@ public:
 
    std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
       opName = "op_" + opName;
+
+      if (UseSequenceParallelGPUScan())
+         return SP + "MambaScanSequenceKernel_" + opName + " mambaSequenceKernel_" + opName + ";\n";
+
+      if (UseParallelGPUScan())
+         return SP + "MambaScanParallelKernel_" + opName + " mambaParallelKernel_" + opName + ";\n";
+
       return SP + "MambaScanKernel_" + opName + " mambaKernel_" + opName + ";\n";
    }
 
@@ -154,11 +424,79 @@ public:
       return SP + "alpaka::memset(queue, deviceBuf_" + fNState + ", 0);\n";
    }
 
+   std::vector<std::string> GetPersistentTensorNames_GPU_ALPAKA() const override {
+      return {fNState};
+   }
+
    std::string Generate_GPU_ALPAKA(std::string opName) override {
       opName = "op_" + opName;
+
+      if (UseSequenceParallelGPUScan()) {
+         const size_t threadCount = GetGPUSequenceScanThreadCount();
+
+         std::stringstream out;
+         out << "\n//------ MAMBA_SCAN_SEQUENCE_GPU_ALPAKA\n";
+         out << SP << "{\n";
+         out << SP << SP << "alpaka::memset(queue, deviceBuf_" << fNState << ", 0);\n";
+         out << SP << SP << "auto const blocksPerGrid = Vec::all(static_cast<Idx>(" << fB << " * " << fD << "));\n";
+         out << SP << SP << "auto const threadsPerBlock = Vec::all(static_cast<Idx>(" << threadCount << "));\n";
+         out << SP << SP << "auto const elementsPerThread = Vec::all(static_cast<Idx>(1));\n";
+         out << SP << SP << "auto const workDiv_" << opName << " = alpaka::WorkDivMembers<Dim, Idx>(blocksPerGrid, threadsPerBlock, elementsPerThread);\n";
+         out << SP << SP << "auto task_" << opName << " = alpaka::createTaskKernel<Acc>(workDiv_" << opName
+             << ", mambaSequenceKernel_" << opName << ", "
+             << "alpaka::getPtrNative(deviceBuf_" << fNU << "), "
+             << "alpaka::getPtrNative(deviceBuf_" << fNDelta << "), "
+             << "alpaka::getPtrNative(deviceBuf_" << fNA << "), "
+             << "alpaka::getPtrNative(deviceBuf_" << fNB << "), "
+             << "alpaka::getPtrNative(deviceBuf_" << fNC << "), "
+             << "alpaka::getPtrNative(deviceBuf_" << fNDbias << "), "
+             << "alpaka::getPtrNative(deviceBuf_" << fNY << "), "
+             << "alpaka::getPtrNative(deviceBuf_" << fNState << "), "
+             << "static_cast<Idx>(" << fB << "), "
+             << "static_cast<Idx>(" << fD << "), "
+             << "static_cast<Idx>(" << fL << "), "
+             << "static_cast<Idx>(" << fN << "));\n";
+         out << SP << SP << "alpaka::enqueue(queue, task_" << opName << ");\n";
+         out << SP << "}\n";
+
+         return out.str();
+      }
+
+      if (UseParallelGPUScan()) {
+         const size_t blockSize = GetGPUScanBlockSize();
+
+         std::stringstream out;
+         out << "\n//------ MAMBA_SCAN_PARALLEL_GPU_ALPAKA\n";
+         out << SP << "{\n";
+         out << SP << SP << "alpaka::memset(queue, deviceBuf_" << fNState << ", 0);\n";
+         out << SP << SP << "auto const blocksPerGrid = Vec::all(static_cast<Idx>(" << fB << " * " << fD << "));\n";
+         out << SP << SP << "auto const threadsPerBlock = Vec::all(static_cast<Idx>(" << blockSize << "));\n";
+         out << SP << SP << "auto const elementsPerThread = Vec::all(static_cast<Idx>(1));\n";
+         out << SP << SP << "auto const workDiv_" << opName << " = alpaka::WorkDivMembers<Dim, Idx>(blocksPerGrid, threadsPerBlock, elementsPerThread);\n";
+         out << SP << SP << "auto task_" << opName << " = alpaka::createTaskKernel<Acc>(workDiv_" << opName
+             << ", mambaParallelKernel_" << opName << ", "
+             << "alpaka::getPtrNative(deviceBuf_" << fNU << "), "
+             << "alpaka::getPtrNative(deviceBuf_" << fNDelta << "), "
+             << "alpaka::getPtrNative(deviceBuf_" << fNA << "), "
+             << "alpaka::getPtrNative(deviceBuf_" << fNB << "), "
+             << "alpaka::getPtrNative(deviceBuf_" << fNC << "), "
+             << "alpaka::getPtrNative(deviceBuf_" << fNDbias << "), "
+             << "alpaka::getPtrNative(deviceBuf_" << fNY << "), "
+             << "alpaka::getPtrNative(deviceBuf_" << fNState << "), "
+             << "static_cast<Idx>(" << fB << "), "
+             << "static_cast<Idx>(" << fD << "), "
+             << "static_cast<Idx>(" << fL << "), "
+             << "static_cast<Idx>(" << fN << "));\n";
+         out << SP << SP << "alpaka::enqueue(queue, task_" << opName << ");\n";
+         out << SP << "}\n";
+
+         return out.str();
+      }
+
       std::stringstream out;
       out << "\n//------ MAMBA_SCAN_GPU_ALPAKA\n";
       out << SP << "{\n";
+      out << SP << SP << "alpaka::memset(queue, deviceBuf_" << fNState << ", 0);\n";
       out << SP << SP << "auto const elementsPerGrid_" << opName
           << " = Vec::all(Idx{" << fB << " * " << fD << "});\n";
       out << SP << SP << "auto const workDiv_" << opName
@@ -182,6 +520,7 @@ public:
       out << SP << "}\n";
       return out.str();
    }
+
 };
 
 } // namespace SOFIE

@@ -166,7 +166,31 @@ public:
    // FusedEltwiseKernel (which reads input and writes output as the same T).
    // Returning false here routes Cast through its own Generate_GPU_ALPAKA path,
    // which correctly uses separate SrcT and DstT device buffers.
-   bool IsElementwise() const override { return false; }
+   bool IsElementwise() const override
+   {
+      return !fIsOutputConstant;
+   }
+
+   EFusionMappingType GetFusionMappingType() const override
+   {
+      return fIsOutputConstant ? EFusionMappingType::Unsupported : EFusionMappingType::OneToOne;
+   }
+
+   bool SupportsFusionTypes(const std::vector<ETensorType> &inputTypes, ETensorType outputType) const override
+   {
+      return inputTypes.size() == 1 && outputType == fType;
+   }
+
+   std::string GetFusionExpr(const std::vector<std::string> &inputs) const override
+   {
+      if (fIsOutputConstant || inputs.size() != 1)
+         return "";
+
+      if (fType == ETensorType::BOOL)
+         return "static_cast<T>(" + inputs[0] + ")";
+
+      return "static_cast<" + ConvertTypeToString(fType) + ">(" + inputs[0] + ")";
+   }
 
 };
 

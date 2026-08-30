@@ -21,6 +21,21 @@ option(SOFIE_BENCHMARK_ORT
     "Also benchmark ONNX Runtime GPU alongside SOFIE (requires ORT ≥ 1.18)"
     OFF)
 
+option(SOFIE_BENCHMARK_TRT "Enable TensorRT benchmark comparison" OFF)
+
+option(SOFIE_BENCHMARK_AOT "Enable PyTorch AOTInductor benchmark comparison" OFF)
+
+option(SOFIE_BENCHMARK_MAMBA_AOT "Enable Mamba custom-op support for AOTInductor" OFF)
+
+set(ONNXRUNTIME_ROOT "" CACHE PATH
+        "Optional ONNX Runtime installation root")
+
+set(TENSORRT_ROOT "" CACHE PATH
+        "Optional TensorRT installation root")
+
+set(MAMBA_SELECTIVE_SCAN_LIBRARY "" CACHE FILEPATH
+        "Optional path to the selective_scan_cuda shared library used by Mamba AOT")
+
 option(SOFIE_BENCHMARK_PROFILE
     "Enable per-operator GPU profiling (per-op timing + memory breakdown). \
 Mutually exclusive with throughput benchmarking — rebuild without this flag \
@@ -88,47 +103,39 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Discover models
 ################################################################################
 
-file(GLOB BENCHMARK_ONNX_MODELS
-    "${CMAKE_CURRENT_SOURCE_DIR}/models/*.onnx")
+set(SOFIE_BENCHMARK_MODEL_DIR "models" CACHE STRING
+        "Directory containing ONNX benchmark models. Relative paths are resolved under benchmark/.")
 
-list(FILTER BENCHMARK_ONNX_MODELS EXCLUDE REGEX
-    "/(gnn_h32_k2|gnn_h64_k4|punet_h32_k2_heads4_layers2|punet_h64_k4_heads4_layers2|transformer_d32_h2_L6_ff32)\\.onnx$")
+if(IS_ABSOLUTE "${SOFIE_BENCHMARK_MODEL_DIR}")
+    set(BENCHMARK_MODEL_DIR "${SOFIE_BENCHMARK_MODEL_DIR}")
+else()
+    set(BENCHMARK_MODEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/${SOFIE_BENCHMARK_MODEL_DIR}")
+endif()
 
-# Exclude models that exceed GPU memory (cudaErrorMemoryAllocation) or trigger
-# a cuBLAS EXECUTION_FAILED error (status 13) on architectures that are not very powerful. 
-# They stay on disk for reference and are
-# compiled into sofie_benchmark_large (cluster target) instead.
+file(GLOB BENCHMARK_ONNX_MODELS "${BENCHMARK_MODEL_DIR}/*.onnx")
+
+# Exclude base/template models with symbolic dimensions.
+# Their fixed-size specialised variants are benchmarked instead.
 list(FILTER BENCHMARK_ONNX_MODELS EXCLUDE REGEX
-    "/(punet_h32_k2_heads4_layers2_n10000_e50000\
-|punet_h32_k2_heads4_layers2_n1000_e5000\
-|punet_h32_k2_heads4_layers2_n3000_e15000\
-|punet_h32_k2_heads4_layers2_n30000_e150000\
-|punet_h32_k2_heads4_layers2_n100000_e500000\
-|punet_h64_k4_heads4_layers2_n10000_e50000\
-|punet_h64_k4_heads4_layers2_n100_e500\
-|punet_h64_k4_heads4_layers2_n300_e1500\
-|punet_h64_k4_heads4_layers2_n3000_e15000\
-|punet_h64_k4_heads4_layers2_n30000_e150000\
-|punet_h64_k4_heads4_layers2_n100000_e500000\
-|gnn_h32_k2_n30000_e150000\
-|gnn_h32_k2_n100000_e500000\
-|gnn_h64_k4_n30000_e150000\
-|gnn_h64_k4_n100000_e500000\
-|transformer_L1000_B100\
-|transformer_L100_B100\
-|transformer_L8000_B1\
-|transformer_d32_h2_L6_ff32_n60_s60)\\.onnx$")
+        "/(gnn_h32_k2|gnn_h64_k4|punet_h32_k2_heads4_layers2|punet_h64_k4_heads4_layers2|transformer_d32_h2_L6_ff32|transformer_d64_h4_L6_ff128|gnn_large|mlpf_fp32_fused|mlpf_fp32_unfused)\\.onnx$")
+
+# Fused MLPF variants are currently unsupported.
+list(FILTER BENCHMARK_ONNX_MODELS EXCLUDE REGEX
+        "/mlpf_fp32_fused_b1_n[0-9]+\\.onnx$")
+
+# Models that exceed GPU memory on all backends.
+list(FILTER BENCHMARK_ONNX_MODELS EXCLUDE REGEX
+        "/(punet_h32_k2_heads4_layers2_n30000_e150000|punet_h32_k2_heads4_layers2_n100000_e500000|punet_h64_k4_heads4_layers2_n30000_e150000|punet_h64_k4_heads4_layers2_n100000_e500000)\\.onnx$")
 
 if(NOT BENCHMARK_ONNX_MODELS)
     message(STATUS
-        "SOFIE Benchmark: No .onnx models found in benchmark/models/. "
+        "SOFIE Benchmark: No .onnx models found in ${BENCHMARK_MODEL_DIR}. "
         "Add ONNX models there and re-run cmake to enable benchmarking.")
     return()
 endif()
 
 list(LENGTH BENCHMARK_ONNX_MODELS N_MODELS)
-message(STATUS "SOFIE Benchmark: Found ${N_MODELS} model(s) in benchmark/models/")
-
+message(STATUS "SOFIE Benchmark: Found ${N_MODELS} model(s) in ${BENCHMARK_MODEL_DIR}")
 
 FetchContent_Declare(
     sofieBLAS
@@ -149,6 +156,8 @@ FetchContent_MakeAvailable(alpaka)
 ################################################################################
 
 enable_language(CUDA)
+find_library(NVML_LIBRARY NAMES nvidia-ml REQUIRED)
+message(STATUS "SOFIE Benchmark: NVML = ${NVML_LIBRARY}")
 find_package(CUDAToolkit REQUIRED)
 message(STATUS "SOFIE Benchmark: CUDA toolkit ${CUDAToolkit_VERSION}")
 
@@ -184,7 +193,7 @@ if(SOFIE_BENCHMARK_ORT)
     # where we tell it, and fall through to manual on failure.
 
     set(_ort_search_roots "")
-    if(DEFINED ONNXRUNTIME_ROOT)
+    if(ONNXRUNTIME_ROOT)
         list(APPEND _ort_search_roots "${ONNXRUNTIME_ROOT}")
     endif()
     list(APPEND _ort_search_roots
@@ -223,6 +232,56 @@ if(SOFIE_BENCHMARK_ORT AND NOT SOFIE_ORT_FOUND)
     message(STATUS "SOFIE Benchmark: ORT benchmarking disabled (library not found)")
 endif()
 
+if(SOFIE_BENCHMARK_TRT)
+    set(_trt_search_roots "")
+    if(TENSORRT_ROOT)
+        list(APPEND _trt_search_roots "${TENSORRT_ROOT}")
+    endif()
+
+    find_path(TENSORRT_INCLUDE_DIR
+            NAMES NvInfer.h
+            HINTS ${_trt_search_roots}
+            PATH_SUFFIXES include include/x86_64-linux-gnu)
+
+    find_library(NVINFER_LIBRARY
+            NAMES nvinfer
+            HINTS ${_trt_search_roots}
+            PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu)
+
+    find_library(NVONNXPARSER_LIBRARY
+            NAMES nvonnxparser
+            HINTS ${_trt_search_roots}
+            PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu)
+
+    find_library(NVINFER_PLUGIN_LIBRARY
+            NAMES nvinfer_plugin
+            HINTS ${_trt_search_roots}
+            PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu)
+
+    if(NOT TENSORRT_INCLUDE_DIR OR
+            NOT NVINFER_LIBRARY OR
+            NOT NVONNXPARSER_LIBRARY OR
+            NOT NVINFER_PLUGIN_LIBRARY)
+        message(FATAL_ERROR
+                "SOFIE Benchmark: TensorRT was requested but could not be found. "
+                "Install TensorRT or set -DTENSORRT_ROOT=<path>.")
+    endif()
+
+    get_filename_component(TENSORRT_LIBRARY_DIR "${NVINFER_LIBRARY}" DIRECTORY)
+
+    message(STATUS "SOFIE Benchmark: TensorRT headers = ${TENSORRT_INCLUDE_DIR}")
+    message(STATUS "SOFIE Benchmark: TensorRT nvinfer = ${NVINFER_LIBRARY}")
+endif()
+
+if(SOFIE_BENCHMARK_AOT)
+    find_package(Torch REQUIRED)
+    message(STATUS "SOFIE Benchmark: PyTorch AOTInductor comparison enabled")
+endif()
+
+################################################################################
+# Build per-model strings for configure_file
+################################################################################
+
 set(_EMIT_BLOCK
 "try {\n\
     EmitBenchmarkModel(\"@1@\", \"@2@\", outDir);\n\
@@ -237,6 +296,7 @@ set(_EMIT_BLOCK
 
 set(BENCHMARK_EMIT_CAPTURES        "")
 set(BENCHMARK_BENCH_HEADERS        "")
+set(BENCHMARK_AOT_META_HEADERS     "")
 set(BENCHMARK_FWD_DECLS            "")
 set(BENCHMARK_SINGLE_MODEL_CASES   "")
 set(BENCHMARK_SPAWN_CALLS          "")
@@ -246,11 +306,17 @@ set(BENCHMARK_MODEL_CU_SRCS        "")
 foreach(ONNX_FILE ${BENCHMARK_ONNX_MODELS})
     get_filename_component(MODEL_NAME "${ONNX_FILE}" NAME_WE)
 
+    set(MODEL_AOT_ENABLED TRUE)
+    if(MODEL_NAME MATCHES "^mambav2_" AND NOT SOFIE_BENCHMARK_MAMBA_AOT)
+        set(MODEL_AOT_ENABLED FALSE)
+    endif()
+
     string(REGEX REPLACE "[^A-Za-z0-9]" "_" MODEL_CPPNAME "${MODEL_NAME}")
 
-    set(GEN_HXX   "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_GPU_ALPAKA.hxx")
-    set(GEN_BENCH "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_bench.hxx")
-    list(APPEND GENERATED_HEADERS "${GEN_HXX}" "${GEN_BENCH}")
+    set(GEN_HXX      "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_GPU_ALPAKA.hxx")
+    set(GEN_BENCH    "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_bench.hxx")
+    set(GEN_AOT_META "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_aot_meta.hxx")
+    list(APPEND GENERATED_HEADERS "${GEN_HXX}" "${GEN_BENCH}" "${GEN_AOT_META}")
 
     string(REPLACE "@1@" "${ONNX_FILE}"  _emit_cap "${_EMIT_BLOCK}")
     string(REPLACE "@2@" "${MODEL_NAME}" _emit_cap "${_emit_cap}")
@@ -259,36 +325,115 @@ foreach(ONNX_FILE ${BENCHMARK_ONNX_MODELS})
     string(APPEND BENCHMARK_BENCH_HEADERS
         "#include \"${MODEL_NAME}_bench.hxx\"\n")
 
+    string(APPEND BENCHMARK_AOT_META_HEADERS
+            "#include \"${MODEL_NAME}_aot_meta.hxx\"\n")
+
     # Forward declaration for the main TU (function defined in per-model .cu)
     string(APPEND BENCHMARK_FWD_DECLS
-        "void Benchmark_${MODEL_CPPNAME}(int warmup, int iterations, const std::string& weightsDir);\n")
+            "void Benchmark_${MODEL_CPPNAME}(int warmup, int iterations, const std::string& weightsDir, bool profile);\n")
 
     # Single-model dispatch: one if-branch per model (used in --single-model mode)
     string(APPEND BENCHMARK_SINGLE_MODEL_CASES
         "    if (model == \"${MODEL_CPPNAME}\") {\n"
-        "        Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir);\n"
+        "        if (run_sofie)\n"
+        "            Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir, profile);\n"
         "#ifdef SOFIE_BENCHMARK_ORT\n"
-        "        if (run_ort) BenchmarkORT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations);\n"
+        "        if (run_ort)\n"
+        "            BenchmarkORT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations, profile);\n"
         "#endif\n"
-        "        return 0;\n"
-        "    }\n"
+        "#ifdef SOFIE_BENCHMARK_TRT\n"
+        "        if (run_trt)\n"
+        "            BenchmarkTRT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations, profile);\n"
+        "#endif\n"
+    )
+
+    if(MODEL_AOT_ENABLED)
+        string(APPEND BENCHMARK_SINGLE_MODEL_CASES
+                "#ifdef SOFIE_BENCHMARK_AOT\n"
+                "        if (run_aot)\n"
+                "            BenchmarkAOT_GPU(\"${BENCHMARK_MODEL_DIR}/aot_models/${MODEL_NAME}.pt2\","
+                " \"${MODEL_NAME}\", GetAOTInputSpecs_${MODEL_CPPNAME}(), warmup, iterations, profile);\n"
+                "#endif\n"
+        )
+    endif()
+
+    string(APPEND BENCHMARK_SINGLE_MODEL_CASES
+            "        return 0;\n"
+            "    }\n"
     )
 
     # Subprocess spawn: run this binary as a child with --single-model <name>.
     # Each child gets a fresh CUDA context so GPU memory from the previous
     # model is completely freed before the next one allocates.
     string(APPEND BENCHMARK_SPAWN_CALLS
-        "    {\n"
-        "        std::string cmd = std::string(argv[0])\n"
-        "            + \" --single-model ${MODEL_CPPNAME}\"\n"
-        "            + commonArgs;\n"
-        "        int rc = std::system(cmd.c_str());\n"
-        "        if (rc != 0) {\n"
-        "            std::fprintf(stderr, \"[ERROR] ${MODEL_NAME}: subprocess exited %d\\n\", rc);\n"
-        "            ++totalFailed;\n"
-        "        }\n"
-        "    }\n"
+            "    {\n"
+
+            "        auto RunBackend = [&](const std::string& flag,\n"
+            "                              const std::string& suffix)\n"
+            "        {\n"
+            "            std::string cmd;\n"
+
+            "            if (profile) {\n"
+            "                const char* resultsDir = std::getenv(\"SOFIE_BENCHMARK_RESULTS_DIR\");\n"
+
+            "                cmd = ncuPath;\n"
+            "                cmd += \" --target-processes all\";\n"
+            "                cmd += \" --profile-from-start off\";\n"
+            "                cmd += \" --quiet\";\n"
+            "                cmd += \" --csv\";\n"
+            "                cmd += \" --force-overwrite\";\n"
+            "                cmd += \" --export \";\n"
+            "                cmd += std::string(resultsDir);\n"
+            "                cmd += \"/\" + suffix + \"/${MODEL_NAME}\";\n"
+            "                cmd += \" --section LaunchStats\";\n"
+            "                cmd += \" --section Occupancy\";\n"
+            "                cmd += \" --section MemoryWorkloadAnalysis\";\n"
+            "                cmd += \" --section SpeedOfLight\";\n"
+            "                cmd += \" \";\n"
+            "                cmd += std::string(argv[0]);\n"
+            "            }\n"
+            "            else {\n"
+            "                cmd = std::string(argv[0]);\n"
+            "            }\n"
+
+            "            cmd += \" --single-model ${MODEL_CPPNAME}\";\n"
+            "            cmd += \" \";\n"
+            "            cmd += flag;\n"
+            "            cmd += commonArgs;\n"
+
+            "            int rc = std::system(cmd.c_str());\n"
+
+            "            if (rc != 0) {\n"
+            "                std::fprintf(stderr,\n"
+            "                    \"[ERROR] ${MODEL_NAME} (%s): subprocess exited %d\\n\",\n"
+            "                    suffix.c_str(), rc);\n"
+            "                ++totalFailed;\n"
+            "            }\n"
+            "        };\n"
+
+            "        RunBackend(\"--sofie-only\", \"sofie\");\n"
+
+            "#ifdef SOFIE_BENCHMARK_ORT\n"
+            "        if (run_ort)\n"
+            "            RunBackend(\"--ort-only\", \"ort\");\n"
+            "#endif\n"
+
+            "#ifdef SOFIE_BENCHMARK_TRT\n"
+            "        if (run_trt)\n"
+            "            RunBackend(\"--trt-only\", \"tensorrt\");\n"
+            "#endif\n"
     )
+
+    if(MODEL_AOT_ENABLED)
+        string(APPEND BENCHMARK_SPAWN_CALLS
+                "#ifdef SOFIE_BENCHMARK_AOT\n"
+                "        if (run_aot)\n"
+                "            RunBackend(\"--aot-only\", \"pytorch_aot\");\n"
+                "#endif\n"
+        )
+    endif()
+
+    string(APPEND BENCHMARK_SPAWN_CALLS "    }\n")
 
     # Per-model compilation unit: include one bench.hxx → one .cu file
     set(_model_cu "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_bench.cu")
@@ -370,6 +515,52 @@ set_source_files_properties("${RUNNER_SRC}" PROPERTIES LANGUAGE CXX)
 
 add_executable(sofie_benchmark "${RUNNER_SRC}" ${BENCHMARK_MODEL_CU_SRCS})
 
+if(SOFIE_BENCHMARK_MAMBA_AOT)
+    if(NOT SOFIE_BENCHMARK_AOT)
+        message(FATAL_ERROR "SOFIE_BENCHMARK_MAMBA_AOT requires SOFIE_BENCHMARK_AOT=ON")
+    endif()
+
+    find_package(Python3 COMPONENTS Interpreter Development.Embed REQUIRED)
+
+    target_sources(sofie_benchmark PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/MambaAOTCustomOps.cxx")
+
+    get_filename_component(_torch_cmake_dir "${Torch_DIR}" DIRECTORY)
+    get_filename_component(_torch_share_dir "${_torch_cmake_dir}" DIRECTORY)
+    get_filename_component(_torch_package_dir "${_torch_share_dir}" DIRECTORY)
+    get_filename_component(_torch_site_packages "${_torch_package_dir}" DIRECTORY)
+
+    if(MAMBA_SELECTIVE_SCAN_LIBRARY)
+        if(NOT EXISTS "${MAMBA_SELECTIVE_SCAN_LIBRARY}")
+            message(FATAL_ERROR
+                    "SOFIE Benchmark: MAMBA_SELECTIVE_SCAN_LIBRARY does not exist: "
+                    "${MAMBA_SELECTIVE_SCAN_LIBRARY}")
+        endif()
+    else()
+        file(GLOB MAMBA_SELECTIVE_SCAN_LIBS
+                "${_torch_site_packages}/selective_scan_cuda*${CMAKE_SHARED_LIBRARY_SUFFIX}")
+        list(LENGTH MAMBA_SELECTIVE_SCAN_LIBS _mamba_selective_scan_count)
+
+        if(NOT _mamba_selective_scan_count EQUAL 1)
+            message(FATAL_ERROR
+                    "SOFIE Benchmark: could not uniquely locate selective_scan_cuda next to PyTorch. "
+                    "Set -DMAMBA_SELECTIVE_SCAN_LIBRARY=/path/to/selective_scan_cuda.so")
+        endif()
+
+        list(GET MAMBA_SELECTIVE_SCAN_LIBS 0 MAMBA_SELECTIVE_SCAN_LIBRARY)
+    endif()
+
+    get_filename_component(MAMBA_SELECTIVE_SCAN_DIR "${MAMBA_SELECTIVE_SCAN_LIBRARY}" DIRECTORY)
+    get_filename_component(MAMBA_SELECTIVE_SCAN_NAME "${MAMBA_SELECTIVE_SCAN_LIBRARY}" NAME)
+
+    target_link_directories(sofie_benchmark PRIVATE "${MAMBA_SELECTIVE_SCAN_DIR}")
+    target_link_libraries(sofie_benchmark PRIVATE "-Wl,-l:${MAMBA_SELECTIVE_SCAN_NAME}")
+    set_property(TARGET sofie_benchmark APPEND PROPERTY BUILD_RPATH
+            "${MAMBA_SELECTIVE_SCAN_DIR};${_torch_package_dir}/lib")
+
+    message(STATUS "SOFIE Benchmark: Mamba AOT custom-op support enabled")
+    message(STATUS "SOFIE Benchmark: selective_scan_cuda = ${MAMBA_SELECTIVE_SCAN_LIBRARY}")
+endif()
+
 add_dependencies(sofie_benchmark sofie_benchmark_headers)
 
 target_include_directories(sofie_benchmark PRIVATE
@@ -379,6 +570,11 @@ target_include_directories(sofie_benchmark PRIVATE
     "${sofieblas_SOURCE_DIR}/include"
     "${CUDAToolkit_INCLUDE_DIRS}"
 )
+
+if(SOFIE_BENCHMARK_TRT)
+    target_include_directories(sofie_benchmark PRIVATE "${TENSORRT_INCLUDE_DIR}")
+    set_property(TARGET sofie_benchmark APPEND PROPERTY BUILD_RPATH "${TENSORRT_LIBRARY_DIR}")
+endif()
 
 
 if(NOT DEFINED SOFIE_BENCHMARK_CUDA_ARCH OR SOFIE_BENCHMARK_CUDA_ARCH STREQUAL "")
@@ -403,6 +599,8 @@ target_compile_definitions(sofie_benchmark PRIVATE
     ${_SOFIE_BENCH_BACKEND_DEFINE}
     ALPAKA_HAS_STD_ATOMIC_REF
     $<$<BOOL:${SOFIE_ORT_FOUND}>:SOFIE_BENCHMARK_ORT>
+    $<$<BOOL:${SOFIE_BENCHMARK_TRT}>:SOFIE_BENCHMARK_TRT>
+    $<$<BOOL:${SOFIE_BENCHMARK_AOT}>:SOFIE_BENCHMARK_AOT>
     $<$<BOOL:${SOFIE_BENCHMARK_PROFILE}>:SOFIE_BENCHMARK_PROFILE>
     $<$<BOOL:${SOFIE_NVML_LIBRARY}>:SOFIE_BENCH_HAVE_NVML>
 )
@@ -431,10 +629,14 @@ target_link_libraries(sofie_benchmark PRIVATE
     CUDA::cublas
     CUDA::cublasLt
     Threads::Threads
+    ${NVML_LIBRARY}
     $<$<BOOL:${SOFIE_ORT_FOUND}>:${SOFIE_ORT_TARGET}>
-    $<$<BOOL:${SOFIE_NVML_LIBRARY}>:${SOFIE_NVML_LIBRARY}>
+    $<$<BOOL:${SOFIE_BENCHMARK_TRT}>:${NVINFER_LIBRARY}>
+    $<$<BOOL:${SOFIE_BENCHMARK_TRT}>:${NVONNXPARSER_LIBRARY}>
+    $<$<BOOL:${SOFIE_BENCHMARK_TRT}>:${NVINFER_PLUGIN_LIBRARY}>
+    $<$<BOOL:${SOFIE_BENCHMARK_AOT}>:${TORCH_LIBRARIES}>
+    $<$<BOOL:${SOFIE_BENCHMARK_MAMBA_AOT}>:Python3::Python>
 )
-
 if(SOFIE_ORT_FOUND)
     message(STATUS "SOFIE Benchmark: target 'sofie_benchmark' configured "
                    "(${N_MODELS} model(s), CUDA backend + ORT-GPU)")
@@ -539,20 +741,22 @@ if(SOFIE_BENCHMARK_LARGE)
             get_filename_component(MODEL_NAME "${ONNX_FILE}" NAME_WE)
             string(REGEX REPLACE "[^A-Za-z0-9]" "_" MODEL_CPPNAME "${MODEL_NAME}")
 
-            set(GEN_HXX   "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_GPU_ALPAKA.hxx")
-            set(GEN_BENCH "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_bench.hxx")
-            list(APPEND LARGE_GENERATED_HEADERS "${GEN_HXX}" "${GEN_BENCH}")
+            set(GEN_HXX      "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_GPU_ALPAKA.hxx")
+            set(GEN_BENCH    "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_bench.hxx")
+            set(GEN_AOT_META "${CMAKE_CURRENT_BINARY_DIR}/${MODEL_NAME}_aot_meta.hxx")
+            list(APPEND LARGE_GENERATED_HEADERS "${GEN_HXX}" "${GEN_BENCH}" "${GEN_AOT_META}")
 
             string(REPLACE "@1@" "${ONNX_FILE}"  _ec "${_EMIT_BLOCK}")
             string(REPLACE "@2@" "${MODEL_NAME}" _ec "${_ec}")
             string(APPEND LARGE_EMIT_CAPTURES "${_ec}")
 
-            string(APPEND LARGE_FWD_DECLS
-                "void Benchmark_${MODEL_CPPNAME}(int warmup, int iterations, const std::string& weightsDir);\n")
+            string(APPEND BENCHMARK_FWD_DECLS
+                    "void Benchmark_${MODEL_CPPNAME}(int warmup, int iterations, const std::string& weightsDir, bool profile);\n")
 
             string(APPEND LARGE_SINGLE_MODEL_CASES
                 "    if (model == \"${MODEL_CPPNAME}\") {\n"
-                "        Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir);\n"
+                "        if (run_sofie)\n"
+                "            Benchmark_${MODEL_CPPNAME}(warmup, iterations, weightsDir, profile);\n"
                 "#ifdef SOFIE_BENCHMARK_ORT\n"
                 "        if (run_ort) BenchmarkORT_GPU(\"${ONNX_FILE}\", \"${MODEL_NAME}\", warmup, iterations);\n"
                 "#endif\n"
@@ -687,12 +891,14 @@ if(SOFIE_BENCHMARK_LARGE)
 
         target_link_libraries(sofie_benchmark_large PRIVATE
             SOFIE_core
-            CUDA::cudart_static
-            CUDA::cublas_static
-            CUDA::cublasLt_static
-            CUDA::culibos
+            CUDA::cudart_static      # statically embed libcudart — no .so needed on the pod
+            CUDA::cublas_static      # statically embed libcublas
+            CUDA::cublasLt_static    # statically embed libcublasLt
+            CUDA::culibos            # required companion for static cublas
+            ${NVML_LIBRARY}
+            # ORT intentionally excluded — no static libonnxruntime available
             Threads::Threads
-            $<$<BOOL:${SOFIE_NVML_LIBRARY}>:${SOFIE_NVML_LIBRARY}>
+
         )
 
         message(STATUS

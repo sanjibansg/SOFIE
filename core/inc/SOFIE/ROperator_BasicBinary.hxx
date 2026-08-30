@@ -5,6 +5,9 @@
 #include "SOFIE/ROperator.hxx"
 #include "SOFIE/RModel.hxx"
 
+#include <cmath>
+#include <cstdint>
+#include <limits>
 #include <sstream>
 
 namespace SOFIE {
@@ -79,6 +82,9 @@ private:
    std::string fNBroadcastedB;
    std::string fNY;
 
+   bool fHasConstantIntegerExponent = false;
+   int64_t fConstantIntegerExponent = 0;
+
    std::vector<size_t> fShapeA;
    std::vector<size_t> fShapeB;
    std::vector<size_t> fShapeY;
@@ -86,6 +92,35 @@ private:
    std::vector<Dim> fDimShapeA;
    std::vector<Dim> fDimShapeB;
    std::vector<Dim> fDimShapeY;
+
+   std::string GetPowExpr(const std::string &base, const std::string &exponent) const
+   {
+      if (!fHasConstantIntegerExponent)
+         return "std::pow(" + base + "," + exponent + ")";
+
+      const int64_t n = fConstantIntegerExponent;
+
+      if (n == 0)
+         return "static_cast<T>(1)";
+      if (n == 1)
+         return base;
+      if (n == -1)
+         return "(static_cast<T>(1) / (" + base + "))";
+      if (n == 2)
+         return "((" + base + ") * (" + base + "))";
+      if (n == 3)
+         return "((" + base + ") * (" + base + ") * (" + base + "))";
+      if (n == 4)
+         return "(((" + base + ") * (" + base + ")) * ((" + base + ") * (" + base + ")))";
+
+      const std::string magnitude =
+         "std::pow(std::abs(" + base + "), static_cast<T>(" + std::to_string(n) + "))";
+
+      if (n % 2 == 0)
+         return magnitude;
+
+      return "std::copysign(" + magnitude + ", " + base + ")";
+   }
 
 public:
    ROperator_BasicBinary() {}
@@ -131,6 +166,21 @@ public:
          fShapeB = model.GetTensorShape(fNB);
          fDimShapeB = ConvertShapeToDim(fShapeB);
       }
+
+      if constexpr (Op == EBasicBinaryOperator::Pow) {
+         if (model.IsInitializedTensor(fNB) && ConvertShapeToLength(fShapeB) == 1) {
+            const auto *data = static_cast<T *>(model.GetInitializedTensorData(fNB).get());
+            const T exponent = data[0];
+
+            if (std::isfinite(exponent) && std::trunc(exponent) == exponent &&
+                exponent >= static_cast<T>(std::numeric_limits<int64_t>::min()) &&
+                exponent <= static_cast<T>(std::numeric_limits<int64_t>::max())) {
+               fHasConstantIntegerExponent = true;
+               fConstantIntegerExponent = static_cast<int64_t>(exponent);
+            }
+         }
+      }
+
       if (dynamicInputs & 1 && model.Verbose())
          std::cout << BinaryOperatorTrait<T, Op>::Name() << " : input " << fNA << " is dynamic "
                    << ConvertDimShapeToString(fDimShapeA) << std::endl;
@@ -497,50 +547,46 @@ public:
             if (fShapeB[i] != fShapeY[i]) { isBContiguous = false; break; }
       }
 
-      std::string flattened_index_A = "";
-      std::string flattened_index_B = "";
+      auto buildBroadcastIndex = [&](const std::vector<size_t> &inputShape, const std::vector<size_t> &inputStrides, bool isScalar, bool isContiguous) {
+         if (isScalar) return std::string("0");
+         if (isContiguous) return std::string("idx");
 
-      if (isAScalar) {
-         // A is a single broadcast value
-         flattened_index_A = "0";
-      } else if (isAContiguous) {
-         // A and Y have identical shapes → direct index
-         flattened_index_A = "idx";
-      } else {
-         // General broadcast case: decompose idx into per-dim coords
-         std::string temp = "idx";
-         for (size_t id_s = 0; id_s < fShapeA.size(); ++id_s) {
-            auto strideY = stridesY[id_s];
-            auto strideA = stridesA[id_s];
-            std::string coord = "(int)(" + temp + " / " + std::to_string(strideY) + ")";
-            flattened_index_A += coord + " * " + std::to_string(strideA) + " + ";
-            temp = temp + " - (" + coord + " * " + std::to_string(strideY) + ")";
+         if (inputShape.size() > fShapeY.size())
+            throw std::runtime_error("SOFIE BasicBinary input rank exceeds output rank");
+
+         const size_t rankOffset = fShapeY.size() - inputShape.size();
+         std::string indexExpression;
+
+         for (size_t inputDimIdx = 0; inputDimIdx < inputShape.size(); ++inputDimIdx) {
+            if (inputShape[inputDimIdx] == 1) continue;
+
+            const size_t outputDimIdx = rankOffset + inputDimIdx;
+            std::string coordinate;
+
+            if (stridesY[outputDimIdx] == 1)
+               coordinate = "(idx % " + std::to_string(fShapeY[outputDimIdx]) + ")";
+            else
+               coordinate = "((idx / " + std::to_string(stridesY[outputDimIdx]) + ") % " + std::to_string(fShapeY[outputDimIdx]) + ")";
+
+            if (!indexExpression.empty()) indexExpression += " + ";
+            indexExpression += coordinate;
+
+            if (inputStrides[inputDimIdx] != 1)
+               indexExpression += " * " + std::to_string(inputStrides[inputDimIdx]);
          }
-         if (!flattened_index_A.empty())
-            flattened_index_A.erase(flattened_index_A.size() - 3);
-      }
 
-      if (isBScalar) {
-         // B is a single broadcast value
-         flattened_index_B = "0";
-      } else if (isBContiguous) {
-         // B and Y have identical shapes → direct index
-         flattened_index_B = "idx";
-      } else {
-         // General broadcast case
-         std::string temp = "idx";
-         for (size_t id_s = 0; id_s < fShapeB.size(); ++id_s) {
-            auto strideY = stridesY[id_s];
-            auto strideB = stridesB[id_s];
-            std::string coord = "(int)(" + temp + " / " + std::to_string(strideY) + ")";
-            flattened_index_B += coord + " * " + std::to_string(strideB) + " + ";
-            temp = temp + " - (" + coord + " * " + std::to_string(strideY) + ")";
-         }
-         if (!flattened_index_B.empty())
-            flattened_index_B.erase(flattened_index_B.size() - 3);
-      }
+         return indexExpression.empty() ? std::string("0") : indexExpression;
+      };
 
-      op += "C[idx] = " + BinaryOperatorTrait<T, Op>::Op("A["+flattened_index_A+"]", "B["+flattened_index_B+"]") + ";\n";
+      const std::string flattened_index_A = buildBroadcastIndex(fShapeA, stridesA, isAScalar, isAContiguous);
+      const std::string flattened_index_B = buildBroadcastIndex(fShapeB, stridesB, isBScalar, isBContiguous);
+      const std::string a = "A[" + flattened_index_A + "]";
+      const std::string b = "B[" + flattened_index_B + "]";
+
+      if constexpr (Op == EBasicBinaryOperator::Pow)
+         op += "C[idx] = " + GetPowExpr(a, b) + ";\n";
+      else
+         op += "C[idx] = " + BinaryOperatorTrait<T, Op>::Op(a, b) + ";\n";
       op += "}\n}\n};\n";
       return op;
    }
@@ -579,6 +625,36 @@ public:
       } else {
          return {};
       }
+   }
+
+   EFusionMappingType GetFusionMappingType() const override
+   {
+      if (fIsOutputConstant)
+         return EFusionMappingType::Unsupported;
+
+      // Initial generic fusion support is restricted to static,
+      // equal-shape binary elementwise operations.
+      if (!fShapeY.empty() && fShapeA == fShapeB && fShapeA == fShapeY)
+         return EFusionMappingType::OneToOne;
+
+      // Broadcasting maps one input value to multiple output positions.
+      if (!fShapeY.empty())
+         return EFusionMappingType::OneToMany;
+
+      // Dynamic-shape cases are not supported by the first implementation.
+      return EFusionMappingType::Unsupported;
+   }
+
+   std::string GetFusionExpr(const std::vector<std::string> &inputs) const override
+   {
+      if (fIsOutputConstant || inputs.size() != 2) return "";
+      const auto mapping = GetFusionMappingType();
+      if (mapping != EFusionMappingType::OneToOne && mapping != EFusionMappingType::OneToMany) return "";
+
+      if constexpr (Op == EBasicBinaryOperator::Pow)
+         return GetPowExpr(inputs[0], inputs[1]);
+
+      return BinaryOperatorTrait<T, Op>::Op(inputs[0], inputs[1]);
    }
 
    

@@ -154,8 +154,6 @@ public:
          }
       }
 
-      std::cout << "bias + scale " << ConvertDimShapeToString(fShapeB) << "  " << ConvertDimShapeToString(fShapeScale) << std::endl;
-
       // // Broadcast the bias
       // if (!fNB.empty()) {
       //    fShapeB = model.GetTensorShape(fNB);

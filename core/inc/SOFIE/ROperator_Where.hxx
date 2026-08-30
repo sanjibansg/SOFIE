@@ -354,6 +354,17 @@ public:
                       << "  B=" << ConvertDimShapeToString(fDimShapeY)
                       << " --> Y=" << ConvertDimShapeToString(fDimShapeZ) << "\n";
       }
+
+      // Broadcasted initialized tensors are temporary initialization artifacts.
+      // Runtime CPU/GPU code performs broadcasting directly from the original inputs.
+      if (!fNBroadcastedX.empty() && model.IsInitializedTensor(fNBroadcastedX))
+         model.RemoveInitializedTensor(fNBroadcastedX);
+
+      if (!fNBroadcastedY.empty() && model.IsInitializedTensor(fNBroadcastedY))
+         model.RemoveInitializedTensor(fNBroadcastedY);
+
+      if (!fNBroadcastedC.empty() && model.IsInitializedTensor(fNBroadcastedC))
+         model.RemoveInitializedTensor(fNBroadcastedC);
    }
 
    std::string GenerateInitCode() override {
@@ -606,6 +617,37 @@ public:
       return out.str();
    }
 
+   EFusionMappingType GetFusionMappingType() const override
+   {
+      if (fIsOutputConstant || fShapeX.empty() || fShapeY.empty() || fShapeC.empty() || fShapeZ.empty())
+         return EFusionMappingType::Unsupported;
+
+      if (fShapeX == fShapeZ && fShapeY == fShapeZ && fShapeC == fShapeZ)
+         return EFusionMappingType::OneToOne;
+
+      return EFusionMappingType::OneToMany;
+   }
+
+   bool SupportsFusionTypes(const std::vector<ETensorType> &inputTypes, ETensorType outputType) const override
+   {
+      return inputTypes.size() == 3 &&
+             inputTypes[0] == outputType &&
+             inputTypes[1] == outputType &&
+             inputTypes[2] == ETensorType::BOOL;
+   }
+
+   std::string GetFusionExpr(const std::vector<std::string> &inputs) const override
+   {
+      if (fIsOutputConstant || inputs.size() != 3)
+         return "";
+
+      const auto mapping = GetFusionMappingType();
+
+      if (mapping != EFusionMappingType::OneToOne && mapping != EFusionMappingType::OneToMany)
+         return "";
+
+      return "(" + inputs[2] + " ? " + inputs[0] + " : " + inputs[1] + ")";
+   }
 };
 
 }//SOFIE

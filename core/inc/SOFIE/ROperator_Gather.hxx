@@ -277,89 +277,72 @@ public:
    }
 
 std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
-    if (fIsOutputConstant) return "";
-    opName = "op_" + opName;
-    if (fShapeY.empty())
-        throw std::runtime_error("SOFIE Gather Op called to Generate without being initialized first");
+   if (fIsOutputConstant) return "";
+   opName = "op_" + opName;
 
-    const std::size_t D  = fShapeY.size();   // output rank = q + r - 1
-    const std::size_t r  = fShapeX.size();
-    const std::size_t q  = fShapeIndices.size();
+   const std::size_t D = fShapeY.size();
+   const std::size_t r = fShapeX.size();
+   const std::size_t q = fShapeIndices.size();
 
-    auto stridesY       = UTILITY::ComputeStrideFromShape(fShapeY);
-    auto stridesX       = UTILITY::ComputeStrideFromShape(fShapeX);
-    auto stridesIndices = UTILITY::ComputeStrideFromShape(fShapeIndices);
+   std::string kname = "GatherKernel_" + opName;
 
-    std::string kname = "GatherKernel_" + opName;
+   std::string op;
+   op = "\n//------ GATHER_KERNEL_ALPAKA\n";
+   op += SP + "struct " + kname + " {\n";
+   op += SP + SP + "template<typename TAcc, typename T>\n";
+   op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
+   op += SP + SP + SP + "TAcc const& acc,\n";
+   op += SP + SP + SP + "T const* __restrict__ input,\n";
+   op += SP + SP + SP + "int64_t const* __restrict__ indices,\n";
+   op += SP + SP + SP + "T* __restrict__ output,\n";
+   op += SP + SP + SP + "std::array<std::size_t, " + std::to_string(D) + "> const stridesY,\n";
+   op += SP + SP + SP + "std::array<std::size_t, " + std::to_string(D) + "> const shapeY,\n";
+   op += SP + SP + SP + "std::array<std::size_t, " + std::to_string(r) + "> const stridesX,\n";
+   op += SP + SP + SP + "std::array<std::size_t, " + std::to_string(q) + "> const stridesIndices,\n";
+   op += SP + SP + SP + "std::size_t const axisDim,\n";
+   op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
 
-    std::string op;
-    op  = "\n//------ GATHER_KERNEL_ALPAKA\n";
-    op += SP + "struct " + kname + " {\n";
-    op += SP + SP + "template<typename TAcc, typename T>\n";
-    op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
-    op += SP + SP + SP + "TAcc const& acc,\n";
-    op += SP + SP + SP + "T const* __restrict__ input,\n";
-    op += SP + SP + SP + "int64_t const* __restrict__ indices,\n";
-    op += SP + SP + SP + "T* __restrict__ output,\n";
-    op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
+   op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+   op += SP + SP + SP + "if (global_thread_idx >= totalElements) return;\n";
+   op += SP + SP + SP + "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
 
-    op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
-    op += SP + SP + SP + "if (global_thread_idx >= totalElements) return;\n";
-    op += SP + SP + SP + "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
+   op += SP + SP + SP + "for (std::size_t elem_idx = global_thread_idx; elem_idx < totalElements; elem_idx += grid_thread_extent) {\n\n";
 
-    op += SP + SP + SP + "for (std::size_t elem_idx = global_thread_idx; elem_idx < totalElements; elem_idx += grid_thread_extent) {\n\n";
+   for (std::size_t d = 0; d < D; ++d)
+      op += SP + SP + SP + SP + "std::size_t const out_" + std::to_string(d) + " = (elem_idx / stridesY[" + std::to_string(d) + "]) % shapeY[" + std::to_string(d) + "];\n";
 
-    for (std::size_t d = 0; d < D; ++d) {
-        op += SP + SP + SP + SP + "std::size_t const out_" + std::to_string(d)
-            + " = (elem_idx / " + stridesY[d].GetVal() + "u) % "
-            + fShapeY[d].GetVal() + "u;\n";
-    }
-    op += "\n";
+   op += "\n";
 
-    // Output dims [axis ... axis+q) correspond to the indices tensor dims [0 ... q)
-    // so i_index = sum over i in [0,q): out_{axis+i} * stridesIndices[i]
-    if (q == 0) {
-        op += SP + SP + SP + SP + "std::size_t const i_index = 0u;\n";
-    } else {
-        op += SP + SP + SP + SP + "std::size_t const i_index =\n";
-        for (std::size_t i = 0; i < q; ++i) {
-            op += SP + SP + SP + SP + SP
-                + "out_" + std::to_string(fAttrAxis + i)
-                + " * " + stridesIndices[i].GetVal() + "u";
-            op += (i + 1 < q) ? " +\n" : ";\n";
-        }
-    }
-    op += "\n";
+   if (q == 0) {
+      op += SP + SP + SP + SP + "std::size_t const i_index = 0u;\n";
+   } else {
+      op += SP + SP + SP + SP + "std::size_t const i_index =\n";
+      for (std::size_t i = 0; i < q; ++i) {
+         op += SP + SP + SP + SP + SP + "out_" + std::to_string(fAttrAxis + i) + " * stridesIndices[" + std::to_string(i) + "]";
+         op += (i + 1 < q) ? " +\n" : ";\n";
+      }
+   }
 
-    op += SP + SP + SP + SP + "int64_t k = indices[i_index];\n";
-    op += SP + SP + SP + SP + "if (k < 0) k += " + fShapeX[fAttrAxis].GetVal() + ";\n";
-    op += SP + SP + SP + SP + "if (k < 0) k = 0;\n";
-    op += SP + SP + SP + SP + "if (k >= static_cast<int64_t>(" + fShapeX[fAttrAxis].GetVal() + ")) "
-        + "k = static_cast<int64_t>(" + fShapeX[fAttrAxis].GetVal() + ") - 1;\n\n";
+   op += "\n";
+   op += SP + SP + SP + SP + "int64_t k = indices[i_index];\n";
+   op += SP + SP + SP + SP + "if (k < 0) k += static_cast<int64_t>(axisDim);\n";
+   op += SP + SP + SP + SP + "if (k < 0) k = 0;\n";
+   op += SP + SP + SP + SP + "if (k >= static_cast<int64_t>(axisDim)) k = static_cast<int64_t>(axisDim) - 1;\n\n";
 
-    // x_index = k * stridesX[axis]
-    //         + sum over j in [0, axis):   out_j          * stridesX[j]
-    //         + sum over j in [axis+1, r): out_{j-1+q}    * stridesX[j]
-    // (the dims after axis in Y are shifted by q-1 relative to X)
-    op += SP + SP + SP + SP + "std::size_t const input_idx =\n";
-    op += SP + SP + SP + SP + SP + "static_cast<std::size_t>(k) * " + stridesX[fAttrAxis].GetVal() + "u";
-    for (std::size_t j = 0; j < static_cast<std::size_t>(fAttrAxis); ++j) {
-        op += " +\n" + SP + SP + SP + SP + SP
-            + "out_" + std::to_string(j) + " * " + stridesX[j].GetVal() + "u";
-    }
-    for (std::size_t j = fAttrAxis + 1; j < r; ++j) {
-        // in Y, the coord for X's dim j lives at output dim q + j - 1
-        op += " +\n" + SP + SP + SP + SP + SP
-            + "out_" + std::to_string(q + j - 1) + " * " + stridesX[j].GetVal() + "u";
-    }
-    op += ";\n\n";
+   op += SP + SP + SP + SP + "std::size_t const input_idx =\n";
+   op += SP + SP + SP + SP + SP + "static_cast<std::size_t>(k) * stridesX[" + std::to_string(fAttrAxis) + "]";
+   for (std::size_t j = 0; j < static_cast<std::size_t>(fAttrAxis); ++j)
+      op += " +\n" + SP + SP + SP + SP + SP + "out_" + std::to_string(j) + " * stridesX[" + std::to_string(j) + "]";
+   for (std::size_t j = fAttrAxis + 1; j < r; ++j)
+      op += " +\n" + SP + SP + SP + SP + SP + "out_" + std::to_string(q + j - 1) + " * stridesX[" + std::to_string(j) + "]";
+   op += ";\n\n";
 
-    op += SP + SP + SP + SP + "output[elem_idx] = input[input_idx];\n";
-    op += SP + SP + SP + "}\n";
-    op += SP + SP + "}\n";
-    op += SP + "};\n";
+   op += SP + SP + SP + SP + "output[elem_idx] = input[input_idx];\n";
+   op += SP + SP + SP + "}\n";
+   op += SP + SP + "}\n";
+   op += SP + "};\n";
 
-    return op;
+   return op;
 }
 
 std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
@@ -370,29 +353,63 @@ std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override 
 }
 
 std::string Generate_GPU_ALPAKA(std::string opName) override {
-    if (fIsOutputConstant) return "";
-    opName = "op_" + opName;
-    if (fShapeY.empty())
-        throw std::runtime_error("SOFIE Gather Op called to Generate without being initialized first");
+   if (fIsOutputConstant) return "";
+   opName = "op_" + opName;
 
-    auto totalElements = ConvertDimShapeToLength(fShapeY);
-    std::string kname = "gatherKernel_" + opName;
+   auto stridesY = UTILITY::ComputeStrideFromShape(fShapeY);
+   auto stridesX = UTILITY::ComputeStrideFromShape(fShapeX);
+   auto stridesIndices = UTILITY::ComputeStrideFromShape(fShapeIndices);
+   std::string totalElements = ConvertDimShapeToLength(fShapeY);
+   std::string kname = "gatherKernel_" + opName;
 
-    std::stringstream out;
-    out << "\n//------ GATHER_GPU_ALPAKA\n";
-    out << SP << "auto const elementsPerThread_" << opName << " = Vec::all(static_cast<Idx>(1));\n";
-    out << SP << "auto const elementsPerGrid_"   << opName << " = Vec::all(Idx{" << totalElements << "});\n";
-    out << SP << "auto const workDiv_" << opName << " = sofie_workdiv(elementsPerGrid_" << opName << ");\n";
-    out << SP << "auto task_" << opName << " = alpaka::createTaskKernel<Acc>(workDiv_" << opName
-        << ", " << kname
-        << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
-        << ", alpaka::getPtrNative(deviceBuf_" << fNIndices << ")"
-        << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
-        << ", static_cast<Idx>(" << totalElements << "));\n";
-    out << SP << "alpaka::enqueue(queue, task_" << opName << ");\n";
-    return out.str();
+   std::stringstream out;
+   out << "\n//------ GATHER_GPU_ALPAKA\n";
+
+   out << SP << "std::array<std::size_t, " << fShapeY.size() << "> stridesY_" << opName << " = {";
+   for (size_t i = 0; i < stridesY.size(); ++i) {
+      if (i > 0) out << ", ";
+      out << stridesY[i].GetVal();
+   }
+   out << "};\n";
+
+   out << SP << "std::array<std::size_t, " << fShapeY.size() << "> shapeY_" << opName << " = {";
+   for (size_t i = 0; i < fShapeY.size(); ++i) {
+      if (i > 0) out << ", ";
+      out << fShapeY[i].GetVal();
+   }
+   out << "};\n";
+
+   out << SP << "std::array<std::size_t, " << fShapeX.size() << "> stridesX_" << opName << " = {";
+   for (size_t i = 0; i < stridesX.size(); ++i) {
+      if (i > 0) out << ", ";
+      out << stridesX[i].GetVal();
+   }
+   out << "};\n";
+
+   out << SP << "std::array<std::size_t, " << fShapeIndices.size() << "> stridesIndices_" << opName << " = {";
+   for (size_t i = 0; i < stridesIndices.size(); ++i) {
+      if (i > 0) out << ", ";
+      out << stridesIndices[i].GetVal();
+   }
+   out << "};\n";
+
+   out << SP << "auto const elementsPerGrid_" << opName << " = Vec::all(Idx{" << totalElements << "});\n";
+   out << SP << "auto const workDiv_" << opName << " = sofie_workdiv(elementsPerGrid_" << opName << ");\n";
+   out << SP << "auto task_" << opName << " = alpaka::createTaskKernel<Acc>(workDiv_" << opName
+       << ", " << kname
+       << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
+       << ", alpaka::getPtrNative(deviceBuf_" << fNIndices << ")"
+       << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
+       << ", stridesY_" << opName
+       << ", shapeY_" << opName
+       << ", stridesX_" << opName
+       << ", stridesIndices_" << opName
+       << ", static_cast<std::size_t>(" << fShapeX[fAttrAxis].GetVal() << ")"
+       << ", static_cast<Idx>(" << totalElements << "));\n";
+   out << SP << "alpaka::enqueue(queue, task_" << opName << ");\n";
+
+   return out.str();
 }
-
 };
 
 }//SOFIE

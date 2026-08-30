@@ -31,6 +31,7 @@ private:
     std::vector<size_t> fShapeX;
     std::vector<size_t> fShapeY;
     std::vector<size_t> fShapeYNotPruned; // needed for fKeepdims=0
+    bool fInitialized = false;
 
 
 public:
@@ -88,12 +89,9 @@ public:
          auto ax = fAttrAxes;
          std::sort(ax.begin(), ax.end());
          for (size_t j = 0; j < ax.size(); j++) {
-            // erase reduced dimensions, but keep last one
-            if (outputShape.size() > 1) {
-               outputShape.erase(outputShape.begin() + ax[j]);
-               for (size_t k = j+1; k < ax.size(); k++)
-                  ax[k] -= 1;  // decrease by one since we have removed a value
-            }
+            outputShape.erase(outputShape.begin() + ax[j]);
+            for (size_t k = j + 1; k < ax.size(); k++)
+               ax[k] -= 1;  // decrease by one since we have removed a value
          }
       }
       return ret;
@@ -127,16 +125,116 @@ public:
          std::cout << Name() << " : " << fNX << " -> " << fNY << " shape " << ConvertShapeToString(fShapeY) << std::endl;
       }
       model.AddNeededStdLib("algorithm");
+      fInitialized = true;
+   }
+
+   EFusionMappingType GetFusionMappingType() const override
+   {
+      return fInitialized ? EFusionMappingType::ManyToMany : EFusionMappingType::Unsupported;
+   }
+
+   std::vector<size_t> GetFusionDataInputIndices() const override
+   {
+      return {0};
+   }
+
+   bool IsFusionReduction() const override { return fInitialized; }
+
+   std::string GetFusionReductionInitExpr() const override
+   {
+      if (fReduceOpMode == ReduceProd)
+         return "static_cast<T>(1)";
+      if (fReduceOpMode == ReduceMax)
+         return "std::numeric_limits<T>::lowest()";
+      return "static_cast<T>(0)";
+   }
+
+   std::string GetFusionReductionAccumulateExpr(const std::string &accumulator, const std::string &value) const override
+   {
+      if (fReduceOpMode == ReduceProd)
+         return "((" + accumulator + ") * (" + value + "))";
+      if (fReduceOpMode == ReduceSumSquare || fReduceOpMode == ReduceL2)
+         return "((" + accumulator + ") + (" + value + ") * (" + value + "))";
+      if (fReduceOpMode == ReduceMax)
+         return "((" + value + ") > (" + accumulator + ") ? (" + value + ") : (" + accumulator + "))";
+      return "((" + accumulator + ") + (" + value + "))";
+   }
+
+   std::string GetFusionReductionCombineExpr(const std::string &left, const std::string &right) const override
+   {
+      if (fReduceOpMode == ReduceProd)
+         return "((" + left + ") * (" + right + "))";
+      if (fReduceOpMode == ReduceMax)
+         return "((" + right + ") > (" + left + ") ? (" + right + ") : (" + left + "))";
+      return "((" + left + ") + (" + right + "))";
+   }
+
+   std::string GetFusionReductionFinalizeExpr(const std::string &accumulator, size_t reducedLength) const override
+   {
+      if (fReduceOpMode == ReduceMean)
+         return "((" + accumulator + ") / static_cast<T>(" + std::to_string(reducedLength) + "u))";
+      if (fReduceOpMode == ReduceL2)
+         return "std::sqrt(" + accumulator + ")";
+      return accumulator;
+   }
+
+   std::string GetFusionReductionInputIndexExpr(const std::string &outputIndex, const std::string &reductionIndex,
+      const std::vector<size_t> &inputShape, const std::vector<size_t> &outputShape) const override
+   {
+      if (!fInitialized || inputShape != fShapeX || outputShape != fShapeY)
+         return "";
+
+      const auto inputStrides = UTILITY::ComputeStrideFromShape(fShapeX);
+      const auto outputStrides = UTILITY::ComputeStrideFromShape(fShapeYNotPruned);
+      std::vector<size_t> reducedAxes;
+
+      for (size_t dim = 0; dim < fShapeX.size(); ++dim) {
+         if (std::find(fAttrAxes.begin(), fAttrAxes.end(), static_cast<int64_t>(dim)) != fAttrAxes.end())
+            reducedAxes.push_back(dim);
+      }
+
+      if (reducedAxes.empty())
+         return "";
+
+      std::vector<size_t> reductionStrides(reducedAxes.size(), 1);
+      for (int axisIdx = static_cast<int>(reducedAxes.size()) - 2; axisIdx >= 0; --axisIdx)
+         reductionStrides[axisIdx] = reductionStrides[axisIdx + 1] * fShapeX[reducedAxes[axisIdx + 1]];
+
+      std::string expression;
+
+      for (size_t dim = 0; dim < fShapeX.size(); ++dim) {
+         const auto reducedIt = std::find(reducedAxes.begin(), reducedAxes.end(), dim);
+         std::string coordinate;
+
+         if (reducedIt != reducedAxes.end()) {
+            const size_t reducedIdx = static_cast<size_t>(std::distance(reducedAxes.begin(), reducedIt));
+            coordinate = "((" + reductionIndex + " / " + std::to_string(reductionStrides[reducedIdx]) + "u) % " +
+                         std::to_string(fShapeX[dim]) + "u)";
+         } else {
+            coordinate = "((" + outputIndex + " / " + std::to_string(outputStrides[dim]) + "u) % " +
+                         std::to_string(fShapeYNotPruned[dim]) + "u)";
+         }
+
+         if (!expression.empty())
+            expression += " + ";
+
+         expression += coordinate;
+         if (inputStrides[dim] != 1)
+            expression += " * " + std::to_string(inputStrides[dim]) + "u";
+      }
+
+      return expression;
    }
 
    std::string Generate(std::string opName) override {
       opName = "op_" + opName;
-      if (fShapeX.empty() || fShapeY.empty()) {
+      if (!fInitialized) {
          throw std::runtime_error("SOFIE Reduce Op called to Generate without being initialized first");
       }
 
       size_t inputLength = SOFIE::ConvertShapeToLength(fShapeX);
       size_t outputLength = SOFIE::ConvertShapeToLength(fShapeY);
+      const std::string typeName = ConvertTypeToString(GetTemplatedType(T{}));
 
       auto inputStrides = SOFIE::UTILITY::ComputeStrideFromShape(fShapeX);
       // output stride (or not pruned vector)
@@ -187,7 +285,7 @@ public:
          if (fReduceOpMode == ReduceProd)
             out << SP << SP << "tensor_" << fNY << "[i] = 1;\n";
          else if (fReduceOpMode == ReduceMax)
-            out << SP << SP << "tensor_" << fNY << "[i] = std::numeric_limits<float>::lowest();\n";
+            out << SP << SP << "tensor_" << fNY << "[i] = std::numeric_limits<" << typeName << ">::lowest();\n";
          else
             out << SP << SP << "tensor_" << fNY << "[i] = 0;\n";
          out << SP << SP << "for (size_t j = 0; j < " << reducedLength << "; j++) {\n";
@@ -204,7 +302,7 @@ public:
                 << SP << SP << SP << SP << "tensor_" << fNY << "[i] = tensor_" << fNX << "[i * " << reducedLength << " + j];\n";
          out << SP << SP << "}\n"; // end j loop
          if(fReduceOpMode == ReduceMean)
-            out << SP << SP << "tensor_" << fNY << "[i] /= static_cast<float>(" << reducedLength << ");\n";
+            out << SP << SP << "tensor_" << fNY << "[i] /= static_cast<" << typeName << ">(" << reducedLength << ");\n";
          else if (fReduceOpMode == ReduceL2)
             out << SP << SP << "tensor_" << fNY << "[i] = std::sqrt(tensor_" << fNY << "[i]);\n";
 
@@ -216,8 +314,8 @@ public:
          if (fReduceOpMode == ReduceProd)
             out << SP << "std::fill(tensor_" << fNY <<", tensor_"<< fNY <<" + "<< outputLength << ", 1);\n";
          else if (fReduceOpMode == ReduceMax)
-            out << SP << "std::fill(tensor_" << fNY <<", tensor_"<< fNY <<" + "<< outputLength
-                      << ", std::numeric_limits<float>::lowest());\n";
+            out << SP << "std::fill(tensor_" << fNY << ", tensor_" << fNY << " + " << outputLength
+                      << ", std::numeric_limits<" << typeName << ">::lowest());\n";
          else
             out << SP << "std::fill(tensor_" << fNY <<", tensor_"<< fNY <<" + "<< outputLength << ", 0);\n";
 
@@ -238,7 +336,7 @@ public:
          out << SP  << "}\n"; // end i loop
          if(fReduceOpMode == ReduceMean) {
             out << SP  << "for (size_t j = 0; j < " << outputLength << "; j++) {\n";
-            out << SP << SP << "tensor_" << fNY << "[j] /= static_cast<float>(" << reducedLength << ");\n";
+            out << SP << SP << "tensor_" << fNY << "[j] /= static_cast<" << typeName << ">(" << reducedLength << ");\n";
             out << SP << "}\n"; // end j loop
          } else if (fReduceOpMode == ReduceL2) {
             out << SP  << "for (size_t j = 0; j < " << outputLength << "; j++) {\n";
@@ -253,8 +351,8 @@ public:
          if (fReduceOpMode == ReduceProd)
             out << SP << "std::fill(tensor_" << fNY <<", tensor_"<< fNY <<" + "<< outputLength << ", 1);\n";
          else if (fReduceOpMode == ReduceMax)
-            out << SP << "std::fill(tensor_" << fNY <<", tensor_"<< fNY <<" + "<< outputLength
-                      << ", std::numeric_limits<float>::lowest());\n";
+            out << SP << "std::fill(tensor_" << fNY << ", tensor_" << fNY << " + " << outputLength
+                      << ", std::numeric_limits<" << typeName << ">::lowest());\n";
          else
             out << SP << "std::fill(tensor_" << fNY <<", tensor_"<< fNY <<" + "<< outputLength << ",0);\n";
 
@@ -288,7 +386,7 @@ public:
          // post-processing passes
          if (fReduceOpMode == ReduceMean) {
             out << SP << "for (size_t i = 0; i < " << outputLength << "; i++) {\n";
-            out << SP << SP << "tensor_" << fNY << "[i] /= static_cast<float>(" << reducedLength << ");\n";
+            out << SP << SP << "tensor_" << fNY << "[i] /= static_cast<" << typeName << ">(" << reducedLength << ");\n";
             out << SP << "}\n";
          } else if (fReduceOpMode == ReduceL2) {
             out << SP << "for (size_t i = 0; i < " << outputLength << "; i++) {\n";
@@ -307,7 +405,7 @@ public:
    // which serialised the entire reduction loop inside a single thread.
    // ---------------------------------------------------------------------------
    std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) override {
-      if (fShapeX.empty() || fShapeY.empty())
+      if (!fInitialized)
          throw std::runtime_error("SOFIE Reduce Op called to Generate without being initialized first");
 
       const std::size_t Dx        = fShapeX.size();
@@ -440,7 +538,7 @@ public:
    }
 
    std::string Generate_GPU_ALPAKA(std::string /*opName*/) override {
-      if (fShapeX.empty() || fShapeY.empty())
+      if (!fInitialized)
          throw std::runtime_error("SOFIE Reduce Op called to Generate without being initialized first");
 
       std::size_t inputLength   = ConvertShapeToLength(fShapeX);

@@ -105,6 +105,68 @@ public:
       }
    }
 
+   EFusionMappingType GetFusionMappingType() const override
+   {
+      if (fInputShape.empty() || fOutputShapes.empty())
+         return EFusionMappingType::Unsupported;
+
+      return EFusionMappingType::OneToMany;
+   }
+
+   std::vector<size_t> GetFusionDataInputIndices() const override
+   {
+      return {0};
+   }
+
+   bool SupportsFusionTypes(const std::vector<ETensorType> &inputTypes, ETensorType outputType) const override
+   {
+      return inputTypes.size() == 1 && inputTypes[0] == outputType;
+   }
+
+   std::string GetFusionExpr(const std::vector<std::string> &inputs) const override
+   {
+      if (inputs.size() != 1)
+         return "";
+
+      return inputs[0];
+   }
+
+   std::string GetFusionInputIndexExprForOutput(size_t inputIndex, size_t outputTensorIndex,
+                                                const std::string &outputIndex,
+                                                const std::vector<size_t> &inputShape,
+                                                const std::vector<size_t> &outputShape) const override
+   {
+      if (inputIndex != 0 || outputTensorIndex >= fOutputShapes.size())
+         return "";
+
+      if (inputShape != fInputShape || outputShape != fOutputShapes[outputTensorIndex])
+         return "";
+
+      const auto inputStrides = UTILITY::ComputeStrideFromShape(inputShape);
+      const auto outputStrides = UTILITY::ComputeStrideFromShape(outputShape);
+
+      size_t axisOffset = 0;
+      for (size_t i = 0; i < outputTensorIndex; ++i)
+         axisOffset += static_cast<size_t>(fSplit[i]);
+
+      std::string expression;
+
+      for (size_t dim = 0; dim < outputShape.size(); ++dim) {
+         if (!expression.empty())
+            expression += " + ";
+
+         std::string coordinate =
+            "((" + outputIndex + " / " + std::to_string(outputStrides[dim]) + "u) % " +
+            std::to_string(outputShape[dim]) + "u)";
+
+         if (dim == static_cast<size_t>(fAxis) && axisOffset != 0)
+            coordinate = "(" + coordinate + " + " + std::to_string(axisOffset) + "u)";
+
+         expression += coordinate + " * " + std::to_string(inputStrides[dim]) + "u";
+      }
+
+      return "(" + expression + ")";
+   }
 
    std::string Generate(std::string OpName) override {
       OpName = "op_" + OpName;

@@ -308,6 +308,37 @@ public:
       return out.str();
    }
 
+   EFusionMappingType GetFusionMappingType() const override
+   {
+      if (fIsOutputConstant || fShapeX1.empty() || fShapeX2.empty() || fShapeY.empty())
+         return EFusionMappingType::Unsupported;
+
+      if (fShapeX1 == fShapeY && fShapeX2 == fShapeY)
+         return EFusionMappingType::OneToOne;
+
+      return EFusionMappingType::OneToMany;
+   }
+
+   bool SupportsFusionTypes(const std::vector<ETensorType> &inputTypes, ETensorType outputType) const override
+   {
+      return inputTypes.size() == 2 &&
+             inputTypes[0] == fTensorType1 &&
+             inputTypes[1] == fTensorType2 &&
+             outputType == ETensorType::BOOL;
+   }
+
+   std::string GetFusionExpr(const std::vector<std::string> &inputs) const override
+   {
+      if (fIsOutputConstant || inputs.size() != 2)
+         return "";
+
+      const auto mapping = GetFusionMappingType();
+
+      if (mapping != EFusionMappingType::OneToOne && mapping != EFusionMappingType::OneToMany)
+         return "";
+
+      return "(" + ComparisionTrait<T, Op>::Op(inputs[0], inputs[1]) + ")";
+   }
 };
 
 }//SOFIE
