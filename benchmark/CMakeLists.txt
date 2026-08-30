@@ -27,6 +27,15 @@ option(SOFIE_BENCHMARK_AOT "Enable PyTorch AOTInductor benchmark comparison" OFF
 
 option(SOFIE_BENCHMARK_MAMBA_AOT "Enable Mamba custom-op support for AOTInductor" OFF)
 
+set(ONNXRUNTIME_ROOT "" CACHE PATH
+        "Optional ONNX Runtime installation root")
+
+set(TENSORRT_ROOT "" CACHE PATH
+        "Optional TensorRT installation root")
+
+set(MAMBA_SELECTIVE_SCAN_LIBRARY "" CACHE FILEPATH
+        "Optional path to the selective_scan_cuda shared library used by Mamba AOT")
+
 option(SOFIE_BENCHMARK_PROFILE
     "Enable per-operator GPU profiling (per-op timing + memory breakdown). \
 Mutually exclusive with throughput benchmarking — rebuild without this flag \
@@ -94,8 +103,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Discover models
 ################################################################################
 
-set(SOFIE_BENCHMARK_MODEL_DIR "models" CACHE STRING "Directory under benchmark/ containing ONNX benchmark models")
-set(BENCHMARK_MODEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/${SOFIE_BENCHMARK_MODEL_DIR}")
+set(SOFIE_BENCHMARK_MODEL_DIR "models" CACHE STRING
+        "Directory containing ONNX benchmark models. Relative paths are resolved under benchmark/.")
+
+if(IS_ABSOLUTE "${SOFIE_BENCHMARK_MODEL_DIR}")
+    set(BENCHMARK_MODEL_DIR "${SOFIE_BENCHMARK_MODEL_DIR}")
+else()
+    set(BENCHMARK_MODEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/${SOFIE_BENCHMARK_MODEL_DIR}")
+endif()
 
 file(GLOB BENCHMARK_ONNX_MODELS "${BENCHMARK_MODEL_DIR}/*.onnx")
 
@@ -178,7 +193,7 @@ if(SOFIE_BENCHMARK_ORT)
     # where we tell it, and fall through to manual on failure.
 
     set(_ort_search_roots "")
-    if(DEFINED ONNXRUNTIME_ROOT)
+    if(ONNXRUNTIME_ROOT)
         list(APPEND _ort_search_roots "${ONNXRUNTIME_ROOT}")
     endif()
     list(APPEND _ort_search_roots
@@ -218,9 +233,44 @@ if(SOFIE_BENCHMARK_ORT AND NOT SOFIE_ORT_FOUND)
 endif()
 
 if(SOFIE_BENCHMARK_TRT)
-    find_library(NVINFER_LIBRARY nvinfer REQUIRED)
-    find_library(NVONNXPARSER_LIBRARY nvonnxparser REQUIRED)
-    find_library(NVINFER_PLUGIN_LIBRARY nvinfer_plugin REQUIRED)
+    set(_trt_search_roots "")
+    if(TENSORRT_ROOT)
+        list(APPEND _trt_search_roots "${TENSORRT_ROOT}")
+    endif()
+
+    find_path(TENSORRT_INCLUDE_DIR
+            NAMES NvInfer.h
+            HINTS ${_trt_search_roots}
+            PATH_SUFFIXES include include/x86_64-linux-gnu)
+
+    find_library(NVINFER_LIBRARY
+            NAMES nvinfer
+            HINTS ${_trt_search_roots}
+            PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu)
+
+    find_library(NVONNXPARSER_LIBRARY
+            NAMES nvonnxparser
+            HINTS ${_trt_search_roots}
+            PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu)
+
+    find_library(NVINFER_PLUGIN_LIBRARY
+            NAMES nvinfer_plugin
+            HINTS ${_trt_search_roots}
+            PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu)
+
+    if(NOT TENSORRT_INCLUDE_DIR OR
+            NOT NVINFER_LIBRARY OR
+            NOT NVONNXPARSER_LIBRARY OR
+            NOT NVINFER_PLUGIN_LIBRARY)
+        message(FATAL_ERROR
+                "SOFIE Benchmark: TensorRT was requested but could not be found. "
+                "Install TensorRT or set -DTENSORRT_ROOT=<path>.")
+    endif()
+
+    get_filename_component(TENSORRT_LIBRARY_DIR "${NVINFER_LIBRARY}" DIRECTORY)
+
+    message(STATUS "SOFIE Benchmark: TensorRT headers = ${TENSORRT_INCLUDE_DIR}")
+    message(STATUS "SOFIE Benchmark: TensorRT nvinfer = ${NVINFER_LIBRARY}")
 endif()
 
 if(SOFIE_BENCHMARK_AOT)
@@ -479,23 +529,36 @@ if(SOFIE_BENCHMARK_MAMBA_AOT)
     get_filename_component(_torch_package_dir "${_torch_share_dir}" DIRECTORY)
     get_filename_component(_torch_site_packages "${_torch_package_dir}" DIRECTORY)
 
-    file(GLOB MAMBA_SELECTIVE_SCAN_LIBS "${_torch_site_packages}/selective_scan_cuda*${CMAKE_SHARED_LIBRARY_SUFFIX}")
-    list(LENGTH MAMBA_SELECTIVE_SCAN_LIBS _mamba_selective_scan_count)
+    if(MAMBA_SELECTIVE_SCAN_LIBRARY)
+        if(NOT EXISTS "${MAMBA_SELECTIVE_SCAN_LIBRARY}")
+            message(FATAL_ERROR
+                    "SOFIE Benchmark: MAMBA_SELECTIVE_SCAN_LIBRARY does not exist: "
+                    "${MAMBA_SELECTIVE_SCAN_LIBRARY}")
+        endif()
+    else()
+        file(GLOB MAMBA_SELECTIVE_SCAN_LIBS
+                "${_torch_site_packages}/selective_scan_cuda*${CMAKE_SHARED_LIBRARY_SUFFIX}")
+        list(LENGTH MAMBA_SELECTIVE_SCAN_LIBS _mamba_selective_scan_count)
 
-    if(NOT _mamba_selective_scan_count EQUAL 1)
-        message(FATAL_ERROR "SOFIE Benchmark: expected exactly one selective_scan_cuda library next to PyTorch, found ${_mamba_selective_scan_count}")
+        if(NOT _mamba_selective_scan_count EQUAL 1)
+            message(FATAL_ERROR
+                    "SOFIE Benchmark: could not uniquely locate selective_scan_cuda next to PyTorch. "
+                    "Set -DMAMBA_SELECTIVE_SCAN_LIBRARY=/path/to/selective_scan_cuda.so")
+        endif()
+
+        list(GET MAMBA_SELECTIVE_SCAN_LIBS 0 MAMBA_SELECTIVE_SCAN_LIBRARY)
     endif()
 
-    list(GET MAMBA_SELECTIVE_SCAN_LIBS 0 MAMBA_SELECTIVE_SCAN_LIB)
-    get_filename_component(MAMBA_SELECTIVE_SCAN_DIR "${MAMBA_SELECTIVE_SCAN_LIB}" DIRECTORY)
-    get_filename_component(MAMBA_SELECTIVE_SCAN_NAME "${MAMBA_SELECTIVE_SCAN_LIB}" NAME)
+    get_filename_component(MAMBA_SELECTIVE_SCAN_DIR "${MAMBA_SELECTIVE_SCAN_LIBRARY}" DIRECTORY)
+    get_filename_component(MAMBA_SELECTIVE_SCAN_NAME "${MAMBA_SELECTIVE_SCAN_LIBRARY}" NAME)
 
     target_link_directories(sofie_benchmark PRIVATE "${MAMBA_SELECTIVE_SCAN_DIR}")
     target_link_libraries(sofie_benchmark PRIVATE "-Wl,-l:${MAMBA_SELECTIVE_SCAN_NAME}")
-    set_property(TARGET sofie_benchmark APPEND PROPERTY BUILD_RPATH "${MAMBA_SELECTIVE_SCAN_DIR};${_torch_package_dir}/lib")
+    set_property(TARGET sofie_benchmark APPEND PROPERTY BUILD_RPATH
+            "${MAMBA_SELECTIVE_SCAN_DIR};${_torch_package_dir}/lib")
 
     message(STATUS "SOFIE Benchmark: Mamba AOT custom-op support enabled")
-    message(STATUS "SOFIE Benchmark: selective_scan_cuda = ${MAMBA_SELECTIVE_SCAN_LIB}")
+    message(STATUS "SOFIE Benchmark: selective_scan_cuda = ${MAMBA_SELECTIVE_SCAN_LIBRARY}")
 endif()
 
 add_dependencies(sofie_benchmark sofie_benchmark_headers)
@@ -507,6 +570,11 @@ target_include_directories(sofie_benchmark PRIVATE
     "${sofieblas_SOURCE_DIR}/include"
     "${CUDAToolkit_INCLUDE_DIRS}"
 )
+
+if(SOFIE_BENCHMARK_TRT)
+    target_include_directories(sofie_benchmark PRIVATE "${TENSORRT_INCLUDE_DIR}")
+    set_property(TARGET sofie_benchmark APPEND PROPERTY BUILD_RPATH "${TENSORRT_LIBRARY_DIR}")
+endif()
 
 
 if(NOT DEFINED SOFIE_BENCHMARK_CUDA_ARCH OR SOFIE_BENCHMARK_CUDA_ARCH STREQUAL "")

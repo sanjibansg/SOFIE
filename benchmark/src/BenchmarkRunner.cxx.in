@@ -100,14 +100,30 @@ int main(int argc, char *argv[]) {
                 "  --warmup,      -w <N>   Warmup iterations       (default: 10)\n"
                 "  --iterations,  -n <N>   Timed iterations         (default: 100)\n"
                 "  --weights-dir    <DIR>  SOFIE .dat weight files  (default: .)\n"
-#ifdef SOFIE_BENCHMARK_ORT
+                #ifdef SOFIE_BENCHMARK_ORT
                 "  --onnxruntime, --ort    Also run ONNX Runtime GPU comparison\n"
-#else
+                #else
                 "  --onnxruntime, --ort    (not available; rebuild with -DSOFIE_BENCHMARK_ORT=ON)\n"
-#endif
-                "  Rebuild with -DSOFIE_BENCHMARK_PROFILE=ON for per-operator profiling.\n"
+                #endif
+                #ifdef SOFIE_BENCHMARK_TRT
+                "  --tensorrt, --trt      Also run TensorRT comparison\n"
+                #else
+                "  --tensorrt, --trt      (not available; rebuild with -DSOFIE_BENCHMARK_TRT=ON)\n"
+                #endif
+                #ifdef SOFIE_BENCHMARK_AOT
+                "  --pytorch-aot, --aot   Also run PyTorch AOTInductor comparison\n"
+                #else
+                "  --pytorch-aot, --aot   (not available; rebuild with -DSOFIE_BENCHMARK_AOT=ON)\n"
+                #endif
+                "  --profile              Run Nsight Compute cross-backend profiling\n"
+                "  --ncu <PATH>           Path to the Nsight Compute executable\n"
+                "  --sofie-only           Run only SOFIE\n"
+                "  --ort-only             Run only ONNX Runtime\n"
+                "  --trt-only             Run only TensorRT\n"
+                "  --aot-only             Run only PyTorch AOTInductor\n"
+                "  Rebuild with -DSOFIE_BENCHMARK_PROFILE=ON for internal SOFIE per-operator profiling.\n"
                 "  --single-model   <N>   Run exactly one model by C++ name (internal)\n"
-                ;
+                    ;
 #endif
             return 0;
         }
@@ -192,6 +208,14 @@ int main(int argc, char *argv[]) {
         run_ort = false;
     }
 #endif
+#ifndef SOFIE_BENCHMARK_TRT
+    if (run_trt) {
+        std::fprintf(stderr,
+                     "Warning: --tensorrt requested but this binary was built without "
+                     "TensorRT support. Rebuild with -DSOFIE_BENCHMARK_TRT=ON.\n");
+        run_trt = false;
+    }
+#endif
 #ifndef SOFIE_BENCHMARK_AOT
     if (run_aot) {
         std::fprintf(stderr,
@@ -243,6 +267,12 @@ int main(int argc, char *argv[]) {
     std::printf("Backend: @SOFIE_BENCHMARK_BACKEND@  |  Warmup: %d  |  Iterations: %d", warmup, iterations);
 #ifdef SOFIE_BENCHMARK_ORT
     if (run_ort) std::printf("  |  ORT-GPU: ON");
+#endif
+#ifdef SOFIE_BENCHMARK_TRT
+    if (run_trt) std::printf("  |  TensorRT: ON");
+#endif
+#ifdef SOFIE_BENCHMARK_AOT
+    if (run_aot) std::printf("  |  PyTorch AOT: ON");
 #endif
     std::printf("\n\n");
 

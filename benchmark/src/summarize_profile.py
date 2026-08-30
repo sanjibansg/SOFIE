@@ -500,8 +500,8 @@ def find_profile_csvs(backend_dir: Path) -> List[Path]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Summarize Nsight Compute CSV reports for SOFIE, ONNX Runtime, and TensorRT.")
-    parser.add_argument("root", type=Path, help="Benchmark run directory containing sofie/, ort/, and/or tensorrt/.")
+    parser = argparse.ArgumentParser(description="Summarize Nsight Compute CSV reports for SOFIE, ONNX Runtime, TensorRT, and PyTorch AOTInductor.")
+    parser.add_argument("root", type=Path, help="Benchmark run directory containing sofie/, ort/, tensorrt/, and/or pytorch_aot/.")
     args = parser.parse_args()
     root = args.root.expanduser().resolve()
     if not root.is_dir():
