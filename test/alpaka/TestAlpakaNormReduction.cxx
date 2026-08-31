@@ -27,10 +27,10 @@ TEST_F(SofieAlpakaTest, RMSNorm)
     auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
 
     {
-        SOFIE_RMSNorm::Session<alpaka::TagGpuCudaRt> session("RMSNorm_FromONNX_GPU_ALPAKA.dat");
+        SOFIE_RMSNorm::Session<TestTag> session("RMSNorm_FromONNX_GPU_ALPAKA.dat");
         auto result = session.infer(input_d);
         alpaka::wait(queue);
-        cudaDeviceSynchronize();
+        alpaka::wait(device);
         alpaka::memcpy(queue, result_h, result);
         alpaka::wait(queue);
     }
@@ -45,7 +45,7 @@ TEST_F(SofieAlpakaTest, RMSNorm)
 
 TEST_F(SofieAlpakaTest, RMSNormResetState)
 {
-    SOFIE_RMSNorm::Session<alpaka::TagGpuCudaRt> session("RMSNorm_FromONNX_GPU_ALPAKA.dat");
+    SOFIE_RMSNorm::Session<TestTag> session("RMSNorm_FromONNX_GPU_ALPAKA.dat");
     // resetState must be callable; for a stateless operator it is a no-op
     EXPECT_NO_THROW(session.resetState(session.queue));
 }
@@ -62,10 +62,10 @@ TEST_F(SofieAlpakaTest, GroupNorm)
     auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
 
     {
-        SOFIE_GroupNorm::Session<alpaka::TagGpuCudaRt> session("GroupNorm_FromONNX_GPU_ALPAKA.dat");
+        SOFIE_GroupNorm::Session<TestTag> session("GroupNorm_FromONNX_GPU_ALPAKA.dat");
         auto result = session.infer(input_d);
         alpaka::wait(queue);
-        cudaDeviceSynchronize();
+        alpaka::wait(device);
         alpaka::memcpy(queue, result_h, result);
         alpaka::wait(queue);
     }
@@ -90,10 +90,10 @@ TEST_F(SofieAlpakaTest, CumSumInclusive)
     auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
 
     {
-        SOFIE_CumSum::Session<alpaka::TagGpuCudaRt> session;
+        SOFIE_CumSum::Session<TestTag> session;
         auto result = session.infer(input_d);
         alpaka::wait(queue);
-        cudaDeviceSynchronize();
+        alpaka::wait(device);
         alpaka::memcpy(queue, result_h, result);
         alpaka::wait(queue);
     }
@@ -118,10 +118,10 @@ TEST_F(SofieAlpakaTest, CumSumExclusive)
     auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
 
     {
-        SOFIE_CumSumExclusive::Session<alpaka::TagGpuCudaRt> session;
+        SOFIE_CumSumExclusive::Session<TestTag> session;
         auto result = session.infer(input_d);
         alpaka::wait(queue);
-        cudaDeviceSynchronize();
+        alpaka::wait(device);
         alpaka::memcpy(queue, result_h, result);
         alpaka::wait(queue);
     }

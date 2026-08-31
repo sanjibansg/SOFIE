@@ -25,10 +25,10 @@ TEST_F(SofieAlpakaTest, Linear64)
    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{640}));
 
    {
-      SOFIE_Linear_64::Session<alpaka::TagGpuCudaRt> session("Linear_64_FromONNX_GPU_ALPAKA.dat");
+      SOFIE_Linear_64::Session<TestTag> session("Linear_64_FromONNX_GPU_ALPAKA.dat");
       auto result = session.infer(A_d);
       alpaka::wait(queue);
-      cudaDeviceSynchronize();
+      alpaka::wait(device);
 
       alpaka::memcpy(queue, result_h, result);
       alpaka::wait(queue);
@@ -66,10 +66,10 @@ TEST_F(SofieAlpakaTest, LinearWithLeakyRelu)
    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{24}));
    
    {
-      SOFIE_LinearWithLeakyRelu::Session<alpaka::TagGpuCudaRt> session;
+      SOFIE_LinearWithLeakyRelu::Session<TestTag> session;
       auto result = session.infer(A_d);
       alpaka::wait(queue);
-      cudaDeviceSynchronize();
+      alpaka::wait(device);
 
       alpaka::memcpy(queue, result_h, result);
       alpaka::wait(queue);
@@ -102,10 +102,10 @@ TEST_F(SofieAlpakaTest, LinearWithSigmoid)
    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{24}));
    
    {
-      SOFIE_LinearWithSigmoid::Session<alpaka::TagGpuCudaRt> session("LinearWithSigmoid_FromONNX_GPU_ALPAKA.dat");
+      SOFIE_LinearWithSigmoid::Session<TestTag> session("LinearWithSigmoid_FromONNX_GPU_ALPAKA.dat");
       auto result = session.infer(A_d);
       alpaka::wait(queue);
-      cudaDeviceSynchronize();
+      alpaka::wait(device);
 
       alpaka::memcpy(queue, result_h, result);
       alpaka::wait(queue);
