@@ -93,7 +93,8 @@ ROOTTEST_ADD_TEST(
 if (ENABLE_ALPAKA_TESTS)
 
   string(TOLOWER "${ALPAKA_BACKEND}" _alpaka_backend)
-  if (NOT _alpaka_backend IN_LIST ALPAKA_BACKEND)
+  set(_alpaka_known_backends cuda cpu hip sycl)
+  if (NOT _alpaka_backend IN_LIST _alpaka_known_backends)
     message(FATAL_ERROR "Unsupported ALPAKA_BACKEND=${ALPAKA_BACKEND}")
   endif()
 
@@ -134,55 +135,78 @@ if (ENABLE_ALPAKA_TESTS)
   )
 
   ##########################################################################
-  # CUDA backend
+  # Backend selection
+  #
+  # The test sources are backend-agnostic (see alpaka/TestAlpakaCommon.h),
+  # only the toolchain, flags and libraries differ per backend.
+  ##########################################################################
+  set(ALPAKA_TEST_SOURCES
+    alpaka/TestAlpakaLinear.cxx
+    alpaka/TestAlpakaConv.cxx
+    alpaka/TestAlpakaNormalization.cxx
+    alpaka/TestAlpakaElementwiseUnary.cxx
+    alpaka/TestAlpakaElementwiseBinaryLogic.cxx
+    alpaka/TestAlpakaReduce.cxx
+    alpaka/TestAlpakaShapeIndexing.cxx
+    alpaka/TestAlpakaGNN.cxx
+    alpaka/TestAlpakaPool.cxx
+    alpaka/TestAlpakaLowRank.cxx
+    alpaka/TestAlpakaKernelOnly.cxx
+    alpaka/TestAlpakaNormReduction.cxx
+    alpaka/TestAlpakaSequenceOps.cxx
+  )
+
+  if (_alpaka_backend STREQUAL "cuda")
+    message(STATUS "Enabling Alpaka CUDA tests")
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    set(ALPAKA_TEST_TARGET TestCustomModelsFromONNXForAlpakaCuda)
+    set_source_files_properties(${ALPAKA_TEST_SOURCES} PROPERTIES LANGUAGE CUDA)
+  elseif (_alpaka_backend STREQUAL "hip")
+    message(STATUS "Enabling Alpaka HIP tests")
+    enable_language(HIP)
+    set(ROCM_BASE "/opt/rocm" CACHE PATH "ROCm installation prefix")
+    set(ALPAKA_TEST_TARGET TestCustomModelsFromONNXForAlpakaHip)
+    set_source_files_properties(${ALPAKA_TEST_SOURCES} PROPERTIES LANGUAGE HIP)
+  elseif (_alpaka_backend STREQUAL "sycl")
+    message(FATAL_ERROR "ALPAKA_BACKEND=sycl is not implemented yet.")
+  elseif (_alpaka_backend STREQUAL "cpu")
+    message(FATAL_ERROR "ALPAKA_BACKEND=cpu is not implemented yet.")
+  endif()
+
+  ROOTTEST_GENERATE_EXECUTABLE(
+    ${ALPAKA_TEST_TARGET}
+    ${ALPAKA_TEST_SOURCES}
+    LIBRARIES SOFIE_core GTest::gtest GTest::gtest_main
+    FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka;sofie-lowrank-emit
+    FIXTURES_SETUP sofie-test-models-onnx-alpaka-build
+  )
+
+  target_include_directories(
+    ${ALPAKA_TEST_TARGET} PRIVATE
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${alpaka_SOURCE_DIR}/include
+    ${sofieblas_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+
+  target_compile_definitions(
+    ${ALPAKA_TEST_TARGET} PRIVATE
+    ALPAKA_HAS_STD_ATOMIC_REF
+  )
+
+  ##########################################################################
+  # Backend-specific flags and libraries
   ##########################################################################
   if (_alpaka_backend STREQUAL "cuda")
 
-    message(STATUS "Enabling Alpaka CUDA tests")
-
-    enable_language(CUDA)
-    find_package(CUDAToolkit REQUIRED)
-
-    set(ALPAKA_CUDA_TEST_SOURCES
-      alpaka/TestAlpakaLinear.cxx
-      alpaka/TestAlpakaConv.cxx
-      alpaka/TestAlpakaNormalization.cxx
-      alpaka/TestAlpakaElementwiseUnary.cxx
-      alpaka/TestAlpakaElementwiseBinaryLogic.cxx
-      alpaka/TestAlpakaReduce.cxx
-      alpaka/TestAlpakaShapeIndexing.cxx
-      alpaka/TestAlpakaGNN.cxx
-      alpaka/TestAlpakaPool.cxx
-      alpaka/TestAlpakaLowRank.cxx
-      alpaka/TestAlpakaKernelOnly.cxx
-      alpaka/TestAlpakaNormReduction.cxx
-      alpaka/TestAlpakaSequenceOps.cxx
-    )
-
-    set_source_files_properties(
-      ${ALPAKA_CUDA_TEST_SOURCES}
-      PROPERTIES LANGUAGE CUDA
-    )
-
-    ROOTTEST_GENERATE_EXECUTABLE(
-      TestCustomModelsFromONNXForAlpakaCuda
-      ${ALPAKA_CUDA_TEST_SOURCES}
-      LIBRARIES SOFIE_core GTest::gtest GTest::gtest_main
-      FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka;sofie-lowrank-emit
-      FIXTURES_SETUP sofie-test-models-onnx-alpaka-build
-    )
-
     target_include_directories(
-      TestCustomModelsFromONNXForAlpakaCuda PRIVATE
-      ${CMAKE_CURRENT_BINARY_DIR}
-      ${alpaka_SOURCE_DIR}/include
-      ${sofieblas_SOURCE_DIR}/include
+      ${ALPAKA_TEST_TARGET} PRIVATE
       ${CUDAToolkit_INCLUDE_DIRS}
-      ${CMAKE_CURRENT_SOURCE_DIR}
     )
 
     set_target_properties(
-      TestCustomModelsFromONNXForAlpakaCuda
+      ${ALPAKA_TEST_TARGET}
       PROPERTIES
         CUDA_SEPARABLE_COMPILATION OFF
         CUDA_STANDARD 20
@@ -190,13 +214,12 @@ if (ENABLE_ALPAKA_TESTS)
     )
 
     target_compile_definitions(
-      TestCustomModelsFromONNXForAlpakaCuda PRIVATE
+      ${ALPAKA_TEST_TARGET} PRIVATE
       ALPAKA_ACC_GPU_CUDA_ENABLED
-      ALPAKA_HAS_STD_ATOMIC_REF
     )
 
     target_compile_options(
-      TestCustomModelsFromONNXForAlpakaCuda PRIVATE
+      ${ALPAKA_TEST_TARGET} PRIVATE
       $<$<COMPILE_LANGUAGE:CUDA>:
         --extended-lambda
         --expt-relaxed-constexpr
@@ -220,25 +243,50 @@ if (ENABLE_ALPAKA_TESTS)
 
     # ROOT-compatible: plain signature only
     target_link_libraries(
-      TestCustomModelsFromONNXForAlpakaCuda
+      ${ALPAKA_TEST_TARGET}
       CUDA::cudart
       CUDA::cublas
       CUDA::cublasLt
     )
 
-    ROOTTEST_ADD_TEST(
-      TestCustomModelsFromONNXForAlpakaCuda
-      EXEC ./TestCustomModelsFromONNXForAlpakaCuda
-      FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka;sofie-lowrank-emit;sofie-test-models-onnx-alpaka-build
+  elseif (_alpaka_backend STREQUAL "hip")
+
+    set_target_properties(
+      ${ALPAKA_TEST_TARGET}
+      PROPERTIES
+        HIP_STANDARD 20
+        HIP_STANDARD_REQUIRED ON
     )
 
-  elseif (_alpaka_backend STREQUAL "hip")
-    message(FATAL_ERROR
-      "ALPAKA_BACKEND=hip is not implemented yet (AMD GPU support is planned, "
-      "see test/alpaka/). Use ALPAKA_BACKEND=cuda for now.")
-  elseif (_alpaka_backend STREQUAL "sycl")
-    message(FATAL_ERROR "ALPAKA_BACKEND=sycl is not implemented yet.")
-  elseif (_alpaka_backend STREQUAL "cpu")
-    message(FATAL_ERROR "ALPAKA_BACKEND=cpu is not implemented yet.")
-  endif() # cuda backend
+    target_compile_definitions(
+      ${ALPAKA_TEST_TARGET} PRIVATE
+      ALPAKA_ACC_GPU_HIP_ENABLED
+    )
+
+    target_compile_options(
+      ${ALPAKA_TEST_TARGET} PRIVATE
+      -O2
+      -g
+      -fPIC
+      -pthread
+    )
+
+    target_include_directories(${ALPAKA_TEST_TARGET} PRIVATE ${ROCM_BASE}/include)
+    target_link_directories(${ALPAKA_TEST_TARGET} PRIVATE ${ROCM_BASE}/lib)
+
+    # ROOT-compatible: plain signature only
+    target_link_libraries(
+      ${ALPAKA_TEST_TARGET}
+      hipblaslt
+      hipblas
+      amdhip64
+    )
+
+  endif()
+
+  ROOTTEST_ADD_TEST(
+    ${ALPAKA_TEST_TARGET}
+    EXEC ./${ALPAKA_TEST_TARGET}
+    FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka;sofie-lowrank-emit;sofie-test-models-onnx-alpaka-build
+  )
 endif()   # ENABLE_ALPAKA_TESTS

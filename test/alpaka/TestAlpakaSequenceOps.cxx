@@ -29,10 +29,10 @@ TEST_F(SofieAlpakaTest, SDPA)
     auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
 
     {
-        SOFIE_SDPA::Session<alpaka::TagGpuCudaRt> session("SDPA_FromONNX_GPU_ALPAKA.dat");
+        SOFIE_SDPA::Session<TestTag> session("SDPA_FromONNX_GPU_ALPAKA.dat");
         auto result = session.infer(q_d, k_d, v_d);
         alpaka::wait(queue);
-        cudaDeviceSynchronize();
+        alpaka::wait(device);
         alpaka::memcpy(queue, result_h, result);
         alpaka::wait(queue);
     }
@@ -61,10 +61,10 @@ TEST_F(SofieAlpakaTest, MambaScan)
     auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
 
     {
-        SOFIE_MambaScan::Session<alpaka::TagGpuCudaRt> session("MambaScan_FromONNX_GPU_ALPAKA.dat");
+        SOFIE_MambaScan::Session<TestTag> session("MambaScan_FromONNX_GPU_ALPAKA.dat");
         auto result = session.infer(u_d, delta_d, B_d, C_d);
         alpaka::wait(queue);
-        cudaDeviceSynchronize();
+        alpaka::wait(device);
         alpaka::memcpy(queue, result_h, result);
         alpaka::wait(queue);
     }
@@ -79,7 +79,7 @@ TEST_F(SofieAlpakaTest, MambaScan)
 
 TEST_F(SofieAlpakaTest, MambaScanResetState)
 {
-    SOFIE_MambaScan::Session<alpaka::TagGpuCudaRt> session("MambaScan_FromONNX_GPU_ALPAKA.dat");
+    SOFIE_MambaScan::Session<TestTag> session("MambaScan_FromONNX_GPU_ALPAKA.dat");
     EXPECT_NO_THROW(session.resetState(session.queue));
 }
 
@@ -98,10 +98,10 @@ TEST_F(SofieAlpakaTest, RWKV_WKV6)
     auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
 
     {
-        SOFIE_RWKV_WKV6::Session<alpaka::TagGpuCudaRt> session("RWKV_WKV6_FromONNX_GPU_ALPAKA.dat");
+        SOFIE_RWKV_WKV6::Session<TestTag> session("RWKV_WKV6_FromONNX_GPU_ALPAKA.dat");
         auto result = session.infer(r_d, k_d, v_d, w_d);
         alpaka::wait(queue);
-        cudaDeviceSynchronize();
+        alpaka::wait(device);
         alpaka::memcpy(queue, result_h, result);
         alpaka::wait(queue);
     }
@@ -116,7 +116,7 @@ TEST_F(SofieAlpakaTest, RWKV_WKV6)
 
 TEST_F(SofieAlpakaTest, RWKV_WKV6ResetState)
 {
-    SOFIE_RWKV_WKV6::Session<alpaka::TagGpuCudaRt> session("RWKV_WKV6_FromONNX_GPU_ALPAKA.dat");
+    SOFIE_RWKV_WKV6::Session<TestTag> session("RWKV_WKV6_FromONNX_GPU_ALPAKA.dat");
     EXPECT_NO_THROW(session.resetState(session.queue));
 }
 
@@ -133,10 +133,10 @@ TEST_F(SofieAlpakaTest, GriffinRGLRU)
     auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
 
     {
-        SOFIE_GriffinRGLRU::Session<alpaka::TagGpuCudaRt> session("GriffinRGLRU_FromONNX_GPU_ALPAKA.dat");
+        SOFIE_GriffinRGLRU::Session<TestTag> session("GriffinRGLRU_FromONNX_GPU_ALPAKA.dat");
         auto result = session.infer(x_d, a_d);
         alpaka::wait(queue);
-        cudaDeviceSynchronize();
+        alpaka::wait(device);
         alpaka::memcpy(queue, result_h, result);
         alpaka::wait(queue);
     }
@@ -151,6 +151,6 @@ TEST_F(SofieAlpakaTest, GriffinRGLRU)
 
 TEST_F(SofieAlpakaTest, GriffinRGLRUResetState)
 {
-    SOFIE_GriffinRGLRU::Session<alpaka::TagGpuCudaRt> session("GriffinRGLRU_FromONNX_GPU_ALPAKA.dat");
+    SOFIE_GriffinRGLRU::Session<TestTag> session("GriffinRGLRU_FromONNX_GPU_ALPAKA.dat");
     EXPECT_NO_THROW(session.resetState(session.queue));
 }

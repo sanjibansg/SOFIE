@@ -38,10 +38,10 @@ TEST_F(SofieAlpakaTest, MaxPool2d)
    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(MaxPool2d_ExpectedOutput::output) / sizeof(float)}));
 
    {
-      SOFIE_MaxPool2d::Session<alpaka::TagGpuCudaRt> session("MaxPool2d_FromONNX_GPU_ALPAKA.dat");
+      SOFIE_MaxPool2d::Session<TestTag> session("MaxPool2d_FromONNX_GPU_ALPAKA.dat");
       auto result = session.infer(input_d);
       alpaka::wait(queue);
-      cudaDeviceSynchronize();
+      alpaka::wait(device);
       alpaka::memcpy(queue, result_h, result);
       alpaka::wait(queue);
    }
@@ -78,10 +78,10 @@ TEST_F(SofieAlpakaTest, MaxPool1d)
    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(MaxPool1d_ExpectedOutput::output) / sizeof(float)}));
 
    {
-      SOFIE_MaxPool1d::Session<alpaka::TagGpuCudaRt> session("MaxPool1d_FromONNX_GPU_ALPAKA.dat");
+      SOFIE_MaxPool1d::Session<TestTag> session("MaxPool1d_FromONNX_GPU_ALPAKA.dat");
       auto result = session.infer(input_d);
       alpaka::wait(queue);
-      cudaDeviceSynchronize();
+      alpaka::wait(device);
       alpaka::memcpy(queue, result_h, result);
       alpaka::wait(queue);
    }
@@ -114,10 +114,10 @@ TEST_F(SofieAlpakaTest, MaxPool3d)
    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(MaxPool3d_ExpectedOutput::output) / sizeof(float)}));
 
    {
-      SOFIE_MaxPool3d::Session<alpaka::TagGpuCudaRt> session("MaxPool3d_FromONNX_GPU_ALPAKA.dat");
+      SOFIE_MaxPool3d::Session<TestTag> session("MaxPool3d_FromONNX_GPU_ALPAKA.dat");
       auto result = session.infer(input_d);
       alpaka::wait(queue);
-      cudaDeviceSynchronize();
+      alpaka::wait(device);
       alpaka::memcpy(queue, result_h, result);
       alpaka::wait(queue);
    }
@@ -160,10 +160,10 @@ TEST_F(SofieAlpakaTest, AvgPool)
    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(AvgPool_ExpectedOutput::output) / sizeof(float)}));
 
    {
-      SOFIE_AvgPool::Session<alpaka::TagGpuCudaRt> session("AvgPool_FromONNX_GPU_ALPAKA.dat");
+      SOFIE_AvgPool::Session<TestTag> session("AvgPool_FromONNX_GPU_ALPAKA.dat");
       auto result = session.infer(input_d);
       alpaka::wait(queue);
-      cudaDeviceSynchronize();
+      alpaka::wait(device);
       alpaka::memcpy(queue, result_h, result);
       alpaka::wait(queue);
    }
@@ -196,10 +196,10 @@ TEST_F(SofieAlpakaTest, AvgPoolPad)
    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(AvgPoolPad_ExpectedOutput::output) / sizeof(float)}));
 
    {
-      SOFIE_AvgPoolPad::Session<alpaka::TagGpuCudaRt> session("AvgPoolPad_FromONNX_GPU_ALPAKA.dat");
+      SOFIE_AvgPoolPad::Session<TestTag> session("AvgPoolPad_FromONNX_GPU_ALPAKA.dat");
       auto result = session.infer(input_d);
       alpaka::wait(queue);
-      cudaDeviceSynchronize();
+      alpaka::wait(device);
       alpaka::memcpy(queue, result_h, result);
       alpaka::wait(queue);
    }
@@ -233,10 +233,10 @@ TEST_F(SofieAlpakaTest, AvgPoolCountIncludePad)
    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(AvgPoolCountIncludePad_ExpectedOutput::output) / sizeof(float)}));
 
    {
-      SOFIE_AvgPoolCountIncludePad::Session<alpaka::TagGpuCudaRt> session("AvgPoolCountIncludePad_FromONNX_GPU_ALPAKA.dat");
+      SOFIE_AvgPoolCountIncludePad::Session<TestTag> session("AvgPoolCountIncludePad_FromONNX_GPU_ALPAKA.dat");
       auto result = session.infer(input_d);
       alpaka::wait(queue);
-      cudaDeviceSynchronize();
+      alpaka::wait(device);
       alpaka::memcpy(queue, result_h, result);
       alpaka::wait(queue);
    }
@@ -270,10 +270,10 @@ TEST_F(SofieAlpakaTest, GlobalAvgPool2d)
    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sizeof(GlobalAvgPool2d_ExpectedOutput::output) / sizeof(float)}));
 
    {
-      SOFIE_GlobalAvgPool2d::Session<alpaka::TagGpuCudaRt> session("GlobalAvgPool2d_FromONNX_GPU_ALPAKA.dat");
+      SOFIE_GlobalAvgPool2d::Session<TestTag> session("GlobalAvgPool2d_FromONNX_GPU_ALPAKA.dat");
       auto result = session.infer(input_d);
       alpaka::wait(queue);
-      cudaDeviceSynchronize();
+      alpaka::wait(device);
       alpaka::memcpy(queue, result_h, result);
       alpaka::wait(queue);
    }

@@ -5,8 +5,6 @@
 #include "TestAlpakaCommon.h"
 #include "LeakyRelu_KernelOnly_GPU_ALPAKA.hxx"
 
-using Acc = alpaka::TagToAcc<alpaka::TagGpuCudaRt, Dim, Idx>;
-
 TEST_F(SofieAlpakaTest, KernelOnlyLeakyRelu)
 {
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;
@@ -18,12 +16,12 @@ TEST_F(SofieAlpakaTest, KernelOnlyLeakyRelu)
     auto output_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{n}));
 
     auto workDiv = sofie_workdiv<Dim, Idx>(Ext1D::all(Idx{n}));
-    auto task = alpaka::createTaskKernel<Acc>(workDiv, SOFIE_LeakyReluKernelOnly::LeakyReluKernel{},
+    auto task = alpaka::createTaskKernel<TestAcc>(workDiv, SOFIE_LeakyReluKernelOnly::LeakyReluKernel{},
                                                alpaka::getPtrNative(input_d), alpaka::getPtrNative(output_d),
                                                n, alpha);
     alpaka::enqueue(queue, task);
     alpaka::wait(queue);
-    cudaDeviceSynchronize();
+    alpaka::wait(device);
 
     auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{n}));
     alpaka::memcpy(queue, result_h, output_d);

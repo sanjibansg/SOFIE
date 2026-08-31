@@ -27,10 +27,10 @@ TEST_F(SofieAlpakaTest, BatchNormalization)
     auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
 
     {
-        SOFIE_BatchNorm::Session<alpaka::TagGpuCudaRt> session("BatchNorm_FromONNX_GPU_ALPAKA.dat");
+        SOFIE_BatchNorm::Session<TestTag> session("BatchNorm_FromONNX_GPU_ALPAKA.dat");
         auto result = session.infer(input_d);
         alpaka::wait(queue);
-        cudaDeviceSynchronize();
+        alpaka::wait(device);
         alpaka::memcpy(queue, result_h, result);
         alpaka::wait(queue);
     }
@@ -64,10 +64,10 @@ TEST_F(SofieAlpakaTest, BatchNormalizationRelu)
     auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
 
     {
-        SOFIE_BatchNormRelu::Session<alpaka::TagGpuCudaRt> session("BatchNormRelu_FromONNX_GPU_ALPAKA.dat");
+        SOFIE_BatchNormRelu::Session<TestTag> session("BatchNormRelu_FromONNX_GPU_ALPAKA.dat");
         auto result = session.infer(input_d);
         alpaka::wait(queue);
-        cudaDeviceSynchronize();
+        alpaka::wait(device);
         alpaka::memcpy(queue, result_h, result);
         alpaka::wait(queue);
     }
@@ -100,10 +100,10 @@ TEST_F(SofieAlpakaTest, LayerNorm)
     auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
 
     {
-        SOFIE_LayerNorm::Session<alpaka::TagGpuCudaRt> session("LayerNorm_FromONNX_GPU_ALPAKA.dat");
+        SOFIE_LayerNorm::Session<TestTag> session("LayerNorm_FromONNX_GPU_ALPAKA.dat");
         auto result = session.infer(input_d);
         alpaka::wait(queue);
-        cudaDeviceSynchronize();
+        alpaka::wait(device);
         alpaka::memcpy(queue, result_h, result);
         alpaka::wait(queue);
     }
@@ -147,10 +147,10 @@ TEST_F(SofieAlpakaTest, LayerNormScaleBias)
     auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
 
     {
-        SOFIE_LayerNormScaleBias::Session<alpaka::TagGpuCudaRt> session("LayerNormScaleBias_FromONNX_GPU_ALPAKA.dat");
+        SOFIE_LayerNormScaleBias::Session<TestTag> session("LayerNormScaleBias_FromONNX_GPU_ALPAKA.dat");
         auto result = session.infer(input_d);
         alpaka::wait(queue);
-        cudaDeviceSynchronize();
+        alpaka::wait(device);
         alpaka::memcpy(queue, result_h, result);
         alpaka::wait(queue);
     }
@@ -188,10 +188,10 @@ TEST_F(SofieAlpakaTest, LayerNorm3D)
     auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
 
     {
-        SOFIE_LayerNorm3D::Session<alpaka::TagGpuCudaRt> session("LayerNorm3D_FromONNX_GPU_ALPAKA.dat");
+        SOFIE_LayerNorm3D::Session<TestTag> session("LayerNorm3D_FromONNX_GPU_ALPAKA.dat");
         auto result = session.infer(input_d);
         alpaka::wait(queue);
-        cudaDeviceSynchronize();
+        alpaka::wait(device);
         alpaka::memcpy(queue, result_h, result);
         alpaka::wait(queue);
     }
