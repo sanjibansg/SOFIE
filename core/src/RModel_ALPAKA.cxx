@@ -672,7 +672,7 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
             if (fOperators[id]->GetKind() == OperatorKind::GEMM || fOperators[id]->GetKind() == OperatorKind::CONV) {
                for (auto &blasCfg : fOperators[id]->GetBlasConfigs()) {
                   if (!blasCfg.empty())
-                     fGC += "\nblas.addLayoutConfig(" + blasCfg + ");\n";
+                     fGC += "\nblas.addOperationConfig(" + blasCfg + ");\n";
                }
             }
          }

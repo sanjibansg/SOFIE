@@ -948,6 +948,9 @@ namespace SOFIE{
          auto ldb = (fAttrTransB ? k : n);
          auto ldc = n;
          std::string transFlags = std::string(fAttrTransB ? "'t'" : "'n'") + ", " + (fAttrTransA ? "'t'" : "'n'");
+         // the epilogue names the call this op emits (see Generate_GPU_ALPAKA)
+         std::string epilogue = fNC.empty() ? "Epilogue::Default"
+                                            : (fActivation == EActivationType::RELU ? "Epilogue::ReluBias" : "Epilogue::Bias");
 
          // For stacked (batched) GEMMs on static shapes, return the layout that
          // matches the actual call emitted by Generate_GPU_ALPAKA:
@@ -967,7 +970,7 @@ namespace SOFIE{
                if (bLeadingDimsAllOne) {
                   // batch-collapse: register layout for the full-batch GEMM
                   auto m_batched = std::to_string(std::stoi(m) * std::stoi(lengthExtra));
-                  return n+", "+m_batched+", "+k+", "+ldb+", "+lda+", "+ldc+", "+transFlags;
+                  return n+", "+m_batched+", "+k+", "+ldb+", "+lda+", "+ldc+", "+transFlags+", "+epilogue;
                } else if (fNC.empty()) {
                   // gemmStridedBatched: legacy cuBLAS, no cuBLASLt layout needed
                   return "";
@@ -976,7 +979,7 @@ namespace SOFIE{
             }
          }
 
-         return n+", "+m+", "+k+", "+ldb+", "+lda+", "+ldc+", "+transFlags;
+         return n+", "+m+", "+k+", "+ldb+", "+lda+", "+ldc+", "+transFlags+", "+epilogue;
       }
 
       // low rank factorized Gemm issues two chained GEMM calls (see Generate_GPU_ALPAKA)
@@ -997,11 +1000,15 @@ namespace SOFIE{
          std::string transFlags1 = std::string("'n', ") + (fAttrTransA ? "'t'" : "'n'");
          auto lda1 = (fAttrTransA ? m : k);
 
+         // the epilogue names the call this op emits (see Generate_GPU_ALPAKA)
+         std::string epilogue = fNC.empty() ? "Epilogue::Default"
+                                            : (fActivation == EActivationType::RELU ? "Epilogue::ReluBias" : "Epilogue::Bias");
+
          // step 1: tmp (m x rank) = op(A) * Bin
-         std::string cfg1 = rankStr+", "+m+", "+k+", "+rankStr+", "+lda1+", "+rankStr+", "+transFlags1;
+         std::string cfg1 = rankStr+", "+m+", "+k+", "+rankStr+", "+lda1+", "+rankStr+", "+transFlags1+", Epilogue::Default";
 
          // step 2: Y (m x n) = tmp * Bout (+ bias) -- both operands untransposed
-         std::string cfg2 = n+", "+m+", "+rankStr+", "+n+", "+rankStr+", "+n+", 'n', 'n'";
+         std::string cfg2 = n+", "+m+", "+rankStr+", "+n+", "+rankStr+", "+n+", 'n', 'n', "+epilogue;
 
          return {cfg1, cfg2};
       }

@@ -1002,7 +1002,7 @@ public:
    std::string GetBlasConfig(){
       auto gemm = GetGemmInfo();
       std::string n = std::to_string(gemm.n), k = std::to_string(gemm.k);
-      return gemm.m + ", " + n + ", " + k + ", " + gemm.m + ", " + k + ", " + gemm.m + ", 'n', 'n'";
+      return gemm.m + ", " + n + ", " + k + ", " + gemm.m + ", " + k + ", " + gemm.m + ", 'n', 'n', Epilogue::Default";
    }
 
 };
