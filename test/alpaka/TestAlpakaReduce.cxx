@@ -16,6 +16,13 @@
 #include "input_models/references/ReduceMax_axis0.ref.hxx"
 #include "input_models/references/ReduceMax_mid.ref.hxx"
 
+#include "DynamicReduceSumLast_FromONNX_GPU_ALPAKA.hxx"
+#include "DynamicReduceMeanMid_FromONNX_GPU_ALPAKA.hxx"
+#include "DynamicReduceMaxFirst_FromONNX_GPU_ALPAKA.hxx"
+#include "DynamicReduceSumMulti_FromONNX_GPU_ALPAKA.hxx"
+#include "TopK_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/TopK.ref.hxx"
+
 TEST_F(SofieAlpakaTest, ReduceMean)
 {
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;
@@ -338,3 +345,183 @@ TEST_F(SofieAlpakaTest, ReduceMax_mid)
         EXPECT_NEAR(res_ptr[i], correct[i], TOLERANCE) << "  i=" << i;
 }
 
+// X[N,4] -> ReduceSum(axis=-1, keepdims=0) -> Y[N]: kLast, pruned output, negative axis
+TEST_F(SofieAlpakaTest, DynamicReduceSumLast)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t cols = 4;
+    for (std::size_t N : {std::size_t(1), std::size_t(8)}) {
+        const std::size_t inSize = N * cols, outSize = N;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{inSize}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < inSize; ++i) in_ptr[i] = static_cast<float>(i + 1);
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{inSize}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outSize}));
+        {
+            SOFIE_DynamicReduceSumLast::Session<alpaka::TagGpuCudaRt> session("", N);
+            auto result = session.infer(N, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t n = 0; n < N; ++n) {
+            float expected = 0.f;
+            for (std::size_t c = 0; c < cols; ++c) expected += in_ptr[n * cols + c];
+            EXPECT_LE(std::abs(res[n] - expected), TOLERANCE);
+        }
+    }
+}
+
+// X[N,4,M] -> ReduceMean(axis=1, keepdims=1) -> Y[N,1,M]: kMiddle with two symbolic dims
+TEST_F(SofieAlpakaTest, DynamicReduceMeanMid)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t K = 4;
+
+    const std::size_t Ns[] = {1, 8};
+    const std::size_t Ms[] = {1, 3};
+    for (int t = 0; t < 2; ++t) {
+        const std::size_t N = Ns[t], M = Ms[t];
+        const std::size_t inSize = N * K * M, outSize = N * M;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{inSize}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < inSize; ++i) in_ptr[i] = static_cast<float>(i + 1);
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{inSize}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outSize}));
+        {
+            SOFIE_DynamicReduceMeanMid::Session<alpaka::TagGpuCudaRt> session("", N, M);
+            auto result = session.infer(N, M, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t n = 0; n < N; ++n)
+            for (std::size_t m = 0; m < M; ++m) {
+                float sum = 0.f;
+                for (std::size_t k = 0; k < K; ++k)
+                    sum += in_ptr[n * K * M + k * M + m];
+                float expected = sum / static_cast<float>(K);
+                EXPECT_LE(std::abs(res[n * M + m] - expected), TOLERANCE);
+            }
+    }
+}
+
+TEST_F(SofieAlpakaTest, DynamicReduceMaxFirst)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t cols = 4;
+    for (std::size_t N : {std::size_t(1), std::size_t(8)}) {
+        const std::size_t inSize = N * cols, outSize = cols;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{inSize}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < inSize; ++i) in_ptr[i] = static_cast<float>((i * 7 + 3) % 11);
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{inSize}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outSize}));
+        {
+            SOFIE_DynamicReduceMaxFirst::Session<alpaka::TagGpuCudaRt> session("", N);
+            auto result = session.infer(N, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t c = 0; c < cols; ++c) {
+            float expected = in_ptr[c];   // n == 0
+            for (std::size_t n = 1; n < N; ++n)
+                if (in_ptr[n * cols + c] > expected) expected = in_ptr[n * cols + c];
+            EXPECT_LE(std::abs(res[c] - expected), TOLERANCE);
+        }
+    }
+}
+
+TEST_F(SofieAlpakaTest, DynamicReduceSumMulti)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t slice = 3 * 2;
+    for (std::size_t N : {std::size_t(1), std::size_t(8)}) {
+        const std::size_t inSize = N * slice, outSize = N;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{inSize}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < inSize; ++i) in_ptr[i] = static_cast<float>(i + 1);
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{inSize}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outSize}));
+        {
+            SOFIE_DynamicReduceSumMulti::Session<alpaka::TagGpuCudaRt> session("", N);
+            auto result = session.infer(N, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t n = 0; n < N; ++n) {
+            float expected = 0.f;
+            for (std::size_t j = 0; j < slice; ++j) expected += in_ptr[n * slice + j];
+            EXPECT_LE(std::abs(res[n] - expected), TOLERANCE);
+        }
+    }
+}
+
+TEST_F(SofieAlpakaTest, TopK)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+
+   // axis=-1, largest=1, sorted=1, k=5 fixed at codegen; input is a single 9-element row
+   std::vector<float> input {9.0, 8.0, 4.5, 1.7, 2.9, 3.2, 4.0, 2.6, 7.4};
+   constexpr std::size_t K = 5;
+
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{input.size()}));
+   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+   for (Idx i = 0; i < input.size(); ++i) input_ptr[i] = input[i];
+
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{input.size()}));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+
+   auto values_h  = alpaka::allocBuf<float,   Idx>(host, Ext1D::all(Idx{K}));
+   auto indices_h = alpaka::allocBuf<int64_t, Idx>(host, Ext1D::all(Idx{K}));
+
+   {
+      SOFIE_TopK::Session<alpaka::TagGpuCudaRt> session;
+      auto [values, indices] = session.infer(input_d);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+
+      alpaka::memcpy(queue, values_h,  values);
+      alpaka::memcpy(queue, indices_h, indices);
+      alpaka::wait(queue);
+   }
+
+   float*   val = reinterpret_cast<float*>(alpaka::getPtrNative(values_h));
+   int64_t* idx = reinterpret_cast<int64_t*>(alpaka::getPtrNative(indices_h));
+
+   for (std::size_t i = 0; i < K; ++i) {
+      EXPECT_LE(std::abs(val[i] - TopK_ExpectedOutput::values[i]), TOLERANCE) << "  value index=" << i;
+      EXPECT_EQ(idx[i], static_cast<int64_t>(TopK_ExpectedOutput::indexes[i])) << "  index index=" << i;
+   }
+}

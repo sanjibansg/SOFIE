@@ -157,12 +157,12 @@ std::string RModelProfilerGPU::GenerateBeginInferCode()
    return gc;
 }
 
-std::string RModelProfilerGPU::GenerateOperatorCode(ROperator &op, size_t op_idx)
+std::string RModelProfilerGPU::GenerateOperatorCode(ROperator &op, size_t op_idx, const std::vector<std::string> &dynParamNames)
 {
    std::string gc;
    gc += "   // -- GPU Profiling operator: " + op.Name() + " --\n";
    gc += "   tp_start = std::chrono::steady_clock::now();\n";
-   gc += op.Generate_GPU_ALPAKA(std::to_string(op_idx));
+   gc += op.Generate_GPU_ALPAKA(std::to_string(op_idx), dynParamNames);
    // Force synchronisation so chrono measures actual GPU execution time
    gc += "   alpaka::wait(queue);\n";
    gc += "   fProfilingResults[\"" + op.Name() + "\"].push_back(\n";

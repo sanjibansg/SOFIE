@@ -556,6 +556,30 @@ std::vector<Dim> UTILITY::ComputeStrideFromShape(const std::vector<Dim> & shape)
    return strides;
 }
 
+UTILITY::SliceInfo UTILITY::ComputeSliceInfo(const std::vector<Dim> & shape, size_t axis) {
+   auto stride = ComputeStrideFromShape(shape);
+   std::vector<Dim> before(shape.begin(), shape.begin() + axis);
+   std::vector<Dim> others(shape);
+   others.erase(others.begin() + axis);
+   SliceInfo s;
+   s.nBefore = ConvertDimShapeToLength(before);
+   s.nAfter = stride[axis].GetVal();
+   s.nSlices = ConvertDimShapeToLength(others);
+   s.nElements = shape[axis].GetVal();
+   s.strideAxis = stride[axis].GetVal();
+   s.strideBefore = (axis > 0) ? stride[axis - 1].GetVal() : "0";
+   return s;
+}
+
+void EmitOutputCoords(std::string &op, const std::string &indent,
+                      const std::vector<Dim> &strides, const std::vector<Dim> &shape) {
+   for (std::size_t d = 0; d < shape.size(); ++d) {
+      op += indent + "std::size_t const out_" + std::to_string(d)
+          + " = (elem_idx / (" + strides[d].GetVal() + ")) % ("
+          + shape[d].GetVal() + ");\n";
+   }
+}
+
 struct FreeBlock {
   std::size_t offset;
   std::size_t size;

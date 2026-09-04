@@ -1126,6 +1126,10 @@ std::string typeForOutput(ETensorType t) {
    return ConvertTypeToString(t);
 }
 
+}
+
+// Session member holding the construction-time value of a shape parameter (N -> fN);
+// shared by the CPU and GPU session generators
 std::string memberNameForDimShape(std::string name)
 {
    if (!name.empty()) {
@@ -1133,8 +1137,6 @@ std::string memberNameForDimShape(std::string name)
    }
    name = "f" + name;
    return name;
-}
-
 }
 
 void RModel::GenerateOutput()

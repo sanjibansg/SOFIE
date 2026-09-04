@@ -38,6 +38,10 @@
 #include "ConvWithDilation_FromONNX_GPU_ALPAKA.hxx"
 #include "input_models/references/ConvWithDilation.ref.hxx"
 
+#include "DynamicConv1D_FromONNX_GPU_ALPAKA.hxx"
+#include "DynamicConv1DNoBias_FromONNX_GPU_ALPAKA.hxx"
+#include "DynamicConv2DNoBias_FromONNX_GPU_ALPAKA.hxx"
+
 TEST_F(SofieAlpakaTest, ConvWithPadding)
 {
    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
@@ -73,7 +77,6 @@ TEST_F(SofieAlpakaTest, ConvWithPadding)
       EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
    }
 }
-
 
 TEST_F(SofieAlpakaTest, ConvWithoutPadding)
 {
@@ -114,7 +117,6 @@ TEST_F(SofieAlpakaTest, ConvWithoutPadding)
 
 }
 
-
 TEST_F(SofieAlpakaTest, ConvWithAutopadSameLower)
 {
    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
@@ -151,7 +153,6 @@ TEST_F(SofieAlpakaTest, ConvWithAutopadSameLower)
    }
 }
 
-
 TEST_F(SofieAlpakaTest, ConvWithAutopadSameUpper)
 {
    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
@@ -185,7 +186,6 @@ TEST_F(SofieAlpakaTest, ConvWithAutopadSameUpper)
       EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
    }
 }
-
 
 TEST_F(SofieAlpakaTest, ConvWithStridesPadding)
 {
@@ -223,7 +223,6 @@ TEST_F(SofieAlpakaTest, ConvWithStridesPadding)
       EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
    }
 }
-
 
 TEST_F(SofieAlpakaTest, ConvWithStridesNoPadding)
 {
@@ -679,4 +678,139 @@ TEST_F(SofieAlpakaTest, ConvWithDilation)
    for (size_t i = 0; i < nOut_dilation; ++i) {
       EXPECT_LE(std::abs(res_ptr[i] - correct[i]), TOLERANCE) << "i=" << i;
    }
+}
+
+// dynamic 1D Conv (k=3, pad=1) + bias, run at (N,n_pf) = (1,1) and (8,5)
+TEST_F(SofieAlpakaTest, DynamicConv1D)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t Cin = 2, Cout = 3, K = 3;
+    const float bias[3] = {0.5f, -0.5f, 1.0f};
+    auto Wv = [&](std::size_t oc, std::size_t ic, std::size_t kk) {
+        return static_cast<float>(oc * (Cin * K) + ic * K + kk);
+    };
+
+    const std::size_t Ns[] = {1, 8};
+    const std::size_t Ps[] = {1, 5};   // n_pf
+    for (int t = 0; t < 2; ++t) {
+        const std::size_t N = Ns[t], P = Ps[t];
+        const std::size_t inSize = N * Cin * P, outSize = N * Cout * P;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{inSize}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < inSize; ++i) in_ptr[i] = static_cast<float>(i % 10) - 5.0f;
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{inSize}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outSize}));
+        {
+            SOFIE_DynamicConv1D::Session<alpaka::TagGpuCudaRt> session("DynamicConv1D_FromONNX_GPU_ALPAKA.dat", N, P);
+            auto result = session.infer(N, P, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t n = 0; n < N; ++n)
+            for (std::size_t oc = 0; oc < Cout; ++oc)
+                for (std::size_t l = 0; l < P; ++l) {
+                    float acc = bias[oc];
+                    for (std::size_t ic = 0; ic < Cin; ++ic)
+                        for (std::size_t kk = 0; kk < K; ++kk) {
+                            int64_t li = static_cast<int64_t>(l) + static_cast<int64_t>(kk) - 1;   // pad=1
+                            if (li >= 0 && li < static_cast<int64_t>(P))
+                                acc += in_ptr[n * Cin * P + ic * P + li] * Wv(oc, ic, kk);
+                        }
+                    std::size_t idx = n * Cout * P + oc * P + l;
+                    EXPECT_LE(std::abs(res[idx] - acc), TOLERANCE) << "n=" << n << " oc=" << oc << " l=" << l;
+                }
+    }
+}
+
+TEST_F(SofieAlpakaTest, DynamicConv1DNoBias)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t Cin = 2, Cout = 3;
+    const float W[3][2] = {{0.5f, -1.0f}, {0.25f, 0.75f}, {-0.5f, 1.5f}};
+
+    const std::size_t Ns[] = {1, 8};
+    const std::size_t Ps[] = {1, 5};   // n_pf
+    for (int t = 0; t < 2; ++t) {
+        const std::size_t N = Ns[t], P = Ps[t];
+        const std::size_t inSize = N * Cin * P, outSize = N * Cout * P;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{inSize}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < inSize; ++i) in_ptr[i] = static_cast<float>(i % 7) - 3.0f;
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{inSize}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outSize}));
+        {
+            SOFIE_DynamicConv1DNoBias::Session<alpaka::TagGpuCudaRt> session("DynamicConv1DNoBias_FromONNX_GPU_ALPAKA.dat", N, P);
+            auto result = session.infer(N, P, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t n = 0; n < N; ++n)
+            for (std::size_t oc = 0; oc < Cout; ++oc)
+                for (std::size_t p = 0; p < P; ++p) {
+                    float expected = 0.0f;
+                    for (std::size_t ic = 0; ic < Cin; ++ic)
+                        expected += W[oc][ic] * in_ptr[n * Cin * P + ic * P + p];
+                    float got = res[n * Cout * P + oc * P + p];
+                    EXPECT_LE(std::abs(got - expected), TOLERANCE) << "n=" << n << " oc=" << oc << " p=" << p;
+                }
+    }
+}
+
+TEST_F(SofieAlpakaTest, DynamicConv2DNoBias)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t Cin = 2, Cout = 3, Q = 4;
+    const float W[3][2] = {{0.5f, -1.0f}, {0.25f, 0.75f}, {-0.5f, 1.5f}};
+
+    const std::size_t Ns[] = {1, 8};
+    const std::size_t Ps[] = {1, 5};   // n_pf
+    for (int t = 0; t < 2; ++t) {
+        const std::size_t N = Ns[t], P = Ps[t];
+        const std::size_t inSize = N * Cin * P * Q, outSize = N * Cout * P * Q;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{inSize}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < inSize; ++i) in_ptr[i] = static_cast<float>(i % 7) - 3.0f;
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{inSize}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outSize}));
+        {
+            SOFIE_DynamicConv2DNoBias::Session<alpaka::TagGpuCudaRt> session("DynamicConv2DNoBias_FromONNX_GPU_ALPAKA.dat", N, P);
+            auto result = session.infer(N, P, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t n = 0; n < N; ++n)
+            for (std::size_t oc = 0; oc < Cout; ++oc)
+                for (std::size_t p = 0; p < P; ++p)
+                    for (std::size_t q = 0; q < Q; ++q) {
+                        float expected = 0.0f;
+                        for (std::size_t ic = 0; ic < Cin; ++ic)
+                            expected += W[oc][ic] * in_ptr[n * Cin * P * Q + ic * P * Q + p * Q + q];
+                        float got = res[n * Cout * P * Q + oc * P * Q + p * Q + q];
+                        EXPECT_LE(std::abs(got - expected), TOLERANCE) << "n=" << n << " oc=" << oc << " p=" << p << " q=" << q;
+                    }
+    }
 }

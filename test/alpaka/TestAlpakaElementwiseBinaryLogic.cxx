@@ -34,10 +34,21 @@
 #include "input_models/references/Greater.ref.hxx"
 #include "input_models/references/Less.ref.hxx"
 #include "Where_FromONNX_GPU_ALPAKA.hxx"
+#include "MaxMultidirectionalBroadcast_FromONNX_GPU_ALPAKA.hxx"
+#include "MinMultidirectionalBroadcast_FromONNX_GPU_ALPAKA.hxx"
+#include "MeanMultidirectionalBroadcast_FromONNX_GPU_ALPAKA.hxx"
+#include "SumMultidirectionalBroadcast_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/MaxMultidirectionalBroadcast.ref.hxx"
+#include "input_models/references/MinMultidirectionalBroadcast.ref.hxx"
+#include "input_models/references/MeanMultidirectionalBroadcast.ref.hxx"
+#include "input_models/references/SumMultidirectionalBroadcast.ref.hxx"
 #include "IsInf_FromONNX_GPU_ALPAKA.hxx"
 #include "IsNaN_FromONNX_GPU_ALPAKA.hxx"
 #include "Clip_FromONNX_GPU_ALPAKA.hxx"
 #include "Not_FromONNX_GPU_ALPAKA.hxx"
+
+#include "DynamicEqual_FromONNX_GPU_ALPAKA.hxx"
+#include "DynamicAddBroadcast_FromONNX_GPU_ALPAKA.hxx"
 
 TEST_F(SofieAlpakaTest, AddBroadcast1)
 {
@@ -91,6 +102,158 @@ TEST_F(SofieAlpakaTest, AddBroadcast1)
    }
 }
 
+TEST_F(SofieAlpakaTest, DynamicAddBroadcast)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t C = 4;
+    const float bias[4] = {0.5f, -1.0f, 0.25f, 2.0f};
+
+    const std::size_t Ns[] = {1, 8};
+    const std::size_t Ps[] = {1, 5};   // n_pf
+    for (int t = 0; t < 2; ++t) {
+        const std::size_t N = Ns[t], P = Ps[t];
+        const std::size_t sz = N * C * P;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sz}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < sz; ++i) in_ptr[i] = static_cast<float>(i % 7) - 3.0f;
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{sz}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sz}));
+        {
+            SOFIE_DynamicAddBroadcast::Session<alpaka::TagGpuCudaRt> session("DynamicAddBroadcast_FromONNX_GPU_ALPAKA.dat", N, P);
+            auto result = session.infer(N, P, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t i = 0; i < sz; ++i) {
+            std::size_t c = (i / P) % C;
+            float expected = in_ptr[i] + bias[c];
+            EXPECT_LE(std::abs(res[i] - expected), TOLERANCE) << "i=" << i << " N=" << N << " P=" << P;
+        }
+    }
+}
+
+// ── BasicNary multidirectional broadcast: A[3,1], B[2,3,1], C[1,4] -> Y[2,3,4] ──────
+TEST_F(SofieAlpakaTest, MaxMultidirectionalBroadcast)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const float a[] = {0.35974154f, -2.20873388f, 0.95746274f};
+    const float b[] = {0.75901985f, -0.46544461f, -0.34920575f, -0.1460754f, 0.08269051f, -0.70045695f};
+    const float c[] = {-0.41468981f, -0.46591926f, 0.56172534f, 0.05616931f};
+
+    auto a_d = makeDeviceBuf(host, device, queue, a, 3);
+    auto b_d = makeDeviceBuf(host, device, queue, b, 6);
+    auto c_d = makeDeviceBuf(host, device, queue, c, 4);
+
+    const std::size_t outSize = sizeof(MaxMultidirectionalBroadcast_ExpectedOutput::output) / sizeof(float);
+    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outSize}));
+    {
+        SOFIE_MaxMultidirectionalBroadcast::Session<alpaka::TagGpuCudaRt> session("MaxMultidirectionalBroadcast_FromONNX_GPU_ALPAKA.dat");
+        auto result = session.infer(a_d, b_d, c_d);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+    float* correct = MaxMultidirectionalBroadcast_ExpectedOutput::output;
+    EXPECT_EQ(outSize, 24u);
+    for (std::size_t i = 0; i < outSize; ++i)
+        EXPECT_LE(std::abs(res[i] - correct[i]), TOLERANCE) << "i=" << i;
+}
+
+TEST_F(SofieAlpakaTest, MinMultidirectionalBroadcast)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const float a[] = {0.35974154f, -2.20873388f, 0.95746274f};
+    const float b[] = {0.75901985f, -0.46544461f, -0.34920575f, -0.1460754f, 0.08269051f, -0.70045695f};
+    const float c[] = {-0.41468981f, -0.46591926f, 0.56172534f, 0.05616931f};
+
+    auto a_d = makeDeviceBuf(host, device, queue, a, 3);
+    auto b_d = makeDeviceBuf(host, device, queue, b, 6);
+    auto c_d = makeDeviceBuf(host, device, queue, c, 4);
+
+    const std::size_t outSize = sizeof(MinMultidirectionalBroadcast_ExpectedOutput::output) / sizeof(float);
+    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outSize}));
+    {
+        SOFIE_MinMultidirectionalBroadcast::Session<alpaka::TagGpuCudaRt> session("MinMultidirectionalBroadcast_FromONNX_GPU_ALPAKA.dat");
+        auto result = session.infer(a_d, b_d, c_d);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+    float* correct = MinMultidirectionalBroadcast_ExpectedOutput::output;
+    EXPECT_EQ(outSize, 24u);
+    for (std::size_t i = 0; i < outSize; ++i)
+        EXPECT_LE(std::abs(res[i] - correct[i]), TOLERANCE) << "i=" << i;
+}
+
+TEST_F(SofieAlpakaTest, MeanMultidirectionalBroadcast)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const float a[] = {0.35974154f, -2.20873388f, 0.95746274f};
+    const float b[] = {0.75901985f, -0.46544461f, -0.34920575f, -0.1460754f, 0.08269051f, -0.70045695f};
+    const float c[] = {-0.41468981f, -0.46591926f, 0.56172534f, 0.05616931f};
+
+    auto a_d = makeDeviceBuf(host, device, queue, a, 3);
+    auto b_d = makeDeviceBuf(host, device, queue, b, 6);
+    auto c_d = makeDeviceBuf(host, device, queue, c, 4);
+
+    const std::size_t outSize = sizeof(MeanMultidirectionalBroadcast_ExpectedOutput::output) / sizeof(float);
+    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outSize}));
+    {
+        SOFIE_MeanMultidirectionalBroadcast::Session<alpaka::TagGpuCudaRt> session("MeanMultidirectionalBroadcast_FromONNX_GPU_ALPAKA.dat");
+        auto result = session.infer(a_d, b_d, c_d);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+    float* correct = MeanMultidirectionalBroadcast_ExpectedOutput::output;
+    EXPECT_EQ(outSize, 24u);
+    for (std::size_t i = 0; i < outSize; ++i)
+        EXPECT_LE(std::abs(res[i] - correct[i]), TOLERANCE) << "i=" << i;
+}
+
+TEST_F(SofieAlpakaTest, SumMultidirectionalBroadcast)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const float a[] = {0.35974154f, -2.20873388f, 0.95746274f};
+    const float b[] = {0.75901985f, -0.46544461f, -0.34920575f, -0.1460754f, 0.08269051f, -0.70045695f};
+    const float c[] = {-0.41468981f, -0.46591926f, 0.56172534f, 0.05616931f};
+
+    auto a_d = makeDeviceBuf(host, device, queue, a, 3);
+    auto b_d = makeDeviceBuf(host, device, queue, b, 6);
+    auto c_d = makeDeviceBuf(host, device, queue, c, 4);
+
+    const std::size_t outSize = sizeof(SumMultidirectionalBroadcast_ExpectedOutput::output) / sizeof(float);
+    auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outSize}));
+    {
+        SOFIE_SumMultidirectionalBroadcast::Session<alpaka::TagGpuCudaRt> session("SumMultidirectionalBroadcast_FromONNX_GPU_ALPAKA.dat");
+        auto result = session.infer(a_d, b_d, c_d);
+        cudaDeviceSynchronize();
+        alpaka::memcpy(queue, result_h, result);
+        alpaka::wait(queue);
+    }
+
+    float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+    float* correct = SumMultidirectionalBroadcast_ExpectedOutput::output;
+    EXPECT_EQ(outSize, 24u);
+    for (std::size_t i = 0; i < outSize; ++i)
+        EXPECT_LE(std::abs(res[i] - correct[i]), TOLERANCE) << "i=" << i;
+}
+// ────────────────────────────────────────────────────────────────────────────────────
+
 TEST_F(SofieAlpakaTest, Equal)
 {
     std::vector<float> input1 = {1.0f, 2.0f, 3.0f};
@@ -127,6 +290,44 @@ TEST_F(SofieAlpakaTest, Equal)
     EXPECT_EQ(outputSize, sizeof(Equal_ExpectedOutput::outputs) / sizeof(bool));
     for (size_t i = 0; i < outputSize; ++i)
         EXPECT_EQ(res_ptr[i], correct[i]) << "i=" << i;
+}
+
+TEST_F(SofieAlpakaTest, DynamicEqual)
+{
+    const std::size_t cols = 3;
+    for (std::size_t N : {std::size_t(1), std::size_t(8)}) {
+        const std::size_t sz = N * cols;
+
+        auto x1_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sz}));
+        auto x2_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sz}));
+        float* x1p = reinterpret_cast<float*>(alpaka::getPtrNative(x1_h));
+        float* x2p = reinterpret_cast<float*>(alpaka::getPtrNative(x2_h));
+        for (Idx i = 0; i < sz; ++i) {
+            x1p[i] = static_cast<float>(i % 3);
+            x2p[i] = static_cast<float>(i % 2);   // mix of equal and unequal
+        }
+
+        auto x1_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{sz}));
+        auto x2_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{sz}));
+        alpaka::memcpy(queue, x1_d, x1_h);
+        alpaka::memcpy(queue, x2_d, x2_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<uint8_t, Idx>(host, Ext1D::all(Idx{sz}));
+        {
+            SOFIE_DynamicEqual::Session<alpaka::TagGpuCudaRt> session("", N);
+            auto result = session.infer(N, x1_d, x2_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        uint8_t* res = reinterpret_cast<uint8_t*>(alpaka::getPtrNative(result_h));
+        for (std::size_t i = 0; i < sz; ++i) {
+            uint8_t expected = (x1p[i] == x2p[i]) ? 1 : 0;
+            EXPECT_EQ(res[i], expected);
+        }
+    }
 }
 
 TEST_F(SofieAlpakaTest, LessOrEqual)

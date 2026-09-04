@@ -7,6 +7,8 @@
 #include "LinearWithSigmoid_FromONNX_GPU_ALPAKA.hxx"
 #include "input_models/references/LinearWithSigmoid.ref.hxx"
 
+#include "DynamicLinear_FromONNX_GPU_ALPAKA.hxx"
+
 TEST_F(SofieAlpakaTest, Linear64)
 {
    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
@@ -118,3 +120,43 @@ TEST_F(SofieAlpakaTest, LinearWithSigmoid)
    }
 }
 
+TEST_F(SofieAlpakaTest, DynamicLinear)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t In = 4, Out = 3;
+    const float W[4][3] = {{0.5f, -1.0f, 0.25f},
+                           {0.75f, 0.5f, -0.5f},
+                           {-0.25f, 1.0f, 0.75f},
+                           {1.5f, -0.75f, 0.5f}};
+    const float B[3] = {0.5f, -0.5f, 0.25f};
+
+    for (std::size_t N : {std::size_t(1), std::size_t(8)}) {
+        const std::size_t inSize = N * In, outSize = N * Out;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{inSize}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < inSize; ++i) in_ptr[i] = static_cast<float>(i % 7) - 3.0f;
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{inSize}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outSize}));
+        {
+            SOFIE_DynamicLinear::Session<alpaka::TagGpuCudaRt> session("DynamicLinear_FromONNX_GPU_ALPAKA.dat", N);
+            auto result = session.infer(N, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t n = 0; n < N; ++n)
+            for (std::size_t j = 0; j < Out; ++j) {
+                float acc = B[j];
+                for (std::size_t i = 0; i < In; ++i) acc += in_ptr[n * In + i] * W[i][j];
+                float expected = acc > 0.0f ? acc : 0.0f;
+                EXPECT_LE(std::abs(res[n * Out + j] - expected), TOLERANCE) << "n=" << n << " j=" << j << " N=" << N;
+            }
+    }
+}

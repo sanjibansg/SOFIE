@@ -28,6 +28,8 @@ private:
 
    std::vector<int64_t> fIndices;  // indices vector in case they are known at initialization
 
+   std::vector<Dim> fOutputShapeData; // in case output is a shape tensor we store here the shape value data (can be parametric)
+
    std::string fType;
 
 public:
@@ -69,19 +71,27 @@ public:
       // case indices tensor is initialized
       if (model.IsInitializedTensor(fNIndices)) {
           // empty shape Indices is a scalar value for the indices
+         bool hasNegativeIndex = false;
          size_t indicesLength = ConvertShapeToLength(model.GetTensorShape(fNIndices));
-         int64_t* indicesData = static_cast<int64_t*>(model.GetInitializedTensorData(fNIndices).get());
+         int64_t* data = static_cast<int64_t*>(model.GetInitializedTensorData(fNIndices).get());
+         // copy in a vector since we may need to update the values in case of negative indices
+         fIndices = std::vector<int64_t>(data, data + indicesLength);
          // update indices data in case of negative dim values
          for (size_t i = 0; i < indicesLength; i++) {
             // move this at generation time?
             if (!fShapeX[fAttrAxis].isParam) {
-               if (indicesData[i] < 0) {
-                  indicesData[i] += fShapeX[fAttrAxis].dim;
+               if (fIndices[i] < 0) {
+                  hasNegativeIndex = true;
+                  fIndices[i] += fShapeX[fAttrAxis].dim;
                }
             }
          }
-         // Save in a vector gather Indices of size q
-         fIndices = std::vector<int64_t>(indicesData, indicesData + indicesLength);
+         // for negative indices we need to add an extra constant tensor
+         if (hasNegativeIndex) {
+            std::string nameIndicesUpdated = fNIndices + "_updated";
+            model.AddConstantTensor(nameIndicesUpdated, model.GetTensorShape(fNIndices), fIndices.data());
+            fNIndices = nameIndicesUpdated;
+         }
       }
       // Output shape
       if (model.Verbose())
@@ -120,17 +130,17 @@ public:
       else if (model.IsShapeTensor(fNX) && q <=1  && fIndices.size() > 0) {
          auto inputData = model.GetShapeTensorValues(fNX);
          // if r == 1 and q<=1 then output length is 1 (is a scalar or tensor of size1)
-         std::vector<Dim> outputData(1);
-         outputData[0] = inputData[fIndices[0]];
-         if (outputData[0].isParam) {
-            fIsOutputConstant = true;
+         fOutputShapeData.resize(1);
+         fOutputShapeData[0] = inputData[fIndices[0]];
+         if (fOutputShapeData[0].isParam) {
+            fIsOutputParamShape = true;
             // shapeY can be scalar or vector of size1
-            model.AddShapeTensor(fNY, outputData, fShapeY.size() == 0);
+            model.AddShapeTensor(fNY, fOutputShapeData, fShapeY.size() == 0);
             if (model.Verbose())
                std::cout << "Gather: " << fNX << " " << ConvertDimShapeToString(fShapeX) << " -> " << fNY << " with shape " << ConvertDimShapeToString(fShapeY)
-                   << " and values " << ConvertDimShapeToString(outputData) << " (shape) " << std::endl;
+                   << " and values " << ConvertDimShapeToString(fOutputShapeData) << " (shape) " << std::endl;
          } else {
-            int64_t value = static_cast<int64_t>(outputData[0].dim);
+            int64_t value = static_cast<int64_t>(fOutputShapeData[0].dim);
             auto shapeY = ConvertShapeToInt(fShapeY);
             model.AddConstantTensor(fNY, shapeY, &value);
             fIsOutputConstant = true;
@@ -139,7 +149,7 @@ public:
                    << " and values {" << value <<  "} (constant) " << std::endl;
          }
       }
-      if (!fIsOutputConstant) {
+      if (!fIsOutputConstant && !fIsOutputParamShape) {
          // Add output tensor
          model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShapeY);
          fType = ConvertTypeToString(model.GetTensorType(fNX));
@@ -156,6 +166,13 @@ public:
       if (fIsOutputConstant) {
          // no code to generate here for constant output. Tensor output is defined in Session constructor
          out << "//--------------------(constant)----------\n";
+         return out.str();
+      }
+      if (fIsOutputParamShape) {
+         out << "//--------------------(shape)----------\n";
+         for (int i = 0; i < static_cast<int>(fOutputShapeData.size()); i++) {
+            out << SP << "tensor_" << fNY << "[" << i << " ] = " << fOutputShapeData[i].GetVal() << ";\n";
+         }
          return out.str();
       }
       // The shape of the output is q + r - 1
@@ -276,13 +293,12 @@ public:
       return out.str();
    }
 
-std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
-    if (fIsOutputConstant) return "";
+std::string Generate_GPU_Kernel_ALPAKA(std::string opName, const std::vector<std::string> &dynParamNames) override {
+    if (fIsOutputConstant || fIsOutputParamShape) return "";
     opName = "op_" + opName;
     if (fShapeY.empty())
         throw std::runtime_error("SOFIE Gather Op called to Generate without being initialized first");
 
-    const std::size_t D  = fShapeY.size();   // output rank = q + r - 1
     const std::size_t r  = fShapeX.size();
     const std::size_t q  = fShapeIndices.size();
 
@@ -301,6 +317,8 @@ std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
     op += SP + SP + SP + "T const* __restrict__ input,\n";
     op += SP + SP + SP + "int64_t const* __restrict__ indices,\n";
     op += SP + SP + SP + "T* __restrict__ output,\n";
+    for (auto &p : dynParamNames)
+        op += SP + SP + SP + "std::size_t const " + p + ",\n";
     op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
 
     op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
@@ -309,11 +327,7 @@ std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
 
     op += SP + SP + SP + "for (std::size_t elem_idx = global_thread_idx; elem_idx < totalElements; elem_idx += grid_thread_extent) {\n\n";
 
-    for (std::size_t d = 0; d < D; ++d) {
-        op += SP + SP + SP + SP + "std::size_t const out_" + std::to_string(d)
-            + " = (elem_idx / " + stridesY[d].GetVal() + "u) % "
-            + fShapeY[d].GetVal() + "u;\n";
-    }
+    EmitOutputCoords(op, SP + SP + SP + SP, stridesY, fShapeY);
     op += "\n";
 
     // Output dims [axis ... axis+q) correspond to the indices tensor dims [0 ... q)
@@ -325,14 +339,14 @@ std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
         for (std::size_t i = 0; i < q; ++i) {
             op += SP + SP + SP + SP + SP
                 + "out_" + std::to_string(fAttrAxis + i)
-                + " * " + stridesIndices[i].GetVal() + "u";
+                + " * (" + stridesIndices[i].GetVal() + ")";
             op += (i + 1 < q) ? " +\n" : ";\n";
         }
     }
     op += "\n";
 
     op += SP + SP + SP + SP + "int64_t k = indices[i_index];\n";
-    op += SP + SP + SP + SP + "if (k < 0) k += " + fShapeX[fAttrAxis].GetVal() + ";\n";
+    op += SP + SP + SP + SP + "if (k < 0) k += (" + fShapeX[fAttrAxis].GetVal() + ");\n";
     op += SP + SP + SP + SP + "if (k < 0) k = 0;\n";
     op += SP + SP + SP + SP + "if (k >= static_cast<int64_t>(" + fShapeX[fAttrAxis].GetVal() + ")) "
         + "k = static_cast<int64_t>(" + fShapeX[fAttrAxis].GetVal() + ") - 1;\n\n";
@@ -342,15 +356,15 @@ std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
     //         + sum over j in [axis+1, r): out_{j-1+q}    * stridesX[j]
     // (the dims after axis in Y are shifted by q-1 relative to X)
     op += SP + SP + SP + SP + "std::size_t const input_idx =\n";
-    op += SP + SP + SP + SP + SP + "static_cast<std::size_t>(k) * " + stridesX[fAttrAxis].GetVal() + "u";
+    op += SP + SP + SP + SP + SP + "static_cast<std::size_t>(k) * (" + stridesX[fAttrAxis].GetVal() + ")";
     for (std::size_t j = 0; j < static_cast<std::size_t>(fAttrAxis); ++j) {
         op += " +\n" + SP + SP + SP + SP + SP
-            + "out_" + std::to_string(j) + " * " + stridesX[j].GetVal() + "u";
+            + "out_" + std::to_string(j) + " * (" + stridesX[j].GetVal() + ")";
     }
     for (std::size_t j = fAttrAxis + 1; j < r; ++j) {
         // in Y, the coord for X's dim j lives at output dim q + j - 1
         op += " +\n" + SP + SP + SP + SP + SP
-            + "out_" + std::to_string(q + j - 1) + " * " + stridesX[j].GetVal() + "u";
+            + "out_" + std::to_string(q + j - 1) + " * (" + stridesX[j].GetVal() + ")";
     }
     op += ";\n\n";
 
@@ -363,14 +377,25 @@ std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
 }
 
 std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override {
-    if (fIsOutputConstant) return "";
+    if (fIsOutputConstant || fIsOutputParamShape) return "";
     opName = "op_" + opName;
     std::string kname = "GatherKernel_" + opName;
     return SP + kname + " gatherKernel_" + opName + ";\n";
 }
 
-std::string Generate_GPU_ALPAKA(std::string opName) override {
+std::string Generate_GPU_ALPAKA(std::string opName, const std::vector<std::string> &dynParamNames) override {
     if (fIsOutputConstant) return "";
+    if (fIsOutputParamShape) {
+        std::stringstream out;
+        out << "\n//------ GATHER (shape) GPU\n";
+        for (int i = 0; i < static_cast<int>(fOutputShapeData.size()); i++) {
+            out << SP << "tensor_" << fNY << "[" << i << "] = " << fOutputShapeData[i].GetVal() << ";\n";
+        }
+        out << SP << "auto hostBuf_" << fNY << " = alpaka::createView(hostAcc, tensor_" << fNY
+            << ", " << fOutputShapeData.size() << ");\n";
+        out << SP << "alpaka::memcpy(queue, deviceBuf_" << fNY << ", hostBuf_" << fNY << ");\n";
+        return out.str();
+    }
     opName = "op_" + opName;
     if (fShapeY.empty())
         throw std::runtime_error("SOFIE Gather Op called to Generate without being initialized first");
@@ -387,8 +412,10 @@ std::string Generate_GPU_ALPAKA(std::string opName) override {
         << ", " << kname
         << ", alpaka::getPtrNative(deviceBuf_" << fNX << ")"
         << ", alpaka::getPtrNative(deviceBuf_" << fNIndices << ")"
-        << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")"
-        << ", static_cast<Idx>(" << totalElements << "));\n";
+        << ", alpaka::getPtrNative(deviceBuf_" << fNY << ")";
+    for (auto &p : dynParamNames)
+        out << ", static_cast<std::size_t>(" << p << ")";
+    out << ", static_cast<Idx>(" << totalElements << "));\n";
     out << SP << "alpaka::enqueue(queue, task_" << opName << ");\n";
     return out.str();
 }
@@ -397,4 +424,4 @@ std::string Generate_GPU_ALPAKA(std::string opName) override {
 
 }//SOFIE
 
-#endif //SOFIE_ROPERATOR_RELU
+#endif //SOFIE_ROPERATOR_GATHER

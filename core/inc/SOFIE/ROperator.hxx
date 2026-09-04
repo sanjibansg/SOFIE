@@ -77,6 +77,10 @@ public:
    virtual void Initialize(RModel&) = 0;
    virtual std::string Generate(std::string OpName) = 0;  //expect unique opName for each operator within the same RModel
    virtual std::string Generate_GPU_ALPAKA(std::string OpName){ return "";} //expect unique opName for each operator within the same RModel
+   //dynParamNames: the model's shape parameters in infer-argument order
+   virtual std::string Generate_GPU_ALPAKA(std::string OpName, const std::vector<std::string> & /*dynParamNames*/) {
+      return Generate_GPU_ALPAKA(OpName);
+   }
    // generate initialization code for session constructor
    virtual std::string GenerateInitCode() { return "";}
    virtual std::string GenerateInitCode_GPU_ALPAKA() { return "";};
@@ -87,6 +91,9 @@ public:
    // generate session data members specific to operator
    virtual std::string GenerateSessionMembersCode(std::string /*opName*/) { return ""; }
    virtual std::string Generate_GPU_Kernel_ALPAKA(std::string /*opName*/) { return ""; }
+   virtual std::string Generate_GPU_Kernel_ALPAKA(std::string opName, const std::vector<std::string> & /*dynParamNames*/) {
+      return Generate_GPU_Kernel_ALPAKA(opName);
+   }
    virtual std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string /*opName*/) { return ""; }
    virtual std::string Header() { return "";}
    virtual std::string GetFusableOutputTensorName() { return "";}

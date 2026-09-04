@@ -35,7 +35,7 @@ public:
    static std::string GenerateMemoryReport(const MemoryInfo &info);
 
    static std::string GenerateBeginInferCode();
-   static std::string GenerateOperatorCode(ROperator &op, size_t op_idx);
+   static std::string GenerateOperatorCode(ROperator &op, size_t op_idx, const std::vector<std::string> &dynParamNames);
    static std::string GenerateEndInferCode();
 
    RModelProfilerGPU() = delete;

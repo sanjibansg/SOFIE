@@ -494,7 +494,7 @@ public:
       return out.str();
    }
 
-   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override {
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName, const std::vector<std::string> &dynParamNames) override {
       if (fIsOutputConstant) return "";
       opName = "op_" + opName;
       if (fShapeInput.empty() || fShapeOutput.empty())
@@ -505,7 +505,6 @@ public:
       auto inputStrides = UTILITY::ComputeStrideFromShape(fShapeInput);
       auto outputStrides = UTILITY::ComputeStrideFromShape(fShapeOutput);
 
-      std::size_t totalElements = ConvertShapeToLength(fShapeOutput);
       std::string kname = "SliceKernel_" + opName;
 
       std::string op;
@@ -516,6 +515,8 @@ public:
       op += SP + SP + SP + "TAcc const& acc,\n";
       op += SP + SP + SP + "T const* __restrict__ input,\n";
       op += SP + SP + SP + "T* __restrict__ output,\n";
+      for (auto &p : dynParamNames)
+         op += SP + SP + SP + "std::size_t const " + p + ",\n";
       op += SP + SP + SP + "std::size_t const totalElements) const {\n\n";
 
       op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
@@ -524,11 +525,7 @@ public:
 
       op += SP + SP + SP + "for (std::size_t elem_idx = global_thread_idx; elem_idx < totalElements; elem_idx += grid_thread_extent) {\n\n";
 
-      for (std::size_t d = 0; d < D; ++d) {
-         op += SP + SP + SP + SP + "std::size_t const out_" + std::to_string(d)
-               + " = (elem_idx / " + outputStrides[d].GetVal() + "u) % "
-               + fShapeOutput[d].GetVal() + "u;\n";
-      }
+      EmitOutputCoords(op, SP + SP + SP + SP, outputStrides, fShapeOutput);
       op += "\n";
 
       // Map each output coord back to input coord:
@@ -538,12 +535,12 @@ public:
       op += SP + SP + SP + SP + "std::size_t const input_idx =\n";
       for (std::size_t d = 0; d < D; ++d) {
          // input coordinate for this dim: start + out_d * step
-         std::string input_coord = "(" + fStart[d].GetVal()
-               + " + out_" + std::to_string(d)
-               + " * " + fSteps[d].GetVal() + ")";
+         std::string input_coord = "((" + fStart[d].GetVal()
+               + ") + out_" + std::to_string(d)
+               + " * (" + fSteps[d].GetVal() + "))";
          op += SP + SP + SP + SP + SP
                + "static_cast<std::size_t>(" + input_coord + ")"
-               + " * " + inputStrides[d].GetVal() + "u";
+               + " * (" + inputStrides[d].GetVal() + ")";
          op += (d + 1 < D) ? " +\n" : ";\n\n";
       }
 
@@ -561,13 +558,13 @@ public:
       return SP + kname + " sliceKernel_" + opName + ";\n";
    }
 
-   std::string Generate_GPU_ALPAKA(std::string opName) override {
+   std::string Generate_GPU_ALPAKA(std::string opName, const std::vector<std::string> &dynParamNames) override {
       if (fIsOutputConstant) return "";
       opName = "op_" + opName;
       if (fShapeInput.empty() || fShapeOutput.empty())
          throw std::runtime_error("SOFIE Slice Op called to Generate without being initialized first");
 
-      std::size_t totalElements = ConvertShapeToLength(fShapeOutput);
+      auto totalElements = ConvertDimShapeToLength(fShapeOutput);
       std::string kname = "sliceKernel_" + opName;
 
       std::stringstream out;
@@ -578,8 +575,10 @@ public:
       out << SP << "alpaka::exec<Acc>(queue, workDiv_" << opName
          << ", " << kname
          << ", alpaka::getPtrNative(deviceBuf_" << fNData << ")"
-         << ", alpaka::getPtrNative(deviceBuf_" << fNOutput << ")"
-         << ", static_cast<Idx>(" << totalElements << "));\n";
+         << ", alpaka::getPtrNative(deviceBuf_" << fNOutput << ")";
+      for (auto &p : dynParamNames)
+         out << ", static_cast<std::size_t>(" << p << ")";
+      out << ", static_cast<Idx>(" << totalElements << "));\n";
 
       return out.str();
    }

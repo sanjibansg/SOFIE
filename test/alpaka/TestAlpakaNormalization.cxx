@@ -6,6 +6,18 @@
 #include "LayerNormScaleBias_FromONNX_GPU_ALPAKA.hxx"
 #include "LayerNorm3D_FromONNX_GPU_ALPAKA.hxx"
 
+#include "DynamicBatchNorm4D_FromONNX_GPU_ALPAKA.hxx"
+#include "DynamicBatchNormDynSpatialRelu_FromONNX_GPU_ALPAKA.hxx"
+#include "DynamicBatchNorm2D_FromONNX_GPU_ALPAKA.hxx"
+#include "Softmax1d_FromONNX_GPU_ALPAKA.hxx"
+#include "Softmax2d_FromONNX_GPU_ALPAKA.hxx"
+#include "Softmax3d_FromONNX_GPU_ALPAKA.hxx"
+#include "Softmax4d_FromONNX_GPU_ALPAKA.hxx"
+#include "input_models/references/Softmax1d.ref.hxx"
+#include "input_models/references/Softmax2d.ref.hxx"
+#include "input_models/references/Softmax3d.ref.hxx"
+#include "input_models/references/Softmax4d.ref.hxx"
+
 TEST_F(SofieAlpakaTest, BatchNormalization)
 {
     constexpr float TOLERANCE = DEFAULT_TOLERANCE;
@@ -79,6 +91,127 @@ TEST_F(SofieAlpakaTest, BatchNormalizationRelu)
     for (size_t i = 0; i < outputSize; ++i) {
         float expected = std::max(0.f, input[i] * inv_std);
         EXPECT_LE(std::abs(res_ptr[i] - expected), TOLERANCE) << "i=" << i;
+    }
+}
+
+// X[N,4,2,3]: dynamic batch, static spatial (6)
+TEST_F(SofieAlpakaTest, DynamicBatchNorm4D)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t C = 4, spatial = 2 * 3;
+    const float scale[4] = {1.0f, 2.0f, 0.5f, 1.5f}, bias[4] = {0.1f, -0.2f, 0.3f, 0.0f};
+    const float mean_[4] = {0.5f, 1.0f, -0.5f, 2.0f}, var_[4] = {1.0f, 4.0f, 0.25f, 2.0f};
+    const float eps = 1e-5f;
+
+    for (std::size_t N : {std::size_t(1), std::size_t(8)}) {
+        const std::size_t sz = N * C * spatial;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sz}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < sz; ++i) in_ptr[i] = static_cast<float>(i % 10) - 5.0f;
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{sz}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sz}));
+        {
+            SOFIE_DynamicBatchNorm4D::Session<alpaka::TagGpuCudaRt> session("DynamicBatchNorm4D_FromONNX_GPU_ALPAKA.dat", N);
+            auto result = session.infer(N, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t i = 0; i < sz; ++i) {
+            std::size_t c = (i / spatial) % C;
+            float fused = scale[c] / std::sqrt(var_[c] + eps);
+            float expected = (in_ptr[i] - mean_[c]) * fused + bias[c];
+            EXPECT_LE(std::abs(res[i] - expected), TOLERANCE) << "i=" << i;
+        }
+    }
+}
+
+// X[N,4,n_pf] + relu: dynamic batch and spatial, rebuilt per size so Y matches its length
+TEST_F(SofieAlpakaTest, DynamicBatchNormDynSpatialRelu)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t C = 4;
+    const float scale[4] = {1.0f, 2.0f, 0.5f, 1.5f}, bias[4] = {0.1f, -0.2f, 0.3f, 0.0f};
+    const float mean_[4] = {0.5f, 1.0f, -0.5f, 2.0f}, var_[4] = {1.0f, 4.0f, 0.25f, 2.0f};
+    const float eps = 1e-5f;
+
+    const std::size_t Ns[] = {1, 8};
+    const std::size_t Ps[] = {1, 5};   // n_pf
+    for (int t = 0; t < 2; ++t) {
+        const std::size_t N = Ns[t], P = Ps[t];
+        const std::size_t sz = N * C * P;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sz}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < sz; ++i) in_ptr[i] = static_cast<float>(i % 10) - 5.0f;
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{sz}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sz}));
+        {
+            SOFIE_DynamicBatchNormDynSpatialRelu::Session<alpaka::TagGpuCudaRt> session("DynamicBatchNormDynSpatialRelu_FromONNX_GPU_ALPAKA.dat", N, P);
+            auto result = session.infer(N, P, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t i = 0; i < sz; ++i) {
+            std::size_t c = (i / P) % C;
+            float fused = scale[c] / std::sqrt(var_[c] + eps);
+            float expected = (in_ptr[i] - mean_[c]) * fused + bias[c];
+            expected = expected > 0.0f ? expected : 0.0f;   // relu
+            EXPECT_LE(std::abs(res[i] - expected), TOLERANCE) << "i=" << i;
+        }
+    }
+}
+
+// X[N,4]: rank 2, spatial is 1
+TEST_F(SofieAlpakaTest, DynamicBatchNorm2D)
+{
+    constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+    const std::size_t C = 4;
+    const float scale[4] = {1.0f, 2.0f, 0.5f, 1.5f}, bias[4] = {0.1f, -0.2f, 0.3f, 0.0f};
+    const float mean_[4] = {0.5f, 1.0f, -0.5f, 2.0f}, var_[4] = {1.0f, 4.0f, 0.25f, 2.0f};
+    const float eps = 1e-5f;
+
+    for (std::size_t N : {std::size_t(1), std::size_t(8)}) {
+        const std::size_t sz = N * C;
+
+        auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sz}));
+        float* in_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+        for (Idx i = 0; i < sz; ++i) in_ptr[i] = static_cast<float>(i % 10) - 5.0f;
+
+        auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(Idx{sz}));
+        alpaka::memcpy(queue, input_d, input_h);
+        alpaka::wait(queue);
+
+        auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{sz}));
+        {
+            SOFIE_DynamicBatchNorm2D::Session<alpaka::TagGpuCudaRt> session("DynamicBatchNorm2D_FromONNX_GPU_ALPAKA.dat", N);
+            auto result = session.infer(N, input_d);
+            cudaDeviceSynchronize();
+            alpaka::memcpy(queue, result_h, result);
+            alpaka::wait(queue);
+        }
+
+        float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+        for (std::size_t i = 0; i < sz; ++i) {
+            std::size_t c = i % C;
+            float fused = scale[c] / std::sqrt(var_[c] + eps);
+            float expected = (in_ptr[i] - mean_[c]) * fused + bias[c];
+            EXPECT_LE(std::abs(res[i] - expected), TOLERANCE) << "i=" << i;
+        }
     }
 }
 
@@ -223,3 +356,131 @@ TEST_F(SofieAlpakaTest, LayerNorm3D)
         EXPECT_LE(std::abs(res_ptr[12 + i] - exp1[i]), TOLERANCE) << "row1 i=" << i;
 }
 
+TEST_F(SofieAlpakaTest, Softmax1d)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+   std::vector<float> input_vec({-1.f, 0.f, 1.f});
+   const Idx N = static_cast<Idx>(input_vec.size());
+
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(N));
+   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+   for (Idx i = 0; i < N; ++i) input_ptr[i] = input_vec[i];
+
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(N));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(N));
+   {
+      SOFIE_Softmax1d::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(input_d);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float* ref = Softmax1d_ExpectedOutput::output;
+   for (Idx i = 0; i < N; ++i)
+      EXPECT_LE(std::abs(res[i] - ref[i]), TOLERANCE) << "  index=" << i;
+}
+
+TEST_F(SofieAlpakaTest, Softmax2d)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+   std::vector<float> input_vec({-1.f, 0.f, 1.f});
+   const Idx N = static_cast<Idx>(input_vec.size());
+
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(N));
+   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+   for (Idx i = 0; i < N; ++i) input_ptr[i] = input_vec[i];
+
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(N));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(N));
+   {
+      SOFIE_Softmax2d::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(input_d);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float* ref = Softmax2d_ExpectedOutput::output;
+   for (Idx i = 0; i < N; ++i)
+      EXPECT_LE(std::abs(res[i] - ref[i]), TOLERANCE) << "  index=" << i;
+}
+
+TEST_F(SofieAlpakaTest, Softmax3d)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+   std::vector<float> input_vec({
+        -0.8939f, -0.3674f,  0.1763f,  1.5804f, -0.4687f,  1.2253f, -1.3488f, -0.1000f,
+        -0.1262f,  0.4962f,  1.0870f,  0.6905f, -0.3451f, -1.6981f, -0.4688f,  0.4468f,
+        -0.5479f,  0.0650f,  1.0446f, -1.6249f, -0.7190f, -1.7520f,  3.7753f, -1.4939f});
+   const Idx N = static_cast<Idx>(input_vec.size());
+
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(N));
+   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+   for (Idx i = 0; i < N; ++i) input_ptr[i] = input_vec[i];
+
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(N));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(N));
+   {
+      SOFIE_Softmax3d::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(input_d);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float* ref = Softmax3d_ExpectedOutput::output;
+   for (Idx i = 0; i < N; ++i)
+      EXPECT_LE(std::abs(res[i] - ref[i]), TOLERANCE) << "  index=" << i;
+}
+
+TEST_F(SofieAlpakaTest, Softmax4d)
+{
+   constexpr float TOLERANCE = DEFAULT_TOLERANCE;
+   std::vector<float> input_vec({
+        -0.5869f, -1.4272f, -0.1546f,  0.0096f,  0.1706f,  0.0388f, -0.3484f, -0.7829f,
+         1.1138f, -0.5644f, -0.6264f, -1.1890f,  1.6741f, -0.7130f,  0.9592f,  1.7477f,
+        -0.4775f,  1.3407f, -0.3882f, -0.4560f,  1.0385f, -0.1669f,  0.5540f, -1.0790f,
+        -0.6153f, -0.6274f, -1.2304f, -0.6757f,  1.0178f, -0.2379f, -0.7912f, -0.0165f,
+        -0.5423f,  0.1459f,  1.3585f, -0.5005f, -0.2187f, -1.8181f, -0.6642f,  0.0287f,
+        -1.9103f,  0.7984f, -0.7860f,  1.5134f,  1.3873f, -0.6462f, -0.6354f, -0.1335f});
+   const Idx N = static_cast<Idx>(input_vec.size());
+
+   auto input_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(N));
+   float* input_ptr = reinterpret_cast<float*>(alpaka::getPtrNative(input_h));
+   for (Idx i = 0; i < N; ++i) input_ptr[i] = input_vec[i];
+
+   auto input_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(N));
+   alpaka::memcpy(queue, input_d, input_h);
+   alpaka::wait(queue);
+
+   auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(N));
+   {
+      SOFIE_Softmax4d::Session<alpaka::TagGpuCudaRt> session;
+      auto result = session.infer(input_d);
+      alpaka::wait(queue);
+      cudaDeviceSynchronize();
+      alpaka::memcpy(queue, result_h, result);
+      alpaka::wait(queue);
+   }
+
+   float* res = reinterpret_cast<float*>(alpaka::getPtrNative(result_h));
+   float* ref = Softmax4d_ExpectedOutput::output;
+   for (Idx i = 0; i < N; ++i)
+      EXPECT_LE(std::abs(res[i] - ref[i]), TOLERANCE) << "  index=" << i;
+}
