@@ -31,7 +31,9 @@ public:
    {
       fKind = OperatorKind::GRIFFIN_RGLRU;
       fInputTensorNames  = { fNX, fNA };
-      fOutputTensorNames = { fNY };
+      // The state tensor is written only inside the kernel; declaring it an
+      // output keeps the buffer alive under use-based buffer emission.
+      fOutputTensorNames = { fNY, fNState };
    }
 
    std::vector<std::vector<size_t>> ShapeInference(std::vector<std::vector<size_t>> input) override

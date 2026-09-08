@@ -4,7 +4,9 @@
 #include "SOFIE/SOFIE_common.hxx"
 #include "SOFIE/ROperator.hxx"
 #include "SOFIE/RModel.hxx"
+#include "SOFIE/RQuantization.hxx"
 
+#include <optional>
 #include <sstream>
 
 namespace SOFIE {
@@ -71,6 +73,16 @@ struct BinaryOperatorTrait<T, FMod> {
 
 template <typename T, EBasicBinaryOperator Op>
 class ROperator_BasicBinary final : public ROperator {
+public:
+   // Add and Mul have quantized elementwise kernels and compute on codes; the rest keep
+   // the conservative float default.
+   ELowPrecisionCarrierSupport CarrierSupport() const override
+   {
+      return (Op == EBasicBinaryOperator::Add || Op == EBasicBinaryOperator::Mul)
+                ? ELowPrecisionCarrierSupport::Arithmetic
+                : ELowPrecisionCarrierSupport::RequiresFloat;
+   }
+
 private:
    int fBroadcastFlag = 0;
    std::string fNA;
@@ -87,6 +99,13 @@ private:
    std::vector<Dim> fDimShapeB;
    std::vector<Dim> fDimShapeY;
 
+   // Grid of an absorbed downstream fake-quant boundary: the kernel applies the boundary's
+   // snap at its store and keeps writing float, so consumers are unaffected.
+   std::optional<QuantizationGrid> fFakeQuantGrid;
+   // Grids of carrier operands adopted at the load; an unset operand reads plain values.
+   std::optional<QuantizationGrid> fInputGridA;
+   std::optional<QuantizationGrid> fInputGridB;
+
 public:
    ROperator_BasicBinary() {}
    ROperator_BasicBinary(std::string nameA, std::string nameB, std::string nameY)
@@ -94,6 +113,48 @@ public:
    {
       fInputTensorNames = {fNA, fNB};
       fOutputTensorNames = {fNY};
+   }
+
+   // Absorbs a downstream fake-quant boundary: the snap runs at this kernel's single store
+   // and the boundary stops emitting. A constant-folded output emits no kernel, so it cannot.
+   bool CanFuseOutputOnGrid(EQuantizedOutputEmit mode) const override
+   {
+      return mode == EQuantizedOutputEmit::Snap && !fIsOutputConstant;
+   }
+
+   // Adopts the boundary's output tensor; the previous output is left for dead-code
+   // elimination.
+   void FuseOutputOnGrid(const std::string &output, const QuantizationGrid &grid,
+                         EQuantizedOutputEmit mode) override
+   {
+      if (mode != EQuantizedOutputEmit::Snap)
+         return ROperator::FuseOutputOnGrid(output, grid, mode);
+      AdoptFusedOutputName(fNY, fOutputTensorNames, output, "BasicBinary");
+      fFakeQuantGrid = grid;
+   }
+
+   // Reads a carrier operand directly, decoding at the load with the pair's own scale --
+   // the same arithmetic the dequantize kernel emits, one memory round trip earlier.
+   bool CanFuseDequantizedInput() const override { return !fIsOutputConstant; }
+
+   bool FuseDequantizedInput(const std::string &from, const std::string &carrier,
+                             const QuantizationGrid &grid) override
+   {
+      // Only the E4M3 decode has an inline spelling here; an affine grid also carries a
+      // zero point, and E5M2 would need its own decode.
+      if (!IsPerTensorE4M3(grid))
+         return false;
+      if (fNA == from && !fInputGridA) {
+         fNA = carrier;
+         fInputGridA = grid;
+      } else if (fNB == from && !fInputGridB) {
+         fNB = carrier;
+         fInputGridB = grid;
+      } else {
+         return false;
+      }
+      fInputTensorNames = {fNA, fNB};
+      return true;
    }
 
    // type of output given input
@@ -458,8 +519,8 @@ public:
       std::string op;
       op = "\n//------ "+opName+"_"+BinaryOperatorTrait<T, Op>::Name()+"_KERNEL_ALPAKA\n";
       op += SP + "struct Binary"+opName+BinaryOperatorTrait<T, Op>::Name()+"Kernel {\n";
-      op += SP + SP + "template<typename TAcc, typename T>\n";
-      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, T const * A, T const * B, T * C) const {\n";
+      op += SP + SP + "template<typename TAcc, typename TA, typename TB, typename T>\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, TA const * A, TB const * B, T * C) const {\n";
       op += SP + SP + SP + "auto idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
       op += SP + SP + SP + "if (idx < " + std::to_string(ConvertShapeToLength(fShapeY)) + ") {\n";
       auto stridesA = UTILITY::ComputeStrideFromShape(fShapeA);
@@ -497,50 +558,60 @@ public:
             if (fShapeB[i] != fShapeY[i]) { isBContiguous = false; break; }
       }
 
-      std::string flattened_index_A = "";
-      std::string flattened_index_B = "";
+      auto makeFlattenedIndex = [&](const std::vector<size_t> &inputShape,
+                                    const std::vector<size_t> &inputStrides,
+                                    bool isScalar, bool isContiguous) {
+         if (isScalar)
+            return std::string{"0"};
+         if (isContiguous)
+            return std::string{"idx"};
 
-      if (isAScalar) {
-         // A is a single broadcast value
-         flattened_index_A = "0";
-      } else if (isAContiguous) {
-         // A and Y have identical shapes → direct index
-         flattened_index_A = "idx";
-      } else {
-         // General broadcast case: decompose idx into per-dim coords
-         std::string temp = "idx";
-         for (size_t id_s = 0; id_s < fShapeA.size(); ++id_s) {
-            auto strideY = stridesY[id_s];
-            auto strideA = stridesA[id_s];
-            std::string coord = "(int)(" + temp + " / " + std::to_string(strideY) + ")";
-            flattened_index_A += coord + " * " + std::to_string(strideA) + " + ";
-            temp = temp + " - (" + coord + " * " + std::to_string(strideY) + ")";
+         const auto rankOffset = fShapeY.size() - inputShape.size();
+         std::string index;
+         for (size_t inputAxis = 0; inputAxis < inputShape.size(); ++inputAxis) {
+            if (inputShape[inputAxis] == 1)
+               continue;
+            const auto outputAxis = inputAxis + rankOffset;
+            std::string term = "((idx / " + std::to_string(stridesY[outputAxis]) +
+                               ") % " + std::to_string(fShapeY[outputAxis]) + ")";
+            if (inputStrides[inputAxis] != 1)
+               term += " * " + std::to_string(inputStrides[inputAxis]);
+            if (!index.empty())
+               index += " + ";
+            index += term;
          }
-         if (!flattened_index_A.empty())
-            flattened_index_A.erase(flattened_index_A.size() - 3);
-      }
+         return index.empty() ? std::string{"0"} : index;
+      };
 
-      if (isBScalar) {
-         // B is a single broadcast value
-         flattened_index_B = "0";
-      } else if (isBContiguous) {
-         // B and Y have identical shapes → direct index
-         flattened_index_B = "idx";
+      const auto flattened_index_A =
+         makeFlattenedIndex(fShapeA, stridesA, isAScalar, isAContiguous);
+      const auto flattened_index_B =
+         makeFlattenedIndex(fShapeB, stridesB, isBScalar, isBContiguous);
+
+      // A carrier operand decodes at the load with the pair's own scale. In one kernel the
+      // compiler keeps this wider than the two-kernel spelling, within one code step.
+      std::string decodes;
+      auto operandExpr = [&decodes](const std::string &load, const char *name,
+                                    const std::optional<QuantizationGrid> &grid) {
+         if (!grid)
+            return load;
+         decodes += "T const " + std::string(name) + "_decoded = static_cast<T>(SOFIE::DecodeFP8E4M3(" +
+                    load + ") * " + ExactDoubleLiteral(grid->scale) + "f);\n";
+         return std::string(name) + "_decoded";
+      };
+      const auto value =
+         BinaryOperatorTrait<T, Op>::Op(operandExpr("A["+flattened_index_A+"]", "a", fInputGridA),
+                                        operandExpr("B["+flattened_index_B+"]", "b", fInputGridB));
+      op += decodes;
+      if (fFakeQuantGrid) {
+         // The absorbed boundary's snap, applied at the store instead of in a separate kernel
+         // over the same tensor: same arithmetic, one memory round trip earlier.
+         op += "T const out_val = " + value + ";\n";
+         op += FakeQuantRoundTripStatements("out_snapped", "out_val", *fFakeQuantGrid, "");
+         op += "C[idx] = static_cast<T>(out_snapped);\n";
       } else {
-         // General broadcast case
-         std::string temp = "idx";
-         for (size_t id_s = 0; id_s < fShapeB.size(); ++id_s) {
-            auto strideY = stridesY[id_s];
-            auto strideB = stridesB[id_s];
-            std::string coord = "(int)(" + temp + " / " + std::to_string(strideY) + ")";
-            flattened_index_B += coord + " * " + std::to_string(strideB) + " + ";
-            temp = temp + " - (" + coord + " * " + std::to_string(strideY) + ")";
-         }
-         if (!flattened_index_B.empty())
-            flattened_index_B.erase(flattened_index_B.size() - 3);
+         op += "C[idx] = " + value + ";\n";
       }
-
-      op += "C[idx] = " + BinaryOperatorTrait<T, Op>::Op("A["+flattened_index_A+"]", "B["+flattened_index_B+"]") + ";\n";
       op += "}\n}\n};\n";
       return op;
    }

@@ -38,8 +38,33 @@ public:
          fOutputTensorNames = { fNY };
    }
 
+   // Normalized (non-negative after Initialize) gather axis. Used by the
+   // quantized weight-only Gather recognizer, mirroring the getter pattern the
+   // dense-linear recognizer uses on ROperator_Gemm.
+   int64_t GetAxis() const { return fAttrAxis; }
+
    std::vector<ETensorType> TypeInference(std::vector<ETensorType> input) override {
       return input;
+   }
+
+   bool PropagatesQuantizationMetadata() const override { return true; }
+
+   std::vector<int_t> GetQuantizationMetadataAxisMap(
+      const std::vector<std::size_t> &sourceShape,
+      const std::vector<std::size_t> &targetShape) const override
+   {
+      if (sourceShape.empty())
+         return std::vector<int_t>(targetShape.size(), -1);
+      const auto axis = static_cast<std::size_t>(fAttrAxis);
+      const auto indicesRank = targetShape.size() + 1 - sourceShape.size();
+      std::vector<int_t> map(targetShape.size(), -1);
+      for (std::size_t outputAxis = 0; outputAxis < targetShape.size(); ++outputAxis) {
+         if (outputAxis < axis)
+            map[outputAxis] = static_cast<int_t>(outputAxis);
+         else if (outputAxis >= axis + indicesRank)
+            map[outputAxis] = static_cast<int_t>(outputAxis - indicesRank + 1);
+      }
+      return map;
    }
 
    std::vector<std::vector<size_t>> ShapeInference(std::vector<std::vector<size_t>> input) override {

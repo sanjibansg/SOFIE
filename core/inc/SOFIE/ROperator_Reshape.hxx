@@ -48,6 +48,79 @@ public:
       return "";
    }
 
+   bool PropagatesQuantizationMetadata() const override { return true; }
+
+   const std::string &GetInputTensor() const { return fNData; }
+   const std::string &GetOutputTensor() const { return fNOutput; }
+
+   // A reshape only relabels the extents of a buffer, so it never reads the bytes it moves
+   // and is indifferent to their type. On the device it emits a non-owning view rather than
+   // a kernel, which means its output *is* its input's storage -- the arena has to be told.
+   ELowPrecisionCarrierSupport CarrierSupport() const override
+   {
+      return ELowPrecisionCarrierSupport::ValuePreserving;
+   }
+   bool CarrierOutputAliasesInput() const override { return true; }
+
+   // Legal after Initialize: only the tensor names change, and the replacements carry the
+   // same shapes as the tensors they stand in for, so the shapes derived there stay valid.
+   // Used by RModel::PropagateLowPrecisionThroughMovement to move this reshape onto the
+   // quantized carrier. fNInput2 is the shape/axes operand, which is unrelated to the data
+   // being moved and is kept as it was.
+   void RewireLowPrecisionCarrier(const std::string &nameData, const std::string &nameOutput) override
+   {
+      fNData = nameData;
+      fNOutput = nameOutput;
+      fInputTensorNames = { fNData };
+      if (!fNInput2.empty())
+         fInputTensorNames.emplace_back(fNInput2);
+      fOutputTensorNames = { fNOutput };
+   }
+
+   std::vector<int_t> GetQuantizationMetadataAxisMap(
+      const std::vector<std::size_t> &sourceShape,
+      const std::vector<std::size_t> &targetShape) const override
+   {
+      if (fOpMode == Unsqueeze) {
+         std::vector<bool> inserted(targetShape.size(), false);
+         for (auto rawAxis : fAttrAxes) {
+            auto axis = rawAxis < 0 ? rawAxis + static_cast<int64_t>(targetShape.size()) : rawAxis;
+            if (axis >= 0 && static_cast<std::size_t>(axis) < inserted.size())
+               inserted[static_cast<std::size_t>(axis)] = true;
+         }
+         std::vector<int_t> map(targetShape.size(), -1);
+         std::size_t inputAxis = 0;
+         for (std::size_t outputAxis = 0; outputAxis < map.size(); ++outputAxis) {
+            if (!inserted[outputAxis])
+               map[outputAxis] = static_cast<int_t>(inputAxis++);
+         }
+         return map;
+      }
+      if (fOpMode == Squeeze) {
+         std::vector<bool> removed(sourceShape.size(), false);
+         if (fAttrAxes.empty()) {
+            for (std::size_t axis = 0; axis < sourceShape.size(); ++axis)
+               removed[axis] = sourceShape[axis] == 1;
+         } else {
+            for (auto rawAxis : fAttrAxes) {
+               auto axis = rawAxis < 0 ? rawAxis + static_cast<int64_t>(sourceShape.size()) : rawAxis;
+               if (axis >= 0 && static_cast<std::size_t>(axis) < removed.size())
+                  removed[static_cast<std::size_t>(axis)] = true;
+            }
+         }
+         std::vector<int_t> map;
+         map.reserve(targetShape.size());
+         for (std::size_t inputAxis = 0; inputAxis < removed.size(); ++inputAxis) {
+            if (!removed[inputAxis])
+               map.push_back(static_cast<int_t>(inputAxis));
+         }
+         return map;
+      }
+      if (sourceShape == targetShape)
+         return {};
+      return std::vector<int_t>(targetShape.size(), -1);
+   }
+
    ROperator_Reshape(){}
    ROperator_Reshape(ReshapeOpMode opMode, int attr_value, std::string nameData, std::string nameInput2, std::string nameOutput)
       : fOpMode(opMode), fNData(UTILITY::Clean_name(nameData)), fNInput2(UTILITY::Clean_name(nameInput2)),

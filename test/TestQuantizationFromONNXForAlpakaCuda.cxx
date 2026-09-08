@@ -1,0 +1,3103 @@
+// Per-operator-family tests and the umbrella translation unit: the section files are #included
+// at the bottom because the Alpaka headers' __global__ kernels allow only one TU per binary.
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "SOFIE/RModel.hxx"
+#include "SOFIE/ROperator_BasicBinary.hxx"
+#include "SOFIE/ROperator_Conv.hxx"
+#include "SOFIE/ROperator_Gather.hxx"
+#include "SOFIE/ROperator_ONNXQuantizeLinear.hxx"
+#include "SOFIE/ROperator_QONNXQuant.hxx"
+#include "SOFIE/quantization/ROperator_QuantizedConv.hxx"
+#include "SOFIE/ROperator_Relu.hxx"
+#include "SOFIE/quantization/RQuantization_Convolution.hxx"
+#include "SOFIE/quantization/RQuantization_DenseLinear.hxx"
+#include "SOFIE/quantization/RQuantization_Storage.hxx"
+#include "SOFIE/SOFIE_QuantizedAlpaka.hxx"
+
+#include "QuantizationAlpakaTestFixture.hxx"
+#include "QuantizationTestHelpers.hxx"
+
+#include "QONNX_QuantConv_FromONNX_GPU_ALPAKA.hxx"
+#include "ONNX_QDQ_QuantConv_FromONNX_GPU_ALPAKA.hxx"
+
+#include <alpaka/alpaka.hpp>
+#include <cuda_runtime.h>
+
+#include <cuda_fp8.h>
+
+#include "gtest/gtest.h"
+
+
+TEST(QuantizationMetadata, Convolution)
+{
+   {
+      SCOPED_TRACE("QONNX and Q/DQ canonicalization");
+         auto addFloat = [](SOFIE::RModel &model, const std::string &name,
+                            const std::vector<std::size_t> &shape, std::vector<float> values) {
+            model.AddInitializedTensor(name, shape, values);
+         };
+         auto addInt8 = [](SOFIE::RModel &model, const std::string &name,
+                           const std::vector<std::size_t> &shape, std::vector<std::int8_t> values) {
+            model.AddInitializedTensor(name, shape, values);
+         };
+         auto addQONNXBoundary = [](SOFIE::RModel &model, const std::string &source,
+                                    const std::string &target, const std::string &prefix) {
+            AddNamedOperator<SOFIE::ROperator_QONNXQuant>(
+               model, prefix, source, "scale", "zero_point_float", "bit_width", target,
+               true, false, SOFIE::EQuantizationRoundingMode::ROUND,
+               SOFIE::EQuantizationOverflowMode::SAT);
+         };
+
+         SOFIE::RModel qonnx("qonnx_depthwise_conv");
+         qonnx.AddInputTensorInfo("input", SOFIE::ETensorType::FLOAT,
+                                  std::vector<std::size_t>{1, 4, 8});
+         addFloat(qonnx, "weight", {4, 1, 3}, std::vector<float>(12, 0.25f));
+         addFloat(qonnx, "bias", {4}, std::vector<float>(4, 0.0f));
+         addFloat(qonnx, "scale", {}, {0.125f});
+         addFloat(qonnx, "zero_point_float", {}, {0.0f});
+         addFloat(qonnx, "bit_width", {}, {8.0f});
+         addQONNXBoundary(qonnx, "input", "input_quantized", "quantize_input");
+         addQONNXBoundary(qonnx, "weight", "weight_quantized", "quantize_weight");
+         AddNamedOperator<SOFIE::ROperator_Conv<float>>(
+            qonnx, "depthwise_conv", "NOTSET", std::vector<std::size_t>{1}, 4,
+            std::vector<std::size_t>{3}, std::vector<std::size_t>{1, 1},
+            std::vector<std::size_t>{1}, "input_quantized", "weight_quantized",
+            "bias", "conv_output");
+         addQONNXBoundary(qonnx, "conv_output", "output_quantized", "quantize_output");
+         qonnx.Initialize();
+
+         SOFIE::RModel qdq("qdq_depthwise_conv");
+         qdq.AddInputTensorInfo("input", SOFIE::ETensorType::FLOAT,
+                                std::vector<std::size_t>{1, 4, 8});
+         addInt8(qdq, "weight_carrier", {4, 1, 3}, std::vector<std::int8_t>(12, 2));
+         addFloat(qdq, "bias", {4}, std::vector<float>(4, 0.0f));
+         addFloat(qdq, "scale", {}, {0.125f});
+         addInt8(qdq, "zero_point_int8", {}, {0});
+         AddNamedOperator<SOFIE::ROperator_ONNXQuantizeLinear>(
+            qdq, "quantize_input", "input", "scale", "zero_point_int8",
+            "input_carrier", SOFIE::ETensorType::INT8, -1);
+         AddNamedOperator<SOFIE::ROperator_ONNXDequantizeLinear>(
+            qdq, "dequantize_input", "input_carrier", "scale", "zero_point_int8",
+            "input_dequantized", SOFIE::ETensorType::INT8, -1);
+         AddNamedOperator<SOFIE::ROperator_ONNXDequantizeLinear>(
+            qdq, "dequantize_weight", "weight_carrier", "scale", "zero_point_int8",
+            "weight_dequantized", SOFIE::ETensorType::INT8, -1);
+         AddNamedOperator<SOFIE::ROperator_Conv<float>>(
+            qdq, "depthwise_conv", "NOTSET", std::vector<std::size_t>{1}, 4,
+            std::vector<std::size_t>{3}, std::vector<std::size_t>{1, 1},
+            std::vector<std::size_t>{1}, "input_dequantized", "weight_dequantized",
+            "bias", "conv_output");
+         AddNamedOperator<SOFIE::ROperator_ONNXQuantizeLinear>(
+            qdq, "quantize_output", "conv_output", "scale", "zero_point_int8",
+            "output_carrier", SOFIE::ETensorType::INT8, -1);
+         qdq.Initialize();
+
+         // Both frontends must canonicalize to exactly one conv region; the pipeline report of
+         // the ALPAKA lowered view is the counting surface.
+         const auto &qonnxReport = SOFIE_TEST::AlpakaPipelineReport(qonnx);
+         const auto &qdqReport = SOFIE_TEST::AlpakaPipelineReport(qdq);
+         ASSERT_EQ(SOFIE_TEST::CountRegions(qonnxReport, "conv"), 1U);
+         ASSERT_EQ(SOFIE_TEST::CountRegions(qdqReport, "conv"), 1U);
+         const auto *qonnxEntry = SOFIE_TEST::FindRegion(qonnxReport, "output_quantized");
+         const auto *qdqEntry = SOFIE_TEST::FindRegion(qdqReport, "output_carrier");
+         ASSERT_NE(qonnxEntry, nullptr);
+         ASSERT_NE(qdqEntry, nullptr);
+         EXPECT_EQ(qonnxEntry->family, "conv");
+         EXPECT_EQ(qdqEntry->family, "conv");
+         const auto &qonnxRegion = *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(qonnx.GetQuantizationState());
+         const auto &qdqRegion = *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(qdq.GetQuantizationState());
+         EXPECT_EQ(qonnxRegion.status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
+         EXPECT_EQ(qdqRegion.status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
+         EXPECT_EQ(qonnxRegion.attributes.kind, SOFIE::EQuantizedConvolutionKind::Depthwise);
+         EXPECT_EQ(qdqRegion.attributes.kind, SOFIE::EQuantizedConvolutionKind::Depthwise);
+         EXPECT_EQ(qonnxRegion.attributes.spatialRank, 1U);
+         EXPECT_EQ(qonnxRegion.attributes.kernelShape, std::vector<std::size_t>({3}));
+         EXPECT_EQ(qonnxRegion.attributes.pads, std::vector<std::size_t>({1, 1}));
+         // The operand contracts are parse products: both frontends must mint the same
+         // grids in the model's tensor-info map.
+         ASSERT_TRUE(qonnx.HasQuantizationInfo("input_quantized"));
+         ASSERT_TRUE(qdq.HasQuantizationInfo("input_dequantized"));
+         ASSERT_TRUE(qonnx.HasQuantizationInfo("weight_quantized"));
+         ASSERT_TRUE(qdq.HasQuantizationInfo("weight_dequantized"));
+         ASSERT_TRUE(qonnx.HasQuantizationInfo("output_quantized"));
+         ASSERT_TRUE(qdq.HasQuantizationInfo("output_carrier"));
+         const auto &qonnxInput = qonnx.GetQuantizationInfo("input_quantized");
+         const auto &qdqInput = qdq.GetQuantizationInfo("input_dequantized");
+         EXPECT_EQ(qonnxInput.bitWidth, qdqInput.bitWidth);
+         EXPECT_EQ(qonnxInput.isSigned, qdqInput.isSigned);
+         EXPECT_DOUBLE_EQ(qonnxInput.scale, qdqInput.scale);
+         EXPECT_EQ(qonnx.GetQuantizationInfo("weight_quantized").axis,
+                   qdq.GetQuantizationInfo("weight_dequantized").axis);
+         EXPECT_DOUBLE_EQ(qonnx.GetQuantizationInfo("output_quantized").scale,
+                          qdq.GetQuantizationInfo("output_carrier").scale);
+
+         const auto *qonnxCpuPlan = SOFIE::FindQuantizedLoweringPlan(
+            qonnx.GetQuantizationState(), qonnxRegion.convOpIndex, SOFIE::EQuantizedBackend::CPU);
+         const auto *qdqCpuPlan = SOFIE::FindQuantizedLoweringPlan(
+            qdq.GetQuantizationState(), qdqRegion.convOpIndex, SOFIE::EQuantizedBackend::CPU);
+         const auto *qonnxAlpakaPlan = SOFIE::FindQuantizedLoweringPlan(
+            qonnx.GetQuantizationState(), qonnxRegion.convOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+         ASSERT_NE(qonnxCpuPlan, nullptr);
+         ASSERT_NE(qdqCpuPlan, nullptr);
+         ASSERT_NE(qonnxAlpakaPlan, nullptr);
+         EXPECT_EQ(qonnxCpuPlan->status, SOFIE::EQuantizedLoweringStatus::Baseline);
+         EXPECT_EQ(qdqCpuPlan->status, SOFIE::EQuantizedLoweringStatus::Baseline);
+         EXPECT_EQ(qonnxCpuPlan->weightLayout, SOFIE::EQuantizedLayout::Plain);
+         EXPECT_EQ(qonnxCpuPlan->accumulatorStorage, SOFIE::EQuantizedStorageType::Int32Accumulator);
+         EXPECT_EQ(qonnxCpuPlan->outputMode, SOFIE::EQuantizedOutputMode::ExactFakeQuantFloat);
+         EXPECT_EQ(qdqCpuPlan->outputMode, SOFIE::EQuantizedOutputMode::Quantized);
+         EXPECT_TRUE(qonnxCpuPlan->suppressesGraphOperators);
+         EXPECT_EQ(qonnxAlpakaPlan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         EXPECT_EQ(qonnxAlpakaPlan->computeProfile, SOFIE::EQuantizedComputeProfile::AffineInt8Conv);
+         EXPECT_EQ(qonnxAlpakaPlan->capabilityTag, "alpaka_int8_depthwise_conv_direct");
+         // "This region actually lowered": the pipeline report row carries the lowered-view
+         // verdict, and the depthwise call check below proves the emission.
+         EXPECT_EQ(qonnxEntry->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         EXPECT_EQ(qonnxEntry->capabilityTag, "alpaka_int8_depthwise_conv_direct");
+         EXPECT_TRUE(qonnxAlpakaPlan->suppressesGraphOperators);
+         EXPECT_FALSE(qonnxAlpakaPlan->matrixShapePolicy.has_value());
+         EXPECT_EQ(SOFIE::QuantizedPackedReusableScratchBytes(qonnxAlpakaPlan->resources), 0U);
+
+         auto hasResourceRole = [](const SOFIE::QuantizedLoweringPlan &plan,
+                                   SOFIE::EQuantizedResourceRole role) {
+            return std::any_of(
+               plan.resources.entries.begin(), plan.resources.entries.end(),
+               [role](const SOFIE::QuantizedResourceRequirement &entry) {
+                  return entry.role == role && entry.bytes != 0;
+               });
+         };
+         EXPECT_TRUE(hasResourceRole(*qonnxCpuPlan, SOFIE::EQuantizedResourceRole::WeightCarrier));
+         EXPECT_TRUE(hasResourceRole(*qonnxCpuPlan, SOFIE::EQuantizedResourceRole::InputStaging));
+         EXPECT_TRUE(hasResourceRole(*qonnxCpuPlan, SOFIE::EQuantizedResourceRole::Accumulator));
+         EXPECT_TRUE(hasResourceRole(*qonnxCpuPlan, SOFIE::EQuantizedResourceRole::OutputCarrier));
+
+         SOFIE::ROperator_QuantizedConv qonnxLowered(
+            qonnxRegion, *qonnxCpuPlan,
+            SOFIE::MakeQuantizedConvCodegenContext(qonnx, qonnxRegion));
+         SOFIE::ROperator_QuantizedConv qdqLowered(
+            qdqRegion, *qdqCpuPlan,
+            SOFIE::MakeQuantizedConvCodegenContext(qdq, qdqRegion));
+         const auto qonnxCode = qonnxLowered.Generate("qonnx_conv");
+         const auto qdqCode = qdqLowered.Generate("qdq_conv");
+         EXPECT_NE(qonnxCode.find("portable centered-integer CPU operator"), std::string::npos);
+         EXPECT_NE(qonnxCode.find("accumulator +="), std::string::npos);
+         EXPECT_NE(qonnxCode.find(qonnxCpuPlan->weightStorageTensor), std::string::npos);
+         EXPECT_NE(qdqCode.find("std::int8_t>(qy)"), std::string::npos);
+
+         SOFIE::ROperator_QuantizedConv qonnxAlpakaLowered(
+            qonnxRegion, *qonnxAlpakaPlan,
+            SOFIE::MakeQuantizedConvCodegenContext(qonnx, qonnxRegion));
+         const auto alpakaCode = qonnxAlpakaLowered.Generate_GPU_ALPAKA("depthwise_conv");
+         EXPECT_NE(alpakaCode.find("direct depthwise CUDA INT8 operator"), std::string::npos);
+         SOFIE_TEST::ExpectCallPresent(alpakaCode, "QuantizedConvCudaDepthwise_Call");
+         SOFIE_TEST::ExpectCallAbsent(alpakaCode, "QuantizedConvCudaLt_Call");
+         EXPECT_TRUE(qonnxAlpakaLowered.Generate_GPU_Kernel_Definitions_ALPAKA(
+            "depthwise_conv").empty());
+
+         // Both frontends derive the same bias contract, scale = inputScale * weightScale;
+         // the derived value is a generated-text carrier, not a region internal.
+         const auto *qdqAlpakaPlan = SOFIE::FindQuantizedLoweringPlan(
+            qdq.GetQuantizationState(), qdqRegion.convOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+         ASSERT_NE(qdqAlpakaPlan, nullptr);
+         SOFIE::ROperator_QuantizedConv qdqAlpakaLowered(
+            qdqRegion, *qdqAlpakaPlan,
+            SOFIE::MakeQuantizedConvCodegenContext(qdq, qdqRegion));
+         const auto qdqAlpakaCode = qdqAlpakaLowered.Generate_GPU_ALPAKA("qdq_depthwise_conv");
+         SOFIE_TEST::ExpectCallPresent(alpakaCode, ".matrix.biasScale = 0.015625;");
+         SOFIE_TEST::ExpectCallPresent(qdqAlpakaCode, ".matrix.biasScale = 0.015625;");
+   }
+   {
+      SCOPED_TRACE("bias and ReLU epilogue");
+         SOFIE::RModel model("qonnx_conv_bias_relu");
+         model.AddInputTensorInfo(
+            "input", SOFIE::ETensorType::FLOAT, std::vector<std::size_t>{1, 2, 4});
+         model.AddInitializedTensor(
+            "weight", std::vector<std::size_t>{2, 2, 1},
+            std::vector<float>{1.0f, -1.0f, -0.5f, 0.5f});
+         model.AddInitializedTensor("bias", std::vector<std::size_t>{2},
+                                    std::vector<float>{-0.25f, 0.25f});
+         model.AddInitializedTensor("scale", std::vector<std::size_t>{},
+                                    std::vector<float>{0.125f});
+         model.AddInitializedTensor("zero_point", std::vector<std::size_t>{},
+                                    std::vector<float>{1.0f});
+         model.AddInitializedTensor("bit_width", std::vector<std::size_t>{},
+                                    std::vector<float>{8.0f});
+         auto addBoundary = [&](const std::string &source, const std::string &target,
+                                const std::string &name) {
+            AddNamedOperator<SOFIE::ROperator_QONNXQuant>(
+               model, name, source, "scale", "zero_point", "bit_width", target,
+               true, false, SOFIE::EQuantizationRoundingMode::ROUND,
+               SOFIE::EQuantizationOverflowMode::SAT);
+         };
+         addBoundary("input", "input_quantized", "quantize_input");
+         addBoundary("weight", "weight_quantized", "quantize_weight");
+         AddNamedOperator<SOFIE::ROperator_Conv<float>>(
+            model, "conv", "NOTSET", std::vector<std::size_t>{1}, 1,
+            std::vector<std::size_t>{1}, std::vector<std::size_t>{0, 0},
+            std::vector<std::size_t>{1}, "input_quantized", "weight_quantized",
+            "bias", "conv_output");
+         AddNamedOperator<SOFIE::ROperator_Relu<float>>(
+            model, "relu", "conv_output", "relu_output");
+         addBoundary("relu_output", "output_quantized", "quantize_output");
+         model.Initialize();
+
+         // One conv region absorbing the bias and ReLU, counted through the pipeline report.
+         ASSERT_EQ(SOFIE_TEST::CountRegions(SOFIE_TEST::AlpakaPipelineReport(model), "conv"), 1U);
+         const auto &region = *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(model.GetQuantizationState());
+         EXPECT_EQ(region.status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
+         EXPECT_EQ(region.epilogueKind, SOFIE::EQuantizedEpilogueKind::BiasRelu);
+         ASSERT_TRUE(region.reluOpIndex.has_value());
+         ASSERT_TRUE(region.outputQuantOpIndex.has_value());
+         EXPECT_EQ(region.outputTensor, "output_quantized");
+
+         const auto *cpu = SOFIE::FindQuantizedLoweringPlan(
+            model.GetQuantizationState(), region.convOpIndex,
+            SOFIE::EQuantizedBackend::CPU);
+         const auto *alpaka = SOFIE::FindQuantizedLoweringPlan(
+            model.GetQuantizationState(), region.convOpIndex,
+            SOFIE::EQuantizedBackend::ALPAKA);
+         ASSERT_NE(cpu, nullptr);
+         ASSERT_NE(alpaka, nullptr);
+         EXPECT_NE(std::find(cpu->consumedOperatorIndices.begin(),
+                             cpu->consumedOperatorIndices.end(), *region.reluOpIndex),
+                   cpu->consumedOperatorIndices.end());
+
+         SOFIE::ROperator_QuantizedConv cpuLowered(
+            region, *cpu, SOFIE::MakeQuantizedConvCodegenContext(model, region));
+         SOFIE::ROperator_QuantizedConv alpakaLowered(
+            region, *alpaka, SOFIE::MakeQuantizedConvCodegenContext(model, region));
+         EXPECT_NE(cpuLowered.Generate("bias_relu").find(
+                      "realValue = std::max(realValue, 0.0)"),
+                   std::string::npos);
+         EXPECT_NE(alpakaLowered.Generate_GPU_ALPAKA("bias_relu").find(
+                      ".matrix.hasRelu = true"),
+                   std::string::npos);
+   }
+   {
+      SCOPED_TRACE("ALPAKA capability selection");
+         auto makeAffineConv = [](const std::string &name, std::size_t group,
+                                  const std::vector<std::size_t> &weightShape,
+                                  float zeroPoint, bool signedCarrier = true,
+                                  std::size_t inputLength = 256) {
+            SOFIE::RModel model(name);
+            const std::size_t inputChannels = weightShape[1] * group;
+            const std::size_t kernel = weightShape[2];
+            model.AddInputTensorInfo("input", SOFIE::ETensorType::FLOAT,
+                                     std::vector<std::size_t>{1, inputChannels, inputLength});
+            model.AddInitializedTensor(
+               "weight", SOFIE::ETensorType::FLOAT, weightShape,
+               std::shared_ptr<void>(
+                  new float[SOFIE::ConvertShapeToLength(weightShape)]{},
+                  std::default_delete<float[]>()));
+            model.AddInitializedTensor("scale", std::vector<std::size_t>{},
+                                       std::vector<float>{0.125f});
+            model.AddInitializedTensor("zero_point", std::vector<std::size_t>{},
+                                       std::vector<float>{zeroPoint});
+            model.AddInitializedTensor("bit_width", std::vector<std::size_t>{},
+                                       std::vector<float>{8.0f});
+            AddNamedOperator<SOFIE::ROperator_QONNXQuant>(
+               model, "quantize_input", "input", "scale", "zero_point", "bit_width",
+               "input_quantized", signedCarrier, false, SOFIE::EQuantizationRoundingMode::ROUND,
+               SOFIE::EQuantizationOverflowMode::SAT);
+            AddNamedOperator<SOFIE::ROperator_QONNXQuant>(
+               model, "quantize_weight", "weight", "scale", "zero_point", "bit_width",
+               "weight_quantized", signedCarrier, false, SOFIE::EQuantizationRoundingMode::ROUND,
+               SOFIE::EQuantizationOverflowMode::SAT);
+            AddNamedOperator<SOFIE::ROperator_Conv<float>>(
+               model, "conv", "NOTSET", std::vector<std::size_t>{1}, group,
+               std::vector<std::size_t>{kernel}, std::vector<std::size_t>{0, 0},
+               std::vector<std::size_t>{1}, "input_quantized", "weight_quantized",
+               "", "conv_output");
+            AddNamedOperator<SOFIE::ROperator_QONNXQuant>(
+               model, "quantize_output", "conv_output", "scale", "zero_point",
+               "bit_width", "output_quantized", signedCarrier, false,
+               SOFIE::EQuantizationRoundingMode::ROUND,
+               SOFIE::EQuantizationOverflowMode::SAT);
+            model.Initialize();
+            return model;
+         };
+
+         auto makeFP8Conv = [](bool depthwise) {
+            SOFIE::RModel model(depthwise ? "fp8_depthwise_conv" : "fp8_standard_conv");
+            const std::vector<std::size_t> weightShape =
+               depthwise ? std::vector<std::size_t>{4, 1, 3}
+                         : std::vector<std::size_t>{8, 4, 3};
+            const auto outputChannels = weightShape.front();
+            const auto weightElements = SOFIE::ConvertShapeToLength(weightShape);
+            model.AddInputTensorInfo("input", SOFIE::ETensorType::FLOAT8E4M3FN,
+                                     std::vector<std::size_t>{1, 4, 8});
+            model.AddInitializedTensor(
+               "weight", SOFIE::ETensorType::FLOAT8E4M3FN,
+               weightShape,
+               std::shared_ptr<void>(new std::uint8_t[weightElements]{},
+                                     std::default_delete<std::uint8_t[]>()));
+            model.AddInitializedTensor(
+               "bias", std::vector<std::size_t>{outputChannels},
+               std::vector<float>(outputChannels, 0.25f));
+            AddNamedOperator<SOFIE::ROperator_Conv<float>>(
+               model, "conv", "NOTSET", std::vector<std::size_t>{1}, depthwise ? 4 : 1,
+               std::vector<std::size_t>{3}, std::vector<std::size_t>{1, 1},
+               std::vector<std::size_t>{1}, "input", "weight", "bias", "output");
+            model.AddLowPrecisionTensorInfo(
+               "input", SOFIE::LowPrecisionTensorInfoFromFP8Carrier(
+                           SOFIE::ELowPrecisionCarrier::FP8E4M3, "input",
+                           "explicit FP8 input carrier"));
+            model.AddLowPrecisionTensorInfo(
+               "weight", SOFIE::LowPrecisionTensorInfoFromFP8Carrier(
+                            SOFIE::ELowPrecisionCarrier::FP8E4M3, "weight",
+                            "explicit FP8 weight carrier"));
+            model.Initialize();
+            return model;
+         };
+
+         auto standard = makeAffineConv("symmetric_standard_conv", 1, {64, 64, 1}, 0.0f);
+         auto asymmetric = makeAffineConv("asymmetric_standard_conv", 1, {64, 64, 1}, 1.0f);
+         auto grouped = makeAffineConv("symmetric_grouped_conv", 2, {128, 64, 1}, 0.0f);
+         auto unsignedConv = makeAffineConv("unsigned_standard_conv", 1, {64, 64, 1}, 127.0f, false);
+         // Budget-class exact shapes tile instead of being rejected; the padded-shape
+         // budget rejection is covered by the shape and resource matrix below.
+         auto tiled = makeAffineConv(
+            "tiled_standard_conv", 1, {64, 64, 1}, 0.0f, true, 2U * 1024U * 1024U);
+         auto fp8 = makeFP8Conv(false);
+         auto fp8Depthwise = makeFP8Conv(true);
+
+         // Builds the ALPAKA lowered view so the pipeline report carries each model's verdict,
+         // then hands back the single conv region's ALPAKA plan.
+         auto alpakaPlan = [](SOFIE::RModel &model) {
+            EXPECT_EQ(SOFIE_TEST::CountRegions(SOFIE_TEST::AlpakaPipelineReport(model), "conv"), 1U);
+            const auto &state = model.GetQuantizationState();
+            const auto opIndex = SOFIE::QuantizedRegionAnchorIndex(*SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(state));
+            return SOFIE::FindQuantizedLoweringPlan(
+               state, opIndex, SOFIE::EQuantizedBackend::ALPAKA);
+         };
+
+         const auto *standardPlan = alpakaPlan(standard);
+         const auto *asymmetricPlan = alpakaPlan(asymmetric);
+         const auto *groupedPlan = alpakaPlan(grouped);
+         const auto *unsignedPlan = alpakaPlan(unsignedConv);
+         const auto *fp8Plan = alpakaPlan(fp8);
+         const auto *fp8DepthwisePlan = alpakaPlan(fp8Depthwise);
+         ASSERT_NE(standardPlan, nullptr);
+         ASSERT_NE(asymmetricPlan, nullptr);
+         ASSERT_NE(groupedPlan, nullptr);
+         ASSERT_NE(unsignedPlan, nullptr);
+         ASSERT_NE(fp8Plan, nullptr);
+         ASSERT_NE(fp8DepthwisePlan, nullptr);
+
+         EXPECT_EQ(standardPlan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         EXPECT_EQ(standardPlan->capabilityTag, "alpaka_int8_conv_matrix_exact");
+         EXPECT_EQ(standardPlan->computeProfile, SOFIE::EQuantizedComputeProfile::AffineInt8Conv);
+         EXPECT_TRUE(standardPlan->suppressesGraphOperators);
+         // "Actually lowered": the pipeline report row for this region reports Optimized, and the
+         // QuantizedConvCudaLt_Call check below proves the call was emitted.
+         {
+            const auto *standardEntry = SOFIE_TEST::FindRegion(
+               standard.GetQuantizationPipelineReport(), "output_quantized");
+            ASSERT_NE(standardEntry, nullptr);
+            EXPECT_EQ(standardEntry->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         }
+         EXPECT_EQ(standardPlan->weightLayout, SOFIE::EQuantizedLayout::PlainDevice);
+         ASSERT_TRUE(standardPlan->matrixShapePolicy.has_value());
+         EXPECT_EQ(standardPlan->matrixShapePolicy->logicalM, 256U);
+         EXPECT_EQ(standardPlan->matrixShapePolicy->logicalK, 64U);
+         EXPECT_EQ(standardPlan->matrixShapePolicy->logicalN, 64U);
+         EXPECT_GT(SOFIE::QuantizedPackedReusableScratchBytes(standardPlan->resources), 0U);
+
+         const auto &standardRegion = *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(standard.GetQuantizationState());
+         SOFIE::ROperator_QuantizedConv lowered(
+            standardRegion, *standardPlan,
+            SOFIE::MakeQuantizedConvCodegenContext(standard, standardRegion));
+         const auto generated = lowered.Generate_GPU_ALPAKA("standard_conv");
+         EXPECT_NE(generated.find("QuantizedConvolutionInvocation"), std::string::npos);
+         EXPECT_EQ(generated.find("QuantizedConvCudaLtParams "), std::string::npos);
+         EXPECT_NE(generated.find("QuantizedConvCudaLt_Call"), std::string::npos);
+         EXPECT_NE(generated.find("quantizedCudaScratchArena.View()"), std::string::npos);
+
+         EXPECT_EQ(groupedPlan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         EXPECT_EQ(groupedPlan->capabilityTag, "alpaka_int8_conv_matrix_exact");
+         ASSERT_TRUE(groupedPlan->matrixShapePolicy.has_value());
+         EXPECT_EQ(groupedPlan->matrixShapePolicy->logicalN, 64U);
+         EXPECT_TRUE(groupedPlan->suppressesGraphOperators);
+         const auto &groupedRegion = *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(grouped.GetQuantizationState());
+         const auto groupedContext = SOFIE::MakeQuantizedConvCodegenContext(grouped, groupedRegion);
+         const auto groupedStorage = SOFIE::MaterializeQuantizedConvWeight(
+            groupedRegion, *groupedPlan, SOFIE::EQuantizedBackend::ALPAKA,
+            grouped.GetInitializedTensorData(groupedRegion.weightSourceTensor).get(),
+            grouped.GetTensorType(groupedRegion.weightSourceTensor),
+            grouped.GetTensorShape(groupedRegion.weightSourceTensor),
+            groupedContext.weightScales, groupedContext.weightZeroPoints);
+         EXPECT_EQ(groupedStorage.storage.shape, std::vector<std::size_t>({2, 64, 64}));
+         EXPECT_EQ(groupedStorage.bytes.size(), 2U * 64U * 64U);
+
+         EXPECT_EQ(asymmetricPlan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         EXPECT_EQ(asymmetricPlan->capabilityTag, "alpaka_affine_conv_direct");
+         EXPECT_EQ(asymmetricPlan->computeProfile,
+                   SOFIE::EQuantizedComputeProfile::AffineInt8AsymmetricConv);
+         EXPECT_FALSE(asymmetricPlan->matrixShapePolicy.has_value());
+         EXPECT_EQ(SOFIE::QuantizedPackedReusableScratchBytes(asymmetricPlan->resources), 0U);
+         const auto &asymmetricRegion = *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(asymmetric.GetQuantizationState());
+         SOFIE::ROperator_QuantizedConv asymmetricLowered(
+            asymmetricRegion, *asymmetricPlan,
+            SOFIE::MakeQuantizedConvCodegenContext(asymmetric, asymmetricRegion));
+         const auto asymmetricCode = asymmetricLowered.Generate_GPU_ALPAKA("asymmetric_conv");
+         EXPECT_NE(asymmetricCode.find("direct centered-affine CUDA operator"), std::string::npos);
+         EXPECT_NE(asymmetricCode.find("QuantizedConvCudaAffine_Call"), std::string::npos);
+         EXPECT_EQ(asymmetricCode.find("QuantizedConvCudaLt_Call"), std::string::npos);
+
+         EXPECT_EQ(unsignedPlan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         EXPECT_EQ(unsignedPlan->capabilityTag, "alpaka_affine_conv_direct");
+         EXPECT_EQ(unsignedPlan->inputContract.carrier, SOFIE::ELowPrecisionCarrier::AffineUInt8);
+         EXPECT_EQ(unsignedPlan->weightContract.carrier, SOFIE::ELowPrecisionCarrier::AffineUInt8);
+         EXPECT_EQ(unsignedPlan->weightStorage, SOFIE::EQuantizedStorageType::UInt8);
+         const auto &unsignedRegion = *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(unsignedConv.GetQuantizationState());
+         const auto unsignedContext = SOFIE::MakeQuantizedConvCodegenContext(unsignedConv, unsignedRegion);
+         const auto unsignedStorage = SOFIE::MaterializeQuantizedConvWeight(
+            unsignedRegion, *unsignedPlan, SOFIE::EQuantizedBackend::ALPAKA,
+            unsignedConv.GetInitializedTensorData(unsignedRegion.weightSourceTensor).get(),
+            unsignedConv.GetTensorType(unsignedRegion.weightSourceTensor),
+            unsignedConv.GetTensorShape(unsignedRegion.weightSourceTensor),
+            unsignedContext.weightScales, unsignedContext.weightZeroPoints);
+         EXPECT_EQ(unsignedStorage.storage.shape, std::vector<std::size_t>({64, 64, 1}));
+         EXPECT_EQ(unsignedStorage.bytes.size(), 4096U);
+         SOFIE::ROperator_QuantizedConv unsignedLowered(
+            unsignedRegion, *unsignedPlan, unsignedContext);
+         const auto unsignedCode = unsignedLowered.Generate_GPU_ALPAKA("unsigned_conv");
+         EXPECT_NE(unsignedCode.find("EQuantizedWeightCarrier::UInt8"), std::string::npos);
+         EXPECT_NE(unsignedCode.find("QuantizedConvCudaAffine_Call"), std::string::npos);
+
+         // Budget-class exact aligned shapes tile instead of rejecting: the arena is
+         // bounded by the row tile and the generated invocation carries the tile size.
+         const auto *tiledPlan = alpakaPlan(tiled);
+         ASSERT_NE(tiledPlan, nullptr);
+         EXPECT_EQ(tiledPlan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         EXPECT_EQ(tiledPlan->capabilityTag, "alpaka_int8_conv_matrix_exact");
+         ASSERT_TRUE(tiledPlan->matrixShapePolicy.has_value());
+         EXPECT_EQ(tiledPlan->matrixShapePolicy->im2colTileRows, 524288U)
+            << tiledPlan->reason;
+         EXPECT_TRUE(tiledPlan->suppressesGraphOperators);
+         EXPECT_LT(SOFIE::QuantizedPackedReusableScratchBytes(tiledPlan->resources),
+                   SOFIE::kQuantizedConvMaxReusableScratchBytes);
+         EXPECT_NE(tiledPlan->reason.find("tiled to 524288 rows"), std::string::npos);
+         const auto &tiledRegion =
+            *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(
+               tiled.GetQuantizationState());
+         SOFIE::ROperator_QuantizedConv tiledLowered(
+            tiledRegion, *tiledPlan,
+            SOFIE::MakeQuantizedConvCodegenContext(tiled, tiledRegion));
+         const auto tiledCode = tiledLowered.Generate_GPU_ALPAKA("tiled_conv");
+         EXPECT_NE(tiledCode.find(".im2colTileRows = 524288;"), std::string::npos);
+
+      #ifdef SOFIE_USE_CUBLASLT
+         EXPECT_EQ(fp8Plan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         EXPECT_EQ(fp8Plan->capabilityTag, "cuda_fp8_conv_matrix_e4m3_f32");
+         EXPECT_EQ(fp8Plan->computeProfile, SOFIE::EQuantizedComputeProfile::FP8E4M3Conv);
+         EXPECT_TRUE(fp8Plan->suppressesGraphOperators);
+         // "Actually lowered": pipeline report verdict plus the QuantizedConvCudaLtFP8_Call
+         // presence check below on the generated text.
+         {
+            const auto *fp8Entry = SOFIE_TEST::FindRegion(
+               fp8.GetQuantizationPipelineReport(), "output");
+            ASSERT_NE(fp8Entry, nullptr);
+            EXPECT_EQ(fp8Entry->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         }
+         ASSERT_TRUE(fp8Plan->matrixShapePolicy.has_value());
+         EXPECT_EQ(fp8Plan->matrixShapePolicy->logicalM, 8U);
+         EXPECT_EQ(fp8Plan->matrixShapePolicy->logicalN, 8U);
+         EXPECT_EQ(fp8Plan->matrixShapePolicy->logicalK, 12U);
+         const auto &fp8Region = *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(fp8.GetQuantizationState());
+         const auto fp8Storage = SOFIE::MaterializeLowPrecisionConvWeight(
+            fp8Region, *fp8Plan, SOFIE::EQuantizedBackend::ALPAKA,
+            fp8.GetInitializedTensorData(fp8Region.weightSourceTensor).get(),
+            fp8.GetTensorShape(fp8Region.weightSourceTensor));
+         EXPECT_EQ(fp8Storage.storage.shape, std::vector<std::size_t>({1, 12, 8}));
+         EXPECT_EQ(fp8Storage.bytes.size(), 96U);
+         SOFIE::ROperator_QuantizedConv fp8Lowered(
+            fp8Region, *fp8Plan,
+            SOFIE::MakeQuantizedConvCodegenContext(fp8, fp8Region));
+         const auto fp8Generated = fp8Lowered.Generate_GPU_ALPAKA("fp8_standard_conv");
+         EXPECT_NE(fp8Generated.find("QuantizedConvCudaLtFP8_Call"), std::string::npos);
+         EXPECT_NE(fp8Generated.find("ELowPrecisionFormat::Float32"),
+                   std::string::npos);
+         EXPECT_NE(fp8Generated.find(".matrix.hasBias = true"), std::string::npos);
+         EXPECT_NE(fp8Generated.find(".matrix.beta = 1.0f"), std::string::npos);
+         EXPECT_EQ(fp8DepthwisePlan->status,
+                   SOFIE::EQuantizedLoweringStatus::Optimized);
+         EXPECT_EQ(fp8DepthwisePlan->capabilityTag,
+                   "cuda_fp8_depthwise_conv_e4m3_f32");
+         EXPECT_FALSE(fp8DepthwisePlan->matrixShapePolicy.has_value());
+         EXPECT_EQ(SOFIE::QuantizedPackedReusableScratchBytes(
+                      fp8DepthwisePlan->resources), 0U);
+         const auto &fp8DepthwiseRegion =
+            *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(fp8Depthwise.GetQuantizationState());
+         const auto fp8DepthwiseStorage = SOFIE::MaterializeLowPrecisionConvWeight(
+            fp8DepthwiseRegion, *fp8DepthwisePlan,
+            SOFIE::EQuantizedBackend::ALPAKA,
+            fp8Depthwise.GetInitializedTensorData(
+               fp8DepthwiseRegion.weightSourceTensor).get(),
+            fp8Depthwise.GetTensorShape(fp8DepthwiseRegion.weightSourceTensor));
+         EXPECT_EQ(fp8DepthwiseStorage.storage.shape,
+                   std::vector<std::size_t>({4, 3, 1}));
+         EXPECT_EQ(fp8DepthwiseStorage.bytes.size(), 12U);
+         SOFIE::ROperator_QuantizedConv fp8DepthwiseLowered(
+            fp8DepthwiseRegion, *fp8DepthwisePlan,
+            SOFIE::MakeQuantizedConvCodegenContext(
+               fp8Depthwise, fp8DepthwiseRegion));
+         EXPECT_TRUE(fp8DepthwiseLowered.Generate_GPU_Kernel_Definitions_ALPAKA(
+                        "fp8_depthwise_conv").empty());
+         const auto fp8DepthwiseGenerated =
+            fp8DepthwiseLowered.Generate_GPU_ALPAKA("fp8_depthwise_conv");
+         EXPECT_NE(fp8DepthwiseGenerated.find(
+                      "QuantizedConvCudaDepthwiseFP8_Call"), std::string::npos);
+         EXPECT_EQ(fp8DepthwiseGenerated.find("QuantizedConvCudaLtFP8_Call"),
+                   std::string::npos);
+         EXPECT_EQ(fp8DepthwiseGenerated.find("quantizedCudaScratchArena.View()"),
+                   std::string::npos);
+      #else
+         EXPECT_EQ(fp8Plan->status, SOFIE::EQuantizedLoweringStatus::BackendUnsupported);
+         EXPECT_EQ(fp8Plan->capabilityTag, "cuda_fp8_conv_backend_unsupported");
+      #endif
+         EXPECT_EQ(fp8Plan->computeProfile, SOFIE::EQuantizedComputeProfile::FP8E4M3Conv);
+         // Accumulation is derived from the carrier, not stored on the plan.
+         EXPECT_EQ(SOFIE::LowPrecisionAccumulationForCarrier(fp8Plan->inputContract.carrier),
+                   SOFIE::ELowPrecisionAccumulation::Float32);
+   }
+   {
+      SCOPED_TRACE("semantic validation matrix");
+         auto containsReason = [](const std::vector<std::string> &reasons,
+                                  const std::string &needle) {
+            return std::any_of(reasons.begin(), reasons.end(),
+                               [&](const auto &reason) {
+                                  return reason.find(needle) != std::string::npos;
+                               });
+         };
+
+         struct ShapeCase {
+            const char *name;
+            std::string autoPad;
+            std::vector<std::size_t> input;
+            std::vector<std::size_t> weight;
+            std::vector<std::size_t> bias;
+            std::vector<std::size_t> output;
+            std::vector<std::size_t> dilations;
+            std::size_t group;
+            std::vector<std::size_t> kernel;
+            std::vector<std::size_t> pads;
+            std::vector<std::size_t> strides;
+            SOFIE::EQuantizedConvolutionKind expectedKind;
+            const char *expectedReason;
+         };
+
+         const std::vector<ShapeCase> shapeCases = {
+            {"standard_conv1d", "NOTSET", {1, 4, 16}, {8, 4, 3}, {8}, {1, 8, 16},
+             {1}, 1, {3}, {1, 1}, {1},
+             SOFIE::EQuantizedConvolutionKind::Standard, ""},
+            {"standard_conv2d", "NOTSET", {1, 4, 8, 8}, {8, 4, 3, 3}, {}, {1, 8, 8, 8},
+             {1, 1}, 1, {3, 3}, {1, 1, 1, 1}, {1, 1},
+             SOFIE::EQuantizedConvolutionKind::Standard, ""},
+            {"grouped_conv1d", "NOTSET", {1, 4, 16}, {8, 2, 3}, {8}, {1, 8, 16},
+             {1}, 2, {3}, {1, 1}, {1},
+             SOFIE::EQuantizedConvolutionKind::Grouped, ""},
+            {"causal_depthwise_conv1d", "NOTSET", {1, 4, 16}, {4, 1, 4}, {4}, {1, 4, 16},
+             {1}, 4, {4}, {3, 0}, {1},
+             SOFIE::EQuantizedConvolutionKind::Depthwise, ""},
+            // Dilation widens the receptive field through the pads while the kernel shape
+            // stays as declared, so the geometry check reads the effective extent only.
+            {"dilated_conv1d", "NOTSET", {1, 4, 16}, {8, 4, 3}, {8}, {1, 8, 16},
+             {2}, 1, {3}, {2, 2}, {1},
+             SOFIE::EQuantizedConvolutionKind::Standard, ""},
+            {"dilated_conv2d", "NOTSET", {1, 4, 8, 8}, {8, 4, 3, 3}, {}, {1, 8, 8, 8},
+             {2, 2}, 1, {3, 3}, {2, 2, 2, 2}, {1, 1},
+             SOFIE::EQuantizedConvolutionKind::Standard, ""},
+            {"inconsistent_group_channels", "NOTSET", {1, 4, 16}, {8, 3, 3}, {}, {1, 8, 16},
+             {1}, 2, {3}, {1, 1}, {1},
+             SOFIE::EQuantizedConvolutionKind::Grouped,
+             "input channels do not equal weight channels times group"},
+            {"invalid_bias_shape", "NOTSET", {1, 4, 16}, {8, 4, 3}, {7}, {1, 8, 16},
+             {1}, 1, {3}, {1, 1}, {1},
+             SOFIE::EQuantizedConvolutionKind::Standard,
+             "bias is not a one-dimensional output-channel tensor"},
+            {"invalid_auto_pad", "UNKNOWN", {1, 4, 16}, {8, 4, 3}, {}, {1, 8, 16},
+             {1}, 1, {3}, {1, 1}, {1},
+             SOFIE::EQuantizedConvolutionKind::Standard,
+             "auto_pad value is unsupported"},
+         };
+
+         for (const auto &testCase : shapeCases) {
+            SCOPED_TRACE(testCase.name);
+            SOFIE::ROperator_Conv<float> conv(
+               testCase.autoPad, testCase.dilations, testCase.group,
+               testCase.kernel, testCase.pads, testCase.strides,
+               "input", "weight", testCase.bias.empty() ? "" : "bias", "output");
+            const auto shape = [&](const std::string &tensor) {
+               if (tensor == "input") return testCase.input;
+               if (tensor == "weight") return testCase.weight;
+               if (tensor == "bias") return testCase.bias;
+               if (tensor == "output") return testCase.output;
+               return std::vector<std::size_t>{};
+            };
+            const auto match = SOFIE::MatchQuantizedConvPattern(conv, 0, shape);
+            EXPECT_EQ(match.region.attributes.kind, testCase.expectedKind);
+            if (std::string(testCase.expectedReason).empty())
+               EXPECT_TRUE(match.reasons.empty());
+            else
+               EXPECT_TRUE(containsReason(match.reasons, testCase.expectedReason));
+         }
+
+         const auto checkAutoPad = [&](const std::string &autoPad,
+                                       const std::vector<std::size_t> &output,
+                                       const std::vector<std::size_t> &expectedPads) {
+            SOFIE::ROperator_Conv<float> conv(
+               autoPad, std::vector<std::size_t>{1}, 1,
+               std::vector<std::size_t>{3}, std::vector<std::size_t>{},
+               std::vector<std::size_t>{2}, "input", "weight", "", "output");
+            const auto shape = [&](const std::string &tensor) {
+               if (tensor == "input") return std::vector<std::size_t>{1, 4, 16};
+               if (tensor == "weight") return std::vector<std::size_t>{8, 4, 3};
+               if (tensor == "output") return output;
+               return std::vector<std::size_t>{};
+            };
+            const auto match = SOFIE::MatchQuantizedConvPattern(conv, 0, shape);
+            EXPECT_TRUE(match.reasons.empty());
+            EXPECT_EQ(match.region.attributes.pads, expectedPads);
+         };
+         checkAutoPad("VALID", {1, 8, 7}, {0, 0});
+         checkAutoPad("SAME_UPPER", {1, 8, 8}, {0, 1});
+         checkAutoPad("SAME_LOWER", {1, 8, 8}, {1, 0});
+
+         // Broken operand contracts must surface as parse-time semantic rejects carrying
+         // the validator's factual reason; each case dials exactly one contract knob.
+         struct ContractCase {
+            const char *name;
+            bool perChannelWeightAxis1;
+            bool perChannelOutput;
+            bool quantizedBias;
+            float biasScale;
+            std::int8_t biasZeroPoint;
+            const char *expectedReason; // empty: the contract is valid and recognized
+         };
+         const std::vector<ContractCase> contractCases = {
+            {"valid_contract", false, false, true, 0.03125f, 0, ""},
+            {"invalid_weight_axis", true, false, false, 0.0f, 0,
+             "axis is not output-channel axis 0"},
+            {"invalid_output_granularity", false, true, false, 0.0f, 0,
+             "output quantization is not per-tensor"},
+            {"invalid_bias_scale", false, false, true, 0.5f, 0,
+             "bias scale does not equal input scale times weight scale"},
+            {"invalid_bias_zero_point", false, false, true, 0.03125f, 1,
+             "bias quantization is not signed with zero point 0"},
+         };
+
+         for (const auto &testCase : contractCases) {
+            SCOPED_TRACE(testCase.name);
+            SOFIE::RModel model(testCase.name);
+            model.AddInputTensorInfo("input", SOFIE::ETensorType::FLOAT,
+                                     std::vector<std::size_t>{1, 4, 16});
+            model.AddInitializedTensor("weight_carrier", std::vector<std::size_t>{8, 4, 3},
+                                       std::vector<std::int8_t>(96, 1));
+            model.AddInitializedTensor("input_scale", std::vector<std::size_t>{},
+                                       std::vector<float>{0.125f});
+            model.AddInitializedTensor("zero_point_int8", std::vector<std::size_t>{},
+                                       std::vector<std::int8_t>{0});
+            if (testCase.perChannelWeightAxis1) {
+               model.AddInitializedTensor("weight_scale", std::vector<std::size_t>{4},
+                                          std::vector<float>(4, 0.25f));
+               model.AddInitializedTensor("weight_zero_point", std::vector<std::size_t>{4},
+                                          std::vector<std::int8_t>(4, 0));
+            } else {
+               model.AddInitializedTensor("weight_scale", std::vector<std::size_t>{},
+                                          std::vector<float>{0.25f});
+               model.AddInitializedTensor("weight_zero_point", std::vector<std::size_t>{},
+                                          std::vector<std::int8_t>{0});
+            }
+            if (testCase.perChannelOutput) {
+               model.AddInitializedTensor("output_scale", std::vector<std::size_t>{8},
+                                          std::vector<float>(8, 0.5f));
+               model.AddInitializedTensor("output_zero_point", std::vector<std::size_t>{8},
+                                          std::vector<std::int8_t>(8, 0));
+            } else {
+               model.AddInitializedTensor("output_scale", std::vector<std::size_t>{},
+                                          std::vector<float>{0.5f});
+               model.AddInitializedTensor("output_zero_point", std::vector<std::size_t>{},
+                                          std::vector<std::int8_t>{0});
+            }
+            AddNamedOperator<SOFIE::ROperator_ONNXQuantizeLinear>(
+               model, "q_in", "input", "input_scale", "zero_point_int8", "input_carrier",
+               SOFIE::ETensorType::INT8, -1);
+            AddNamedOperator<SOFIE::ROperator_ONNXDequantizeLinear>(
+               model, "dq_in", "input_carrier", "input_scale", "zero_point_int8",
+               "input_dequantized", SOFIE::ETensorType::INT8, -1);
+            AddNamedOperator<SOFIE::ROperator_ONNXDequantizeLinear>(
+               model, "dq_w", "weight_carrier", "weight_scale", "weight_zero_point",
+               "weight_dequantized", SOFIE::ETensorType::INT8,
+               testCase.perChannelWeightAxis1 ? 1 : -1);
+            if (testCase.quantizedBias) {
+               model.AddInitializedTensor("bias_carrier", std::vector<std::size_t>{8},
+                                          std::vector<std::int8_t>(8, 0));
+               model.AddInitializedTensor("bias_scale", std::vector<std::size_t>{},
+                                          std::vector<float>{testCase.biasScale});
+               model.AddInitializedTensor("bias_zero_point", std::vector<std::size_t>{},
+                                          std::vector<std::int8_t>{testCase.biasZeroPoint});
+               AddNamedOperator<SOFIE::ROperator_ONNXDequantizeLinear>(
+                  model, "dq_b", "bias_carrier", "bias_scale", "bias_zero_point",
+                  "bias_dequantized", SOFIE::ETensorType::INT8, -1);
+            }
+            AddNamedOperator<SOFIE::ROperator_Conv<float>>(
+               model, "conv", "NOTSET", std::vector<std::size_t>{1}, 1,
+               std::vector<std::size_t>{3}, std::vector<std::size_t>{1, 1},
+               std::vector<std::size_t>{1}, "input_dequantized", "weight_dequantized",
+               testCase.quantizedBias ? "bias_dequantized" : "", "conv_output");
+            AddNamedOperator<SOFIE::ROperator_ONNXQuantizeLinear>(
+               model, "q_out", "conv_output", "output_scale", "output_zero_point",
+               "output_quantized", SOFIE::ETensorType::INT8,
+               testCase.perChannelOutput ? 1 : -1);
+            model.Initialize();
+
+            const auto *region = SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(
+               model.GetQuantizationState());
+            ASSERT_NE(region, nullptr);
+            if (std::string(testCase.expectedReason).empty()) {
+               EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized)
+                  << region->reason;
+            } else {
+               EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticUnsupported)
+                  << region->reason;
+               EXPECT_NE(region->reason.find(testCase.expectedReason), std::string::npos)
+                  << region->reason;
+            }
+         }
+
+         // A native FP8 Conv declaring an FP8 output contract must reject at parse:
+         // the backend contract is FP32 output only.
+         {
+            SCOPED_TRACE("invalid_fp8_output_contract");
+            SOFIE::RModel model("fp8_conv_fp8_output_contract");
+            model.AddInputTensorInfo("input", SOFIE::ETensorType::FLOAT8E4M3FN,
+                                     std::vector<std::size_t>{1, 4, 8});
+            model.AddInitializedTensor(
+               "weight", SOFIE::ETensorType::FLOAT8E4M3FN, std::vector<std::size_t>{8, 4, 3},
+               std::shared_ptr<void>(new std::uint8_t[96]{},
+                                     std::default_delete<std::uint8_t[]>()));
+            AddNamedOperator<SOFIE::ROperator_Conv<float>>(
+               model, "conv", "NOTSET", std::vector<std::size_t>{1}, 1,
+               std::vector<std::size_t>{3}, std::vector<std::size_t>{1, 1},
+               std::vector<std::size_t>{1}, "input", "weight", "", "output");
+            model.AddLowPrecisionTensorInfo(
+               "input", SOFIE::LowPrecisionTensorInfoFromFP8Carrier(
+                           SOFIE::ELowPrecisionCarrier::FP8E4M3, "input", "test input"));
+            model.AddLowPrecisionTensorInfo(
+               "weight", SOFIE::LowPrecisionTensorInfoFromFP8Carrier(
+                            SOFIE::ELowPrecisionCarrier::FP8E4M3, "weight", "test weight"));
+            model.AddLowPrecisionTensorInfo(
+               "output", SOFIE::LowPrecisionTensorInfoFromFP8Carrier(
+                            SOFIE::ELowPrecisionCarrier::FP8E4M3, "output", "test output"));
+            model.Initialize();
+            const auto *region = SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(
+               model.GetQuantizationState());
+            ASSERT_NE(region, nullptr);
+            EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticUnsupported);
+            EXPECT_NE(region->reason.find("currently requires FP32 output"), std::string::npos)
+               << region->reason;
+         }
+   }
+   {
+      SCOPED_TRACE("shape and resource matrix");
+         struct PlanCase {
+            const char *name;
+            std::vector<std::size_t> weightShape;
+            std::size_t group;
+            std::size_t inputLength;
+            std::vector<std::size_t> pads;
+            SOFIE::EQuantizedConvolutionKind kind;
+            SOFIE::EQuantizedShapePolicy shapePolicy;
+            SOFIE::EQuantizedLoweringStatus status;
+            const char *capabilityTag;
+            int scratchLimitSide;
+            std::size_t expectedTileRows = 0;
+         };
+
+         const std::vector<PlanCase> cases = {
+            // Representative Mamba projection: 1.05M persistent weights.
+            {"mamba_standard_exact", {1024, 1024, 1}, 1, 4096, {0, 0},
+             SOFIE::EQuantizedConvolutionKind::Standard,
+             SOFIE::EQuantizedShapePolicy::Exact,
+             SOFIE::EQuantizedLoweringStatus::Optimized,
+             "alpaka_int8_conv_matrix_exact", -1},
+            // Channel-grouped projection with Mamba-scale activation dimensions.
+            {"mamba_grouped_exact", {1024, 128, 1}, 8, 4096, {0, 0},
+             SOFIE::EQuantizedConvolutionKind::Grouped,
+             SOFIE::EQuantizedShapePolicy::Exact,
+             SOFIE::EQuantizedLoweringStatus::Optimized,
+             "alpaka_int8_conv_matrix_exact", -1},
+            // Causal selective-state Conv1D shape; direct execution has no im2col arena.
+            {"mamba_depthwise_direct", {1024, 1, 4}, 1024, 4096, {3, 0},
+             SOFIE::EQuantizedConvolutionKind::Depthwise,
+             SOFIE::EQuantizedShapePolicy::Exact,
+             SOFIE::EQuantizedLoweringStatus::Optimized,
+             "alpaka_int8_depthwise_conv_direct", 0},
+            // All matrix dimensions are awkward, but padding remains profitable.
+            {"awkward_standard_padded", {79, 79, 1}, 1, 4097, {0, 0},
+             SOFIE::EQuantizedConvolutionKind::Standard,
+             SOFIE::EQuantizedShapePolicy::Padded,
+             SOFIE::EQuantizedLoweringStatus::Optimized,
+             "alpaka_int8_conv_matrix_padded", -1},
+            // Packed scratch is 6 KiB below the 512 MiB plan-time limit; the
+            // plan stays single-shot and untiled.
+            {"scratch_below_limit", {64, 64, 1}, 1, 1310704, {0, 0},
+             SOFIE::EQuantizedConvolutionKind::Standard,
+             SOFIE::EQuantizedShapePolicy::Exact,
+             SOFIE::EQuantizedLoweringStatus::Optimized,
+             "alpaka_int8_conv_matrix_exact", -1, 0},
+            // Two aligned steps later the untiled arena exceeds the limit; the plan
+            // switches to tiled execution with a bounded arena instead of being rejected.
+            {"scratch_above_limit", {64, 64, 1}, 1, 1310736, {0, 0},
+             SOFIE::EQuantizedConvolutionKind::Standard,
+             SOFIE::EQuantizedShapePolicy::Exact,
+             SOFIE::EQuantizedLoweringStatus::Optimized,
+             "alpaka_int8_conv_matrix_exact", -1, 524288},
+            // Padded shapes keep their per-group path and are not tiled, so an
+            // oversized padded arena still rejects at the budget boundary.
+            {"scratch_padded_over_budget", {79, 79, 1}, 1, 2097152, {0, 0},
+             SOFIE::EQuantizedConvolutionKind::Standard,
+             SOFIE::EQuantizedShapePolicy::Padded,
+             SOFIE::EQuantizedLoweringStatus::BackendUnsupported,
+             "alpaka_conv_resource_budget_exceeded", 1, 0},
+         };
+
+         const auto makeModel = [](const PlanCase &testCase) {
+            SOFIE::RModel model(testCase.name);
+            const auto inputChannels = testCase.weightShape[1] * testCase.group;
+            const auto kernel = testCase.weightShape[2];
+            model.AddInputTensorInfo(
+               "input", SOFIE::ETensorType::FLOAT,
+               std::vector<std::size_t>{1, inputChannels, testCase.inputLength});
+            model.AddInitializedTensor(
+               "weight_carrier", SOFIE::ETensorType::INT8, testCase.weightShape,
+               std::shared_ptr<void>(
+                  new std::int8_t[SOFIE::ConvertShapeToLength(testCase.weightShape)]{},
+                  std::default_delete<std::int8_t[]>()));
+            model.AddInitializedTensor("scale", std::vector<std::size_t>{},
+                                       std::vector<float>{0.125f});
+            model.AddInitializedTensor("zero_point_int8", std::vector<std::size_t>{},
+                                       std::vector<std::int8_t>{0});
+            AddNamedOperator<SOFIE::ROperator_ONNXQuantizeLinear>(
+               model, "quantize_input", "input", "scale", "zero_point_int8",
+               "input_carrier", SOFIE::ETensorType::INT8, -1);
+            AddNamedOperator<SOFIE::ROperator_ONNXDequantizeLinear>(
+               model, "dequantize_input", "input_carrier", "scale",
+               "zero_point_int8", "input_dequantized", SOFIE::ETensorType::INT8,
+               -1);
+            AddNamedOperator<SOFIE::ROperator_ONNXDequantizeLinear>(
+               model, "dequantize_weight", "weight_carrier", "scale",
+               "zero_point_int8", "weight_dequantized", SOFIE::ETensorType::INT8,
+               -1);
+            AddNamedOperator<SOFIE::ROperator_Conv<float>>(
+               model, "conv", "NOTSET", std::vector<std::size_t>{1},
+               testCase.group, std::vector<std::size_t>{kernel}, testCase.pads,
+               std::vector<std::size_t>{1}, "input_dequantized", "weight_dequantized",
+               "", "conv_output");
+            AddNamedOperator<SOFIE::ROperator_ONNXQuantizeLinear>(
+               model, "quantize_output", "conv_output", "scale", "zero_point_int8",
+               "output_quantized", SOFIE::ETensorType::INT8, -1);
+            model.Initialize();
+            return model;
+         };
+
+         for (const auto &testCase : cases) {
+            SCOPED_TRACE(testCase.name);
+            auto model = makeModel(testCase);
+            // One conv region per case, counted through the pipeline pipeline report.
+            ASSERT_EQ(SOFIE_TEST::CountRegions(SOFIE_TEST::AlpakaPipelineReport(model), "conv"), 1U);
+            const auto &state = model.GetQuantizationState();
+            const auto &region = *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(state);
+            EXPECT_EQ(region.attributes.kind, testCase.kind);
+            const auto *plan = SOFIE::FindQuantizedLoweringPlan(
+               state, region.convOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+            ASSERT_NE(plan, nullptr);
+            if (testCase.kind == SOFIE::EQuantizedConvolutionKind::Depthwise) {
+               EXPECT_FALSE(plan->matrixShapePolicy.has_value()) << plan->reason;
+            } else {
+               ASSERT_TRUE(plan->matrixShapePolicy.has_value()) << plan->reason;
+               EXPECT_EQ(plan->matrixShapePolicy->policy, testCase.shapePolicy) << plan->reason;
+               EXPECT_EQ(plan->matrixShapePolicy->im2colTileRows, testCase.expectedTileRows)
+                  << plan->reason;
+            }
+            EXPECT_EQ(plan->status, testCase.status) << plan->reason;
+            EXPECT_EQ(plan->capabilityTag, testCase.capabilityTag) << plan->reason;
+
+            const auto scratchBytes =
+               SOFIE::QuantizedPackedReusableScratchBytes(plan->resources);
+            if (testCase.scratchLimitSide < 0)
+               EXPECT_LT(scratchBytes, SOFIE::kQuantizedConvMaxReusableScratchBytes);
+            else if (testCase.scratchLimitSide > 0)
+               EXPECT_GT(scratchBytes, SOFIE::kQuantizedConvMaxReusableScratchBytes);
+            else
+               EXPECT_EQ(scratchBytes, 0U);
+
+            const auto weightResource = std::find_if(
+               plan->resources.entries.begin(), plan->resources.entries.end(),
+               [](const auto &entry) {
+                  return entry.role == SOFIE::EQuantizedResourceRole::WeightCarrier;
+               });
+            ASSERT_NE(weightResource, plan->resources.entries.end());
+            // Persistent-weight accounting without the lifetime tag: the carrier is
+            // non-reusable tensor storage at least as large as the logical weight payload.
+            EXPECT_EQ(weightResource->category,
+                      SOFIE::EQuantizedResourceCategory::TensorStorage);
+            EXPECT_GE(weightResource->bytes,
+                      SOFIE::ConvertShapeToLength(testCase.weightShape));
+            EXPECT_FALSE(weightResource->reusable);
+            EXPECT_FALSE(plan->weightStorageTensor.empty());
+            if (testCase.status == SOFIE::EQuantizedLoweringStatus::BackendUnsupported)
+               EXPECT_FALSE(plan->suppressesGraphOperators);
+         }
+   }
+   {
+      SCOPED_TRACE("per-output-channel weights");
+         SOFIE::RModel model("qonnx_per_channel_conv");
+         model.AddInputTensorInfo(
+            "input", SOFIE::ETensorType::FLOAT, std::vector<std::size_t>{1, 64, 256});
+         model.AddInitializedTensor(
+            "weight", SOFIE::ETensorType::FLOAT, std::vector<std::size_t>{64, 64, 1},
+            std::shared_ptr<void>(new float[4096]{}, std::default_delete<float[]>()));
+         model.AddInitializedTensor(
+            "bias", std::vector<std::size_t>{64}, std::vector<float>(64, 0.0f));
+         model.AddInitializedTensor("input_scale", std::vector<std::size_t>{},
+                                    std::vector<float>{0.125f});
+         model.AddInitializedTensor("weight_scale", std::vector<std::size_t>{64},
+                                    std::vector<float>(64, 0.25f));
+         model.AddInitializedTensor("output_scale", std::vector<std::size_t>{},
+                                    std::vector<float>{0.5f});
+         model.AddInitializedTensor("input_zero_point", std::vector<std::size_t>{},
+                                    std::vector<float>{0.0f});
+         model.AddInitializedTensor("weight_zero_point", std::vector<std::size_t>{64},
+                                    std::vector<float>(64, 0.0f));
+         model.AddInitializedTensor("output_zero_point", std::vector<std::size_t>{},
+                                    std::vector<float>{0.0f});
+         model.AddInitializedTensor("bit_width", std::vector<std::size_t>{},
+                                    std::vector<float>{8.0f});
+         AddNamedOperator<SOFIE::ROperator_QONNXQuant>(
+            model, "quantize_input", "input", "input_scale", "input_zero_point",
+            "bit_width", "input_quantized", true, false,
+            SOFIE::EQuantizationRoundingMode::ROUND,
+            SOFIE::EQuantizationOverflowMode::SAT);
+         AddNamedOperator<SOFIE::ROperator_QONNXQuant>(
+            model, "quantize_weight", "weight", "weight_scale", "weight_zero_point",
+            "bit_width", "weight_quantized", true, false,
+            SOFIE::EQuantizationRoundingMode::ROUND,
+            SOFIE::EQuantizationOverflowMode::SAT);
+         AddNamedOperator<SOFIE::ROperator_Conv<float>>(
+            model, "conv", "NOTSET", std::vector<std::size_t>{1}, 1,
+            std::vector<std::size_t>{1}, std::vector<std::size_t>{0, 0},
+            std::vector<std::size_t>{1}, "input_quantized", "weight_quantized",
+            "bias", "conv_output");
+         AddNamedOperator<SOFIE::ROperator_QONNXQuant>(
+            model, "quantize_output", "conv_output", "output_scale",
+            "output_zero_point", "bit_width", "output_quantized", true, false,
+            SOFIE::EQuantizationRoundingMode::ROUND,
+            SOFIE::EQuantizationOverflowMode::SAT);
+         model.Initialize();
+
+         // One conv region; per-channel recognition is a parse product in the
+         // tensor-info map.
+         ASSERT_EQ(SOFIE_TEST::CountRegions(SOFIE_TEST::AlpakaPipelineReport(model), "conv"), 1U);
+         const auto &region = *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(model.GetQuantizationState());
+         ASSERT_TRUE(model.HasQuantizationInfo("weight_quantized"));
+         const auto &weightInfo = model.GetQuantizationInfo("weight_quantized");
+         EXPECT_EQ(weightInfo.granularity,
+                   SOFIE::EQuantizationGranularity::PerChannel);
+         EXPECT_EQ(weightInfo.axis, 0);
+         EXPECT_EQ(region.biasSourceTensor, "bias");
+         ASSERT_TRUE(region.biasQuant.has_value());
+         EXPECT_EQ(region.biasQuant->bitWidth, 32U);
+         EXPECT_EQ(region.biasQuant->granularity,
+                   SOFIE::EQuantizationGranularity::PerChannel);
+         EXPECT_EQ(region.biasQuant->axis, 0);
+         const auto *plan = SOFIE::FindQuantizedLoweringPlan(
+            model.GetQuantizationState(), region.convOpIndex,
+            SOFIE::EQuantizedBackend::ALPAKA);
+         ASSERT_NE(plan, nullptr);
+         EXPECT_EQ(plan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         EXPECT_FALSE(plan->weightContract.perChannelScaleTensor.empty());
+         const auto context = SOFIE::MakeQuantizedConvCodegenContext(model, region);
+         EXPECT_EQ(context.weightScales.size(), 64U);
+         EXPECT_EQ(context.weightZeroPoints.size(), 64U);
+         const auto materialized = SOFIE::MaterializeQuantizedConvWeight(
+            region, *plan, SOFIE::EQuantizedBackend::ALPAKA,
+            model.GetInitializedTensorData(region.weightSourceTensor).get(),
+            model.GetTensorType(region.weightSourceTensor),
+            model.GetTensorShape(region.weightSourceTensor),
+            context.weightScales, context.weightZeroPoints);
+         EXPECT_EQ(materialized.storage.shape,
+                   std::vector<std::size_t>({1, 64, 64}));
+         EXPECT_EQ(materialized.bytes.size(),
+                   4096U);
+   }
+}
+
+TEST_F(QuantizationAlpakaTest, ConvolutionKernels)
+{
+   {
+      SCOPED_TRACE("INT8 affine standard Conv");
+         constexpr Idx inputChannels = 2;
+         constexpr Idx outputChannels = 2;
+         constexpr Idx width = 5;
+         constexpr Idx kernel = 3;
+         const std::vector<std::uint8_t> input = {
+            5, 7, 4, 8, 6,
+            3, 9, 5, 4, 10};
+         const std::vector<std::uint8_t> weight = {
+            7, 8, 6, 9, 7, 5,
+            6, 7, 10, 8, 5, 7};
+         const std::vector<float> bias = {0.125f, -0.125f};
+         const std::vector<float> weightScales = {0.5f, 0.25f};
+         constexpr std::int32_t inputZeroPoint = 5;
+         constexpr std::int32_t weightZeroPoint = 7;
+         constexpr std::int32_t outputZeroPoint = 11;
+         constexpr double inputScale = 0.25;
+         constexpr double outputScale = 0.125;
+
+         std::vector<std::uint8_t> expected(outputChannels * width);
+         for (Idx oc = 0; oc < outputChannels; ++oc) {
+            const double accumulatorScale = inputScale * weightScales[oc];
+            const auto biasAccumulator = static_cast<std::int64_t>(
+               std::nearbyint(static_cast<double>(bias[oc]) / accumulatorScale));
+            for (Idx output = 0; output < width; ++output) {
+               std::int64_t accumulator = biasAccumulator;
+               for (Idx ic = 0; ic < inputChannels; ++ic) {
+                  for (Idx k = 0; k < kernel; ++k) {
+                     const auto source = static_cast<std::int64_t>(output + k) - 1;
+                     if (source < 0 || source >= static_cast<std::int64_t>(width))
+                        continue;
+                     const auto inputValue = input[ic * width + static_cast<Idx>(source)];
+                     const auto weightValue = weight[(oc * inputChannels + ic) * kernel + k];
+                     accumulator += static_cast<std::int64_t>(inputValue - inputZeroPoint) *
+                                    static_cast<std::int64_t>(weightValue - weightZeroPoint);
+                  }
+               }
+               // saturate(round(x / scale) + zeroPoint): the zero point shifts the code
+               // after the rounding, so it cannot move a half-way tie by its parity.
+               const auto quantized = static_cast<long>(std::nearbyint(
+                                         static_cast<double>(accumulator) * accumulatorScale / outputScale)) +
+                                      outputZeroPoint;
+               expected[oc * width + output] = static_cast<std::uint8_t>(
+                  std::clamp(std::max(quantized, static_cast<long>(outputZeroPoint)),
+                             0L, 255L));
+            }
+         }
+
+         auto input_h = alpaka::allocBuf<std::uint8_t, Idx>(host, Ext1D::all(input.size()));
+         auto weight_h = alpaka::allocBuf<std::uint8_t, Idx>(host, Ext1D::all(weight.size()));
+         auto bias_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(bias.size()));
+         auto scales_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(weightScales.size()));
+         std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
+         std::copy(weight.begin(), weight.end(), alpaka::getPtrNative(weight_h));
+         std::copy(bias.begin(), bias.end(), alpaka::getPtrNative(bias_h));
+         std::copy(weightScales.begin(), weightScales.end(), alpaka::getPtrNative(scales_h));
+
+         auto input_d = alpaka::allocBuf<std::uint8_t, Idx>(device, Ext1D::all(input.size()));
+         auto weight_d = alpaka::allocBuf<std::uint8_t, Idx>(device, Ext1D::all(weight.size()));
+         auto bias_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(bias.size()));
+         auto scales_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(weightScales.size()));
+         auto output_d = alpaka::allocBuf<std::uint8_t, Idx>(device, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, input_d, input_h);
+         alpaka::memcpy(queue, weight_d, weight_h);
+         alpaka::memcpy(queue, bias_d, bias_h);
+         alpaka::memcpy(queue, scales_d, scales_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedConvolutionInvocation params{};
+         params.batch = 1;
+         params.inputChannels = inputChannels;
+         params.inputHeight = 1;
+         params.inputWidth = width;
+         params.outputChannels = outputChannels;
+         params.outputHeight = 1;
+         params.outputWidth = width;
+         params.kernelHeight = 1;
+         params.kernelWidth = kernel;
+         params.groups = 1;
+         params.strideWidth = 1;
+         params.dilationWidth = 1;
+         params.padLeft = 1;
+         params.matrix.inputScale = inputScale;
+         params.matrix.weightScale = weightScales.front();
+         params.matrix.outputScale = outputScale;
+         params.matrix.inputZeroPoint = inputZeroPoint;
+         params.matrix.weightZeroPoint = weightZeroPoint;
+         params.matrix.outputZeroPoint = outputZeroPoint;
+         params.matrix.inputQMin = 0;
+         params.matrix.inputQMax = 255;
+         params.matrix.biasQMin = std::numeric_limits<std::int32_t>::min();
+         params.matrix.biasQMax = std::numeric_limits<std::int32_t>::max();
+         params.matrix.outputQMin = 0;
+         params.matrix.outputQMax = 255;
+         params.matrix.hasBias = true;
+         params.matrix.hasRelu = true;
+         params.matrix.inputCarrier = SOFIE::EQuantizedInputCarrier::UInt8;
+         params.matrix.weightType = SOFIE::EQuantizedWeightCarrier::UInt8;
+         params.matrix.outputCarrier = SOFIE::EQuantizedOutputCarrier::UInt8;
+         params.matrix.weightScaleMode = SOFIE::EQuantizedScaleMode::PerOutputChannel;
+         params.biasCarrier = SOFIE::EQuantizedBiasCarrier::Float;
+
+         SOFIE::QuantizedConvCudaAffine_Call(
+            alpaka::getNativeHandle(queue), alpaka::getPtrNative(output_d),
+            alpaka::getPtrNative(input_d), alpaka::getPtrNative(weight_d),
+            alpaka::getPtrNative(bias_d), alpaka::getPtrNative(scales_d), params);
+         alpaka::wait(queue);
+
+         auto output_h = alpaka::allocBuf<std::uint8_t, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, output_h, output_d);
+         alpaka::wait(queue);
+         EXPECT_EQ(std::vector<std::uint8_t>(alpaka::getPtrNative(output_h),
+                                             alpaka::getPtrNative(output_h) + expected.size()),
+                   expected);
+   }
+   {
+      SCOPED_TRACE("INT8 grouped Conv");
+      #ifndef SOFIE_USE_CUBLASLT
+         GTEST_SKIP() << "SOFIE_USE_CUBLASLT is not enabled";
+      #else
+         constexpr Idx groups = 2;
+         constexpr Idx channelsPerGroup = 16;
+         constexpr Idx channels = groups * channelsPerGroup;
+         constexpr Idx width = 16;
+         std::vector<std::int8_t> input(channels * width);
+         std::vector<std::int8_t> weight(groups * channelsPerGroup * channelsPerGroup, 0);
+         std::vector<float> bias(channels);
+         std::vector<std::int8_t> expected(channels * width);
+         for (Idx channel = 0; channel < channels; ++channel) {
+            bias[channel] = channel % 2 == 0 ? 1.0f : -1.0f;
+            const Idx group = channel / channelsPerGroup;
+            const Idx local = channel % channelsPerGroup;
+            weight[(group * channelsPerGroup + local) * channelsPerGroup + local] = 1;
+            for (Idx position = 0; position < width; ++position) {
+               const auto value = static_cast<std::int8_t>(
+                  static_cast<int>((channel + position) % 5) - 2);
+               input[channel * width + position] = value;
+               expected[channel * width + position] = static_cast<std::int8_t>(
+                  std::max(0, static_cast<int>(value) + static_cast<int>(bias[channel])));
+            }
+         }
+
+         auto input_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(input.size()));
+         auto weight_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(weight.size()));
+         auto bias_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(bias.size()));
+         std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
+         std::copy(weight.begin(), weight.end(), alpaka::getPtrNative(weight_h));
+         std::copy(bias.begin(), bias.end(), alpaka::getPtrNative(bias_h));
+         auto input_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(input.size()));
+         auto weight_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(weight.size()));
+         auto bias_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(bias.size()));
+         auto output_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(expected.size()));
+         const Idx scratchBytes = SOFIE::kQuantizedCudaLtMaxWorkspaceBytes + 4096;
+         auto scratch_d = alpaka::allocBuf<std::uint8_t, Idx>(device, Ext1D::all(scratchBytes));
+         alpaka::memcpy(queue, input_d, input_h);
+         alpaka::memcpy(queue, weight_d, weight_h);
+         alpaka::memcpy(queue, bias_d, bias_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedConvolutionInvocation params{};
+         params.batch = 1;
+         params.inputChannels = channels;
+         params.inputWidth = width;
+         params.outputChannels = channels;
+         params.outputWidth = width;
+         params.kernelWidth = 1;
+         params.groups = groups;
+         params.matrix.m = width;
+         params.matrix.n = channelsPerGroup;
+         params.matrix.k = channelsPerGroup;
+         params.matrix.logicalM = width;
+         params.matrix.logicalN = channelsPerGroup;
+         params.matrix.logicalK = channelsPerGroup;
+         params.matrix.inputScale = 1.0;
+         params.matrix.weightScale = 1.0;
+         params.matrix.biasScale = 1.0;
+         params.matrix.outputScale = 1.0;
+         params.matrix.hasBias = true;
+         params.matrix.hasRelu = true;
+         params.matrix.inputCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.matrix.outputCarrier = SOFIE::EQuantizedOutputCarrier::Int8;
+         params.matrix.epilogueMode = SOFIE::EQuantizedEpilogueMode::Quantized;
+
+         SOFIE::QuantizedGemmCudaLtState state;
+         SOFIE::QuantizedCudaScratchView scratch{
+            reinterpret_cast<std::byte *>(alpaka::getPtrNative(scratch_d)),
+            static_cast<std::size_t>(scratchBytes)};
+         SOFIE::QuantizedConvCudaLt_Call(
+            state, scratch, alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(output_d), alpaka::getPtrNative(input_d),
+            alpaka::getPtrNative(weight_d), alpaka::getPtrNative(bias_d), nullptr, params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto output_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, output_h, output_d);
+         alpaka::wait(queue);
+         EXPECT_EQ(std::vector<std::int8_t>(alpaka::getPtrNative(output_h),
+                                            alpaka::getPtrNative(output_h) + expected.size()),
+                   expected);
+      #endif
+   }
+   {
+      SCOPED_TRACE("INT8 unit-kernel Conv direct NCHW input");
+      #ifndef SOFIE_USE_CUBLASLT
+         GTEST_SKIP() << "SOFIE_USE_CUBLASLT is not enabled";
+      #else
+         // 1x1 Conv whose NCHW input is consumed directly as the GEMM operand; each output
+         // channel sums its own and the next input channel, keeping integer math exact.
+         constexpr Idx channels = 64;
+         constexpr Idx width = 784;
+         std::vector<std::int8_t> input(channels * width);
+         std::vector<std::int8_t> weight(channels * channels, 0);
+         std::vector<float> bias(channels);
+         std::vector<std::int8_t> expected(channels * width);
+         for (Idx channel = 0; channel < channels; ++channel) {
+            bias[channel] = channel % 2 == 0 ? 1.0f : -1.0f;
+            weight[channel * channels + channel] = 1;
+            weight[channel * channels + (channel + 1) % channels] = 1;
+            for (Idx position = 0; position < width; ++position)
+               input[channel * width + position] = static_cast<std::int8_t>(
+                  static_cast<int>((channel + position) % 5) - 2);
+         }
+         for (Idx channel = 0; channel < channels; ++channel) {
+            const Idx next = (channel + 1) % channels;
+            for (Idx position = 0; position < width; ++position) {
+               const int accumulator = static_cast<int>(input[channel * width + position]) +
+                                       static_cast<int>(input[next * width + position]) +
+                                       static_cast<int>(bias[channel]);
+               expected[channel * width + position] =
+                  static_cast<std::int8_t>(std::max(0, accumulator));
+            }
+         }
+
+         auto input_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(input.size()));
+         auto weight_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(weight.size()));
+         auto bias_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(bias.size()));
+         std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
+         std::copy(weight.begin(), weight.end(), alpaka::getPtrNative(weight_h));
+         std::copy(bias.begin(), bias.end(), alpaka::getPtrNative(bias_h));
+         auto input_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(input.size()));
+         auto weight_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(weight.size()));
+         auto bias_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(bias.size()));
+         auto output_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(expected.size()));
+         const Idx scratchBytes = SOFIE::kQuantizedCudaLtMaxWorkspaceBytes + (1u << 20);
+         auto scratch_d = alpaka::allocBuf<std::uint8_t, Idx>(device, Ext1D::all(scratchBytes));
+         alpaka::memcpy(queue, input_d, input_h);
+         alpaka::memcpy(queue, weight_d, weight_h);
+         alpaka::memcpy(queue, bias_d, bias_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedConvolutionInvocation params{};
+         params.batch = 1;
+         params.inputChannels = channels;
+         params.inputWidth = width;
+         params.outputChannels = channels;
+         params.outputWidth = width;
+         params.kernelWidth = 1;
+         params.groups = 1;
+         params.matrix.m = width;
+         params.matrix.n = channels;
+         params.matrix.k = channels;
+         params.matrix.logicalM = width;
+         params.matrix.logicalN = channels;
+         params.matrix.logicalK = channels;
+         params.matrix.inputScale = 1.0;
+         params.matrix.weightScale = 1.0;
+         params.matrix.biasScale = 1.0;
+         params.matrix.outputScale = 1.0;
+         params.matrix.hasBias = true;
+         params.matrix.hasRelu = true;
+         params.matrix.inputCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.matrix.outputCarrier = SOFIE::EQuantizedOutputCarrier::Int8;
+         params.matrix.epilogueMode = SOFIE::EQuantizedEpilogueMode::Quantized;
+         params.unitKernelDirectInputCandidate = true;
+
+         SOFIE::QuantizedGemmCudaLtState state;
+         SOFIE::QuantizedCudaScratchView scratch{
+            reinterpret_cast<std::byte *>(alpaka::getPtrNative(scratch_d)),
+            static_cast<std::size_t>(scratchBytes)};
+         // Two inferences: the first probes and selects the direct layout, the
+         // second must reuse the initialized state.
+         for (int run = 0; run < 2; ++run) {
+            SOFIE::QuantizedConvCudaLt_Call(
+               state, scratch, alpaka::getNativeHandle(queue),
+               alpaka::getPtrNative(output_d), alpaka::getPtrNative(input_d),
+               alpaka::getPtrNative(weight_d), alpaka::getPtrNative(bias_d), nullptr, params);
+            alpaka::wait(queue);
+            ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+            auto output_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(expected.size()));
+            alpaka::memcpy(queue, output_h, output_d);
+            alpaka::wait(queue);
+            EXPECT_EQ(std::vector<std::int8_t>(alpaka::getPtrNative(output_h),
+                                               alpaka::getPtrNative(output_h) + expected.size()),
+                      expected);
+         }
+         // The candidate must have been attempted: either the direct layout is
+         // active or the provider factually reported it unsupported.
+         EXPECT_TRUE(state.fAColumnMajorInput || state.fDirectInputLayoutUnsupported);
+         EXPECT_TRUE(state.fAColumnMajorInput)
+            << "provider unexpectedly lacks the direct int8 layout for an aligned 1x1 shape";
+      #endif
+   }
+   {
+      SCOPED_TRACE("INT8 unit-kernel Conv direct-input fallback");
+      #ifndef SOFIE_USE_CUBLASLT
+         GTEST_SKIP() << "SOFIE_USE_CUBLASLT is not enabled";
+      #else
+         // batch > 1 with groups > 1 is not expressible as one strided-batch direct GEMM;
+         // the candidate flag must fall back to staged im2col and still produce exact results.
+         constexpr Idx batch = 2;
+         constexpr Idx groups = 2;
+         constexpr Idx channelsPerGroup = 16;
+         constexpr Idx channels = groups * channelsPerGroup;
+         constexpr Idx width = 16;
+         std::vector<std::int8_t> input(batch * channels * width);
+         std::vector<std::int8_t> weight(groups * channelsPerGroup * channelsPerGroup, 0);
+         std::vector<float> bias(channels);
+         std::vector<std::int8_t> expected(batch * channels * width);
+         for (Idx channel = 0; channel < channels; ++channel) {
+            bias[channel] = channel % 2 == 0 ? 1.0f : -1.0f;
+            const Idx group = channel / channelsPerGroup;
+            const Idx local = channel % channelsPerGroup;
+            weight[(group * channelsPerGroup + local) * channelsPerGroup + local] = 1;
+            for (Idx element = 0; element < batch; ++element) {
+               for (Idx position = 0; position < width; ++position) {
+                  const auto value = static_cast<std::int8_t>(
+                     static_cast<int>((element + channel + position) % 5) - 2);
+                  input[(element * channels + channel) * width + position] = value;
+                  expected[(element * channels + channel) * width + position] =
+                     static_cast<std::int8_t>(
+                        std::max(0, static_cast<int>(value) + static_cast<int>(bias[channel])));
+               }
+            }
+         }
+
+         auto input_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(input.size()));
+         auto weight_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(weight.size()));
+         auto bias_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(bias.size()));
+         std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
+         std::copy(weight.begin(), weight.end(), alpaka::getPtrNative(weight_h));
+         std::copy(bias.begin(), bias.end(), alpaka::getPtrNative(bias_h));
+         auto input_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(input.size()));
+         auto weight_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(weight.size()));
+         auto bias_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(bias.size()));
+         auto output_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(expected.size()));
+         const Idx scratchBytes = SOFIE::kQuantizedCudaLtMaxWorkspaceBytes + (1u << 20);
+         auto scratch_d = alpaka::allocBuf<std::uint8_t, Idx>(device, Ext1D::all(scratchBytes));
+         alpaka::memcpy(queue, input_d, input_h);
+         alpaka::memcpy(queue, weight_d, weight_h);
+         alpaka::memcpy(queue, bias_d, bias_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedConvolutionInvocation params{};
+         params.batch = batch;
+         params.inputChannels = channels;
+         params.inputWidth = width;
+         params.outputChannels = channels;
+         params.outputWidth = width;
+         params.kernelWidth = 1;
+         params.groups = groups;
+         params.matrix.m = batch * width;
+         params.matrix.n = channelsPerGroup;
+         params.matrix.k = channelsPerGroup;
+         params.matrix.logicalM = batch * width;
+         params.matrix.logicalN = channelsPerGroup;
+         params.matrix.logicalK = channelsPerGroup;
+         params.matrix.inputScale = 1.0;
+         params.matrix.weightScale = 1.0;
+         params.matrix.biasScale = 1.0;
+         params.matrix.outputScale = 1.0;
+         params.matrix.hasBias = true;
+         params.matrix.hasRelu = true;
+         params.matrix.inputCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.matrix.outputCarrier = SOFIE::EQuantizedOutputCarrier::Int8;
+         params.matrix.epilogueMode = SOFIE::EQuantizedEpilogueMode::Quantized;
+         params.unitKernelDirectInputCandidate = true;
+
+         SOFIE::QuantizedGemmCudaLtState state;
+         SOFIE::QuantizedCudaScratchView scratch{
+            reinterpret_cast<std::byte *>(alpaka::getPtrNative(scratch_d)),
+            static_cast<std::size_t>(scratchBytes)};
+         SOFIE::QuantizedConvCudaLt_Call(
+            state, scratch, alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(output_d), alpaka::getPtrNative(input_d),
+            alpaka::getPtrNative(weight_d), alpaka::getPtrNative(bias_d), nullptr, params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto output_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, output_h, output_d);
+         alpaka::wait(queue);
+         EXPECT_EQ(std::vector<std::int8_t>(alpaka::getPtrNative(output_h),
+                                            alpaka::getPtrNative(output_h) + expected.size()),
+                   expected);
+         EXPECT_FALSE(state.fAColumnMajorInput);
+      #endif
+   }
+   {
+      SCOPED_TRACE("INT8 tiled matrix Conv");
+      #ifndef SOFIE_USE_CUBLASLT
+         GTEST_SKIP() << "SOFIE_USE_CUBLASLT is not enabled";
+      #else
+         // Tiled execution with logicalM = 40 and 16-row tiles: two full tiles plus one
+         // zero-padded remainder tile, checked exactly against the identity-per-group construction.
+         constexpr Idx batch = 2;
+         constexpr Idx groups = 2;
+         constexpr Idx channelsPerGroup = 16;
+         constexpr Idx channels = groups * channelsPerGroup;
+         constexpr Idx width = 20;
+         std::vector<std::int8_t> input(batch * channels * width);
+         std::vector<std::int8_t> weight(groups * channelsPerGroup * channelsPerGroup, 0);
+         std::vector<float> bias(channels);
+         std::vector<std::int8_t> expected(batch * channels * width);
+         for (Idx channel = 0; channel < channels; ++channel) {
+            bias[channel] = channel % 2 == 0 ? 1.0f : -1.0f;
+            const Idx group = channel / channelsPerGroup;
+            const Idx local = channel % channelsPerGroup;
+            weight[(group * channelsPerGroup + local) * channelsPerGroup + local] = 1;
+            for (Idx element = 0; element < batch; ++element) {
+               for (Idx position = 0; position < width; ++position) {
+                  const auto value = static_cast<std::int8_t>(
+                     static_cast<int>((element + channel + position) % 5) - 2);
+                  input[(element * channels + channel) * width + position] = value;
+                  expected[(element * channels + channel) * width + position] =
+                     static_cast<std::int8_t>(
+                        std::max(0, static_cast<int>(value) + static_cast<int>(bias[channel])));
+               }
+            }
+         }
+
+         auto input_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(input.size()));
+         auto weight_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(weight.size()));
+         auto bias_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(bias.size()));
+         std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
+         std::copy(weight.begin(), weight.end(), alpaka::getPtrNative(weight_h));
+         std::copy(bias.begin(), bias.end(), alpaka::getPtrNative(bias_h));
+         auto input_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(input.size()));
+         auto weight_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(weight.size()));
+         auto bias_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(bias.size()));
+         auto output_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(expected.size()));
+         const Idx scratchBytes = SOFIE::kQuantizedCudaLtMaxWorkspaceBytes + (1u << 20);
+         auto scratch_d = alpaka::allocBuf<std::uint8_t, Idx>(device, Ext1D::all(scratchBytes));
+         alpaka::memcpy(queue, input_d, input_h);
+         alpaka::memcpy(queue, weight_d, weight_h);
+         alpaka::memcpy(queue, bias_d, bias_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedConvolutionInvocation params{};
+         params.batch = batch;
+         params.inputChannels = channels;
+         params.inputWidth = width;
+         params.outputChannels = channels;
+         params.outputWidth = width;
+         params.kernelWidth = 1;
+         params.groups = groups;
+         params.matrix.m = batch * width;
+         params.matrix.n = channelsPerGroup;
+         params.matrix.k = channelsPerGroup;
+         params.matrix.logicalM = batch * width;
+         params.matrix.logicalN = channelsPerGroup;
+         params.matrix.logicalK = channelsPerGroup;
+         params.matrix.inputScale = 1.0;
+         params.matrix.weightScale = 1.0;
+         params.matrix.biasScale = 1.0;
+         params.matrix.outputScale = 1.0;
+         params.matrix.hasBias = true;
+         params.matrix.hasRelu = true;
+         params.matrix.inputCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.matrix.outputCarrier = SOFIE::EQuantizedOutputCarrier::Int8;
+         params.matrix.epilogueMode = SOFIE::EQuantizedEpilogueMode::Quantized;
+         params.im2colTileRows = 16;
+
+         SOFIE::QuantizedGemmCudaLtState state;
+         SOFIE::QuantizedCudaScratchView scratch{
+            reinterpret_cast<std::byte *>(alpaka::getPtrNative(scratch_d)),
+            static_cast<std::size_t>(scratchBytes)};
+         // Two inferences: pipeline creation on the first, reuse on the second.
+         for (int run = 0; run < 2; ++run) {
+            SOFIE::QuantizedConvCudaLt_Call(
+               state, scratch, alpaka::getNativeHandle(queue),
+               alpaka::getPtrNative(output_d), alpaka::getPtrNative(input_d),
+               alpaka::getPtrNative(weight_d), alpaka::getPtrNative(bias_d), nullptr, params);
+            alpaka::wait(queue);
+            ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+            auto output_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(expected.size()));
+            alpaka::memcpy(queue, output_h, output_d);
+            alpaka::wait(queue);
+            EXPECT_EQ(std::vector<std::int8_t>(alpaka::getPtrNative(output_h),
+                                               alpaka::getPtrNative(output_h) + expected.size()),
+                      expected);
+         }
+      #endif
+   }
+   {
+      SCOPED_TRACE("INT8 depthwise Conv");
+         constexpr Idx batch = 1;
+         constexpr Idx channels = 4;
+         constexpr Idx width = 8;
+         constexpr Idx kernel = 4;
+         const std::vector<std::int8_t> input = {
+            1, 2, 3, 4, 5, 6, 7, 8,
+            -2, -1, 0, 1, 2, 3, 4, 5,
+            3, 1, -1, -3, 2, 0, -2, 4,
+            4, 3, 2, 1, 0, -1, -2, -3};
+         const std::vector<std::int8_t> weight = {
+            1, 2, 3, 4,
+            -1, 1, -1, 1,
+            2, 0, -2, 1,
+            1, 1, 1, 1};
+         const std::vector<float> bias = {0.25f, -0.25f, 0.125f, 0.0f};
+         const std::vector<float> weightScales = {0.5f, 0.25f, 0.125f, 0.5f};
+
+         std::vector<std::int8_t> expected(batch * channels * width);
+         for (Idx channel = 0; channel < channels; ++channel) {
+            const double accumulatorScale = 0.25 * weightScales[channel];
+            const auto biasAccumulator = static_cast<std::int64_t>(
+               std::nearbyint(static_cast<double>(bias[channel]) / accumulatorScale));
+            for (Idx output = 0; output < width; ++output) {
+               std::int64_t accumulator = biasAccumulator;
+               for (Idx k = 0; k < kernel; ++k) {
+                  const auto source = static_cast<std::int64_t>(output + k) - 3;
+                  if (source >= 0 && source < static_cast<std::int64_t>(width)) {
+                     accumulator += static_cast<std::int64_t>(
+                                       input[channel * width + static_cast<Idx>(source)]) *
+                                    static_cast<std::int64_t>(weight[channel * kernel + k]);
+                  }
+               }
+               const auto quantized = static_cast<long>(
+                  std::nearbyint(static_cast<double>(accumulator) * accumulatorScale / 0.125));
+               expected[channel * width + output] =
+                  static_cast<std::int8_t>(std::clamp(quantized, -128L, 127L));
+            }
+         }
+
+         auto input_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(input.size()));
+         auto weight_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(weight.size()));
+         auto bias_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(bias.size()));
+         auto scales_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(weightScales.size()));
+         std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
+         std::copy(weight.begin(), weight.end(), alpaka::getPtrNative(weight_h));
+         std::copy(bias.begin(), bias.end(), alpaka::getPtrNative(bias_h));
+         std::copy(weightScales.begin(), weightScales.end(), alpaka::getPtrNative(scales_h));
+
+         auto input_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(input.size()));
+         auto weight_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(weight.size()));
+         auto bias_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(bias.size()));
+         auto scales_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(weightScales.size()));
+         auto output_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, input_d, input_h);
+         alpaka::memcpy(queue, weight_d, weight_h);
+         alpaka::memcpy(queue, bias_d, bias_h);
+         alpaka::memcpy(queue, scales_d, scales_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedConvolutionInvocation params{};
+         params.batch = batch;
+         params.inputChannels = channels;
+         params.inputHeight = 1;
+         params.inputWidth = width;
+         params.outputChannels = channels;
+         params.outputHeight = 1;
+         params.outputWidth = width;
+         params.kernelHeight = 1;
+         params.kernelWidth = kernel;
+         params.groups = channels;
+         params.strideWidth = 1;
+         params.dilationWidth = 1;
+         params.padLeft = 3;
+         params.matrix.inputScale = 0.25;
+         params.matrix.weightScale = 0.5;
+         params.matrix.outputScale = 0.125;
+         params.matrix.inputZeroPoint = 0;
+         params.matrix.weightZeroPoint = 0;
+         params.matrix.outputZeroPoint = 0;
+         params.matrix.inputQMin = -128;
+         params.matrix.inputQMax = 127;
+         params.matrix.outputQMin = -128;
+         params.matrix.outputQMax = 127;
+         params.matrix.hasBias = true;
+         params.matrix.inputCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.matrix.outputCarrier = SOFIE::EQuantizedOutputCarrier::Int8;
+         params.matrix.weightScaleMode = SOFIE::EQuantizedScaleMode::PerOutputChannel;
+
+         SOFIE::QuantizedConvCudaDepthwise_Call(
+            alpaka::getNativeHandle(queue), alpaka::getPtrNative(output_d),
+            alpaka::getPtrNative(input_d), alpaka::getPtrNative(weight_d),
+            alpaka::getPtrNative(bias_d), alpaka::getPtrNative(scales_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto output_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, output_h, output_d);
+         alpaka::wait(queue);
+         const auto *actual = alpaka::getPtrNative(output_h);
+         for (Idx index = 0; index < expected.size(); ++index)
+            EXPECT_EQ(static_cast<int>(actual[index]), static_cast<int>(expected[index]))
+               << "index=" << index;
+   }
+   {
+      SCOPED_TRACE("FP8 standard Conv");
+      #ifndef SOFIE_USE_CUBLASLT
+         GTEST_SKIP() << "SOFIE_USE_CUBLASLT is not enabled";
+      #else
+         int cudaDevice = 0;
+         cudaDeviceProp properties{};
+         ASSERT_EQ(cudaGetDevice(&cudaDevice), cudaSuccess);
+         ASSERT_EQ(cudaGetDeviceProperties(&properties, cudaDevice), cudaSuccess);
+         if (properties.major * 10 + properties.minor < 89)
+            GTEST_SKIP() << "E4M3 Conv requires CUDA compute capability 8.9 or newer";
+
+         constexpr Idx groups = 2;
+         constexpr Idx channelsPerGroup = 16;
+         constexpr Idx channels = groups * channelsPerGroup;
+         constexpr Idx width = 16;
+         constexpr Idx elements = channels * width;
+         std::vector<__nv_fp8_e4m3> input(elements);
+         std::vector<__nv_fp8_e4m3> weight(groups * channelsPerGroup * channelsPerGroup);
+         std::vector<float> bias(channels);
+         std::vector<float> expected(elements);
+         for (Idx channel = 0; channel < channels; ++channel) {
+            bias[channel] = channel % 2 == 0 ? 0.5f : -0.5f;
+            for (Idx position = 0; position < width; ++position) {
+               const float value = static_cast<float>(
+                  static_cast<int>((channel + position) % 5) - 2);
+               input[channel * width + position] = __nv_fp8_e4m3(value);
+               expected[channel * width + position] =
+                  std::max(value + bias[channel], 0.0f);
+            }
+            const Idx group = channel / channelsPerGroup;
+            const Idx channelLocal = channel % channelsPerGroup;
+            for (Idx outputLocal = 0; outputLocal < channelsPerGroup; ++outputLocal)
+               weight[(group * channelsPerGroup + outputLocal) * channelsPerGroup + channelLocal] =
+                  __nv_fp8_e4m3(channelLocal == outputLocal ? 1.0f : 0.0f);
+         }
+
+         auto input_h = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(host, Ext1D::all(input.size()));
+         auto weight_h = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(host, Ext1D::all(weight.size()));
+         auto bias_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(bias.size()));
+         std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
+         std::copy(weight.begin(), weight.end(), alpaka::getPtrNative(weight_h));
+         std::copy(bias.begin(), bias.end(), alpaka::getPtrNative(bias_h));
+         auto input_d = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(device, Ext1D::all(input.size()));
+         auto weight_d = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(device, Ext1D::all(weight.size()));
+         auto bias_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(bias.size()));
+         auto output_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(expected.size()));
+         const Idx scratchBytes = SOFIE::kQuantizedCudaLtMaxWorkspaceBytes + 4096;
+         auto scratch_d = alpaka::allocBuf<std::uint8_t, Idx>(device, Ext1D::all(scratchBytes));
+         alpaka::memcpy(queue, input_d, input_h);
+         alpaka::memcpy(queue, weight_d, weight_h);
+         alpaka::memcpy(queue, bias_d, bias_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedFP8ConvolutionInvocation params{};
+         params.matrix.m = width;
+         params.matrix.n = channelsPerGroup;
+         params.matrix.k = channelsPerGroup;
+         params.matrix.inputFormat = SOFIE::ELowPrecisionFormat::FP8E4M3;
+         params.matrix.weightFormat = SOFIE::ELowPrecisionFormat::FP8E4M3;
+         params.matrix.outputCarrier = SOFIE::ELowPrecisionFormat::Float32;
+         params.matrix.accumulation = SOFIE::ELowPrecisionFormat::Float32;
+         params.matrix.hasBias = true;
+         params.matrix.beta = 1.0f;
+         params.geometry.batch = 1;
+         params.geometry.inputChannels = channels;
+         params.geometry.inputWidth = width;
+         params.geometry.outputChannels = channels;
+         params.geometry.outputWidth = width;
+         params.geometry.kernelWidth = 1;
+         params.geometry.groups = groups;
+         params.hasRelu = true;
+
+         SOFIE::QuantizedGemmCudaLtFP8State state;
+         SOFIE::QuantizedCudaScratchView scratch{
+            reinterpret_cast<std::byte *>(alpaka::getPtrNative(scratch_d)),
+            static_cast<std::size_t>(scratchBytes)};
+         SOFIE::QuantizedConvCudaLtFP8_Call(
+            state, scratch, alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(output_d), alpaka::getPtrNative(input_d),
+            alpaka::getPtrNative(weight_d), alpaka::getPtrNative(bias_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto output_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, output_h, output_d);
+         alpaka::wait(queue);
+         const auto *actual = alpaka::getPtrNative(output_h);
+         for (Idx index = 0; index < expected.size(); ++index)
+            EXPECT_NEAR(actual[index], expected[index], 0.05f) << "index=" << index;
+      #endif
+   }
+   {
+      SCOPED_TRACE("FP8 depthwise Conv");
+      #ifndef SOFIE_USE_CUBLASLT
+         GTEST_SKIP() << "SOFIE_USE_CUBLASLT is not enabled";
+      #else
+         int cudaDevice = 0;
+         cudaDeviceProp properties{};
+         ASSERT_EQ(cudaGetDevice(&cudaDevice), cudaSuccess);
+         ASSERT_EQ(cudaGetDeviceProperties(&properties, cudaDevice), cudaSuccess);
+         if (properties.major * 10 + properties.minor < 89)
+            GTEST_SKIP() << "E4M3 depthwise Conv requires CUDA compute capability 8.9 or newer";
+
+         constexpr Idx channels = 4;
+         constexpr Idx width = 8;
+         constexpr Idx kernel = 3;
+         std::vector<__nv_fp8_e4m3> input(channels * width);
+         std::vector<__nv_fp8_e4m3> weight(channels * kernel);
+         std::vector<float> bias(channels);
+         std::vector<float> expected(channels * width);
+         const float evenWeight[kernel] = {1.0f, 0.0f, -1.0f};
+         const float oddWeight[kernel] = {0.5f, 1.0f, 0.5f};
+         for (Idx channel = 0; channel < channels; ++channel) {
+            bias[channel] = channel % 2 == 0 ? 0.5f : -0.5f;
+            for (Idx position = 0; position < width; ++position) {
+               const float value = static_cast<float>(
+                  static_cast<int>((channel + position) % 5) - 2);
+               input[channel * width + position] = __nv_fp8_e4m3(value);
+            }
+            const auto *channelWeight = channel % 2 == 0 ? evenWeight : oddWeight;
+            for (Idx k = 0; k < kernel; ++k)
+               weight[channel * kernel + k] = __nv_fp8_e4m3(channelWeight[k]);
+            for (Idx position = 0; position < width; ++position) {
+               float value = bias[channel];
+               for (Idx k = 0; k < kernel; ++k) {
+                  const auto source = static_cast<std::int64_t>(position + k) - 1;
+                  if (source >= 0 && source < static_cast<std::int64_t>(width))
+                     value += static_cast<float>(input[channel * width + source]) *
+                              channelWeight[k];
+               }
+               expected[channel * width + position] = std::max(value, 0.0f);
+            }
+         }
+
+         auto input_h = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(host, Ext1D::all(input.size()));
+         auto weight_h = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(host, Ext1D::all(weight.size()));
+         auto bias_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(bias.size()));
+         std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
+         std::copy(weight.begin(), weight.end(), alpaka::getPtrNative(weight_h));
+         std::copy(bias.begin(), bias.end(), alpaka::getPtrNative(bias_h));
+         auto input_d = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(device, Ext1D::all(input.size()));
+         auto weight_d = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(device, Ext1D::all(weight.size()));
+         auto bias_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(bias.size()));
+         auto output_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, input_d, input_h);
+         alpaka::memcpy(queue, weight_d, weight_h);
+         alpaka::memcpy(queue, bias_d, bias_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedFP8ConvolutionInvocation params{};
+         params.matrix.m = width;
+         params.matrix.n = 1;
+         params.matrix.k = kernel;
+         params.matrix.inputFormat = SOFIE::ELowPrecisionFormat::FP8E4M3;
+         params.matrix.weightFormat = SOFIE::ELowPrecisionFormat::FP8E4M3;
+         params.matrix.outputCarrier = SOFIE::ELowPrecisionFormat::Float32;
+         params.matrix.accumulation = SOFIE::ELowPrecisionFormat::Float32;
+         params.matrix.hasBias = true;
+         params.geometry.batch = 1;
+         params.geometry.inputChannels = channels;
+         params.geometry.inputWidth = width;
+         params.geometry.outputChannels = channels;
+         params.geometry.outputWidth = width;
+         params.geometry.kernelWidth = kernel;
+         params.geometry.groups = channels;
+         params.geometry.padLeft = 1;
+         params.hasRelu = true;
+
+         SOFIE::QuantizedConvCudaDepthwiseFP8_Call(
+            alpaka::getNativeHandle(queue), alpaka::getPtrNative(output_d),
+            alpaka::getPtrNative(input_d), alpaka::getPtrNative(weight_d),
+            alpaka::getPtrNative(bias_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto output_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, output_h, output_d);
+         alpaka::wait(queue);
+         const auto *actual = alpaka::getPtrNative(output_h);
+         for (Idx index = 0; index < expected.size(); ++index)
+            EXPECT_NEAR(actual[index], expected[index], 0.05f) << "index=" << index;
+      #endif
+   }
+}
+
+TEST_F(QuantizationAlpakaTest, ConvolutionDilation)
+{
+   {
+      SCOPED_TRACE("dilation reaches the launch geometry unexpanded");
+         // A dilated Conv keeps its declared kernel shape, so the reduction depth stays
+         // channels times taps and the spacing travels beside it as its own factor.
+         constexpr std::size_t inputChannels = 32;
+         constexpr std::size_t outputChannels = 64;
+         constexpr std::size_t kernel = 3;
+         constexpr std::size_t dilation = 2;
+         constexpr std::size_t inputLength = 260;
+         constexpr std::size_t outputLength = inputLength - dilation * (kernel - 1);
+
+         SOFIE::RModel model("dilated_conv_lowering");
+         const std::vector<std::size_t> weightShape{outputChannels, inputChannels, kernel};
+         model.AddInputTensorInfo("input", SOFIE::ETensorType::FLOAT,
+                                  std::vector<std::size_t>{1, inputChannels, inputLength});
+         model.AddInitializedTensor(
+            "weight", SOFIE::ETensorType::FLOAT, weightShape,
+            std::shared_ptr<void>(new float[SOFIE::ConvertShapeToLength(weightShape)]{},
+                                  std::default_delete<float[]>()));
+         model.AddInitializedTensor("scale", std::vector<std::size_t>{},
+                                    std::vector<float>{0.125f});
+         model.AddInitializedTensor("zero_point", std::vector<std::size_t>{},
+                                    std::vector<float>{0.0f});
+         model.AddInitializedTensor("bit_width", std::vector<std::size_t>{},
+                                    std::vector<float>{8.0f});
+         const auto addBoundary = [&](const std::string &name, const std::string &source,
+                                      const std::string &target) {
+            AddNamedOperator<SOFIE::ROperator_QONNXQuant>(
+               model, name, source, "scale", "zero_point", "bit_width", target, true, false,
+               SOFIE::EQuantizationRoundingMode::ROUND,
+               SOFIE::EQuantizationOverflowMode::SAT);
+         };
+         addBoundary("quantize_input", "input", "input_quantized");
+         addBoundary("quantize_weight", "weight", "weight_quantized");
+         AddNamedOperator<SOFIE::ROperator_Conv<float>>(
+            model, "conv", "NOTSET", std::vector<std::size_t>{dilation}, 1,
+            std::vector<std::size_t>{kernel}, std::vector<std::size_t>{0, 0},
+            std::vector<std::size_t>{1}, "input_quantized", "weight_quantized", "",
+            "conv_output");
+         addBoundary("quantize_output", "conv_output", "output_quantized");
+         model.Initialize();
+
+         ASSERT_EQ(SOFIE_TEST::CountRegions(SOFIE_TEST::AlpakaPipelineReport(model), "conv"), 1U);
+         const auto &region = *SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedConvRegion>(
+            model.GetQuantizationState());
+         EXPECT_EQ(region.attributes.dilations, std::vector<std::size_t>{dilation});
+         EXPECT_EQ(region.attributes.kernelShape, std::vector<std::size_t>{kernel});
+         const auto *plan = SOFIE::FindQuantizedLoweringPlan(
+            model.GetQuantizationState(), region.convOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+         ASSERT_NE(plan, nullptr);
+         ASSERT_EQ(plan->status, SOFIE::EQuantizedLoweringStatus::Optimized)
+            << plan->capabilityTag << " | " << plan->reason;
+
+         SOFIE::ROperator_QuantizedConv lowered(
+            region, *plan, SOFIE::MakeQuantizedConvCodegenContext(model, region));
+         const auto generated = lowered.Generate_GPU_ALPAKA("dilated_conv");
+         EXPECT_NE(generated.find(".dilationWidth = " + std::to_string(dilation)),
+                   std::string::npos);
+         EXPECT_NE(generated.find(".kernelWidth = " + std::to_string(kernel)),
+                   std::string::npos);
+         EXPECT_NE(generated.find(".outputWidth = " + std::to_string(outputLength)),
+                   std::string::npos);
+         EXPECT_NE(generated.find(".matrix.k = " + std::to_string(inputChannels * kernel)),
+                   std::string::npos);
+   }
+   {
+      SCOPED_TRACE("INT8 affine dilated Conv");
+         constexpr Idx inputChannels = 2;
+         constexpr Idx outputChannels = 2;
+         constexpr Idx width = 7;
+         constexpr Idx kernel = 3;
+         constexpr Idx dilation = 2;
+         constexpr Idx padLeft = 2;
+         const std::vector<std::uint8_t> input = {
+            5, 7, 4, 8, 6, 9, 3,
+            3, 9, 5, 4, 10, 6, 8};
+         const std::vector<std::uint8_t> weight = {
+            7, 8, 6, 9, 7, 5,
+            6, 7, 10, 8, 5, 7};
+         const std::vector<float> bias = {0.125f, -0.125f};
+         const std::vector<float> weightScales = {0.5f, 0.25f};
+         constexpr std::int32_t inputZeroPoint = 5;
+         constexpr std::int32_t weightZeroPoint = 7;
+         constexpr std::int32_t outputZeroPoint = 11;
+         constexpr double inputScale = 0.25;
+         constexpr double outputScale = 0.125;
+
+         std::vector<std::uint8_t> expected(outputChannels * width);
+         for (Idx oc = 0; oc < outputChannels; ++oc) {
+            const double accumulatorScale = inputScale * weightScales[oc];
+            const auto biasAccumulator = static_cast<std::int64_t>(
+               std::nearbyint(static_cast<double>(bias[oc]) / accumulatorScale));
+            for (Idx output = 0; output < width; ++output) {
+               std::int64_t accumulator = biasAccumulator;
+               for (Idx ic = 0; ic < inputChannels; ++ic) {
+                  for (Idx k = 0; k < kernel; ++k) {
+                     // The tap spacing is the dilation, applied once to the kernel offset.
+                     const auto source =
+                        static_cast<std::int64_t>(output + k * dilation) - padLeft;
+                     if (source < 0 || source >= static_cast<std::int64_t>(width))
+                        continue;
+                     const auto inputValue = input[ic * width + static_cast<Idx>(source)];
+                     const auto weightValue = weight[(oc * inputChannels + ic) * kernel + k];
+                     accumulator += static_cast<std::int64_t>(inputValue - inputZeroPoint) *
+                                    static_cast<std::int64_t>(weightValue - weightZeroPoint);
+                  }
+               }
+               const auto quantized = static_cast<long>(std::nearbyint(
+                                         static_cast<double>(accumulator) * accumulatorScale /
+                                         outputScale)) +
+                                      outputZeroPoint;
+               expected[oc * width + output] = static_cast<std::uint8_t>(
+                  std::clamp(std::max(quantized, static_cast<long>(outputZeroPoint)),
+                             0L, 255L));
+            }
+         }
+
+         auto input_h = alpaka::allocBuf<std::uint8_t, Idx>(host, Ext1D::all(input.size()));
+         auto weight_h = alpaka::allocBuf<std::uint8_t, Idx>(host, Ext1D::all(weight.size()));
+         auto bias_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(bias.size()));
+         auto scales_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(weightScales.size()));
+         std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
+         std::copy(weight.begin(), weight.end(), alpaka::getPtrNative(weight_h));
+         std::copy(bias.begin(), bias.end(), alpaka::getPtrNative(bias_h));
+         std::copy(weightScales.begin(), weightScales.end(), alpaka::getPtrNative(scales_h));
+
+         auto input_d = alpaka::allocBuf<std::uint8_t, Idx>(device, Ext1D::all(input.size()));
+         auto weight_d = alpaka::allocBuf<std::uint8_t, Idx>(device, Ext1D::all(weight.size()));
+         auto bias_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(bias.size()));
+         auto scales_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(weightScales.size()));
+         auto output_d = alpaka::allocBuf<std::uint8_t, Idx>(device, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, input_d, input_h);
+         alpaka::memcpy(queue, weight_d, weight_h);
+         alpaka::memcpy(queue, bias_d, bias_h);
+         alpaka::memcpy(queue, scales_d, scales_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedConvolutionInvocation params{};
+         params.batch = 1;
+         params.inputChannels = inputChannels;
+         params.inputHeight = 1;
+         params.inputWidth = width;
+         params.outputChannels = outputChannels;
+         params.outputHeight = 1;
+         params.outputWidth = width;
+         params.kernelHeight = 1;
+         params.kernelWidth = kernel;
+         params.groups = 1;
+         params.strideWidth = 1;
+         params.dilationWidth = dilation;
+         params.padLeft = padLeft;
+         params.matrix.inputScale = inputScale;
+         params.matrix.weightScale = weightScales.front();
+         params.matrix.outputScale = outputScale;
+         params.matrix.inputZeroPoint = inputZeroPoint;
+         params.matrix.weightZeroPoint = weightZeroPoint;
+         params.matrix.outputZeroPoint = outputZeroPoint;
+         params.matrix.inputQMin = 0;
+         params.matrix.inputQMax = 255;
+         params.matrix.biasQMin = std::numeric_limits<std::int32_t>::min();
+         params.matrix.biasQMax = std::numeric_limits<std::int32_t>::max();
+         params.matrix.outputQMin = 0;
+         params.matrix.outputQMax = 255;
+         params.matrix.hasBias = true;
+         params.matrix.hasRelu = true;
+         params.matrix.inputCarrier = SOFIE::EQuantizedInputCarrier::UInt8;
+         params.matrix.weightType = SOFIE::EQuantizedWeightCarrier::UInt8;
+         params.matrix.outputCarrier = SOFIE::EQuantizedOutputCarrier::UInt8;
+         params.matrix.weightScaleMode = SOFIE::EQuantizedScaleMode::PerOutputChannel;
+         params.biasCarrier = SOFIE::EQuantizedBiasCarrier::Float;
+
+         SOFIE::QuantizedConvCudaAffine_Call(
+            alpaka::getNativeHandle(queue), alpaka::getPtrNative(output_d),
+            alpaka::getPtrNative(input_d), alpaka::getPtrNative(weight_d),
+            alpaka::getPtrNative(bias_d), alpaka::getPtrNative(scales_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto output_h = alpaka::allocBuf<std::uint8_t, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, output_h, output_d);
+         alpaka::wait(queue);
+         EXPECT_EQ(std::vector<std::uint8_t>(alpaka::getPtrNative(output_h),
+                                             alpaka::getPtrNative(output_h) + expected.size()),
+                   expected);
+   }
+   {
+      SCOPED_TRACE("INT8 depthwise dilated Conv");
+         constexpr Idx channels = 4;
+         constexpr Idx width = 8;
+         constexpr Idx kernel = 3;
+         constexpr Idx dilation = 3;
+         constexpr Idx padLeft = 3;
+         constexpr double inputScale = 0.25;
+         constexpr double outputScale = 0.125;
+         // Ratios of one and two: the output code is an exact integer, so a dilation
+         // fault shows as a changed value rather than a rounding tie.
+         const std::vector<float> weightScales = {0.5f, 1.0f, 0.5f, 1.0f};
+
+         std::vector<std::int8_t> input(channels * width);
+         std::vector<std::int8_t> weight(channels * kernel);
+         std::vector<float> bias(channels);
+         for (Idx channel = 0; channel < channels; ++channel) {
+            bias[channel] = channel % 2 == 0 ? 0.5f : -0.5f;
+            for (Idx k = 0; k < kernel; ++k)
+               weight[channel * kernel + k] =
+                  static_cast<std::int8_t>(static_cast<int>((channel + 2 * k) % 5) - 2);
+            for (Idx position = 0; position < width; ++position)
+               input[channel * width + position] = static_cast<std::int8_t>(
+                  static_cast<int>((channel * 3 + position) % 7) - 3);
+         }
+
+         std::vector<std::int8_t> expected(channels * width);
+         for (Idx channel = 0; channel < channels; ++channel) {
+            const double accumulatorScale = inputScale * weightScales[channel];
+            const auto biasAccumulator = static_cast<std::int64_t>(
+               std::nearbyint(static_cast<double>(bias[channel]) / accumulatorScale));
+            for (Idx output = 0; output < width; ++output) {
+               std::int64_t accumulator = biasAccumulator;
+               for (Idx k = 0; k < kernel; ++k) {
+                  const auto source =
+                     static_cast<std::int64_t>(output + k * dilation) - padLeft;
+                  if (source < 0 || source >= static_cast<std::int64_t>(width))
+                     continue;
+                  accumulator += static_cast<std::int64_t>(
+                                    input[channel * width + static_cast<Idx>(source)]) *
+                                 static_cast<std::int64_t>(weight[channel * kernel + k]);
+               }
+               const auto quantized = static_cast<long>(std::nearbyint(
+                  static_cast<double>(accumulator) * accumulatorScale / outputScale));
+               expected[channel * width + output] =
+                  static_cast<std::int8_t>(std::clamp(quantized, -128L, 127L));
+            }
+         }
+
+         auto input_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(input.size()));
+         auto weight_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(weight.size()));
+         auto bias_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(bias.size()));
+         auto scales_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(weightScales.size()));
+         std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
+         std::copy(weight.begin(), weight.end(), alpaka::getPtrNative(weight_h));
+         std::copy(bias.begin(), bias.end(), alpaka::getPtrNative(bias_h));
+         std::copy(weightScales.begin(), weightScales.end(), alpaka::getPtrNative(scales_h));
+
+         auto input_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(input.size()));
+         auto weight_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(weight.size()));
+         auto bias_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(bias.size()));
+         auto scales_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(weightScales.size()));
+         auto output_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, input_d, input_h);
+         alpaka::memcpy(queue, weight_d, weight_h);
+         alpaka::memcpy(queue, bias_d, bias_h);
+         alpaka::memcpy(queue, scales_d, scales_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedConvolutionInvocation params{};
+         params.batch = 1;
+         params.inputChannels = channels;
+         params.inputHeight = 1;
+         params.inputWidth = width;
+         params.outputChannels = channels;
+         params.outputHeight = 1;
+         params.outputWidth = width;
+         params.kernelHeight = 1;
+         params.kernelWidth = kernel;
+         params.groups = channels;
+         params.strideWidth = 1;
+         params.dilationWidth = dilation;
+         params.padLeft = padLeft;
+         params.matrix.inputScale = inputScale;
+         params.matrix.weightScale = weightScales.front();
+         params.matrix.outputScale = outputScale;
+         params.matrix.inputZeroPoint = 0;
+         params.matrix.weightZeroPoint = 0;
+         params.matrix.outputZeroPoint = 0;
+         params.matrix.inputQMin = -128;
+         params.matrix.inputQMax = 127;
+         params.matrix.outputQMin = -128;
+         params.matrix.outputQMax = 127;
+         params.matrix.hasBias = true;
+         params.matrix.inputCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.matrix.outputCarrier = SOFIE::EQuantizedOutputCarrier::Int8;
+         params.matrix.weightScaleMode = SOFIE::EQuantizedScaleMode::PerOutputChannel;
+
+         SOFIE::QuantizedConvCudaDepthwise_Call(
+            alpaka::getNativeHandle(queue), alpaka::getPtrNative(output_d),
+            alpaka::getPtrNative(input_d), alpaka::getPtrNative(weight_d),
+            alpaka::getPtrNative(bias_d), alpaka::getPtrNative(scales_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto output_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, output_h, output_d);
+         alpaka::wait(queue);
+         const auto *actual = alpaka::getPtrNative(output_h);
+         for (Idx index = 0; index < expected.size(); ++index)
+            EXPECT_EQ(static_cast<int>(actual[index]), static_cast<int>(expected[index]))
+               << "index=" << index;
+   }
+   {
+      SCOPED_TRACE("INT8 im2col dilated Conv");
+      #ifndef SOFIE_USE_CUBLASLT
+         GTEST_SKIP() << "SOFIE_USE_CUBLASLT is not enabled";
+      #else
+         // Two live taps on the kernel diagonal: at spacing two they read the pixels
+         // diagonally adjacent to the output, which no other spacing reaches.
+         constexpr Idx inputChannels = 8;
+         constexpr Idx outputChannels = 16;
+         constexpr Idx extent = 8;
+         constexpr Idx kernel = 2;
+         constexpr Idx dilation = 2;
+         constexpr Idx pad = 1;
+         constexpr Idx spatial = extent * extent;
+
+         std::vector<std::int8_t> input(inputChannels * spatial);
+         std::vector<std::int8_t> weight(outputChannels * inputChannels * kernel * kernel, 0);
+         std::vector<float> bias(outputChannels);
+         for (Idx channel = 0; channel < inputChannels; ++channel)
+            for (Idx position = 0; position < spatial; ++position)
+               input[channel * spatial + position] = static_cast<std::int8_t>(
+                  static_cast<int>((channel * 5 + position * 3) % 7) - 3);
+         for (Idx outputChannel = 0; outputChannel < outputChannels; ++outputChannel) {
+            bias[outputChannel] = outputChannel % 2 == 0 ? 1.0f : -1.0f;
+            const Idx channel = outputChannel % inputChannels;
+            const Idx base = (outputChannel * inputChannels + channel) * kernel * kernel;
+            weight[base] = 1;
+            weight[base + kernel + 1] = 1;
+         }
+
+         std::vector<std::int8_t> expected(outputChannels * spatial);
+         for (Idx outputChannel = 0; outputChannel < outputChannels; ++outputChannel) {
+            const Idx channel = outputChannel % inputChannels;
+            for (Idx outputHeight = 0; outputHeight < extent; ++outputHeight) {
+               for (Idx outputWidth = 0; outputWidth < extent; ++outputWidth) {
+                  auto accumulator = static_cast<std::int64_t>(bias[outputChannel]);
+                  for (Idx tap = 0; tap < kernel; ++tap) {
+                     const auto row =
+                        static_cast<std::int64_t>(outputHeight + tap * dilation) - pad;
+                     const auto column =
+                        static_cast<std::int64_t>(outputWidth + tap * dilation) - pad;
+                     if (row < 0 || column < 0 || row >= extent || column >= extent)
+                        continue;
+                     accumulator += static_cast<std::int64_t>(
+                        input[channel * spatial + static_cast<Idx>(row) * extent +
+                              static_cast<Idx>(column)]);
+                  }
+                  expected[outputChannel * spatial + outputHeight * extent + outputWidth] =
+                     static_cast<std::int8_t>(std::clamp(accumulator, std::int64_t{-128},
+                                                         std::int64_t{127}));
+               }
+            }
+         }
+
+         auto input_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(input.size()));
+         auto weight_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(weight.size()));
+         auto bias_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(bias.size()));
+         std::copy(input.begin(), input.end(), alpaka::getPtrNative(input_h));
+         std::copy(weight.begin(), weight.end(), alpaka::getPtrNative(weight_h));
+         std::copy(bias.begin(), bias.end(), alpaka::getPtrNative(bias_h));
+         auto input_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(input.size()));
+         auto weight_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(weight.size()));
+         auto bias_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(bias.size()));
+         auto output_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(expected.size()));
+         const Idx scratchBytes = SOFIE::kQuantizedCudaLtMaxWorkspaceBytes + (1u << 20);
+         auto scratch_d = alpaka::allocBuf<std::uint8_t, Idx>(device, Ext1D::all(scratchBytes));
+         alpaka::memcpy(queue, input_d, input_h);
+         alpaka::memcpy(queue, weight_d, weight_h);
+         alpaka::memcpy(queue, bias_d, bias_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedConvolutionInvocation params{};
+         params.batch = 1;
+         params.inputChannels = inputChannels;
+         params.inputHeight = extent;
+         params.inputWidth = extent;
+         params.outputChannels = outputChannels;
+         params.outputHeight = extent;
+         params.outputWidth = extent;
+         params.kernelHeight = kernel;
+         params.kernelWidth = kernel;
+         params.groups = 1;
+         params.strideHeight = 1;
+         params.strideWidth = 1;
+         params.dilationHeight = dilation;
+         params.dilationWidth = dilation;
+         params.padTop = pad;
+         params.padLeft = pad;
+         params.matrix.m = spatial;
+         params.matrix.n = outputChannels;
+         params.matrix.k = inputChannels * kernel * kernel;
+         params.matrix.logicalM = spatial;
+         params.matrix.logicalN = outputChannels;
+         params.matrix.logicalK = inputChannels * kernel * kernel;
+         params.matrix.inputScale = 1.0;
+         params.matrix.weightScale = 1.0;
+         params.matrix.biasScale = 1.0;
+         params.matrix.outputScale = 1.0;
+         params.matrix.hasBias = true;
+         params.matrix.inputCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.matrix.outputCarrier = SOFIE::EQuantizedOutputCarrier::Int8;
+         params.matrix.epilogueMode = SOFIE::EQuantizedEpilogueMode::Quantized;
+
+         SOFIE::QuantizedGemmCudaLtState state;
+         SOFIE::QuantizedCudaScratchView scratch{
+            reinterpret_cast<std::byte *>(alpaka::getPtrNative(scratch_d)),
+            static_cast<std::size_t>(scratchBytes)};
+         SOFIE::QuantizedConvCudaLt_Call(
+            state, scratch, alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(output_d), alpaka::getPtrNative(input_d),
+            alpaka::getPtrNative(weight_d), alpaka::getPtrNative(bias_d), nullptr, params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto output_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, output_h, output_d);
+         alpaka::wait(queue);
+         const auto *actual = alpaka::getPtrNative(output_h);
+         for (Idx index = 0; index < expected.size(); ++index)
+            EXPECT_EQ(static_cast<int>(actual[index]), static_cast<int>(expected[index]))
+               << "index=" << index;
+      #endif
+   }
+}
+
+TEST_F(QuantizationAlpakaTest, ConvolutionFrontendsEquivalent)
+{
+   // Both graphs are a 1x1 NCHW Conv; QONNX exposes the dequantized float grid, standard
+   // Q/DQ the physical INT8 output carrier. The reference below is independent of both.
+   constexpr Idx channels = 64;
+   constexpr Idx width = 256;
+   constexpr double inputScale = 0.125;
+   constexpr double weightScale = 0.0625;
+   constexpr double outputScale = 0.25;
+   constexpr Idx elements = channels * width;
+
+   std::vector<std::int8_t> carrier(elements);
+   std::vector<float> fakeQuantInput(elements);
+   for (Idx channel = 0; channel < channels; ++channel) {
+      for (Idx position = 0; position < width; ++position) {
+         const auto value = static_cast<std::int8_t>(
+            static_cast<int>((channel * 7 + position * 3) % 31) - 15);
+         carrier[channel * width + position] = value;
+         fakeQuantInput[channel * width + position] =
+            static_cast<float>(static_cast<double>(value) * inputScale);
+      }
+   }
+
+   std::vector<std::int8_t> expectedCarrier(elements);
+   std::vector<float> expectedFakeQuant(elements);
+   for (Idx outputChannel = 0; outputChannel < channels; ++outputChannel) {
+      const Idx adjacent = (outputChannel + 1) % channels;
+      for (Idx position = 0; position < width; ++position) {
+         const auto accumulator =
+            8 * static_cast<int>(carrier[outputChannel * width + position]) -
+            2 * static_cast<int>(carrier[adjacent * width + position]);
+         const auto quantized = static_cast<long>(std::nearbyint(
+            static_cast<double>(accumulator) * inputScale * weightScale / outputScale));
+         const auto clamped = static_cast<std::int8_t>(
+            std::clamp(quantized, -128L, 127L));
+         expectedCarrier[outputChannel * width + position] = clamped;
+         expectedFakeQuant[outputChannel * width + position] =
+            static_cast<float>(static_cast<double>(clamped) * outputScale);
+      }
+   }
+
+   auto qonnxInput_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(elements));
+   std::copy(fakeQuantInput.begin(), fakeQuantInput.end(),
+             alpaka::getPtrNative(qonnxInput_h));
+   auto qonnxInput_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(elements));
+   alpaka::memcpy(queue, qonnxInput_d, qonnxInput_h);
+
+   auto qdqInput_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(elements));
+   std::copy(carrier.begin(), carrier.end(), alpaka::getPtrNative(qdqInput_h));
+   auto qdqInput_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(elements));
+   alpaka::memcpy(queue, qdqInput_d, qdqInput_h);
+   alpaka::wait(queue);
+
+   SOFIE_QONNX_QuantConv::Session<alpaka::TagGpuCudaRt> qonnx(
+      "QONNX_QuantConv_FromONNX_GPU_ALPAKA.dat");
+   SOFIE_ONNX_QDQ_QuantConv::Session<alpaka::TagGpuCudaRt> qdq(
+      "ONNX_QDQ_QuantConv_FromONNX_GPU_ALPAKA.dat");
+   auto qonnxOutput_d = qonnx.infer(qonnxInput_d);
+   auto qdqOutput_d = qdq.infer(qdqInput_d);
+   alpaka::wait(queue);
+   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+   auto qonnxOutput_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(elements));
+   auto qdqOutput_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(elements));
+   alpaka::memcpy(queue, qonnxOutput_h, qonnxOutput_d);
+   alpaka::memcpy(queue, qdqOutput_h, qdqOutput_d);
+   alpaka::wait(queue);
+
+   const auto *qonnxActual = alpaka::getPtrNative(qonnxOutput_h);
+   const auto *qdqActual = alpaka::getPtrNative(qdqOutput_h);
+   for (Idx index = 0; index < elements; ++index) {
+      EXPECT_FLOAT_EQ(qonnxActual[index], expectedFakeQuant[index]) << "index=" << index;
+      EXPECT_EQ(static_cast<int>(qdqActual[index]),
+                static_cast<int>(expectedCarrier[index])) << "index=" << index;
+   }
+}
+
+TEST_F(QuantizationAlpakaTest, ElementwiseKernels)
+{
+   // SOFIE quantization uses round-half-to-even (nearbyint); the references
+   // below must match so exact-half cases do not spuriously diverge.
+   {
+      SCOPED_TRACE("INT8 Add with differing scales and zero points");
+         constexpr Idx n = 64;
+         const double sa = 0.05, sb = 0.02, so = 0.03;
+         const std::int32_t za = -3, zb = 7, zo = 2;
+         std::vector<std::int8_t> a(n), b(n), expected(n);
+         for (Idx i = 0; i < n; ++i) {
+            a[i] = static_cast<std::int8_t>(static_cast<int>(i) - 20);
+            b[i] = static_cast<std::int8_t>(30 - static_cast<int>(i));
+            const double real = sa * (a[i] - za) + sb * (b[i] - zb);
+            long q = static_cast<long>(std::nearbyint(real / so + zo));
+            expected[i] = static_cast<std::int8_t>(std::clamp(q, -128L, 127L));
+         }
+
+         auto a_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(n));
+         auto b_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(n));
+         auto out_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(n));
+         auto a_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(n));
+         auto b_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(n));
+         std::copy(a.begin(), a.end(), alpaka::getPtrNative(a_h));
+         std::copy(b.begin(), b.end(), alpaka::getPtrNative(b_h));
+         alpaka::memcpy(queue, a_d, a_h);
+         alpaka::memcpy(queue, b_d, b_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedElementwiseInvocation params{};
+         params.op = SOFIE::EQuantizedElementwiseOp::Add;
+         params.rank = 1;
+         params.outputExtent[0] = n;
+         params.inputExtent[0] = n;
+         params.operandBExtent[0] = n;
+         params.inputScale = sa; params.operandBScale = sb; params.outputScale = so;
+         params.inputZeroPoint = za; params.operandBZeroPoint = zb; params.outputZeroPoint = zo;
+         params.outputQMin = -128; params.outputQMax = 127;
+         params.inputCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.operandBCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.outputCarrier = SOFIE::EQuantizedOutputCarrier::Int8;
+
+         SOFIE::QuantizedElementwise_Call(alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(out_d), alpaka::getPtrNative(a_d),
+            alpaka::getPtrNative(b_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto out_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(n));
+         alpaka::memcpy(queue, out_h, out_d);
+         alpaka::wait(queue);
+         EXPECT_EQ(std::vector<std::int8_t>(alpaka::getPtrNative(out_h),
+                                            alpaka::getPtrNative(out_h) + n), expected);
+   }
+   {
+      SCOPED_TRACE("INT8 Mul uses the product scale");
+         constexpr Idx n = 48;
+         const double sa = 0.1, sb = 0.05, so = 0.2;
+         std::vector<std::int8_t> a(n), b(n), expected(n);
+         for (Idx i = 0; i < n; ++i) {
+            a[i] = static_cast<std::int8_t>(static_cast<int>(i) - 15);
+            b[i] = static_cast<std::int8_t>(static_cast<int>(i) - 25);
+            const double real = (sa * a[i]) * (sb * b[i]);
+            long q = static_cast<long>(std::nearbyint(real / so));
+            expected[i] = static_cast<std::int8_t>(std::clamp(q, -128L, 127L));
+         }
+
+         auto a_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(n));
+         auto b_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(n));
+         auto out_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(n));
+         auto a_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(n));
+         auto b_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(n));
+         std::copy(a.begin(), a.end(), alpaka::getPtrNative(a_h));
+         std::copy(b.begin(), b.end(), alpaka::getPtrNative(b_h));
+         alpaka::memcpy(queue, a_d, a_h);
+         alpaka::memcpy(queue, b_d, b_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedElementwiseInvocation params{};
+         params.op = SOFIE::EQuantizedElementwiseOp::Mul;
+         params.rank = 1;
+         params.outputExtent[0] = n; params.inputExtent[0] = n; params.operandBExtent[0] = n;
+         params.inputScale = sa; params.operandBScale = sb; params.outputScale = so;
+         params.outputQMin = -128; params.outputQMax = 127;
+         params.inputCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.operandBCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.outputCarrier = SOFIE::EQuantizedOutputCarrier::Int8;
+
+         SOFIE::QuantizedElementwise_Call(alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(out_d), alpaka::getPtrNative(a_d),
+            alpaka::getPtrNative(b_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto out_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(n));
+         alpaka::memcpy(queue, out_h, out_d);
+         alpaka::wait(queue);
+         EXPECT_EQ(std::vector<std::int8_t>(alpaka::getPtrNative(out_h),
+                                            alpaka::getPtrNative(out_h) + n), expected);
+   }
+   {
+      SCOPED_TRACE("INT8 Mul with Mamba gating broadcast [1,2048,1]x[1,1,16]");
+         constexpr Idx D = 2048, H = 16;
+         const double sa = 0.03, sb = 0.07, so = 0.02;
+         std::vector<std::int8_t> a(D), b(H), expected(D * H);
+         for (Idx i = 0; i < D; ++i) a[i] = static_cast<std::int8_t>(static_cast<int>(i % 40) - 20);
+         for (Idx i = 0; i < H; ++i) b[i] = static_cast<std::int8_t>(static_cast<int>(i) - 8);
+         for (Idx d = 0; d < D; ++d)
+            for (Idx h = 0; h < H; ++h) {
+               const double real = (sa * a[d]) * (sb * b[h]);
+               long q = static_cast<long>(std::nearbyint(real / so));
+               expected[d * H + h] = static_cast<std::int8_t>(std::clamp(q, -128L, 127L));
+            }
+
+         auto a_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(D));
+         auto b_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(H));
+         auto out_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(D * H));
+         auto a_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(D));
+         auto b_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(H));
+         std::copy(a.begin(), a.end(), alpaka::getPtrNative(a_h));
+         std::copy(b.begin(), b.end(), alpaka::getPtrNative(b_h));
+         alpaka::memcpy(queue, a_d, a_h);
+         alpaka::memcpy(queue, b_d, b_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedElementwiseInvocation params{};
+         params.op = SOFIE::EQuantizedElementwiseOp::Mul;
+         params.rank = 3;
+         params.outputExtent[0] = 1; params.outputExtent[1] = D; params.outputExtent[2] = H;
+         params.inputExtent[0] = 1; params.inputExtent[1] = D; params.inputExtent[2] = 1;
+         params.operandBExtent[0] = 1; params.operandBExtent[1] = 1; params.operandBExtent[2] = H;
+         params.inputScale = sa; params.operandBScale = sb; params.outputScale = so;
+         params.outputQMin = -128; params.outputQMax = 127;
+         params.inputCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.operandBCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.outputCarrier = SOFIE::EQuantizedOutputCarrier::Int8;
+
+         SOFIE::QuantizedElementwise_Call(alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(out_d), alpaka::getPtrNative(a_d),
+            alpaka::getPtrNative(b_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto out_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(D * H));
+         alpaka::memcpy(queue, out_h, out_d);
+         alpaka::wait(queue);
+         EXPECT_EQ(std::vector<std::int8_t>(alpaka::getPtrNative(out_h),
+                                            alpaka::getPtrNative(out_h) + D * H), expected);
+   }
+   {
+      SCOPED_TRACE("native FP8 E4M3 Add to FP32 output");
+         constexpr Idx n = 32;
+         std::vector<__nv_fp8_e4m3> a(n), b(n);
+         std::vector<float> expected(n);
+         for (Idx i = 0; i < n; ++i) {
+            const float av = 0.5f * (static_cast<int>(i) - 16);
+            const float bv = 0.25f * (static_cast<int>(i) - 8);
+            a[i] = static_cast<__nv_fp8_e4m3>(av);
+            b[i] = static_cast<__nv_fp8_e4m3>(bv);
+            // Reference dequantizes through the same E4M3 rounding the device uses.
+            expected[i] = static_cast<float>(a[i]) + static_cast<float>(b[i]);
+         }
+
+         auto a_d = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(device, Ext1D::all(n));
+         auto b_d = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(device, Ext1D::all(n));
+         auto out_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(n));
+         auto a_h = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(host, Ext1D::all(n));
+         auto b_h = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(host, Ext1D::all(n));
+         std::copy(a.begin(), a.end(), alpaka::getPtrNative(a_h));
+         std::copy(b.begin(), b.end(), alpaka::getPtrNative(b_h));
+         alpaka::memcpy(queue, a_d, a_h);
+         alpaka::memcpy(queue, b_d, b_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedElementwiseInvocation params{};
+         params.op = SOFIE::EQuantizedElementwiseOp::Add;
+         params.rank = 1;
+         params.outputExtent[0] = n; params.inputExtent[0] = n; params.operandBExtent[0] = n;
+         params.lowPrecisionFP8 = true;
+         params.outputCarrier = SOFIE::EQuantizedOutputCarrier::Float;
+
+         SOFIE::QuantizedElementwise_Call(alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(out_d), alpaka::getPtrNative(a_d),
+            alpaka::getPtrNative(b_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto out_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(n));
+         alpaka::memcpy(queue, out_h, out_d);
+         alpaka::wait(queue);
+         const float *result = alpaka::getPtrNative(out_h);
+         for (Idx i = 0; i < n; ++i)
+            EXPECT_FLOAT_EQ(result[i], expected[i]);
+   }
+   {
+      // The case above leaves both scales at one, so it passes whether or not the kernel
+      // applies them. The two sides of a residual Add need not share a grid, so these differ.
+      SCOPED_TRACE("native FP8 E4M3 Add applies a distinct per-operand scale");
+         constexpr Idx n = 32;
+         constexpr float scaleA = 0.0022321429569274187f;
+         constexpr float scaleB = 0.0044642859138548374f;
+         std::vector<__nv_fp8_e4m3> a(n), b(n);
+         std::vector<float> expected(n);
+         for (Idx i = 0; i < n; ++i) {
+            a[i] = static_cast<__nv_fp8_e4m3>(0.5f * (static_cast<int>(i) - 16));
+            b[i] = static_cast<__nv_fp8_e4m3>(0.25f * (static_cast<int>(i) - 8));
+            // The kernel's asymmetric spelling: A's product rounded, B's contracted, in float.
+            expected[i] = std::fma(static_cast<float>(b[i]), scaleB,
+                                   static_cast<float>(a[i]) * scaleA);
+         }
+
+         auto a_d = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(device, Ext1D::all(n));
+         auto b_d = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(device, Ext1D::all(n));
+         auto out_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(n));
+         auto a_h = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(host, Ext1D::all(n));
+         auto b_h = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(host, Ext1D::all(n));
+         std::copy(a.begin(), a.end(), alpaka::getPtrNative(a_h));
+         std::copy(b.begin(), b.end(), alpaka::getPtrNative(b_h));
+         alpaka::memcpy(queue, a_d, a_h);
+         alpaka::memcpy(queue, b_d, b_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedElementwiseInvocation params{};
+         params.op = SOFIE::EQuantizedElementwiseOp::Add;
+         params.rank = 1;
+         params.outputExtent[0] = n; params.inputExtent[0] = n; params.operandBExtent[0] = n;
+         params.lowPrecisionFP8 = true;
+         params.inputScale = scaleA;
+         params.operandBScale = scaleB;
+         params.outputCarrier = SOFIE::EQuantizedOutputCarrier::Float;
+
+         SOFIE::QuantizedElementwise_Call(alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(out_d), alpaka::getPtrNative(a_d),
+            alpaka::getPtrNative(b_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto out_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(n));
+         alpaka::memcpy(queue, out_h, out_d);
+         alpaka::wait(queue);
+         const float *result = alpaka::getPtrNative(out_h);
+         // Exact, not approximate: the fusion changes no bits, so a tolerance would hide drift.
+         for (Idx i = 0; i < n; ++i)
+            EXPECT_EQ(result[i], expected[i]);
+   }
+}
+
+TEST(QuantizationMetadata, Elementwise)
+{
+   using SOFIE::EBasicBinaryOperator;
+   const std::vector<std::size_t> shape{1, 8};
+
+   auto addFloatTensor = [](SOFIE::RModel &model, const std::string &name,
+                            const std::vector<std::size_t> &tensorShape,
+                            const std::vector<float> &values) {
+      model.AddInitializedTensor(
+         name, SOFIE::ETensorType::FLOAT, tensorShape,
+         std::shared_ptr<void>(new float[values.size()], std::default_delete<float[]>()));
+      std::copy(values.begin(), values.end(),
+                static_cast<float *>(model.GetInitializedTensorData(name).get()));
+   };
+
+   // QONNX fake-quant elementwise: both operands and the output pass through
+   // QONNX Quant boundaries, so operands are float carriers on the grid.
+   auto buildQONNX = [&](const std::string &name, EBasicBinaryOperator op, float zeroPoint) {
+      SOFIE::RModel model(name);
+      model.AddInputTensorInfo("xa", SOFIE::ETensorType::FLOAT, shape);
+      model.AddInputTensorInfo("xb", SOFIE::ETensorType::FLOAT, shape);
+      addFloatTensor(model, "scale", {}, {0.125f});
+      addFloatTensor(model, "zero_point", {}, {zeroPoint});
+      addFloatTensor(model, "bit_width", {}, {8.0f});
+      auto quant = [&](const std::string &prefix, const std::string &src, const std::string &dst) {
+         AddNamedOperator<SOFIE::ROperator_QONNXQuant>(
+            model, prefix, src, "scale", "zero_point", "bit_width", dst, true, false,
+            SOFIE::EQuantizationRoundingMode::ROUND, SOFIE::EQuantizationOverflowMode::SAT);
+      };
+      quant("quant_a", "xa", "xa_q");
+      quant("quant_b", "xb", "xb_q");
+      if (op == EBasicBinaryOperator::Add)
+         AddNamedOperator<SOFIE::ROperator_BasicBinary<float, EBasicBinaryOperator::Add>>(
+            model, "elementwise", "xa_q", "xb_q", "ew_out");
+      else
+         AddNamedOperator<SOFIE::ROperator_BasicBinary<float, EBasicBinaryOperator::Mul>>(
+            model, "elementwise", "xa_q", "xb_q", "ew_out");
+      quant("quant_out", "ew_out", "output");
+      model.Initialize();
+      return model;
+   };
+
+   // ONNX Q/DQ elementwise: operands are genuine INT8 carriers dequantized into
+   // the Add/Mul and requantized after.
+   auto buildQDQ = [&](const std::string &name, EBasicBinaryOperator op) {
+      SOFIE::RModel model(name);
+      model.AddInputTensorInfo("xa", SOFIE::ETensorType::FLOAT, shape);
+      model.AddInputTensorInfo("xb", SOFIE::ETensorType::FLOAT, shape);
+      addFloatTensor(model, "scale", {}, {0.125f});
+      model.AddInitializedTensor(
+         "zero_point_int8", SOFIE::ETensorType::INT8, std::vector<std::size_t>{},
+         std::shared_ptr<void>(new std::int8_t[1]{}, std::default_delete<std::int8_t[]>()));
+      auto quantize = [&](const std::string &prefix, const std::string &src, const std::string &dst) {
+         AddNamedOperator<SOFIE::ROperator_ONNXQuantizeLinear>(
+            model, prefix, src, "scale", "zero_point_int8", dst, SOFIE::ETensorType::INT8, -1);
+      };
+      auto dequantize = [&](const std::string &prefix, const std::string &src, const std::string &dst) {
+         AddNamedOperator<SOFIE::ROperator_ONNXDequantizeLinear>(
+            model, prefix, src, "scale", "zero_point_int8", dst, SOFIE::ETensorType::INT8, -1);
+      };
+      quantize("q_a", "xa", "xa_i8");
+      quantize("q_b", "xb", "xb_i8");
+      dequantize("dq_a", "xa_i8", "xa_f");
+      dequantize("dq_b", "xb_i8", "xb_f");
+      if (op == EBasicBinaryOperator::Add)
+         AddNamedOperator<SOFIE::ROperator_BasicBinary<float, EBasicBinaryOperator::Add>>(
+            model, "elementwise", "xa_f", "xb_f", "ew_out");
+      else
+         AddNamedOperator<SOFIE::ROperator_BasicBinary<float, EBasicBinaryOperator::Mul>>(
+            model, "elementwise", "xa_f", "xb_f", "ew_out");
+      quantize("q_out", "ew_out", "output");
+      model.Initialize();
+      return model;
+   };
+
+   // One elementwise region per model, counted through the pipeline pipeline report; the
+   // region handle itself is still needed to reach its plans.
+   auto singleRegion = [](SOFIE::RModel &model) -> const SOFIE::QuantizedElementwiseRegion * {
+      EXPECT_EQ(SOFIE_TEST::CountRegions(SOFIE_TEST::AlpakaPipelineReport(model), "elementwise"), 1U);
+      return SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedElementwiseRegion>(
+         model.GetQuantizationState());
+   };
+
+   {
+      SCOPED_TRACE("QONNX and Q/DQ Add canonicalize to one recognized region");
+         auto qonnx = buildQONNX("qonnx_add", EBasicBinaryOperator::Add, 0.0f);
+         auto qdq = buildQDQ("qdq_add", EBasicBinaryOperator::Add);
+         const auto *qonnxRegion = singleRegion(qonnx);
+         const auto *qdqRegion = singleRegion(qdq);
+         ASSERT_NE(qonnxRegion, nullptr);
+         ASSERT_NE(qdqRegion, nullptr);
+         EXPECT_EQ(qonnxRegion->kind, SOFIE::EQuantizedElementwiseKind::Add);
+         EXPECT_EQ(qdqRegion->kind, SOFIE::EQuantizedElementwiseKind::Add);
+         EXPECT_EQ(qonnxRegion->status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
+         EXPECT_EQ(qdqRegion->status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
+         // The operand grids are parse products: both frontends must mint the same
+         // input and output scales, read from the tensor-info map.
+         ASSERT_TRUE(qonnx.HasQuantizationInfo("xa_q"));
+         ASSERT_TRUE(qdq.HasQuantizationInfo("xa_i8"));
+         EXPECT_EQ(qonnx.GetQuantizationInfo("xa_q").scale,
+                   qdq.GetQuantizationInfo("xa_i8").scale);
+         ASSERT_TRUE(qonnx.HasQuantizationInfo("output"));
+         ASSERT_TRUE(qdq.HasQuantizationInfo("output"));
+         EXPECT_EQ(qonnx.GetQuantizationInfo("output").scale,
+                   qdq.GetQuantizationInfo("output").scale);
+
+         for (const auto *model : {&qonnx, &qdq}) {
+            const auto &state = model->GetQuantizationState();
+            const auto *region = SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedElementwiseRegion>(state);
+            const auto *plan = SOFIE::FindQuantizedLoweringPlan(
+               state, region->elementwiseOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+            ASSERT_NE(plan, nullptr) << region->reason;
+            EXPECT_EQ(plan->status, SOFIE::EQuantizedLoweringStatus::Optimized) << region->reason;
+            EXPECT_EQ(plan->capabilityTag, "alpaka_int8_elementwise_add");
+            EXPECT_TRUE(plan->suppressesGraphOperators);
+         }
+         // The Q/DQ operands are true INT8 carriers; the QONNX operands are
+         // float fake-quant carriers. Both are correct for their frontend.
+         const auto &qdqState = qdq.GetQuantizationState();
+         const auto *qdqPlan = SOFIE::FindQuantizedLoweringPlan(
+            qdqState, qdqRegion->elementwiseOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+         EXPECT_EQ(qdqPlan->inputStorage, SOFIE::EQuantizedStorageType::Int8);
+         EXPECT_EQ(qdqPlan->outputStorage, SOFIE::EQuantizedStorageType::Int8);
+   }
+   {
+      SCOPED_TRACE("Mul lowers with the same family");
+         auto qdqMul = buildQDQ("qdq_mul", EBasicBinaryOperator::Mul);
+         const auto *region = singleRegion(qdqMul);
+         ASSERT_NE(region, nullptr);
+         EXPECT_EQ(region->kind, SOFIE::EQuantizedElementwiseKind::Mul);
+         EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
+         const auto *plan = SOFIE::FindQuantizedLoweringPlan(
+            qdqMul.GetQuantizationState(), region->elementwiseOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+         ASSERT_NE(plan, nullptr);
+         EXPECT_EQ(plan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         EXPECT_EQ(plan->capabilityTag, "alpaka_int8_elementwise_mul");
+   }
+   {
+      SCOPED_TRACE("constant operand is recognized and canonicalized into the B slot");
+         // Activation A times a genuine INT8 constant B; `swapOperands` places the constant
+         // first to exercise commutative canonicalization.
+         auto buildConstMul = [&](const std::string &name, bool swapOperands) {
+            SOFIE::RModel model(name);
+            model.AddInputTensorInfo("xa", SOFIE::ETensorType::FLOAT, shape);
+            addFloatTensor(model, "scale", {}, {0.125f});
+            model.AddInitializedTensor(
+               "zero_point_int8", SOFIE::ETensorType::INT8, std::vector<std::size_t>{},
+               std::shared_ptr<void>(new std::int8_t[1]{}, std::default_delete<std::int8_t[]>()));
+            model.AddInitializedTensor(
+               "cB_i8", SOFIE::ETensorType::INT8, shape,
+               std::shared_ptr<void>(new std::int8_t[8]{1, 2, 3, 4, 5, 6, 7, 8},
+                                     std::default_delete<std::int8_t[]>()));
+            AddNamedOperator<SOFIE::ROperator_ONNXQuantizeLinear>(
+               model, "q_a", "xa", "scale", "zero_point_int8", "xa_i8", SOFIE::ETensorType::INT8, -1);
+            AddNamedOperator<SOFIE::ROperator_ONNXDequantizeLinear>(
+               model, "dq_a", "xa_i8", "scale", "zero_point_int8", "xa_f", SOFIE::ETensorType::INT8, -1);
+            AddNamedOperator<SOFIE::ROperator_ONNXDequantizeLinear>(
+               model, "dq_b", "cB_i8", "scale", "zero_point_int8", "cB_f", SOFIE::ETensorType::INT8, -1);
+            if (swapOperands)
+               AddNamedOperator<SOFIE::ROperator_BasicBinary<float, EBasicBinaryOperator::Mul>>(
+                  model, "elementwise", "cB_f", "xa_f", "ew_out");
+            else
+               AddNamedOperator<SOFIE::ROperator_BasicBinary<float, EBasicBinaryOperator::Mul>>(
+                  model, "elementwise", "xa_f", "cB_f", "ew_out");
+            AddNamedOperator<SOFIE::ROperator_ONNXQuantizeLinear>(
+               model, "q_out", "ew_out", "scale", "zero_point_int8", "output", SOFIE::ETensorType::INT8, -1);
+            model.Initialize();
+            return model;
+         };
+
+         for (bool swap : {false, true}) {
+            SCOPED_TRACE(swap ? "constant as first operand" : "constant as second operand");
+            auto model = buildConstMul(swap ? "const_mul_swapped" : "const_mul", swap);
+            const auto *region = singleRegion(model);
+            ASSERT_NE(region, nullptr);
+            EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
+            // The constant is always canonicalized into B; the activation stays
+            // in the input slot regardless of source operand order.
+            EXPECT_TRUE(region->operandBIsConstant);
+            EXPECT_EQ(region->operandBSourceTensor, "cB_i8");
+            EXPECT_EQ(region->inputSourceTensor, "xa_i8");
+            const auto *plan = SOFIE::FindQuantizedLoweringPlan(
+               model.GetQuantizationState(), region->elementwiseOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+            ASSERT_NE(plan, nullptr);
+            EXPECT_EQ(plan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+            // The constant is pointed at the shared storage/externalization path.
+            EXPECT_EQ(plan->weightStorageTensor, "cB_i8");
+         }
+   }
+   {
+      SCOPED_TRACE("asymmetric-zero-point Mul is rejected with a factual reason");
+         auto qonnxMul = buildQONNX("qonnx_mul_asym", EBasicBinaryOperator::Mul, 5.0f);
+         const auto *region = singleRegion(qonnxMul);
+         ASSERT_NE(region, nullptr);
+         EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticUnsupported);
+         EXPECT_NE(region->reason.find("symmetric"), std::string::npos) << region->reason;
+         const auto *plan = SOFIE::FindQuantizedLoweringPlan(
+            qonnxMul.GetQuantizationState(), region->elementwiseOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+         ASSERT_NE(plan, nullptr);
+         EXPECT_FALSE(SOFIE::IsQuantizedLoweringAvailable(plan->status));
+   }
+   {
+      SCOPED_TRACE("mixed precision with an unquantized operand is rejected");
+         SOFIE::RModel model("mixed_precision_add");
+         model.AddInputTensorInfo("xa", SOFIE::ETensorType::FLOAT, shape);
+         model.AddInputTensorInfo("xb", SOFIE::ETensorType::FLOAT, shape);
+         addFloatTensor(model, "scale", {}, {0.125f});
+         addFloatTensor(model, "zero_point", {}, {0.0f});
+         addFloatTensor(model, "bit_width", {}, {8.0f});
+         AddNamedOperator<SOFIE::ROperator_QONNXQuant>(
+            model, "quant_a", "xa", "scale", "zero_point", "bit_width", "xa_q", true, false,
+            SOFIE::EQuantizationRoundingMode::ROUND, SOFIE::EQuantizationOverflowMode::SAT);
+         // Operand B (xb) stays an unquantized float activation.
+         AddNamedOperator<SOFIE::ROperator_BasicBinary<float, EBasicBinaryOperator::Add>>(
+            model, "elementwise", "xa_q", "xb", "ew_out");
+         AddNamedOperator<SOFIE::ROperator_QONNXQuant>(
+            model, "quant_out", "ew_out", "scale", "zero_point", "bit_width", "output", true, false,
+            SOFIE::EQuantizationRoundingMode::ROUND, SOFIE::EQuantizationOverflowMode::SAT);
+         model.Initialize();
+         const auto *region = singleRegion(model);
+         ASSERT_NE(region, nullptr);
+         EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticUnsupported);
+         EXPECT_NE(region->reason.find("no quantization or low-precision metadata"), std::string::npos)
+            << region->reason;
+   }
+}
+
+
+TEST_F(QuantizationAlpakaTest, GatherKernels)
+{
+   {
+      SCOPED_TRACE("INT8 weight-only gather, axis 0, with a negative index");
+         constexpr Idx V = 6, D = 4;
+         const double scale = 0.05;
+         const std::int32_t zero = 3;
+         std::vector<std::int8_t> table(V * D);
+         for (Idx i = 0; i < V * D; ++i)
+            table[i] = static_cast<std::int8_t>(static_cast<int>(i) - 12);
+         const std::vector<std::int64_t> idx = {2, 0, 5, -1};
+         std::vector<float> expected(idx.size() * D);
+         for (Idx t = 0; t < idx.size(); ++t) {
+            long k = idx[t];
+            if (k < 0) k += V;
+            for (Idx d = 0; d < D; ++d)
+               expected[t * D + d] = static_cast<float>(scale * (table[k * D + d] - zero));
+         }
+
+         auto table_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(table.size()));
+         auto idx_d = alpaka::allocBuf<std::int64_t, Idx>(device, Ext1D::all(idx.size()));
+         auto out_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(expected.size()));
+         auto table_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(table.size()));
+         auto idx_h = alpaka::allocBuf<std::int64_t, Idx>(host, Ext1D::all(idx.size()));
+         std::copy(table.begin(), table.end(), alpaka::getPtrNative(table_h));
+         std::copy(idx.begin(), idx.end(), alpaka::getPtrNative(idx_h));
+         alpaka::memcpy(queue, table_d, table_h);
+         alpaka::memcpy(queue, idx_d, idx_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedGatherInvocation params{};
+         params.outer = 1; params.axisLength = V; params.inner = D; params.indexCount = idx.size();
+         params.scale = scale; params.zeroPoint = zero;
+         params.tableCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.indicesInt64 = true;
+
+         SOFIE::QuantizedGather_Call(alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(out_d), alpaka::getPtrNative(table_d),
+            alpaka::getPtrNative(idx_d), nullptr, params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto out_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, out_h, out_d);
+         alpaka::wait(queue);
+         const float *result = alpaka::getPtrNative(out_h);
+         for (Idx i = 0; i < expected.size(); ++i)
+            EXPECT_FLOAT_EQ(result[i], expected[i]);
+   }
+   {
+      SCOPED_TRACE("general axis=1 gather with int32 indices");
+         constexpr Idx B = 2, V = 5, C = 3;
+         const double scale = 0.1;
+         std::vector<std::int8_t> table(B * V * C);
+         for (Idx i = 0; i < table.size(); ++i)
+            table[i] = static_cast<std::int8_t>(static_cast<int>((i * 3) % 200) - 100);
+         const std::vector<std::int32_t> idx = {3, 1};
+         std::vector<float> expected(B * idx.size() * C);
+         for (Idx b = 0; b < B; ++b)
+            for (Idx t = 0; t < idx.size(); ++t)
+               for (Idx c = 0; c < C; ++c)
+                  expected[(b * idx.size() + t) * C + c] =
+                     static_cast<float>(scale * table[(b * V + idx[t]) * C + c]);
+
+         auto table_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(table.size()));
+         auto idx_d = alpaka::allocBuf<std::int32_t, Idx>(device, Ext1D::all(idx.size()));
+         auto out_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(expected.size()));
+         auto table_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(table.size()));
+         auto idx_h = alpaka::allocBuf<std::int32_t, Idx>(host, Ext1D::all(idx.size()));
+         std::copy(table.begin(), table.end(), alpaka::getPtrNative(table_h));
+         std::copy(idx.begin(), idx.end(), alpaka::getPtrNative(idx_h));
+         alpaka::memcpy(queue, table_d, table_h);
+         alpaka::memcpy(queue, idx_d, idx_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedGatherInvocation params{};
+         params.outer = B; params.axisLength = V; params.inner = C; params.indexCount = idx.size();
+         params.scale = scale; params.zeroPoint = 0;
+         params.tableCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.indicesInt64 = false;
+
+         SOFIE::QuantizedGather_Call(alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(out_d), alpaka::getPtrNative(table_d),
+            alpaka::getPtrNative(idx_d), nullptr, params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto out_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, out_h, out_d);
+         alpaka::wait(queue);
+         const float *result = alpaka::getPtrNative(out_h);
+         for (Idx i = 0; i < expected.size(); ++i)
+            EXPECT_FLOAT_EQ(result[i], expected[i]);
+   }
+   {
+      SCOPED_TRACE("native FP8 E4M3 weight-only gather");
+         constexpr Idx V = 4, D = 2;
+         std::vector<__nv_fp8_e4m3> table(V * D);
+         for (Idx i = 0; i < table.size(); ++i)
+            table[i] = static_cast<__nv_fp8_e4m3>(0.5f * (static_cast<int>(i) - 3));
+         const std::vector<std::int64_t> idx = {1, 3, 0};
+         std::vector<float> expected(idx.size() * D);
+         for (Idx t = 0; t < idx.size(); ++t)
+            for (Idx d = 0; d < D; ++d)
+               expected[t * D + d] = static_cast<float>(table[idx[t] * D + d]);
+
+         auto table_d = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(device, Ext1D::all(table.size()));
+         auto idx_d = alpaka::allocBuf<std::int64_t, Idx>(device, Ext1D::all(idx.size()));
+         auto out_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(expected.size()));
+         auto table_h = alpaka::allocBuf<__nv_fp8_e4m3, Idx>(host, Ext1D::all(table.size()));
+         auto idx_h = alpaka::allocBuf<std::int64_t, Idx>(host, Ext1D::all(idx.size()));
+         std::copy(table.begin(), table.end(), alpaka::getPtrNative(table_h));
+         std::copy(idx.begin(), idx.end(), alpaka::getPtrNative(idx_h));
+         alpaka::memcpy(queue, table_d, table_h);
+         alpaka::memcpy(queue, idx_d, idx_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedGatherInvocation params{};
+         params.outer = 1; params.axisLength = V; params.inner = D; params.indexCount = idx.size();
+         params.lowPrecisionFP8 = true; params.indicesInt64 = true;
+
+         SOFIE::QuantizedGather_Call(alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(out_d), alpaka::getPtrNative(table_d),
+            alpaka::getPtrNative(idx_d), nullptr, params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto out_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, out_h, out_d);
+         alpaka::wait(queue);
+         const float *result = alpaka::getPtrNative(out_h);
+         for (Idx i = 0; i < expected.size(); ++i)
+            EXPECT_FLOAT_EQ(result[i], expected[i]);
+   }
+   {
+      SCOPED_TRACE("INT8 per-channel (per-row) gather along the gathered axis");
+         // Table [V, D] quantized per-row (quant axis 0 == gather axis 0): the
+         // scale vector is gathered by the same index. quantAxisStride = D.
+         constexpr Idx V = 6, D = 4;
+         std::vector<std::int8_t> table(V * D);
+         std::vector<float> scaleVec(V);
+         for (Idx r = 0; r < V; ++r) {
+            scaleVec[r] = 0.02f * static_cast<float>(r + 1);
+            for (Idx d = 0; d < D; ++d)
+               table[r * D + d] = static_cast<std::int8_t>(static_cast<int>(r * D + d) - 12);
+         }
+         const std::vector<std::int64_t> idx = {4, 1, 4, 0};
+         std::vector<float> expected(idx.size() * D);
+         for (Idx t = 0; t < idx.size(); ++t)
+            for (Idx d = 0; d < D; ++d)
+               expected[t * D + d] = scaleVec[idx[t]] * table[idx[t] * D + d];
+
+         auto table_d = alpaka::allocBuf<std::int8_t, Idx>(device, Ext1D::all(table.size()));
+         auto scale_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(scaleVec.size()));
+         auto idx_d = alpaka::allocBuf<std::int64_t, Idx>(device, Ext1D::all(idx.size()));
+         auto out_d = alpaka::allocBuf<float, Idx>(device, Ext1D::all(expected.size()));
+         auto table_h = alpaka::allocBuf<std::int8_t, Idx>(host, Ext1D::all(table.size()));
+         auto scale_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(scaleVec.size()));
+         auto idx_h = alpaka::allocBuf<std::int64_t, Idx>(host, Ext1D::all(idx.size()));
+         std::copy(table.begin(), table.end(), alpaka::getPtrNative(table_h));
+         std::copy(scaleVec.begin(), scaleVec.end(), alpaka::getPtrNative(scale_h));
+         std::copy(idx.begin(), idx.end(), alpaka::getPtrNative(idx_h));
+         alpaka::memcpy(queue, table_d, table_h);
+         alpaka::memcpy(queue, scale_d, scale_h);
+         alpaka::memcpy(queue, idx_d, idx_h);
+         alpaka::wait(queue);
+
+         SOFIE::QuantizedGatherInvocation params{};
+         params.outer = 1; params.axisLength = V; params.inner = D; params.indexCount = idx.size();
+         params.perChannel = true; params.quantAxisStride = D; params.quantAxisLength = V;
+         params.tableCarrier = SOFIE::EQuantizedInputCarrier::Int8;
+         params.indicesInt64 = true;
+
+         SOFIE::QuantizedGather_Call(alpaka::getNativeHandle(queue),
+            alpaka::getPtrNative(out_d), alpaka::getPtrNative(table_d),
+            alpaka::getPtrNative(idx_d), alpaka::getPtrNative(scale_d), params);
+         alpaka::wait(queue);
+         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+         auto out_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(expected.size()));
+         alpaka::memcpy(queue, out_h, out_d);
+         alpaka::wait(queue);
+         const float *result = alpaka::getPtrNative(out_h);
+         for (Idx i = 0; i < expected.size(); ++i)
+            EXPECT_FLOAT_EQ(result[i], expected[i]);
+   }
+}
+
+TEST(QuantizationMetadata, Gather)
+{
+   const std::vector<std::size_t> tableShape{6, 4};
+   const std::vector<std::size_t> indicesShape{3};
+
+   auto addInt8Table = [](SOFIE::RModel &model, const std::string &name,
+                          const std::vector<std::size_t> &shape) {
+      const auto count = SOFIE::ConvertShapeToLength(shape);
+      model.AddInitializedTensor(
+         name, SOFIE::ETensorType::INT8, shape,
+         std::shared_ptr<void>(new std::int8_t[count]{}, std::default_delete<std::int8_t[]>()));
+   };
+   auto addFloatScalar = [](SOFIE::RModel &model, const std::string &name, float value) {
+      model.AddInitializedTensor(
+         name, SOFIE::ETensorType::FLOAT, std::vector<std::size_t>{},
+         std::shared_ptr<void>(new float[1]{value}, std::default_delete<float[]>()));
+   };
+
+   enum class Quant { PerTensor, PerChannelSymmetric, PerChannelAsymmetric };
+
+   // Q/DQ weight-only Gather: INT8 table -> DQ -> Gather(table, int64 indices); per-channel
+   // uses a per-row scale/zero-point vector along axis 0 (the gathered axis).
+   auto buildQDQGather = [&](const std::string &name, Quant quant) {
+      SOFIE::RModel model(name);
+      addInt8Table(model, "table_i8", tableShape);
+      model.AddInputTensorInfo("indices", SOFIE::ETensorType::INT64, indicesShape);
+      const bool perChannel = quant != Quant::PerTensor;
+      if (perChannel) {
+         const auto rows = tableShape.front();
+         model.AddInitializedTensor(
+            "scale", SOFIE::ETensorType::FLOAT, std::vector<std::size_t>{rows},
+            std::shared_ptr<void>(new float[rows], std::default_delete<float[]>()));
+         std::fill_n(static_cast<float *>(model.GetInitializedTensorData("scale").get()), rows, 0.05f);
+         auto zeros = std::shared_ptr<void>(new std::int8_t[rows]{}, std::default_delete<std::int8_t[]>());
+         if (quant == Quant::PerChannelAsymmetric)
+            static_cast<std::int8_t *>(zeros.get())[0] = 4; // one non-zero row -> asymmetric
+         model.AddInitializedTensor("zero_point_int8", SOFIE::ETensorType::INT8,
+                                    std::vector<std::size_t>{rows}, std::move(zeros));
+      } else {
+         addFloatScalar(model, "scale", 0.05f);
+         model.AddInitializedTensor(
+            "zero_point_int8", SOFIE::ETensorType::INT8, std::vector<std::size_t>{},
+            std::shared_ptr<void>(new std::int8_t[1]{}, std::default_delete<std::int8_t[]>()));
+      }
+      const int axis = perChannel ? 0 : -1;
+      AddNamedOperator<SOFIE::ROperator_ONNXDequantizeLinear>(
+         model, "dq_table", "table_i8", "scale", "zero_point_int8", "table_f",
+         SOFIE::ETensorType::INT8, axis);
+      AddNamedOperator<SOFIE::ROperator_Gather>(
+         model, "gather", int64_t{0}, "table_f", "indices", "gather_out");
+      model.Initialize();
+      return model;
+   };
+
+   {
+      SCOPED_TRACE("per-tensor weight-only Gather is recognized and externalizes the table");
+         auto model = buildQDQGather("qdq_gather", Quant::PerTensor);
+         // One gather region, counted through the pipeline pipeline report.
+         ASSERT_EQ(SOFIE_TEST::CountRegions(SOFIE_TEST::AlpakaPipelineReport(model), "gather"), 1U);
+         const auto &state = model.GetQuantizationState();
+         const auto *region = SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedGatherRegion>(state);
+         ASSERT_NE(region, nullptr);
+         EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized);
+         EXPECT_EQ(region->axis, 0);
+         EXPECT_EQ(region->tableSourceTensor, "table_i8");
+         const auto *plan = SOFIE::FindQuantizedLoweringPlan(
+            state, region->gatherOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+         ASSERT_NE(plan, nullptr) << region->reason;
+         EXPECT_EQ(plan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         EXPECT_EQ(plan->capabilityTag, "alpaka_int8_gather");
+         EXPECT_TRUE(plan->suppressesGraphOperators);
+         EXPECT_EQ(plan->weightStorageTensor, "table_i8");
+   }
+   {
+      SCOPED_TRACE("symmetric per-gathered-axis quantization is recognized and protects the scale");
+         auto model = buildQDQGather("qdq_gather_perchannel", Quant::PerChannelSymmetric);
+         const auto &state = model.GetQuantizationState();
+         const auto *region = SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedGatherRegion>(state);
+         ASSERT_NE(region, nullptr);
+         EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticRecognized) << region->reason;
+         const auto *plan = SOFIE::FindQuantizedLoweringPlan(
+            state, region->gatherOpIndex, SOFIE::EQuantizedBackend::ALPAKA);
+         ASSERT_NE(plan, nullptr);
+         EXPECT_EQ(plan->status, SOFIE::EQuantizedLoweringStatus::Optimized);
+         EXPECT_EQ(plan->weightContract.perChannelScaleTensor, "scale");
+   }
+   {
+      SCOPED_TRACE("asymmetric per-channel quantization is rejected");
+         auto model = buildQDQGather("qdq_gather_asym", Quant::PerChannelAsymmetric);
+         const auto &state = model.GetQuantizationState();
+         const auto *region = SOFIE::FindFirstQuantizedRegion<SOFIE::QuantizedGatherRegion>(state);
+         ASSERT_NE(region, nullptr);
+         EXPECT_EQ(region->status, SOFIE::EQuantizedLoweringStatus::SemanticUnsupported);
+         EXPECT_NE(region->reason.find("symmetric"), std::string::npos) << region->reason;
+   }
+}
+
+// Umbrella includes; see the header comment. Section files keep their own
+// include lists; the guards make the union well-formed in this single TU.
+#include "TestQuantizationNumerics.cxx"
+#include "TestQuantizationEliminationLadder.cxx"
+#include "TestQuantizationReport.cxx"

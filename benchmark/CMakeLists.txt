@@ -333,7 +333,7 @@ target_include_directories(sofie_benchmark_emitter PRIVATE
 )
 
 target_link_libraries(sofie_benchmark_emitter PRIVATE
-    SOFIE_core
+    SOFIE_quantization
     SOFIE_parsers
     protobuf::libprotobuf
 )
@@ -426,7 +426,7 @@ target_compile_options(sofie_benchmark PRIVATE
 find_package(Threads REQUIRED)
 
 target_link_libraries(sofie_benchmark PRIVATE
-    SOFIE_core
+    SOFIE_quantization
     CUDA::cudart
     CUDA::cublas
     CUDA::cublasLt
@@ -606,7 +606,7 @@ if(SOFIE_BENCHMARK_LARGE)
             "${CMAKE_CURRENT_SOURCE_DIR}/../parsers/inc"
         )
         target_link_libraries(sofie_benchmark_large_emitter PRIVATE
-            SOFIE_core
+            SOFIE_quantization
             SOFIE_parsers
             protobuf::libprotobuf
         )
@@ -686,7 +686,7 @@ if(SOFIE_BENCHMARK_LARGE)
         )
 
         target_link_libraries(sofie_benchmark_large PRIVATE
-            SOFIE_core
+            SOFIE_quantization
             CUDA::cudart_static
             CUDA::cublas_static
             CUDA::cublasLt_static

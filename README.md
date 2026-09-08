@@ -86,8 +86,78 @@ ctest --output-on-failure
 | `-DALPAKA_BACKEND=<val>` | `cuda` | Alpaka backend: `cuda`, `hip`, `cpu`, `sycl` |
 
 The test executable is `TestCustomModelsFromONNXForAlpakaCuda`.  ONNX model files
-used as test inputs are located in `core/test/input_models/`.  Models with symbolic
+used as test inputs are located in `test/input_models/`.  Models with symbolic
 (dynamic) input dimensions are specialised by the emitter before testing.
+
+---
+
+## Quantization
+
+SOFIE lowers quantized ONNX graphs to integer and low-precision float kernels. It recognises
+`QuantizeLinear`/`DequantizeLinear` pairs and QONNX `Quant` nodes, proves which regions can
+run on codes rather than floats, and replaces those regions with kernels that keep the carrier
+in int8 or FP8 across as much of the graph as the operators allow.
+
+The pipeline builds as its own library, `SOFIE_quantization`, which links `SOFIE_core` one
+way. Base SOFIE does not reference it, so a build that never links it generates ordinary
+float code.
+
+### Building
+
+The pipeline is part of the default build and needs no flag:
+
+```bash
+cmake -DCMAKE_INSTALL_PREFIX=../install -DCMAKE_BUILD_TYPE=RelWithDebInfo ..
+cmake --build . --target install -j$(nproc)
+```
+
+This produces `libSOFIE_core`, `libSOFIE_quantization` and `libSOFIE_parsers`.
+
+### Using it
+
+Link the target. `find_package(SOFIE)` exports it, and linking the parser is enough because
+the parser depends on it:
+
+```cmake
+find_package(SOFIE REQUIRED)
+target_link_libraries(my_app PRIVATE SOFIE::SOFIE_parsers)   # brings in SOFIE_quantization
+```
+
+`RModelParser_ONNX::Parse` installs the pipeline into code generation, so parsing a quantized
+ONNX file and calling `Generate()` or `GenerateGPU_ALPAKA()` is all that is required:
+
+```cpp
+SOFIE::RModelParser_ONNX parser;
+auto model = parser.Parse("model_qdq.onnx");
+model.GenerateGPU_ALPAKA(SOFIE::Options::kBinaryWeightFile);
+model.OutputGenerated("model_qdq.hxx");
+```
+
+Linking `SOFIE::SOFIE_core` alone is also supported and generates float code, since code
+generation runs unchanged with no pipeline installed.
+
+### Testing
+
+The quantization tests are part of the Alpaka GPU suite and need the same flags:
+
+```bash
+cmake -Dtesting=ON \
+      -DENABLE_ALPAKA_TESTS=ON \
+      -DALPAKA_BACKEND=cuda \
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo ..
+cmake --build . -j$(nproc)
+ctest --output-on-failure
+```
+
+To run the quantization suite directly, run it from its own build directory, since its ONNX
+fixtures are found by relative path:
+
+```bash
+cd build/test && ./TestQuantizationFromONNXForAlpakaCuda
+```
+
+Its fixtures are the quantized models in `test/input_models/` (`*_QDQ_*`, `*_QONNX_*`,
+`FP8_*`), and `qonnx_samples/` holds the scripts that export them.
 
 ---
 
@@ -166,7 +236,8 @@ architectures:
 ```
 SOFIE/
 ├── core/           # Core SOFIE library (RModel, operators, code generators)
-│   └── test/       # Unit/integration tests
+│                   # and the quantization pipeline (RQuantization_*, RModel_Quantization)
+├── test/           # Unit/integration tests and their ONNX fixtures
 ├── parsers/        # ONNX → RModel parser
 ├── benchmark/      # Latency / throughput benchmark toolkit
 │   ├── models/     # Place .onnx benchmark models here

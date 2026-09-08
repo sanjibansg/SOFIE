@@ -28,8 +28,10 @@ enum class Options {
    kGNN = 0x8,
    kGNNComponent = 0x10,
    kProfile = 0x20,
-   kLowRankFactorize = 0x40,
-   kKernelOnly = 0x80,
+   kBinaryWeightFile = 0x40,
+   kTextWeightFile = 0x80,
+   kLowRankFactorize = 0x100,
+   kKernelOnly = 0x200,
 };
 
 // Optimization levels inspired by ONNXRuntime.
@@ -41,7 +43,7 @@ enum class OptimizationLevel {
    kExtended = 0x1,
 };
 
-enum class WeightFileType { None, RootBinary, Text };
+enum class WeightFileType { None, RootBinary, Text, Binary };
 
 
 inline std::underlying_type_t<Options> operator|(Options opA, Options opB) {

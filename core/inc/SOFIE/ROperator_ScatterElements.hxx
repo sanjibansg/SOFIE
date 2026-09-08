@@ -66,6 +66,15 @@ public:
          fOutputTensorNames = { fNY };
       }
 
+   bool PropagatesQuantizationMetadata() const override { return true; }
+
+   std::vector<std::string> GetQuantizationMetadataSourceTensors() const override
+   {
+      return {fNX, fNU};
+   }
+
+   bool RequiresCompatibleQuantizationMetadataInputs() const override { return true; }
+
    // type of output given input
    std::vector<ETensorType> TypeInference(std::vector<ETensorType> input) override {
       return input;

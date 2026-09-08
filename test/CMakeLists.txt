@@ -16,6 +16,15 @@ endif()
 
 option(ENABLE_ALPAKA_TESTS "Enable Alpaka-based SOFIE tests" OFF)
 
+############################################################################
+# Package boundary
+############################################################################
+# Linking against SOFIE_core alone fails as soon as base references a symbol the
+# quantization package defines, and running it exercises the no-pass-installed path.
+add_executable(SofieCoreStandsAlone CoreStandsAlone.cxx)
+target_link_libraries(SofieCoreStandsAlone PRIVATE SOFIE_core)
+add_test(NAME SofieCoreStandsAlone COMMAND SofieCoreStandsAlone)
+
 set(ALPAKA_BACKEND "cuda"
     CACHE STRING "Alpaka backend to test (cuda, cpu, hip, sycl)")
 set_property(CACHE ALPAKA_BACKEND PROPERTY STRINGS cuda cpu hip sycl)
@@ -42,7 +51,7 @@ set(CAPTURE_STR
 }\n\
 ")
 
-file(GLOB ONNX_FILES "${ONNX_MODELS_DIR}/*.onnx")
+file(GLOB ONNX_FILES "${ONNX_MODELS_DIR}/*.onnx" "${ONNX_MODELS_DIR}/quantized/*.onnx")
 
 set(ALL_CAPTURES "")
 foreach(onnx_file ${ONNX_FILES})
@@ -92,6 +101,11 @@ ROOTTEST_ADD_TEST(
 ############################################################################
 if (ENABLE_ALPAKA_TESTS)
 
+  # sm_90 gives the FP8 paths native E4M3 instructions; below sm_89 nvcc falls back to software
+  # emulation. Each listed architecture is a full compile pass.
+  set(SOFIE_TEST_CUDA_ARCHITECTURES "70;80;86;90" CACHE STRING
+      "CUDA architectures for the Alpaka/CUDA test targets")
+
   string(TOLOWER "${ALPAKA_BACKEND}" _alpaka_backend)
   if (NOT _alpaka_backend IN_LIST ALPAKA_BACKEND)
     message(FATAL_ERROR "Unsupported ALPAKA_BACKEND=${ALPAKA_BACKEND}")
@@ -117,7 +131,7 @@ if (ENABLE_ALPAKA_TESTS)
   ROOTTEST_GENERATE_EXECUTABLE(
     emitFromONNXAlpaka
     EmitFromONNX_GPU_ALPAKA_all.cxx
-    LIBRARIES protobuf::libprotobuf SOFIE_core SOFIE_parsers
+    LIBRARIES protobuf::libprotobuf SOFIE_quantization SOFIE_parsers
     FIXTURES_SETUP sofie-compile-models-onnx-alpaka-build
   )
 
@@ -133,6 +147,14 @@ if (ENABLE_ALPAKA_TESTS)
     FIXTURES_SETUP sofie-compile-models-onnx-alpaka
   )
 
+  ROOTTEST_ADD_TEST(
+    SofieQuantizedStorageExternalized_ONNX_Alpaka
+    COMMAND ${CMAKE_COMMAND}
+            -DGENERATED_DIR=${CMAKE_CURRENT_BINARY_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/CheckQuantizedStorageExternalized.cmake
+    FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka
+  )
+
   ##########################################################################
   # CUDA backend
   ##########################################################################
@@ -142,6 +164,11 @@ if (ENABLE_ALPAKA_TESTS)
 
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
+
+    set(_alpaka_cuda_test_targets
+      TestCustomModelsFromONNXForAlpakaCuda
+      TestQuantizationFromONNXForAlpakaCuda
+    )
 
     set(ALPAKA_CUDA_TEST_SOURCES
       alpaka/TestAlpakaLinear.cxx
@@ -161,75 +188,93 @@ if (ENABLE_ALPAKA_TESTS)
 
     set_source_files_properties(
       ${ALPAKA_CUDA_TEST_SOURCES}
+      TestQuantizationFromONNXForAlpakaCuda.cxx
       PROPERTIES LANGUAGE CUDA
     )
 
     ROOTTEST_GENERATE_EXECUTABLE(
       TestCustomModelsFromONNXForAlpakaCuda
       ${ALPAKA_CUDA_TEST_SOURCES}
-      LIBRARIES SOFIE_core GTest::gtest GTest::gtest_main
+      LIBRARIES SOFIE_quantization GTest::gtest GTest::gtest_main
       FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka;sofie-lowrank-emit
       FIXTURES_SETUP sofie-test-models-onnx-alpaka-build
     )
 
-    target_include_directories(
-      TestCustomModelsFromONNXForAlpakaCuda PRIVATE
-      ${CMAKE_CURRENT_BINARY_DIR}
-      ${alpaka_SOURCE_DIR}/include
-      ${sofieblas_SOURCE_DIR}/include
-      ${CUDAToolkit_INCLUDE_DIRS}
-      ${CMAKE_CURRENT_SOURCE_DIR}
+    ROOTTEST_GENERATE_EXECUTABLE(
+      TestQuantizationFromONNXForAlpakaCuda
+      TestQuantizationFromONNXForAlpakaCuda.cxx
+      LIBRARIES SOFIE_quantization GTest::gtest GTest::gtest_main
+      FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka
+      FIXTURES_SETUP sofie-quantization-models-onnx-alpaka-build
     )
 
-    set_target_properties(
-      TestCustomModelsFromONNXForAlpakaCuda
-      PROPERTIES
-        CUDA_SEPARABLE_COMPILATION OFF
-        CUDA_STANDARD 20
-        CUDA_STANDARD_REQUIRED ON
-    )
+    foreach(_alpaka_cuda_test_target IN LISTS _alpaka_cuda_test_targets)
+      target_include_directories(
+        ${_alpaka_cuda_test_target} PRIVATE
+        ${CMAKE_CURRENT_BINARY_DIR}
+        ${alpaka_SOURCE_DIR}/include
+        ${sofieblas_SOURCE_DIR}/include
+        ${CUDAToolkit_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+      )
 
-    target_compile_definitions(
-      TestCustomModelsFromONNXForAlpakaCuda PRIVATE
-      ALPAKA_ACC_GPU_CUDA_ENABLED
-      ALPAKA_HAS_STD_ATOMIC_REF
-    )
+      set_target_properties(
+        ${_alpaka_cuda_test_target}
+        PROPERTIES
+          CUDA_SEPARABLE_COMPILATION OFF
+          CUDA_ARCHITECTURES "${SOFIE_TEST_CUDA_ARCHITECTURES}"
+          CUDA_STANDARD 20
+          CUDA_STANDARD_REQUIRED ON
+      )
 
-    target_compile_options(
-      TestCustomModelsFromONNXForAlpakaCuda PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:
-        --extended-lambda
-        --expt-relaxed-constexpr
-        --generate-line-info
-        --use_fast_math
-        -g
-        -G
-        # -fsanitize=address
-        -O1
-        -Wno-deprecated-gpu-targets
-      >
-      $<$<COMPILE_LANGUAGE:CXX>:
-        -O2
-        -g
-        -G
-        -fPIC
-        -pthread
-      >
-    )
-  # set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+      target_compile_definitions(
+        ${_alpaka_cuda_test_target} PRIVATE
+        ALPAKA_ACC_GPU_CUDA_ENABLED
+        ALPAKA_HAS_STD_ATOMIC_REF
+        SOFIE_USE_CUBLASLT
+      )
 
-    # ROOT-compatible: plain signature only
-    target_link_libraries(
-      TestCustomModelsFromONNXForAlpakaCuda
-      CUDA::cudart
-      CUDA::cublas
-      CUDA::cublasLt
-    )
+      target_compile_options(
+        ${_alpaka_cuda_test_target} PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:
+          --extended-lambda
+          --expt-relaxed-constexpr
+          --generate-line-info
+          --use_fast_math
+          -g
+          -G
+          # -fsanitize=address
+          -O1
+          -Wno-deprecated-gpu-targets
+        >
+        $<$<COMPILE_LANGUAGE:CXX>:
+          -O2
+          -g
+          -G
+          -fPIC
+          -pthread
+        >
+      )
+
+      # ROOT-compatible: plain signature only.
+      target_link_libraries(
+        ${_alpaka_cuda_test_target}
+        CUDA::cudart
+        CUDA::cublas
+        CUDA::cublasLt
+      )
+    endforeach()
 
     ROOTTEST_ADD_TEST(
       TestCustomModelsFromONNXForAlpakaCuda
       EXEC ./TestCustomModelsFromONNXForAlpakaCuda
       FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka;sofie-lowrank-emit;sofie-test-models-onnx-alpaka-build
+    )
+
+    ROOTTEST_ADD_TEST(
+      TestQuantizationFromONNXForAlpakaCuda
+      EXEC ./TestQuantizationFromONNXForAlpakaCuda
+      FIXTURES_REQUIRED sofie-compile-models-onnx-alpaka
     )
 
   elseif (_alpaka_backend STREQUAL "hip")
@@ -240,5 +285,6 @@ if (ENABLE_ALPAKA_TESTS)
     message(FATAL_ERROR "ALPAKA_BACKEND=sycl is not implemented yet.")
   elseif (_alpaka_backend STREQUAL "cpu")
     message(FATAL_ERROR "ALPAKA_BACKEND=cpu is not implemented yet.")
+
   endif() # cuda backend
 endif()   # ENABLE_ALPAKA_TESTS

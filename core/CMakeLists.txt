@@ -17,8 +17,11 @@ set(sources_headers
    SOFIE/OperatorList.hxx
    SOFIE/RModel_Base.hxx
    SOFIE/RModel.hxx
+   SOFIE/RModelExtension.hxx
+   SOFIE/RModelCodegenPass.hxx
    SOFIE/RModelProfiler.hxx
    SOFIE/RModelProfilerGPU.hxx
+   SOFIE/RWeightFile.hxx
    SOFIE/ROperator.hxx
    SOFIE/ROperator_BasicUnary.hxx
    SOFIE/ROperator_BasicBinary.hxx
@@ -57,6 +60,8 @@ set(sources_headers
    SOFIE/ROperator_Split.hxx
    SOFIE/ROperator_SubGraph.hxx
    SOFIE/ROperator_Pad.hxx
+   SOFIE/ROperator_QONNXQuant.hxx
+   SOFIE/ROperator_ONNXQuantizeLinear.hxx
    SOFIE/ROperator_Where.hxx
    SOFIE/ROperator_Einsum.hxx
    SOFIE/ROperator_Random.hxx
@@ -73,11 +78,69 @@ set(sources_headers
    SOFIE/RFunction_Mean.hxx
 )
 
+# The quantization pipeline's headers. LinkDef names no quantization class, so keeping
+# them out of the base list leaves the base dictionary complete.
+set(sources_quantization_headers
+   SOFIE/quantization/ROperator_QuantizedConv.hxx
+   SOFIE/quantization/ROperator_QuantizedElementwise.hxx
+   SOFIE/quantization/ROperator_QuantizedGather.hxx
+   SOFIE/quantization/ROperator_QuantizedGemm.hxx
+   SOFIE/quantization/ROperator_QuantizedMatMul.hxx
+   SOFIE/quantization/ROperator_QuantizedMatrix.hxx
+   SOFIE/SOFIE_Quantized.hxx
+   SOFIE/SOFIE_QuantizedAlpaka.hxx
+   SOFIE/quantization/RQuantization_AlpakaCommon.hxx
+   SOFIE/quantization/RQuantization_Invocations.hxx
+   SOFIE/quantization/RQuantization_AlpakaPrimitives.hxx
+   SOFIE/quantization/RQuantization_AlpakaBroadcast.hxx
+   SOFIE/quantization/RQuantization_AlpakaDenseLinear.hxx
+   SOFIE/quantization/RQuantization_AlpakaDenseLinearCommon.hxx
+   SOFIE/quantization/RQuantization_AlpakaDenseLinearInt8.hxx
+   SOFIE/quantization/RQuantization_AlpakaDenseLinearFP8.hxx
+   SOFIE/quantization/RQuantization_AlpakaConvolution.hxx
+   SOFIE/quantization/RQuantization_AlpakaConvolutionCommon.hxx
+   SOFIE/quantization/RQuantization_AlpakaConvolutionInt8.hxx
+   SOFIE/quantization/RQuantization_AlpakaConvolutionFP8.hxx
+   SOFIE/quantization/RQuantization_AlpakaElementwise.hxx
+   SOFIE/quantization/RQuantization_AlpakaGather.hxx
+   SOFIE/RQuantization.hxx
+   SOFIE/quantization/RQuantization_Analysis.hxx
+   SOFIE/quantization/RQuantization_Convolution.hxx
+   SOFIE/quantization/RQuantization_ConvolutionTypes.hxx
+   SOFIE/quantization/RQuantization_DenseLinear.hxx
+   SOFIE/quantization/RQuantization_DenseLinearTypes.hxx
+   SOFIE/quantization/RQuantization_Elementwise.hxx
+   SOFIE/quantization/RQuantization_Gather.hxx
+   SOFIE/quantization/RQuantization_Lowering.hxx
+   SOFIE/quantization/RQuantization_Parameters.hxx
+   SOFIE/quantization/RQuantization_Pipeline.hxx
+   SOFIE/quantization/RQuantization_Storage.hxx
+)
+
 list(TRANSFORM sources_headers PREPEND "inc/")
+list(TRANSFORM sources_quantization_headers PREPEND "inc/")
+
+# The quantization pipeline's translation units. RModel_Quantization.cxx belongs here
+# despite defining RModel members, because base calls none of them.
+set(sources_quantization_cxx
+    src/quantization/RModel_Quantization.cxx
+    src/quantization/RQuantization_Analysis.cxx
+    src/quantization/RQuantization_Convolution.cxx
+    src/quantization/RQuantization_ConvolutionLowering.cxx
+    src/quantization/RQuantization_DenseLinear.cxx
+    src/quantization/RQuantization_DenseLinearPass.cxx
+    src/quantization/RQuantization_Elementwise.cxx
+    src/quantization/RQuantization_Gather.cxx
+    src/quantization/RQuantization_Parameters.cxx
+    src/quantization/RQuantization_Pipeline.cxx
+    src/quantization/RQuantization_Storage.cxx
+)
 
 set(sources_cxx
     src/RModel_Base.cxx
     src/RModel.cxx
+    src/RModelCodegenPass.cxx
+    src/RWeightFile.cxx
     src/RModelProfiler.cxx
     src/RModelProfilerGPU.cxx
     src/RModel_ALPAKA.cxx
@@ -113,11 +176,16 @@ if(SOFIE_WITH_ROOT AND ROOT_FOUND)
           DESTINATION lib)
 endif()
 
-install(TARGETS SOFIE_core
+# The quantization pipeline. Depends on base SOFIE, which depends on nothing here, so the
+# link below runs one way.
+add_library(SOFIE_quantization SHARED)
+target_sources(SOFIE_quantization PRIVATE ${sources_quantization_headers} ${sources_quantization_cxx})
+target_link_libraries(SOFIE_quantization PUBLIC SOFIE_core)
+
+install(TARGETS SOFIE_core SOFIE_quantization
   EXPORT SOFIETargets
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/inc/"
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
-

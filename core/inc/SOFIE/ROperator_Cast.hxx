@@ -28,6 +28,7 @@ private:
    std::string fNY;
    std::vector<Dim> fShape;
    ETensorType fType;
+   ETensorType fInputType = ETensorType::UNDEFINED;
 
 public:
    ROperator_Cast(){}
@@ -57,6 +58,7 @@ public:
       fShape = model.GetDimTensorShape(fNX);
       // should we add a check if the same type
       auto inputType = model.GetTensorType(fNX);
+      fInputType = inputType;
       if (model.IsInitializedTensor(fNX)) {
          fIsOutputConstant = true;
          auto inputData = model.GetInitializedTensorData(fNX);
@@ -112,6 +114,8 @@ public:
       // need to handle bool case separatly since casting to uint8 will not give right result
       if (fType == ETensorType::BOOL)
          out << SP << SP << "tensor_" << fNY << "[id] = (tensor_" << fNX << "[id] != 0) ? 1 : 0;\n";
+      else if (IsFP8TensorType(fType) || IsFP8TensorType(fInputType))
+         throw std::runtime_error("SOFIE Cast to or from FP8 is implemented for the GPU backend only");
       else
          out << SP << SP << "tensor_" << fNY << "[id] = static_cast<"<< ConvertTypeToString(fType) << ">(tensor_" << fNX << "[id]);\n";
 
@@ -127,7 +131,13 @@ public:
       op += SP + SP + "template<typename TAcc, typename SrcT, typename DstT>\n";
       op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, SrcT const * src, DstT * dst, std::size_t numElements) const {\n";
       op += SP + SP + SP + "for (auto i : alpaka::uniformElements(acc, numElements)) {\n";
-      op += SP + SP + SP + "dst[i] = static_cast<DstT>(src[i]);\n";
+      // A numeric cast into an FP8 byte carrier would truncate the value to an integer.
+      if (IsFP8TensorType(fType))
+         op += SP + SP + SP + "dst[i] = SOFIE::EncodeFP8E4M3(static_cast<float>(src[i]));\n";
+      else if (IsFP8TensorType(fInputType))
+         op += SP + SP + SP + "dst[i] = static_cast<DstT>(SOFIE::DecodeFP8E4M3(src[i]));\n";
+      else
+         op += SP + SP + SP + "dst[i] = static_cast<DstT>(src[i]);\n";
       op += SP + SP + "}\n";
       op += SP + "}\n};\n";
       return op;

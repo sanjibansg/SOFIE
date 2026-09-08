@@ -2,9 +2,15 @@
 #define SOFIE_ROPERATOR_Softmax
 
 #include "SOFIE/SOFIE_common.hxx"
+#include "SOFIE/RQuantization.hxx"
 #include "SOFIE/ROperator.hxx"
 #include "SOFIE/RModel.hxx"
 
+#include <cstdint>
+#include <functional>
+#include <iomanip>
+#include <limits>
+#include <optional>
 #include <sstream>
 
 namespace SOFIE {
@@ -22,6 +28,66 @@ private:
 
    std::string fType;
 
+   // Set when a following Clip, and optionally its QuantizeLinear, are absorbed into
+   // pass 3. The absorbed operator's output tensor is written in place of fNY.
+   std::string fFusedOutputTensor; // empty means write fNY as usual
+   // Set means write a low-precision carrier rather than a float. Held as a QuantizationGrid
+   // so one encode serves int8 and FP8: the affine map plus which codes exist.
+   std::optional<QuantizationGrid> fOutputGrid;
+   bool fQuantHasClip = false;
+   double fQuantClipLow = 0.0;
+   double fQuantClipHigh = 0.0;
+
+   // The producing GEMM's cuBLASLt state, when it deferred its float epilogue here; the launch
+   // reads the accumulator and epilogue parameters from it. Empty means read the float output.
+   std::string fAccumulatorStateName;
+   // The planner's epilogue shape, instantiated into the call so untaken branches are dropped.
+   QuantizedEpilogueSpecialization fAccumulatorSpec;
+
+   bool ReadsDeferredAccumulator() const { return !fAccumulatorStateName.empty(); }
+
+   // The absorbed DequantizeLinear's grid: its carrier is read and decoded at the load.
+   std::optional<QuantizationGrid> fInputGrid;
+
+   bool ReadsCarrierInput() const { return fInputGrid.has_value(); }
+
+   // Where pass 1's values come from, kept together because a parameter changed without its
+   // load, or a T deduced from a pointee that is no longer the working type, still compiles.
+   struct SoftmaxInputBinding {
+      std::string templateParams;   // after `typename TAcc, `, before `, typename TOut`
+      std::string parameter;        // the input parameter declaration
+      std::string workingType;      // T, when it cannot be deduced from the input; else empty
+      std::function<std::string(const std::string &)> load;   // one element, by index expression
+   };
+
+   SoftmaxInputBinding InputBinding() const
+   {
+      // Same function and params struct as QuantizedGemmCudaEpilogueKernel, passed through from
+      // the GEMM rather than rebuilt, so the value is bit-identical. The index is the producer's
+      // logical output index, which AcceptInt32Accumulator checked against this traversal.
+      if (ReadsDeferredAccumulator()) {
+         const std::string args = fAccumulatorSpec.TemplateArgs();
+         // No input template parameter: the epilogue struct is concrete and yields float.
+         return {"", "SOFIE::QuantizedDeferredEpilogue const& ep", "float",
+                 [args](const std::string &at) {
+                    return "SOFIE::INTERNAL::QuantizedGemmCudaEpilogueValueSpec" + args + "(" + at +
+                           ", ep.accumulator, ep.bias, ep.weightScaleVector, "
+                           "ep.inputZeroPointColumnSums, ep.params)";
+                 }};
+      }
+      // Spelled as ROperator_ONNXDequantizeLinear's FP8 kernel does, so absorbing it changes no
+      // bits. T is the decode's result, not the carrier.
+      if (ReadsCarrierInput()) {
+         const std::string scale = ExactDoubleLiteral(fInputGrid->scale);
+         return {"typename TIn", "TIn const* __restrict__ X", "float",
+                 [scale](const std::string &at) {
+                    return "static_cast<T>(SOFIE::DecodeFP8E4M3(X[" + at + "]) * " + scale + "f)";
+                 }};
+      }
+      return {"typename T", "T const* __restrict__ X", "",
+              [](const std::string &at) { return "X[" + at + "]"; }};
+   }
+
 public:
    ROperator_Softmax() {}
    ROperator_Softmax(int64_t attr_axis, std::string nameX, std::string nameY, bool logSoftmax = false)
@@ -31,6 +97,98 @@ public:
    {
          fInputTensorNames = { fNX };
          fOutputTensorNames = { fNY };
+   }
+
+   // The fusion gate for every hook below: only the register-resident emission reads each
+   // element exactly once and keeps it, so only it can absorb work into the load or the store.
+   // The staged variant re-reads X in pass 2 and uses Y as scratch for the exponentials.
+   bool CanFuseClip() const { return SoftmaxUsesRegisterResidentRows(); }
+   // A log-softmax output is not on the grid the boundary describes, so it cannot encode.
+   bool CanFuseOutputOnGrid(EQuantizedOutputEmit mode) const override
+   {
+      return mode == EQuantizedOutputEmit::Carrier && CanFuseClip() && !fLogSoftmax;
+   }
+
+   // The general hook: encode onto `grid` with no additional clamp. The five-argument
+   // FuseQuantizedOutput below is the Softmax-and-Clip case, which also folds the Clip's bounds.
+   void FuseOutputOnGrid(const std::string &output, const QuantizationGrid &grid,
+                         EQuantizedOutputEmit mode) override
+   {
+      if (mode != EQuantizedOutputEmit::Carrier)
+         return ROperator::FuseOutputOnGrid(output, grid, mode);
+      FuseQuantizedOutput(output, grid, false, 0.0, 0.0);
+   }
+
+   // Absorb a following Clip, writing its output tensor instead of fNY.
+   void FuseClip(std::string clipOutput, double clipLow, double clipHigh)
+   {
+      fFusedOutputTensor = std::move(clipOutput);
+      fOutputTensorNames = { fFusedOutputTensor };
+      fQuantHasClip = true;
+      fQuantClipLow = clipLow;
+      fQuantClipHigh = clipHigh;
+   }
+
+   // As FuseClip, and additionally encode onto `grid`, writing `carrier` as a low-precision
+   // code rather than a float.
+   void FuseQuantizedOutput(std::string carrier, const QuantizationGrid &grid, bool hasClip,
+                            double clipLow, double clipHigh)
+   {
+      FuseClip(std::move(carrier), clipLow, clipHigh);
+      fQuantHasClip = hasClip;
+      fOutputGrid = grid;
+   }
+
+   // See CanFuseClip for why only this emission may fuse.
+   bool CanAcceptInt32Accumulator() const override { return SoftmaxUsesRegisterResidentRows(); }
+
+   // This traversal is `row * axisLen + k`, matching the producer's logical index only when its
+   // rows tile these and its columns are the axis length; a wrong mapping is silently wrong.
+   bool AcceptInt32Accumulator(const std::string &stateName, std::size_t batch, std::size_t rows,
+                               std::size_t cols, const QuantizedEpilogueSpecialization &spec) override
+   {
+      if (stateName.empty() || fShape.empty() || !CanAcceptInt32Accumulator())
+         return false;
+      const auto &axisDim = fShape[SoftmaxAxis()];
+      if (axisDim.isParam || axisDim.dim == 0)
+         return false;
+      if (cols != axisDim.dim)
+         return false;
+      // Rows are the product of the non-axis dimensions, visited in the producer's write order.
+      std::size_t ourRows = 1;
+      for (std::size_t i = 0; i < fShape.size(); ++i) {
+         if (i == SoftmaxAxis())
+            continue;
+         if (fShape[i].isParam)
+            return false;
+         ourRows *= fShape[i].dim;
+      }
+      const std::size_t batchCount = batch == 0 ? 1 : batch;
+      if (batchCount * rows != ourRows)
+         return false;
+      fAccumulatorStateName = stateName;
+      fAccumulatorSpec = spec;
+      return true;
+   }
+
+   // Read the carrier and decode at the load, dropping the DequantizeLinear kernel and the
+   // float round trip on both sides. Gated as CanFuseClip.
+   bool CanFuseDequantizedInput() const override
+   {
+      return SoftmaxUsesRegisterResidentRows() && !ReadsDeferredAccumulator();
+   }
+
+   bool FuseDequantizedInput(const std::string &from, const std::string &carrier,
+                             const QuantizationGrid &grid) override
+   {
+      // E4M3 only, as in ROperator_BasicBinary: an affine grid carries a zero point too, and
+      // E5M2 needs its own decode.
+      if (!IsPerTensorE4M3(grid) || fNX != from || fInputGrid || ReadsDeferredAccumulator())
+         return false;
+      fNX = carrier;
+      fInputGrid = grid;
+      fInputTensorNames = {fNX};
+      return true;
    }
 
    std::vector<ETensorType> TypeInference(std::vector<ETensorType> input) override { return input; }
@@ -184,6 +342,321 @@ public:
          }
       }
       return out.str();
+   }
+
+   // GPU/Alpaka codegen: two kernels selected by `inner`, one thread per row when
+   // inner > 1 and one block per row when inner == 1; the block path reduces pairwise.
+private:
+   // Threads per block for the contiguous path; a power of two for the tree reductions.
+   static constexpr std::size_t kSoftmaxBlockThreads = 256;
+   // Cap on the per-thread register array; above it the values spill to local memory and
+   // the emitter uses the staged path instead.
+   static constexpr std::size_t kSoftmaxMaxRegisters = 8;
+
+   // Elements each thread owns when one block covers a row. Zero means the axis length
+   // is a runtime parameter, so no compile-time register array can be sized.
+   std::size_t SoftmaxElementsPerThread() const
+   {
+      if (fShape.empty())
+         return 0;
+      const auto &axisDim = fShape[SoftmaxAxis()];
+      if (axisDim.isParam || axisDim.dim == 0)
+         return 0;
+      return (axisDim.dim + kSoftmaxBlockThreads - 1) / kSoftmaxBlockThreads;
+   }
+
+   // True when each thread can hold its elements in registers across all three passes
+   // instead of staging them through Y. Visits elements in the strided loops' order.
+   bool SoftmaxUsesRegisterResidentRows() const
+   {
+      const std::size_t perThread = SoftmaxElementsPerThread();
+      return SoftmaxRowIsContiguous() && perThread > 0 && perThread <= kSoftmaxMaxRegisters;
+   }
+
+   std::size_t SoftmaxAxis() const
+   {
+      const std::size_t size = fShape.size();
+      return fAttrAxis < 0 ? size + fAttrAxis : static_cast<std::size_t>(fAttrAxis);
+   }
+   std::string SoftmaxDimProduct(std::size_t lo, std::size_t hi) const
+   {
+      std::string product;
+      for (std::size_t i = lo; i < hi; ++i)
+         product += (product.empty() ? "(" : "*(") + fShape[i].GetVal() + ")";
+      return product.empty() ? "1" : product;
+   }
+   // Structural, so it holds for parametric dims too: inner is the product of the axes
+   // after the softmax axis, hence 1 exactly when that axis is last.
+   bool SoftmaxRowIsContiguous() const
+   {
+      return !fShape.empty() && SoftmaxAxis() + 1 == fShape.size();
+   }
+   static std::string SubstitutePlaceholder(std::string text, const std::string &token,
+                                            const std::string &value)
+   {
+      for (auto at = text.find(token); at != std::string::npos; at = text.find(token, at))
+         text.replace(at, token.size(), value);
+      return text;
+   }
+
+   // Block-wide reduction over kSoftmaxBlockThreads, unrolled at codegen time. In `combine`,
+   // "@A" is the accumulator and "@B" the partner; both halves substitute their own names.
+   std::string SoftmaxBlockReduce(const std::string &indent, const std::string &combine) const
+   {
+      const auto step = [&combine](const std::string &a, const std::string &b) {
+         return SubstitutePlaceholder(SubstitutePlaceholder(combine, "@A", a), "@B", b);
+      };
+      std::string out;
+      // Shared-memory tree only while the survivors span more than one warp; below 32 a
+      // block-wide barrier buys nothing. `alpaka::warp::shfl_down`, not `__shfl_down_sync`, so
+      // CPU and HIP keep their WarpSingleThread fallback. Lane `tid` still pairs with
+      // `tid + half` in the same order, so the result is bit-identical to the tree.
+      constexpr std::size_t kWarp = 32;
+      for (std::size_t half = kSoftmaxBlockThreads / 2; half >= kWarp; half >>= 1) {
+         const std::string h = std::to_string(half) + "u";
+         out += indent + "if (tid < " + h + ") { " + step("shmem[tid]", "shmem[tid + " + h + "]") + " }\n";
+         out += indent + "alpaka::syncBlockThreads(acc);\n";
+      }
+      out += indent + "if (tid < " + std::to_string(kWarp) + "u) {\n";
+      out += indent + "   auto v = shmem[tid];\n";
+      for (std::size_t half = kWarp / 2; half > 0; half >>= 1) {
+         out += indent + "   { const auto other = alpaka::warp::shfl_down(acc, v, " +
+                std::to_string(half) + "u); " + step("v", "other") + " }\n";
+      }
+      out += indent + "   if (tid == 0u) shmem[0] = v;\n";
+      out += indent + "}\n";
+      out += indent + "alpaka::syncBlockThreads(acc);\n";
+      return out;
+   }
+
+public:
+   std::string Generate_GPU_Kernel_ALPAKA(std::string opName) override
+   {
+      opName = "op_" + opName;
+      const std::string kname = "SoftmaxKernel_" + opName;
+      std::string op;
+      op = "\n//------ SOFTMAX_KERNEL_ALPAKA\n";
+      op += SP + "struct " + kname + " {\n";
+      // TOut is deduced: it is T for an ordinary Softmax and the integer carrier type
+      // when the output quantization is fused in.
+      const auto binding = InputBinding();
+      std::string templateParams = "typename TAcc";
+      if (!binding.templateParams.empty())
+         templateParams += ", " + binding.templateParams;
+      templateParams += ", typename TOut";
+      op += SP + SP + "template<" + templateParams + ">\n";
+      op += SP + SP + "ALPAKA_FN_ACC void operator()(TAcc const & acc, " + binding.parameter +
+            ", TOut* __restrict__ Y, std::size_t numRows, std::size_t axisLen, "
+            "std::size_t inner) const {\n";
+      if (!binding.workingType.empty())
+         op += SP + SP + SP + "using T = " + binding.workingType + ";\n";
+
+      if (SoftmaxRowIsContiguous()) {
+         const std::string I3 = SP + SP + SP;
+         const std::string I4 = SP + SP + SP + SP;
+         const std::string bt = std::to_string(kSoftmaxBlockThreads) + "u";
+
+         op += I3 + "// Contiguous rows (inner == 1): one block per row, " + bt +
+               " threads striding\n";
+         op += I3 + "// the axis so a warp reads one cache line instead of 32.\n";
+         op += I3 + "auto& shmem = alpaka::declareSharedVar<T[" +
+               std::to_string(kSoftmaxBlockThreads) + "], __COUNTER__>(acc);\n";
+         // row is a BLOCK index, so every thread in the block takes this branch together
+         // and the syncBlockThreads below are never reached by a partial block.
+         op += I3 + "auto const row = alpaka::getIdx<alpaka::Grid, alpaka::Blocks>(acc)[0];\n";
+         op += I3 + "auto const tid = alpaka::getIdx<alpaka::Block, alpaka::Threads>(acc)[0];\n";
+         op += I3 + "(void)inner;\n";
+         op += I3 + "if (row >= numRows) return;\n";
+         op += I3 + "const std::size_t base = row * axisLen;\n\n";
+
+         const std::size_t perThread = SoftmaxElementsPerThread();
+         const bool registerResident = SoftmaxUsesRegisterResidentRows();
+         // k = tid + j * blockThreads visits elements in the strided loop's order, so
+         // the max and the sum accumulate in the same sequence.
+         if (registerResident) {
+            const std::string pt = std::to_string(perThread);
+            op += I3 + "// Row fits in registers (" + pt + " element(s) per thread), so the\n";
+            op += I3 + "// exponentials never round-trip through Y. Same access order as the\n";
+            op += I3 + "// strided form, hence the same reduction order and the same result.\n";
+            op += I3 + "T vals[" + pt + "];\n\n";
+
+            op += I3 + "// Pass 1: block-wide max. Threads with no element contribute the\n";
+            op += I3 + "// identity, which is what makes axisLen < " + bt + " safe.\n";
+            op += I3 + "T vmax = std::numeric_limits<T>::lowest();\n";
+            op += I3 + "#pragma unroll\n";
+            op += I3 + "for (std::size_t j = 0; j < " + pt + "; ++j) {\n";
+            op += I4 + "const std::size_t k = tid + j * " + bt + ";\n";
+            op += I4 + "if (k < axisLen) { vals[j] = " + binding.load("base + k") +
+                  "; if (vals[j] > vmax) vmax = vals[j]; }\n";
+            op += I3 + "}\n";
+            op += I3 + "shmem[tid] = vmax;\n";
+            op += I3 + "alpaka::syncBlockThreads(acc);\n";
+            op += SoftmaxBlockReduce(I3, "if (@B > @A) @A = @B;");
+            op += I3 + "vmax = shmem[0];\n";
+            op += I3 + "alpaka::syncBlockThreads(acc);\n\n";
+
+            op += I3 + "// Pass 2: exp onto the shifted grid, kept in registers, block-wide sum.\n";
+            op += I3 + "T sum = static_cast<T>(0);\n";
+            op += I3 + "#pragma unroll\n";
+            op += I3 + "for (std::size_t j = 0; j < " + pt + "; ++j) {\n";
+            op += I4 + "const std::size_t k = tid + j * " + bt + ";\n";
+            op += I4 + "if (k < axisLen) { vals[j] = static_cast<T>(exp(vals[j] - vmax)); sum += vals[j]; }\n";
+            op += I3 + "}\n";
+            op += I3 + "shmem[tid] = sum;\n";
+            op += I3 + "alpaka::syncBlockThreads(acc);\n";
+            op += SoftmaxBlockReduce(I3, "@A += @B;");
+            op += I3 + "const T inv = static_cast<T>(1) / shmem[0];\n";
+            op += I3 + "alpaka::syncBlockThreads(acc);\n\n";
+
+            op += I3 + "// Pass 3: normalise straight out of registers into Y.\n";
+            op += I3 + "#pragma unroll\n";
+            op += I3 + "for (std::size_t j = 0; j < " + pt + "; ++j) {\n";
+            op += I4 + "const std::size_t k = tid + j * " + bt + ";\n";
+            op += I4 + "if (k >= axisLen) continue;\n";
+            op += I4 + "T v = vals[j] * inv;\n";
+            if (fLogSoftmax)
+               op += I4 + "v = static_cast<T>(log(v));\n";
+            // The absorbed Clip clamps in T, the type and position the Clip kernel used.
+            if (fQuantHasClip) {
+               op += I4 + "v = v < static_cast<T>(" + ExactDoubleLiteral(fQuantClipLow) +
+                     ") ? static_cast<T>(" + ExactDoubleLiteral(fQuantClipLow) + ") : (v > static_cast<T>(" +
+                     ExactDoubleLiteral(fQuantClipHigh) + ") ? static_cast<T>(" +
+                     ExactDoubleLiteral(fQuantClipHigh) + ") : v);\n";
+            }
+            if (fOutputGrid && fOutputGrid->IsFloatingPoint()) {
+               // An FP8 grid has no zero point and its own saturation: the encode is the scale
+               // division followed by the hardware convert, matching ROperator_ONNXQuantizeLinear.
+               op += I4 + "auto q = SOFIE::EncodeFP8E4M3(static_cast<float>(static_cast<double>(v) / " +
+                     ExactDoubleLiteral(fOutputGrid->scale) + "));\n";
+               op += I4 + "Y[base + k] = static_cast<TOut>(q);\n";
+            } else if (fOutputGrid) {
+               // Exactly the expression ROperator_ONNXQuantizeLinear emits, in the same
+               // order and the same types.
+               const auto qMin = static_cast<std::int64_t>(fOutputGrid->codeMin);
+               const auto qMax = static_cast<std::int64_t>(fOutputGrid->codeMax);
+               op += I4 + "double q = nearbyint(static_cast<double>(v) / " +
+                     ExactDoubleLiteral(fOutputGrid->scale) + ") + " +
+                     std::to_string(fOutputGrid->zeroPoint) + ";\n";
+               op += I4 + "q = (q < " + std::to_string(qMin) + ") ? " + std::to_string(qMin) +
+                     " : ((q > " + std::to_string(qMax) + ") ? " + std::to_string(qMax) + " : q);\n";
+               op += I4 + "Y[base + k] = static_cast<TOut>(q);\n";
+            } else {
+               op += I4 + "Y[base + k] = v;\n";
+            }
+            op += I3 + "}\n";
+         } else {
+            op += I3 + "// Pass 1: block-wide max. Threads with no element contribute the\n";
+            op += I3 + "// identity, which is what makes axisLen < " + bt + " safe.\n";
+            op += I3 + "T vmax = std::numeric_limits<T>::lowest();\n";
+            op += I3 + "for (std::size_t k = tid; k < axisLen; k += " + bt +
+                  ") { T v = X[base + k]; if (v > vmax) vmax = v; }\n";
+            op += I3 + "shmem[tid] = vmax;\n";
+            op += I3 + "alpaka::syncBlockThreads(acc);\n";
+            op += SoftmaxBlockReduce(I3, "if (@B > @A) @A = @B;");
+            op += I3 + "vmax = shmem[0];\n";
+            // Re-sync before reusing shmem, or a fast thread's pass-2 write races the slow
+            // threads still reading shmem[0].
+            op += I3 + "alpaka::syncBlockThreads(acc);\n\n";
+
+            op += I3 + "// Pass 2: exp onto the shifted grid, store, block-wide sum.\n";
+            op += I3 + "T sum = static_cast<T>(0);\n";
+            op += I3 + "for (std::size_t k = tid; k < axisLen; k += " + bt +
+                  ") { T e = static_cast<T>(exp(X[base + k] - vmax)); Y[base + k] = e; sum += e; }\n";
+            op += I3 + "shmem[tid] = sum;\n";
+            op += I3 + "alpaka::syncBlockThreads(acc);\n";
+            op += SoftmaxBlockReduce(I3, "@A += @B;");
+            op += I3 + "const T inv = static_cast<T>(1) / shmem[0];\n";
+            op += I3 + "alpaka::syncBlockThreads(acc);\n\n";
+
+            op += I3 + "// Pass 3: normalise.\n";
+            op += I3 + "for (std::size_t k = tid; k < axisLen; k += " + bt + ") {\n";
+            op += I4 + "Y[base + k] *= inv;\n";
+            if (fLogSoftmax)
+               op += I4 + "Y[base + k] = static_cast<T>(log(Y[base + k]));\n";
+            op += I3 + "}\n";
+         }
+      } else {
+         // inner > 1: adjacent threads already read adjacent addresses, so the serial
+         // per-row scan is coalesced as it stands.
+         op += SP + SP + SP + "const auto row = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
+         op += SP + SP + SP + "if (row >= numRows) return;\n";
+         op += SP + SP + SP + "const std::size_t o = row / inner;\n";
+         op += SP + SP + SP + "const std::size_t i = row % inner;\n";
+         op += SP + SP + SP + "const std::size_t base = o * axisLen * inner + i;\n";
+         op += SP + SP + SP + "T vmax = X[base];\n";
+         op += SP + SP + SP + "for (std::size_t k = 1; k < axisLen; ++k) { T v = X[base + k * inner]; if (v > vmax) vmax = v; }\n";
+         op += SP + SP + SP + "T sum = static_cast<T>(0);\n";
+         op += SP + SP + SP + "for (std::size_t k = 0; k < axisLen; ++k) { T e = static_cast<T>(exp(X[base + k * inner] - vmax)); Y[base + k * inner] = e; sum += e; }\n";
+         op += SP + SP + SP + "const T inv = static_cast<T>(1) / sum;\n";
+         op += SP + SP + SP + "for (std::size_t k = 0; k < axisLen; ++k) {\n";
+         op += SP + SP + SP + SP + "Y[base + k * inner] *= inv;\n";
+         if (fLogSoftmax)
+            op += SP + SP + SP + SP + "Y[base + k * inner] = static_cast<T>(log(Y[base + k * inner]));\n";
+         op += SP + SP + SP + "}\n";
+      }
+      op += SP + SP + "}\n";
+      op += SP + "};\n";
+      return op;
+   }
+
+   std::string Generate_GPU_Kernel_Definitions_ALPAKA(std::string opName) override
+   {
+      opName = "op_" + opName;
+      return SP + "SoftmaxKernel_" + opName + " softmaxKernel_" + opName + ";\n";
+   }
+
+   std::string Generate_GPU_ALPAKA(std::string opName) override
+   {
+      if (fShape.empty())
+         throw std::runtime_error("SOFIE Operator Softmax called to Generate without being initialized first");
+      opName = "op_" + opName;
+      const std::size_t size = fShape.size();
+      const std::size_t axis = SoftmaxAxis();
+      const std::string axisLen = "(" + fShape[axis].GetVal() + ")";
+      const std::string inner = SoftmaxDimProduct(axis + 1, size);
+      const std::string outer = SoftmaxDimProduct(0, axis);
+      const std::string numRows = "(" + outer + ")*(" + inner + ")";
+
+      std::stringstream out;
+      out << "\n//------ SOFTMAX_GPU_ALPAKA\n";
+      if (SoftmaxRowIsContiguous()) {
+         // One block per row; the kernel strides the axis inside the block, so the grid
+         // does not depend on axisLen.
+         out << SP << "alpaka::WorkDivMembers<Dim, Idx> workDiv_" << fNY << "(\n";
+         out << SP << SP << "Vec::all(static_cast<Idx>(" << numRows << ")),\n";
+         out << SP << SP << "Vec::all(Idx{" << kSoftmaxBlockThreads << "u}),\n";
+         out << SP << SP << "Vec::all(Idx{1u}));\n";
+      } else {
+         out << SP << "auto const elementsPerThread_" << fNY << " = Vec::all(static_cast<Idx>(1));\n";
+         out << SP << "auto const elementsPerGrid_" << fNY << " = Vec::all(Idx{" << numRows << "});\n";
+         out << SP << "auto const workDiv_" << fNY << " = sofie_workdiv(elementsPerGrid_" << fNY << ");\n";
+      }
+      // The fused form writes the Quantize's carrier; the bypassed float intermediate
+      // has no reader and is never allocated.
+      const std::string outBuf = fFusedOutputTensor.empty() ? fNY : fFusedOutputTensor;
+      // The GEMM's scratch is reused by the next quantized GEMM; safe only because this
+      // enqueue sits between them on one in-order queue.
+      const std::string inArg = ReadsDeferredAccumulator()
+                                   ? fAccumulatorStateName + ".DeferredEpilogue()"
+                                   : "alpaka::getPtrNative(deviceBuf_" + fNX + ")";
+      // The kernel is compiled for one epilogue shape, and a disagreement is a wrong number
+      // rather than a crash, so it is caught on the host.
+      if (ReadsDeferredAccumulator()) {
+         out << SP << "SOFIE::RequireDeferredEpilogueSpecialization(" << fAccumulatorStateName
+             << ".DeferredEpilogue(), " << fAccumulatorSpec.CallArgs() << ");\n";
+      }
+      out << SP << "auto task_" << opName << " = alpaka::createTaskKernel<Acc>(workDiv_" << fNY
+          << ", softmaxKernel_" << opName << ", " << inArg
+          << ", alpaka::getPtrNative(deviceBuf_" << outBuf << "), static_cast<Idx>(" << numRows
+          << "), static_cast<Idx>(" << axisLen << "), static_cast<Idx>(" << inner << "));\n";
+      out << SP << "alpaka::enqueue(queue, task_" << opName << ");\n";
+      return out.str();
+   }
+
+   // <limits> for the numeric_limits identity the block-wide max reduction seeds with.
+   std::vector<std::string> GetStdLibs() override
+   {
+      return { std::string("cmath"), std::string("limits") };
    }
 };
 

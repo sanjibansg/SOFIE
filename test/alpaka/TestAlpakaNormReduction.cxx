@@ -90,7 +90,7 @@ TEST_F(SofieAlpakaTest, CumSumInclusive)
     auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
 
     {
-        SOFIE_CumSum::Session<alpaka::TagGpuCudaRt> session;
+        SOFIE_CumSum::Session<alpaka::TagGpuCudaRt> session("CumSum_FromONNX_GPU_ALPAKA.dat");
         auto result = session.infer(input_d);
         alpaka::wait(queue);
         cudaDeviceSynchronize();
@@ -118,7 +118,7 @@ TEST_F(SofieAlpakaTest, CumSumExclusive)
     auto result_h = alpaka::allocBuf<float, Idx>(host, Ext1D::all(Idx{outputSize}));
 
     {
-        SOFIE_CumSumExclusive::Session<alpaka::TagGpuCudaRt> session;
+        SOFIE_CumSumExclusive::Session<alpaka::TagGpuCudaRt> session("CumSumExclusive_FromONNX_GPU_ALPAKA.dat");
         auto result = session.infer(input_d);
         alpaka::wait(queue);
         cudaDeviceSynchronize();

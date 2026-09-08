@@ -18,6 +18,16 @@ namespace SOFIE {
 template<typename T>
 class ROperator_Conv final : public ROperator
 {
+public:
+
+   // Computes on codes, but the product/sum lands on a different grid than the operands, so
+   // it needs a scale contract rather than a retyping; the low-precision kernels for this
+   // family exist. Lets the frontier check tell an unabsorbed boundary from a legitimate one.
+   ELowPrecisionCarrierSupport CarrierSupport() const override
+   {
+      return ELowPrecisionCarrierSupport::Arithmetic;
+   }
+
 private:
    bool fBroadcastBias = false;
 
@@ -65,7 +75,7 @@ public:
          throw
             std::runtime_error("TMVA SOFIE Encountered unsupported type parsing a Conv operator");
       }
-      fInputTensorNames = { fNX, fNB };
+      fInputTensorNames = { fNX, fNW, fNB };
       fOutputTensorNames = { fNY };
       fKind = OperatorKind::CONV;
    }
@@ -84,15 +94,33 @@ public:
          throw
             std::runtime_error("TMVA SOFIE Encountered unsupported type parsing a Conv operator");
       }
-      fInputTensorNames = { fNX };
+      fInputTensorNames = { fNX, fNW };
       fOutputTensorNames = { fNY };
       fKind=  OperatorKind::CONV;
    }
 
    std::vector<ETensorType> TypeInference(std::vector<ETensorType> input) override {
       ETensorType out = input[0];
+      if (IsFP8TensorType(out))
+         out = ETensorType::FLOAT;
       return {out};
    }
+
+   const std::string &GetInputTensorName() const { return fNX; }
+   const std::string &GetWeightTensorName() const { return fNW; }
+   const std::string &GetBiasTensorName() const { return fNB; }
+   const std::string &GetOutputTensorName() const { return fNY; }
+   const std::string &GetAutoPad() const { return fAttrAutopad; }
+   const std::vector<size_t> &GetDilations() const { return fAttrDilations; }
+   size_t GetGroup() const { return fAttrGroup; }
+   std::vector<size_t> GetKernelShape() const
+   {
+      if (fShapeW.size() >= 3)
+         return {fShapeW.begin() + 2, fShapeW.end()};
+      return fAttrKernelShape;
+   }
+   const std::vector<size_t> &GetPads() const { return fAttrPads; }
+   const std::vector<size_t> &GetStrides() const { return fAttrStrides; }
 
    // function returning output shape given input
    std::vector<Dim> DoShapeInference(const std::vector<Dim> & input, const std::vector<size_t> & weight) {
@@ -259,6 +287,12 @@ public:
          throw std::runtime_error("TMVA SOFIE Conv Op input weight tensor" + fNW + " is not of 3,4 or 5 dimensions");
       }
       fShapeY = DoShapeInference(fShapeX, fShapeW);
+      if (fAttrGroup == 0)
+         throw std::runtime_error("TMVA SOFIE Conv Op has an invalid zero group count");
+      if (!fShapeX[1].isParam && fShapeX[1].dim != fShapeW[1] * fAttrGroup)
+         throw std::runtime_error("TMVA SOFIE Conv Op input channels do not match weight channels and groups");
+      if (fShapeW[0] % fAttrGroup != 0)
+         throw std::runtime_error("TMVA SOFIE Conv Op output channels are not divisible by groups");
       model.AddIntermediateTensor(fNY, model.GetTensorType(fNX), fShapeY);
       if (fNB != "") {
          if (!model.CheckIfTensorAlreadyExist(fNB)) {

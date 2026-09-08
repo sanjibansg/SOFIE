@@ -20,12 +20,14 @@
 #include <iomanip>
 #include <cassert>
 #include <limits>
+#include <optional>
 
 namespace SOFIE {
 
 enum class ETensorType{
    UNDEFINED = 0, FLOAT = 1, UINT8 = 2, INT8 = 3, UINT16 = 4, INT16 = 5, INT32 = 6, INT64 = 7, STRING = 8, BOOL = 9, //order sensitive
-    FLOAT16 = 10, DOUBLE = 11, UINT32 = 12, UINT64 = 13, COMPLEX64 = 14, COMPLEX28 = 15, BFLOAT16 = 16
+    FLOAT16 = 10, DOUBLE = 11, UINT32 = 12, UINT64 = 13, COMPLEX64 = 14, COMPLEX28 = 15, BFLOAT16 = 16,
+    FLOAT8E4M3FN = 17, FLOAT8E4M3FNUZ = 18, FLOAT8E5M2 = 19, FLOAT8E5M2FNUZ = 20, FLOAT8E8M0 = 24
 };
 
 enum class EActivationType{
@@ -45,9 +47,22 @@ constexpr size_t GetTypeSize(ETensorType type) {
         case ETensorType::UINT32:    return sizeof(uint32_t);
         case ETensorType::UINT64:    return sizeof(uint64_t);
         case ETensorType::BOOL:      return sizeof(bool);
+        case ETensorType::FLOAT16: return sizeof(uint16_t);
         case ETensorType::STRING:    return sizeof(std::string);
+        case ETensorType::FLOAT8E4M3FN:
+        case ETensorType::FLOAT8E4M3FNUZ:
+        case ETensorType::FLOAT8E5M2:
+        case ETensorType::FLOAT8E5M2FNUZ:
+        case ETensorType::FLOAT8E8M0: return sizeof(uint8_t);
         default: return 0;
     }
+}
+
+inline bool IsFP8TensorType(ETensorType type)
+{
+    return type == ETensorType::FLOAT8E4M3FN || type == ETensorType::FLOAT8E4M3FNUZ ||
+           type == ETensorType::FLOAT8E5M2 || type == ETensorType::FLOAT8E5M2FNUZ ||
+           type == ETensorType::FLOAT8E8M0;
 }
 
 typedef std::int64_t int_t;
@@ -302,7 +317,7 @@ public:
    void SetNotWritable() { fIsNotWritable = true;}
    // set writable initialized tensors - i.e. tensor that must be written in a file
    void SetWritable() { fIsNotWritable = false;}
-   // set as constant (needed for non-float initialized tensors)
+   // embed an initialized tensor in generated code instead of the weight file
    void SetConstant() { fConstant = true;}
 
    template <class T = void>

@@ -1,5 +1,8 @@
 #include "SOFIE/ROperator_Transpose.hxx"
 #include "SOFIE/ROperator_Gemm.hxx"
+#include "SOFIE/quantization/ROperator_QuantizedGemm.hxx"
+#include "SOFIE/quantization/ROperator_QuantizedMatMul.hxx"
+#include "SOFIE/ROperator_ONNXQuantizeLinear.hxx"
 #include "SOFIE/ROperator_Relu.hxx"
 #include "SOFIE/ROperator_Tanh.hxx"
 #include "SOFIE/ROperator_LeakyRelu.hxx"

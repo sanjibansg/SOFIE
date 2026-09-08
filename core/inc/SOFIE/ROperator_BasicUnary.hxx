@@ -65,7 +65,13 @@ struct UnaryOpTraits<T, EBasicUnaryOperator::kAbs> {
 template <typename T>
 struct UnaryOpTraits<T, EBasicUnaryOperator::kSoftplus> {
    static std::string Name() { return "Softplus"; }
-   static std::string Op(const std::string &X) { return "std::log(std::exp(" + X + ") + 1)"; }
+   // log(exp(x)+1) overflows to inf once exp(x) does, around x > 88 in float, where the
+   // true value is just x. Branching on the sign keeps both tails finite.
+   static std::string Op(const std::string &X)
+   {
+      return "((" + X + ") > 0 ? (" + X + ") + std::log1p(std::exp(-(" + X + "))) : std::log1p(std::exp(" +
+             X + ")))";
+   }
 };
 
 template <typename T>
@@ -120,6 +126,15 @@ public:
                break;
             case EBasicUnaryOperator::kAbs:
                fKind = OperatorKind::UNARY_ABS;
+               break;
+            case EBasicUnaryOperator::kSoftplus:
+               fKind = OperatorKind::UNARY_SOFTPLUS;
+               break;
+            case EBasicUnaryOperator::kAtan:
+               fKind = OperatorKind::UNARY_ATAN;
+               break;
+            case EBasicUnaryOperator::kFloor:
+               fKind = OperatorKind::UNARY_FLOOR;
                break;
          }
          fInputTensorNames =  { fNX };
@@ -189,11 +204,12 @@ public:
    }
 
    std::vector<std::string> GetStdLibs() override {
-      if (Op == EBasicUnaryOperator::kSqrt || Op == EBasicUnaryOperator::kExp || Op == EBasicUnaryOperator::kLog) {
-         return { std::string("cmath") };
-      } else {
+      // Every op whose expression emits a std:: math call needs <cmath>; only
+      // Reciprocal and Neg are plain arithmetic.
+      if (Op == EBasicUnaryOperator::kReciprocal || Op == EBasicUnaryOperator::kNeg) {
          return {};
       }
+      return { std::string("cmath") };
    }
 
    bool IsElementwise() const override { return !fIsOutputConstant; }

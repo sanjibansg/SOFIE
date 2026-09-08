@@ -1,12 +1,24 @@
 #ifndef SOFIE_RMODEL
 #define SOFIE_RMODEL
 
+#include <unordered_set>
+
 #include "SOFIE/RModel_Base.hxx"
 #include "SOFIE/SOFIE_common.hxx"
+#include "SOFIE/RModelExtension.hxx"
 #include "SOFIE/ROperator.hxx"
 
 
 namespace SOFIE {
+
+// Declared by the quantization pass library. Named here only in declarations, so this
+// header stays parseable without the pass library's types.
+struct QuantizationInfo;
+struct LowPrecisionTensorInfo;
+struct QuantizedTensorStorage;
+struct QuantizationModelState;
+struct QuantizationPipelineReport;
+struct CarrierFrontierViolation;
 
 class RModel final : public RModel_Base {
 
@@ -34,6 +46,9 @@ private:
    std::unordered_map<std::string, InitializedTensor> fInitializedTensors;
    std::unordered_map<std::string, TensorInfo> fIntermediateTensorInfos;
    std::unordered_map<std::string, DynamicTensorInfo> fDynamicTensorInfos;
+   std::unique_ptr<RModelExtension> fExtension;    ///<!  pass-library state, opaque to this class (transient)
+   std::size_t fAlpakaIntermediateDeviceBytes = 0; // transient live intermediate allocation total
+   std::unordered_set<std::string> fAlpakaDeclaredIntermediateBuffers; // intermediates that received a deviceBuf_ declaration (transient)
    std::unordered_map<std::string, std::pair<std::vector<Dim>, bool>> fShapeTensors; // constant tensors describing a shape
    std::unordered_map<std::string, std::string> fAliasTensors; // alias tensors (name -> original tensor name)
    std::unordered_map<std::string, std::string>
@@ -43,6 +58,11 @@ private:
    std::vector<std::string> fInputTensorNames; // input tensor names using ONNX order
 
    std::vector<std::unique_ptr<ROperator>> fOperators;
+
+   // transient lowered operator view while the parsed fOperators graph remains intact.
+   // let code generation use synthetic operators for proven regions.
+   std::unordered_map<std::size_t, std::unique_ptr<ROperator>> fLoweredOperators;
+   std::set<std::size_t> fLoweredConsumedOperatorIndices;
 
    std::vector<std::shared_ptr<RModel>> fSubGraphs;    ///<!  sub-graph models (transient)
    RModel * fParentGraph = nullptr;
@@ -76,6 +96,14 @@ private:
    /// GPU-only pass: fuse GEMM→LeakyReLU (and GEMM→ReLU where not already
    /// handled by the ONNX parser) into a single in-place kernel sequence.
    void FuseGemmActivations_GPU();
+   // The lowered-view passes, declared in RQuantization_Pipeline.hxx. They rewrite this
+   // model's operators and reach its internals through this one declaration.
+   friend struct QuantizationPipeline;
+   // Stops emitting operators whose outputs nobody reads. Not quantization specific.
+   void EliminateDeadOperators();
+   // Puts a batched MatMul's B operand in [.., N, K] by re-permuting the Transpose that
+   // produces it and setting transB. Runs before Initialize so shape inference follows.
+   void CanonicaliseBatchedMatMulOperands();
 
 public:
    // Rule of five: explicitly define move semantics, disallow copy
@@ -97,10 +125,52 @@ public:
 
    int Verbose() const { return fVerbose;}
 
+   // Surviving Q/DQ boundaries that no adjacent operator asked for; populated by the
+   // last stage of the lowered-view build.
+   const std::vector<CarrierFrontierViolation> &GetCarrierFrontierViolations() const;
+
    std::vector<size_t> GetTensorShape(const std::string & name) const;
    std::vector<Dim> GetDimTensorShape(const std::string & name) const;
    ETensorType GetTensorType(std::string name) const;
    std::vector<Dim> GetDynamicTensorShape(const std::string & name) const ;
+
+   void AddQuantizationInfo(const std::string & tensor_name, QuantizationInfo info);
+   bool HasQuantizationInfo(const std::string & tensor_name) const;
+   const QuantizationInfo & GetQuantizationInfo(const std::string & tensor_name) const;
+
+   void AddLowPrecisionTensorInfo(const std::string & tensor_name, LowPrecisionTensorInfo info);
+   bool HasLowPrecisionTensorInfo(const std::string & tensor_name) const;
+   const LowPrecisionTensorInfo & GetLowPrecisionTensorInfo(const std::string & tensor_name) const;
+
+   void RegisterQuantizedTensorStorage(QuantizedTensorStorage storage);
+   bool HasQuantizedTensorStorage(const std::string & storage_tensor_name) const;
+   const QuantizedTensorStorage & GetQuantizedTensorStorage(const std::string & storage_tensor_name) const;
+
+   void AnalyzeQuantizedRegions();
+   const QuantizationModelState & GetQuantizationState() const;
+   // Report of the last lowered-view build: per-pass event counts, the frontier
+   // classification, and one entry per planned region.
+   const QuantizationPipelineReport &GetQuantizationPipelineReport() const;
+
+   // The pass library's state, or null when nothing has attached any.
+   RModelExtension *GetExtension() { return fExtension.get(); }
+   const RModelExtension *GetExtension() const { return fExtension.get(); }
+   void SetExtension(std::unique_ptr<RModelExtension> extension) { fExtension = std::move(extension); }
+   std::size_t GetOperatorCount() const { return fOperators.size(); }
+   bool IsOperatorLowered(std::size_t index) const
+   {
+      return fLoweredOperators.find(index) != fLoweredOperators.end();
+   }
+   // The operator emitted at this index: the lowered region if one replaced the original,
+   // which reads an int8 carrier where the original read a float. Null if suppressed.
+   const ROperator * GetEmittedOperatorAt(std::size_t index) const
+   {
+      if (fLoweredConsumedOperatorIndices.count(index) != 0)
+         return nullptr;
+      if (auto it = fLoweredOperators.find(index); it != fLoweredOperators.end())
+         return it->second.get();
+      return index < fOperators.size() ? fOperators[index].get() : nullptr;
+   }
 
    // get the values for the tensor representing a shape
    const std::vector<Dim> & GetShapeTensorValues(const std::string & tensor_name) const;
@@ -145,6 +215,18 @@ public:
       std::shared_ptr<void> data(malloc(size * sizeof(T)), free);
       std::memcpy(data.get(), raw_data, size * sizeof(T));
       AddInitializedTensor(tensor_name,  GetTemplatedType(T()), shape, data);
+   }
+
+   template <typename T>
+   void AddInitializedTensor(const std::string & tensor_name, const std::vector<std::size_t> & shape, const std::vector<T> &values)
+   {
+      size_t size = ConvertShapeToLength(shape);
+      if (values.size() != size) {
+         throw std::runtime_error("sofie: initialized tensor " + tensor_name + " data length does not match shape");
+      }
+      std::shared_ptr<void> data(malloc(size * sizeof(T)), free);
+      std::copy(values.begin(), values.end(), static_cast<T *>(data.get()));
+      AddInitializedTensor(tensor_name, GetTemplatedType(T()), shape, data);
    }
 
    void AddShapeTensor(const std::string & name, const std::vector<Dim> & shapeValues, bool scalar = false);

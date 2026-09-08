@@ -1,4 +1,7 @@
 #include "SOFIE/RModelParser_ONNX.hxx"
+#include "SOFIE/RQuantization.hxx"
+#include "SOFIE/quantization/RQuantization_Pipeline.hxx"
+#include "SOFIE/quantization/RQuantization_Lowering.hxx"
 #include "onnx_proto3.pb.h"
 
 #include <stdexcept>
@@ -73,6 +76,9 @@ extern ParserFuncSignature ParseLeakyRelu;
 extern ParserFuncSignature ParseSelu;
 extern ParserFuncSignature ParseSigmoid;
 extern ParserFuncSignature ParseGemm;
+extern ParserFuncSignature ParseQONNXQuant;
+extern ParserFuncSignature ParseQuantizeLinear;
+extern ParserFuncSignature ParseDequantizeLinear;
 extern ParserFuncSignature ParseRNN;
 extern ParserFuncSignature ParseLSTM;
 extern ParserFuncSignature ParsePool;
@@ -125,10 +131,87 @@ extern ParserFuseFuncSignature ParseFuseBatchnormRelu;
 extern ParserFuseFuncSignature ParseFuseConvTransposeAdd;
 extern ParserFuseFuncSignature ParseFuseMatMulAdd;
 
+namespace {
+
+std::string NormalizeONNXDomain(const std::string &domain)
+{
+   // ONNX's default operator set is normally encoded with an empty domain.
+   // Just treat the explicit ai.onnx spelling as the same standard domain if it appears.
+   return (domain.empty() || domain == "ai.onnx") ? std::string{} : domain;
+}
+
+std::string FormatQualifiedOperatorName(const std::string &domain, const std::string &opType)
+{
+   const std::string normalizedDomain = NormalizeONNXDomain(domain);
+   return normalizedDomain.empty() ? opType : normalizedDomain + "::" + opType;
+}
+
+std::optional<ELowPrecisionCarrier> LowPrecisionCarrierFromONNXTensorType(ETensorType type)
+{
+   switch (type) {
+   case ETensorType::FLOAT8E4M3FN:
+   case ETensorType::FLOAT8E4M3FNUZ:
+      return ELowPrecisionCarrier::FP8E4M3;
+   case ETensorType::FLOAT8E5M2:
+   case ETensorType::FLOAT8E5M2FNUZ:
+      return ELowPrecisionCarrier::FP8E5M2;
+   default:
+      return std::nullopt;
+   }
+}
+
+void RegisterLowPrecisionTensorInfoFromONNXType(RModel &model,
+                                                const std::string &tensorName,
+                                                ETensorType tensorType,
+                                                const std::string &reason)
+{
+   auto carrier = LowPrecisionCarrierFromONNXTensorType(tensorType);
+   if (!carrier)
+      return;
+   model.AddLowPrecisionTensorInfo(tensorName,
+      LowPrecisionTensorInfoFromFP8Carrier(*carrier, UTILITY::Clean_name(tensorName), reason));
+}
+
+
+void PopulateOpsetVersionMap(const onnx::ModelProto &model, std::unordered_map<std::string, int> &opsetVersionMap)
+{
+   opsetVersionMap.clear();
+   for (int i = 0; i < model.opset_import_size(); ++i) {
+      const auto &opset = model.opset_import(i);
+      opsetVersionMap[NormalizeONNXDomain(opset.domain())] = static_cast<int>(opset.version());
+   }
+}
+
+} // namespace
+
 // Definition of  RModelParser_ONNX::OperatorsMap
 struct RModelParser_ONNX::OperatorsMapImpl {
-   // Registered operators
-   std::unordered_map<std::string, ParserFuncSignature> fOperatorsMap;
+   struct OperatorKey {
+      std::string fDomain;
+      std::string fOpType;
+
+      bool operator==(const OperatorKey &other) const
+      {
+         return fDomain == other.fDomain && fOpType == other.fOpType;
+      }
+   };
+
+   struct OperatorKeyHash {
+      std::size_t operator()(const OperatorKey &key) const
+      {
+         const std::size_t h1 = std::hash<std::string>{}(key.fDomain);
+         const std::size_t h2 = std::hash<std::string>{}(key.fOpType);
+         return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+      }
+   };
+
+   static OperatorKey MakeKey(const std::string &domain, const std::string &opType)
+   {
+      return {NormalizeONNXDomain(domain), opType};
+   }
+
+   // Registered operators keyed by ONNX domain and operator type.
+   std::unordered_map<OperatorKey, ParserFuncSignature, OperatorKeyHash> fOperatorsMap;
 };
 
 // helper function to get initialized tensor data
@@ -155,6 +238,46 @@ struct ExtractDataFromTP<int32_t> {
    static void Copy(onnx::TensorProto * tensor, void * data) {
       tensor->mutable_int32_data()->ExtractSubrange(0, tensor->int32_data_size(),
                                                             static_cast<int32_t *>(data));
+   }
+};
+template<>
+struct ExtractDataFromTP<int8_t> {
+   static void Copy(onnx::TensorProto * tensor, void * data) {
+      auto *out = static_cast<int8_t *>(data);
+      for (int i = 0; i < tensor->int32_data_size(); ++i)
+         out[i] = static_cast<int8_t>(tensor->int32_data(i));
+   }
+};
+template<>
+struct ExtractDataFromTP<uint8_t> {
+   static void Copy(onnx::TensorProto * tensor, void * data) {
+      auto *out = static_cast<uint8_t *>(data);
+      for (int i = 0; i < tensor->int32_data_size(); ++i)
+         out[i] = static_cast<uint8_t>(tensor->int32_data(i));
+   }
+};
+template<>
+struct ExtractDataFromTP<int16_t> {
+   static void Copy(onnx::TensorProto * tensor, void * data) {
+      auto *out = static_cast<int16_t *>(data);
+      for (int i = 0; i < tensor->int32_data_size(); ++i)
+         out[i] = static_cast<int16_t>(tensor->int32_data(i));
+   }
+};
+template<>
+struct ExtractDataFromTP<uint16_t> {
+   static void Copy(onnx::TensorProto * tensor, void * data) {
+      auto *out = static_cast<uint16_t *>(data);
+      for (int i = 0; i < tensor->int32_data_size(); ++i)
+         out[i] = static_cast<uint16_t>(tensor->int32_data(i));
+   }
+};
+template<>
+struct ExtractDataFromTP<uint32_t> {
+   static void Copy(onnx::TensorProto * tensor, void * data) {
+      auto *out = static_cast<uint32_t *>(data);
+      for (int i = 0; i < tensor->uint64_data_size(); ++i)
+         out[i] = static_cast<uint32_t>(tensor->uint64_data(i));
    }
 };
 template<>
@@ -249,6 +372,9 @@ RModelParser_ONNX::RModelParser_ONNX() noexcept : fOperatorsMapImpl(std::make_un
    RegisterOperator("Conv", ParseConv);
    RegisterOperator("ConvTranspose", ParseConvTranspose);
    RegisterOperator("Gemm", ParseGemm);
+   RegisterOperator("QuantizeLinear", ParseQuantizeLinear);
+   RegisterOperator("DequantizeLinear", ParseDequantizeLinear);
+   RegisterOperator("qonnx.custom_op.general", "Quant", ParseQONNXQuant);
    RegisterOperator("GRU", ParseGRU);
    RegisterOperator("Identity", ParseIdentity);
    RegisterOperator("LeakyRelu", ParseLeakyRelu);
@@ -306,9 +432,10 @@ RModelParser_ONNX::RModelParser_ONNX() noexcept : fOperatorsMapImpl(std::make_un
    RegisterOperator("GroupNormalization", ParseGroupNorm);
    RegisterOperator("CumSum", ParseCumSum);
    RegisterOperator("ScaledDotProductAttention", ParseSDPA);
-   RegisterOperator("MambaScan", ParseMambaScan);
-   RegisterOperator("RWKV_WKV6", ParseRWKVWKV6);
-   RegisterOperator("GriffinRGLRU", ParseGriffinRGLRU);
+   // The recurrent-scan operators are custom ops living in the com.sofie domain.
+   RegisterOperator("com.sofie", "MambaScan", ParseMambaScan);
+   RegisterOperator("com.sofie", "RWKV_WKV6", ParseRWKVWKV6);
+   RegisterOperator("com.sofie", "GriffinRGLRU", ParseGriffinRGLRU);
 }
 
 // Destructor of the parser
@@ -316,12 +443,23 @@ RModelParser_ONNX::~RModelParser_ONNX() = default;
 
 void RModelParser_ONNX::RegisterOperator(const std::string &name, ParserFuncSignature func)
 {
-   fOperatorsMapImpl->fOperatorsMap[name] = func;
+   RegisterOperator("", name, std::move(func));
+}
+
+void RModelParser_ONNX::RegisterOperator(const std::string &domain, const std::string &name, ParserFuncSignature func)
+{
+   fOperatorsMapImpl->fOperatorsMap[RModelParser_ONNX::OperatorsMapImpl::MakeKey(domain, name)] = std::move(func);
 }
 
 bool RModelParser_ONNX::IsRegisteredOperator(const std::string &name)
 {
-   return fOperatorsMapImpl->fOperatorsMap.find(name) != fOperatorsMapImpl->fOperatorsMap.end();
+   return IsRegisteredOperator("", name);
+}
+
+bool RModelParser_ONNX::IsRegisteredOperator(const std::string &domain, const std::string &name)
+{
+   return fOperatorsMapImpl->fOperatorsMap.find(RModelParser_ONNX::OperatorsMapImpl::MakeKey(domain, name)) !=
+          fOperatorsMapImpl->fOperatorsMap.end();
 }
 
 std::vector<std::string> RModelParser_ONNX::GetRegisteredOperators()
@@ -329,7 +467,7 @@ std::vector<std::string> RModelParser_ONNX::GetRegisteredOperators()
    std::vector<std::string> ops;
    ops.reserve(fOperatorsMapImpl->fOperatorsMap.size());
    for (auto &it : fOperatorsMapImpl->fOperatorsMap) {
-      ops.emplace_back(it.first);
+      ops.emplace_back(FormatQualifiedOperatorName(it.first.fDomain, it.first.fOpType));
    }
    // return sorted list in alphabetical order
    std::sort(ops.begin(), ops.end());
@@ -351,6 +489,12 @@ ETensorType RModelParser_ONNX::GetTensorType(const std::string &name)
    return fTensorTypeMap[UTILITY::Clean_name(name)];
 }
 
+int RModelParser_ONNX::GetOpsetVersion(const std::string &domain) const
+{
+   auto it = fOpsetVersionMap.find(NormalizeONNXDomain(domain));
+   return it == fOpsetVersionMap.end() ? -1 : it->second;
+}
+
 // Parse an operator
 std::unique_ptr<ROperator>
 RModelParser_ONNX::ParseOperator(const size_t i, const onnx::GraphProto &graphproto, const std::vector<size_t> &nodes, const std::vector<int> & children)
@@ -360,14 +504,16 @@ RModelParser_ONNX::ParseOperator(const size_t i, const onnx::GraphProto &graphpr
    int idx = nodes[i];
    const auto &nodeproto = graphproto.node(idx);
    const std::string op_type = nodeproto.op_type();
+   const std::string op_domain = NormalizeONNXDomain(nodeproto.domain());
    if (fVerbose)
-      std::cout << "Parsing operator " << op_type << std::endl;
+      std::cout << "Parsing operator " << FormatQualifiedOperatorName(op_domain, op_type) << std::endl;
 
    // skip already fused operators
    if (fFusedOperators[idx]) return nullptr;
 
-   // try to fuse with following operator in case it is not last one
-   if (children.size() == 1) {
+   // try to fuse with following operator in case it is not last one.
+   // Parser fusions are defined only for standard ONNX operators.
+   if (op_domain.empty() && children.size() == 1) {
       int idx2 = children.front();
       if (op_type == "MatMul") {
         // Fuse MatMul and Add
@@ -405,13 +551,15 @@ RModelParser_ONNX::ParseOperator(const size_t i, const onnx::GraphProto &graphpr
 
 
 
-   auto it = fOperatorsMapImpl->fOperatorsMap.find(op_type);
+   const auto op_key = RModelParser_ONNX::OperatorsMapImpl::MakeKey(op_domain, op_type);
+   auto it = fOperatorsMapImpl->fOperatorsMap.find(op_key);
    if (it == fOperatorsMapImpl->fOperatorsMap.end()) {
-      std::cout << "operator " << op_type << " is not supported" << std::endl;
-      throw std::runtime_error("TMVA::SOFIE Operator type " + op_type + " is not yet supported");
+      const std::string qualifiedName = FormatQualifiedOperatorName(op_domain, op_type);
+      std::cout << "operator " << qualifiedName << " is not supported" << std::endl;
+      throw std::runtime_error("TMVA::SOFIE Operator type " + qualifiedName + " is not yet supported");
    }
    if (fVerbose) {
-      std::cout << "\tCreating operator " << op_type << std::endl;
+      std::cout << "\tCreating operator " << FormatQualifiedOperatorName(op_domain, op_type) << std::endl;
    }
    return it->second(*this, nodeproto);
 }
@@ -421,11 +569,18 @@ RModel RModelParser_ONNX::Parse(std::string filename, bool verbose)
 {
    fVerbose = verbose;
 
+   // The parser writes quantization metadata onto a model, so it is what makes code
+   // generation read it. Naming the entry point also keeps the linker from dropping it.
+   InstallQuantizationCodegenPass();
+
    fTensorTypeMap.clear();
+   fOpsetVersionMap.clear();
 
    auto model = LoadModel(filename);
    if (!model)
       throw std::runtime_error("TMVA::SOFIE - Failed to load onnx file " + filename);
+
+   PopulateOpsetVersionMap(*model, fOpsetVersionMap);
 
    const onnx::GraphProto &graph = model->graph(); // not a memory leak. model freed automatically at the end.
 
@@ -476,8 +631,10 @@ void RModelParser_ONNX::CheckGraph(const onnx::GraphProto & graph, int & level, 
    for (int i = 0; i < graph.node_size(); i++) {
       const auto & node = graph.node(i);
       const std::string opType =  node.op_type();
+      const std::string opDomain = NormalizeONNXDomain(node.domain());
+      const std::string qualifiedName = FormatQualifiedOperatorName(opDomain, opType);
       if (fVerbose) {
-         std::cout << "\tOperator " << i << " : " << opType << " (" << node.name() << "), " << graph.node(i).input_size()
+         std::cout << "\tOperator " << i << " : " << qualifiedName << " (" << node.name() << "), " << graph.node(i).input_size()
                       << " inputs : {";
             for (int j = 0; j < graph.node(i).input_size(); j++) {
                std::cout << graph.node(i).input(j);
@@ -487,8 +644,8 @@ void RModelParser_ONNX::CheckGraph(const onnx::GraphProto & graph, int & level, 
          std::cout << " }" << std::endl;
       }
       // check if operator exists
-      if (!IsRegisteredOperator(opType))
-         missingOperators[opType] = level;
+      if (!IsRegisteredOperator(opDomain, opType))
+         missingOperators[qualifiedName] = level;
       // see if sub-graph exists as node attributes
       for (int j = 0; j < node.attribute_size(); j++) {
          const auto & attribute = node.attribute(j);
@@ -504,8 +661,11 @@ void RModelParser_ONNX::CheckGraph(const onnx::GraphProto & graph, int & level, 
 bool RModelParser_ONNX::CheckModel(std::string filename, bool verbose) {
 
    fVerbose = verbose;
+   fOpsetVersionMap.clear();
    auto model = LoadModel(filename);
    if (!model) return false;
+
+   PopulateOpsetVersionMap(*model, fOpsetVersionMap);
 
    const onnx::GraphProto &graph = model->graph();
     // Initial operator order
@@ -561,6 +721,7 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
       std::string input_name = valueinfoproto.name();
 
       ETensorType type = static_cast<ETensorType>(valueinfoproto.type().tensor_type().elem_type());
+      RegisterLowPrecisionTensorInfoFromONNXType(rmodel, input_name, type, "native ONNX FP8 graph input");
 
       std::vector<Dim> fShape;
       bool existParam = false;
@@ -632,6 +793,7 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
       // register also the initialized tensors
       auto tensor_type = static_cast<ETensorType>(graph.initializer(i).data_type());
       RegisterTensorType(input_name, tensor_type);
+      RegisterLowPrecisionTensorInfoFromONNXType(rmodel, input_name, tensor_type, "native ONNX FP8 initializer");
 
       switch (tensor_type) {
       case ETensorType::FLOAT: {
@@ -648,10 +810,56 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
          allInitializedTensors[input_name] = i;
          break;
       }
+      case ETensorType::INT8: {
+         std::shared_ptr<void> data = GetInitializedTensorData<int8_t>(tensorproto, fLength);
+         if (verbose) std::cout << "add INT8 initialized tensor " << input_name << " shape " << ConvertShapeToString(shape) << std::endl;
+         rmodel.AddInitializedTensor(input_name, ETensorType::INT8, shape, data);
+         allInitializedTensors[input_name] = i;
+         break;
+      }
+      case ETensorType::UINT8: {
+         std::shared_ptr<void> data = GetInitializedTensorData<uint8_t>(tensorproto, fLength);
+         if (verbose) std::cout << "add UINT8 initialized tensor " << input_name << " shape " << ConvertShapeToString(shape) << std::endl;
+         rmodel.AddInitializedTensor(input_name, ETensorType::UINT8, shape, data);
+         allInitializedTensors[input_name] = i;
+         break;
+      }
+      case ETensorType::FLOAT8E4M3FN:
+      case ETensorType::FLOAT8E4M3FNUZ:
+      case ETensorType::FLOAT8E5M2:
+      case ETensorType::FLOAT8E5M2FNUZ:
+      case ETensorType::FLOAT8E8M0: {
+         std::shared_ptr<void> data = GetInitializedTensorData<uint8_t>(tensorproto, fLength);
+         if (verbose) std::cout << "add FP8 initialized tensor " << input_name << " shape " << ConvertShapeToString(shape) << std::endl;
+         rmodel.AddInitializedTensor(input_name, tensor_type, shape, data);
+         allInitializedTensors[input_name] = i;
+         break;
+      }
+      case ETensorType::INT16: {
+         std::shared_ptr<void> data = GetInitializedTensorData<int16_t>(tensorproto, fLength);
+         if (verbose) std::cout << "add INT16 initialized tensor " << input_name << " shape " << ConvertShapeToString(shape) << std::endl;
+         rmodel.AddInitializedTensor(input_name, ETensorType::INT16, shape, data);
+         allInitializedTensors[input_name] = i;
+         break;
+      }
+      case ETensorType::UINT16: {
+         std::shared_ptr<void> data = GetInitializedTensorData<uint16_t>(tensorproto, fLength);
+         if (verbose) std::cout << "add UINT16 initialized tensor " << input_name << " shape " << ConvertShapeToString(shape) << std::endl;
+         rmodel.AddInitializedTensor(input_name, ETensorType::UINT16, shape, data);
+         allInitializedTensors[input_name] = i;
+         break;
+      }
       case ETensorType::INT32: {
          std::shared_ptr<void> data = GetInitializedTensorData<int32_t>(tensorproto, fLength);
          if (verbose) std::cout << "add INT32 initialized tensor " << input_name << " shape " << ConvertShapeToString(shape) << std::endl;
          rmodel.AddInitializedTensor(input_name, ETensorType::INT32, shape, data);
+         allInitializedTensors[input_name] = i;
+         break;
+      }
+      case ETensorType::UINT32: {
+         std::shared_ptr<void> data = GetInitializedTensorData<uint32_t>(tensorproto, fLength);
+         if (verbose) std::cout << "add UINT32 initialized tensor " << input_name << " shape " << ConvertShapeToString(shape) << std::endl;
+         rmodel.AddInitializedTensor(input_name, ETensorType::UINT32, shape, data);
          allInitializedTensors[input_name] = i;
          break;
       }
@@ -858,6 +1066,18 @@ void RModelParser_ONNX::ParseONNXGraph(RModel & rmodel, const onnx::GraphProto &
    // Restore the parent graph's fFusedOperators (may have been saved as empty
    // for the top-level call, which is fine — we're done with the loop).
    fFusedOperators = std::move(savedFusedOperators);
+
+   // FP8 graph inputs and initializers are registered while their declarations
+   // are parsed. Register the same canonical carrier contract for explicitly
+   // typed intermediate values, including Cast-produced activation carriers.
+   for (const auto &node : graph.node()) {
+      for (const auto &output : node.output()) {
+         if (!output.empty() && IsRegisteredTensorType(output)) {
+            RegisterLowPrecisionTensorInfoFromONNXType(
+               rmodel, output, GetTensorType(output), "native ONNX FP8 intermediate tensor");
+         }
+      }
+   }
 
    std::vector<std::string> outputnames;
    if (verbose)

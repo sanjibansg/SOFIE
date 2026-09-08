@@ -41,6 +41,8 @@ set(sources_cxx
     src/ParseConv.cxx
     src/ParseConvTranspose.cxx
     src/ParseGemm.cxx
+    src/ParseQONNXQuant.cxx
+    src/ParseONNXQuantization.cxx
     src/ParseGRU.cxx
     src/ParseIdentity.cxx
     src/ParseLeakyRelu.cxx
@@ -99,7 +101,7 @@ set(sources_cxx
   ${DEPENDENCIES}
     ${SOFIE_core}
 )
-target_link_libraries(SOFIE_parsers PRIVATE SOFIE_core)
+target_link_libraries(SOFIE_parsers PUBLIC SOFIE_quantization)
 target_sources(SOFIE_parsers PRIVATE ${sources_headers} ${sources_cxx})
 
 target_include_directories(SOFIE_parsers BEFORE PUBLIC

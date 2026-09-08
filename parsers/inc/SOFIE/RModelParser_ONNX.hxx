@@ -24,6 +24,11 @@ using ParserFuncSignature =
 using ParserFuseFuncSignature =
    std::function<std::unique_ptr<ROperator> (RModelParser_ONNX& /*parser*/, const onnx::NodeProto& /*firstnode*/, const onnx::NodeProto& /*secondnode*/)>;
 
+inline ETensorType DenseLinearOutputTensorType(ETensorType inputType)
+{
+   return IsFP8TensorType(inputType) ? ETensorType::FLOAT : inputType;
+}
+
 class RModelParser_ONNX {
 public:
    struct OperatorsMapImpl;
@@ -35,16 +40,23 @@ private:
    std::unique_ptr<OperatorsMapImpl> fOperatorsMapImpl;
    // Type of the tensors
    std::unordered_map<std::string, ETensorType> fTensorTypeMap;
+   std::unordered_map<std::string, int> fOpsetVersionMap;
    // flag list of fused operators
    std::vector<bool> fFusedOperators;
 
 
 public:
-   // Register an ONNX operator
+   // Register an ONNX operator in the standard/default ONNX domain
    void RegisterOperator(const std::string &name, ParserFuncSignature func);
 
-   // Check if the operator is registered
+   // Register an ONNX operator in an explicit domain. The standard ONNX domain is "".
+   void RegisterOperator(const std::string &domain, const std::string &name, ParserFuncSignature func);
+
+   // Check if the operator is registered in the standard/default ONNX domain
    bool IsRegisteredOperator(const std::string &name);
+
+   // Check if the operator is registered in an explicit domain
+   bool IsRegisteredOperator(const std::string &domain, const std::string &name);
 
    // List of registered operators (in alphabetical order)
    std::vector<std::string> GetRegisteredOperators();
@@ -62,6 +74,9 @@ public:
 
    // Get the type of the tensor
    ETensorType GetTensorType(const std::string &name);
+
+   // Get imported ONNX opset version for a domain. Returns -1 if absent.
+   int GetOpsetVersion(const std::string &domain) const;
 
    // Parse the index'th node from the ONNX graph
    std::unique_ptr<ROperator> ParseOperator(const size_t /*index*/, const onnx::GraphProto & /*graphproto*/,

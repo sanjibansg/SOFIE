@@ -6,6 +6,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #ifdef SOFIE_SUPPORT_ROOT_BINARY
 #include "TFile.h"
@@ -17,8 +18,21 @@
 #include "SOFIE/ROperator_Gemm.hxx"
 #include "SOFIE/ROperator_LeakyRelu.hxx"
 #include "SOFIE/ROperator_Relu.hxx"
+#include "SOFIE/quantization/RQuantization_Pipeline.hxx"
 
 namespace SOFIE {
+
+namespace {
+
+bool IsByteBackedAlpakaTensorType(ETensorType type)
+{
+   return type == ETensorType::BOOL || type == ETensorType::UINT8 ||
+          type == ETensorType::FLOAT8E4M3FN || type == ETensorType::FLOAT8E4M3FNUZ ||
+          type == ETensorType::FLOAT8E5M2 || type == ETensorType::FLOAT8E5M2FNUZ ||
+          type == ETensorType::FLOAT8E8M0;
+}
+
+} // namespace
 
 void RModel::ComputeEltwiseFusionGroups() {
    fEltwiseFusionGroups.clear();
@@ -149,6 +163,8 @@ void RModel::GenerateInitializedTensorInfo_GPU_ALPAKA() {
    }
 
    for (auto &i : fInitializedTensors) {
+      if (i.second.IsNotWritable())
+         continue;
       if (!fUseWeightFile || i.second.IsConstantTensor()) {
          if (i.second.type() == ETensorType::FLOAT)
             fGC += GenerateConstantTensorCode<float>(i);
@@ -156,9 +172,10 @@ void RModel::GenerateInitializedTensorInfo_GPU_ALPAKA() {
             fGC += GenerateConstantTensorCode<int64_t>(i);
          else if (i.second.type() == ETensorType::INT32)
             fGC += GenerateConstantTensorCode<int32_t>(i);
+         else if (i.second.type() == ETensorType::INT8)
+            fGC += GenerateConstantTensorCode<int8_t>(i);
 
-         else if (i.second.type() == ETensorType::BOOL ||
-                  i.second.type() == ETensorType::UINT8)
+         else if (IsByteBackedAlpakaTensorType(i.second.type()))
             fGC += GenerateConstantTensorCode<uint8_t>(i);
       }
 
@@ -171,12 +188,15 @@ void RModel::GenerateInitializedTensorInfo_GPU_ALPAKA() {
             fGC += "BufI321D deviceBuf_" + i.first +
                    " = alpaka::allocBuf<int32_t, Idx>(devAcc, Ext1D::all(Idx{" +
                    std::to_string(length) + "}));\n";
+         } else if (i.second.type() == ETensorType::INT8) {
+            fGC += "BufI81D deviceBuf_" + i.first +
+                   " = alpaka::allocBuf<int8_t, Idx>(devAcc, Ext1D::all(Idx{" +
+                   std::to_string(length) + "}));\n";
          } else if (i.second.type() == ETensorType::INT64) {
             fGC += "BufI641D deviceBuf_" + i.first +
                    " = alpaka::allocBuf<int64_t, Idx>(devAcc, Ext1D::all(Idx{" +
                    std::to_string(length) + "}));\n";
-         } else if (i.second.type() == ETensorType::BOOL ||
-                    i.second.type() == ETensorType::UINT8) {
+         } else if (IsByteBackedAlpakaTensorType(i.second.type())) {
             fGC += "BufUI81D deviceBuf_" + i.first +
                    " = alpaka::allocBuf<uint8_t, Idx>(devAcc, Ext1D::all(Idx{" +
                    std::to_string(length) + "}));\n";
@@ -191,6 +211,8 @@ void RModel::GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA()
       fGC += "// temporary initialized tensors for loading weights\n";
 
    for (auto &i : fInitializedTensors) {
+      if (i.second.IsNotWritable())
+         continue;
       if (fUseWeightFile && !i.second.IsConstantTensor()) {
          // case of tensors which are read from a file
          size_t length = ConvertShapeToLength(i.second.shape());
@@ -198,55 +220,156 @@ void RModel::GenerateTemporaryInitializedTensorContainers_GPU_ALPAKA()
             fGC += "std::vector<float> tensor_" + i.first + "(" + std::to_string(length) + ");\n";
          } else if (i.second.type() == ETensorType::INT32) {
             fGC += "std::vector<int32_t> tensor_" + i.first + "(" + std::to_string(length) + ");\n";
+         } else if (i.second.type() == ETensorType::INT8) {
+            fGC += "std::vector<int8_t> tensor_" + i.first + "(" + std::to_string(length) + ");\n";
          } else if (i.second.type() == ETensorType::INT64) {
             fGC += "std::vector<int64_t> tensor_" + i.first + "(" + std::to_string(length) + ");\n";
-         } else if (i.second.type() == ETensorType::BOOL ||
-                    i.second.type() == ETensorType::UINT8) {
+         } else if (IsByteBackedAlpakaTensorType(i.second.type())) {
             fGC += "std::vector<uint8_t> tensor_" + i.first + "(" + std::to_string(length) + ");\n";
          }
       }
    }
 }
 
-void RModel::GenerateGPU_ALPAKA_Buffers() {
+void RModel::GenerateGPU_ALPAKA_Buffers()
+{
+   fAlpakaIntermediateDeviceBytes = 0;
    if (!fIntermediateTensorInfos.empty()) {
-      std::string tensor_declaration_block = "";
+      struct TensorUse {
+         std::size_t first = 0;
+         std::size_t last = 0;
+      };
+      std::unordered_map<std::string, TensorUse> tensorUses;
+      std::size_t graphStep = 0;
 
-      for (auto &i : fIntermediateTensorInfos) {
-         // Skip tensors that are purely intermediate within a fused kernel chain
-         if (fFusionIntermediateTensors.count(i.first)) continue;
+      auto recordUse = [&](const std::string &rawName, bool isDefinition) {
+         const auto name = UTILITY::Clean_name(rawName);
+         if (fIntermediateTensorInfos.count(name) == 0)
+            return;
+         auto [it, inserted] = tensorUses.emplace(name, TensorUse{graphStep, graphStep});
+         if (!inserted) {
+            if (isDefinition)
+               it->second.first = std::min(it->second.first, graphStep);
+            it->second.last = std::max(it->second.last, graphStep);
+         }
+      };
 
-         size_t length = ConvertShapeToLength(i.second.shape);
+      // Lifetime analysis follows the effective operator view used by code generation.
+      // Outputs of suppressed Q/DQ/QONNX source operators therefore never enter the plan.
+      for (std::size_t opIndex = 0; opIndex < fOperators.size(); ++opIndex) {
+         if (fSkipOperators.count(opIndex) || fLoweredConsumedOperatorIndices.count(opIndex))
+            continue;
+         const auto lowered = fLoweredOperators.find(opIndex);
+         const ROperator *op = lowered == fLoweredOperators.end()
+                                 ? fOperators[opIndex].get()
+                                 : lowered->second.get();
+         for (const auto &input : op->GetOpInputTensors())
+            recordUse(std::string(input), false);
+         for (const auto &output : op->GetOpOutputTensors())
+            recordUse(std::string(output), true);
+         ++graphStep;
+      }
 
-         if (i.second.type == ETensorType::FLOAT) {
-            tensor_declaration_block += "BufF1D deviceBuf_" + i.first +
-                                          " = alpaka::allocBuf<float, size_t>(devAcc, Ext1D::all(Idx{" +
-                                          std::to_string(length) + "}));\n";
-         } else if (i.second.type == ETensorType::DOUBLE) {
-            tensor_declaration_block += "BufD1D deviceBuf_" + i.first +
-                                          " = alpaka::allocBuf<double, size_t>(devAcc, Ext1D::all(Idx{" +
-                                          std::to_string(length) + "}));\n";
-         } else if (i.second.type == ETensorType::INT32) {
-            tensor_declaration_block += "BufI321D deviceBuf_" + i.first +
-                                          " = alpaka::allocBuf<int32_t, size_t>(devAcc, Ext1D::all(Idx{" +
-                                          std::to_string(length) + "}));\n";
-         } else if (i.second.type == ETensorType::INT64) {
-            tensor_declaration_block += "BufI641D deviceBuf_" + i.first +
-                                          " = alpaka::allocBuf<int64_t, size_t>(devAcc, Ext1D::all(Idx{" +
-                                          std::to_string(length) + "}));\n";
-         } else if (i.second.type == ETensorType::BOOL) {
-            tensor_declaration_block += "BufUI81D deviceBuf_" + i.first +
-                                          " = alpaka::allocBuf<std::uint8_t, size_t>(devAcc, Ext1D::all(Idx{" +
-                                          std::to_string(length) + "}));\n";
+      std::unordered_set<std::string> aliases;
+      for (const auto &[alias, origin] : fAliasTensors) {
+         aliases.insert(alias);
+         aliases.insert(origin);
+      }
+      std::unordered_set<std::string> modelOutputs(fOutputTensorNames.begin(), fOutputTensorNames.end());
+      // Tensors the generator would allocate individually, offered to the pass in case it
+      // can place them in one arena instead.
+      std::vector<PoolableTensor> poolable;
+      for (const auto &[name, info] : fIntermediateTensorInfos) {
+         const auto use = tensorUses.find(name);
+         if (use == tensorUses.end() || modelOutputs.count(name) || aliases.count(name) ||
+             fFusionIntermediateTensors.count(name))
+            continue;
+         const auto elementBytes = GetTypeSize(info.type);
+         if (elementBytes == 0)
+            continue;
+         poolable.push_back({name, info.type, ConvertShapeToLength(info.shape) * elementBytes,
+                             use->second.first, use->second.last});
+      }
+      PooledStoragePlan pooled;
+      if (auto *pass = InstalledCodegenPass())
+         pooled = pass->PlanPooledStorage(*this, poolable);
+      fAlpakaIntermediateDeviceBytes += pooled.arenaBytes;
+
+      std::string tensorDeclarationBlock;
+      if (pooled.arenaBytes != 0) {
+         tensorDeclarationBlock +=
+            "BufUI81D " + pooled.arenaName + " = alpaka::allocBuf<std::uint8_t, size_t>"
+            "(devAcc, Ext1D::all(Idx{" + std::to_string(pooled.arenaBytes) + "}));\n";
+      }
+
+      fAlpakaDeclaredIntermediateBuffers.clear();
+      for (const auto &[name, info] : fIntermediateTensorInfos) {
+         if (fFusionIntermediateTensors.count(name))
+            continue;
+         const auto use = tensorUses.find(name);
+         if (use == tensorUses.end() && modelOutputs.count(name) == 0)
+            continue;
+         fAlpakaDeclaredIntermediateBuffers.insert(name);
+
+         const auto length = ConvertShapeToLength(info.shape);
+         if (auto allocation = pooled.offsets.find(name); allocation != pooled.offsets.end()) {
+            const auto offset = std::to_string(allocation->second);
+            const auto extent = "Ext1D::all(Idx{" + std::to_string(length) + "})";
+            const auto pointer = "alpaka::getPtrNative(" + pooled.arenaName + ") + " + offset;
+            if (info.type == ETensorType::FLOAT) {
+               tensorDeclarationBlock += "ViewF1D deviceBuf_" + name + "{reinterpret_cast<float *>(" +
+                                         pointer + "), devAcc, " + extent + "};\n";
+            } else if (info.type == ETensorType::INT8) {
+               tensorDeclarationBlock += "ViewI81D deviceBuf_" + name + "{reinterpret_cast<std::int8_t *>(" +
+                                         pointer + "), devAcc, " + extent + "};\n";
+            } else if (info.type == ETensorType::FLOAT16) {
+               tensorDeclarationBlock += "ViewUI161D deviceBuf_" + name + "{reinterpret_cast<std::uint16_t *>(" +
+                                         pointer + "), devAcc, " + extent + "};\n";
+            } else {
+               tensorDeclarationBlock += "ViewUI81D deviceBuf_" + name + "{" + pointer +
+                                         ", devAcc, " + extent + "};\n";
+            }
+            continue;
+         }
+
+         fAlpakaIntermediateDeviceBytes += length * GetTypeSize(info.type);
+         if (info.type == ETensorType::FLOAT) {
+            tensorDeclarationBlock += "BufF1D deviceBuf_" + name +
+                                      " = alpaka::allocBuf<float, size_t>(devAcc, Ext1D::all(Idx{" +
+                                      std::to_string(length) + "}));\n";
+         } else if (info.type == ETensorType::DOUBLE) {
+            tensorDeclarationBlock += "BufD1D deviceBuf_" + name +
+                                      " = alpaka::allocBuf<double, size_t>(devAcc, Ext1D::all(Idx{" +
+                                      std::to_string(length) + "}));\n";
+         } else if (info.type == ETensorType::INT32) {
+            tensorDeclarationBlock += "BufI321D deviceBuf_" + name +
+                                      " = alpaka::allocBuf<int32_t, size_t>(devAcc, Ext1D::all(Idx{" +
+                                      std::to_string(length) + "}));\n";
+         } else if (info.type == ETensorType::INT8) {
+            tensorDeclarationBlock += "BufI81D deviceBuf_" + name +
+                                      " = alpaka::allocBuf<int8_t, size_t>(devAcc, Ext1D::all(Idx{" +
+                                      std::to_string(length) + "}));\n";
+         } else if (info.type == ETensorType::INT64) {
+            tensorDeclarationBlock += "BufI641D deviceBuf_" + name +
+                                      " = alpaka::allocBuf<int64_t, size_t>(devAcc, Ext1D::all(Idx{" +
+                                      std::to_string(length) + "}));\n";
+         } else if (info.type == ETensorType::FLOAT16) {
+            tensorDeclarationBlock += "BufUI161D deviceBuf_" + name +
+                                      " = alpaka::allocBuf<std::uint16_t, size_t>(devAcc, Ext1D::all(Idx{" +
+                                      std::to_string(length) + "}));\n";
+         } else if (IsByteBackedAlpakaTensorType(info.type)) {
+            tensorDeclarationBlock += "BufUI81D deviceBuf_" + name +
+                                      " = alpaka::allocBuf<std::uint8_t, size_t>(devAcc, Ext1D::all(Idx{" +
+                                      std::to_string(length) + "}));\n";
          }
       }
 
-      if (tensor_declaration_block.length()) {
-         fGC += "\n//--- declare and allocate the intermediate tensors\n" + tensor_declaration_block;
-      }
+      if (!tensorDeclarationBlock.empty())
+         fGC += "\n//--- declare and allocate live intermediate tensors\n" + tensorDeclarationBlock;
    }
 
-   // add also the dynamic tensors (only declarations, allocation will be done later)
+   // Dynamic graph values retain independent ownership because their byte sizes
+   // are not known when the static carrier plan is built.
    if (!fDynamicTensorInfos.empty()) {
       fGC += "//--- declare the dynamic tensors\n";
       fGC += "using bufDev_float = alpaka::Buf<devAcc, float, alpaka::DimInt<1u>, size_t>;\n";
@@ -254,13 +377,12 @@ void RModel::GenerateGPU_ALPAKA_Buffers() {
       fGC += "using bufDev_int64  = alpaka::Buf<devAcc, int64_t, alpaka::DimInt<1u>, size_t>;\n";
 
       for (auto &i : fDynamicTensorInfos) {
-         if (i.second.type == ETensorType::FLOAT) {
+         if (i.second.type == ETensorType::FLOAT)
             fGC += "bufDev_float bufDev_" + i.first + ";\n";
-         } else if (i.second.type == ETensorType::DOUBLE) {
+         else if (i.second.type == ETensorType::DOUBLE)
             fGC += "bufDev_double bufDev_" + i.first + ";\n";
-         } else if (i.second.type == ETensorType::INT64) {
+         else if (i.second.type == ETensorType::INT64)
             fGC += "bufDev_int64 bufDev_" + i.first + ";\n";
-         }
       }
    }
 }
@@ -287,7 +409,8 @@ std::string RModel::GenerateInferSignature_GPU_ALPAKA(bool isdecl) {
       if (type == ETensorType::DOUBLE) return "BufD1D";
       if (type == ETensorType::INT32)  return "BufI321D";
       if (type == ETensorType::INT64)  return "BufI641D";
-      if (type == ETensorType::BOOL)  return "BufUI81D";
+      if (type == ETensorType::INT8)   return "BufI81D";
+      if (IsByteBackedAlpakaTensorType(type))  return "BufUI81D";
       throw std::runtime_error("sofie: input tensor " + name +
                                " is of a data type which is not yet supported.");
    };
@@ -327,7 +450,8 @@ std::string RModel::GenerateImplSignature_GPU_ALPAKA(bool isdecl) {
       if (type == ETensorType::DOUBLE) return "ViewConstD1D";
       if (type == ETensorType::INT32)  return "ViewConstI321D";
       if (type == ETensorType::INT64)  return "ViewConstI641D";
-      if (type == ETensorType::BOOL)   return "ViewConstUI81D";
+      if (type == ETensorType::INT8)   return "ViewConstI81D";
+      if (IsByteBackedAlpakaTensorType(type))   return "ViewConstUI81D";
       throw std::runtime_error("sofie: input tensor " + name +
                                " is of a data type which is not yet supported.");
    };
@@ -379,7 +503,8 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
       if (type == ETensorType::DOUBLE) return "ViewConstD1D";
       if (type == ETensorType::INT32)  return "ViewConstI321D";
       if (type == ETensorType::INT64)  return "ViewConstI641D";
-      if (type == ETensorType::BOOL)   return "ViewConstUI81D";
+      if (type == ETensorType::INT8)   return "ViewConstI81D";
+      if (IsByteBackedAlpakaTensorType(type))   return "ViewConstUI81D";
       throw std::runtime_error("sofie: input tensor " + name + " is of an unsupported data type.");
    };
 
@@ -417,7 +542,9 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
       if (fVerbose)
          std::cout << "Generating code for operator .... " << op_idx << std::endl;
 
-      if (fSkipOperators.count(op_idx)) continue;
+      if (fSkipOperators.count(op_idx) || fLoweredConsumedOperatorIndices.count(op_idx) != 0) continue;
+      auto loweredIt = fLoweredOperators.find(op_idx);
+      ROperator *op = (loweredIt != fLoweredOperators.end()) ? loweredIt->second.get() : fOperators[op_idx].get();
 
       auto gIt = fOpToFusionGroupIdx.find(op_idx);
       size_t gIdx = (gIt != fOpToFusionGroupIdx.end()) ? gIt->second : SIZE_MAX;
@@ -458,9 +585,9 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
          // Chain followers: skip — their logic is inside the fused kernel
       } else {
          if (fProfile) {
-            fGC += RModelProfilerGPU::GenerateOperatorCode(*fOperators[op_idx], op_idx);
+            fGC += RModelProfilerGPU::GenerateOperatorCode(*op, op_idx);
          } else {
-            fGC += fOperators[op_idx]->Generate_GPU_ALPAKA(std::to_string(op_idx));
+            fGC += op->Generate_GPU_ALPAKA(std::to_string(op_idx));
          }
       }
    }
@@ -478,31 +605,34 @@ void RModel::GenerateOutput_GPU_ALPAKA() {
    for (auto &p : dynParamNames)
       spanDynDecl += ", size_t " + p;
 
-   fGC += "void infer(std::span<ViewConstF1D const> inputs, std::span<ViewF1D> outputs" + spanDynDecl + "){\n";
+   const bool allFloatOutputs = sameOutputTypes && eFirstOutputType == ETensorType::FLOAT;
+   if (allFloatOutputs) {
+      fGC += "void infer(std::span<ViewConstF1D const> inputs, std::span<ViewF1D> outputs" + spanDynDecl + "){\n";
 
-   {
-      fGC += SP + "_infer_impl(";
-      bool first = true;
-      for (auto &p : dynParamNames) {
-         if (!first) fGC += ", ";
-         fGC += p;
-         first = false;
+      {
+         fGC += SP + "_infer_impl(";
+         bool first = true;
+         for (auto &p : dynParamNames) {
+            if (!first) fGC += ", ";
+            fGC += p;
+            first = false;
+         }
+         for (size_t i = 0; i < fInputTensorNames.size(); i++) {
+            if (!first) fGC += ", ";
+            fGC += "inputs[" + std::to_string(i) + "]";
+            first = false;
+         }
+         fGC += ");\n";
       }
-      for (size_t i = 0; i < fInputTensorNames.size(); i++) {
-         if (!first) fGC += ", ";
-         fGC += "inputs[" + std::to_string(i) + "]";
-         first = false;
-      }
-      fGC += ");\n";
-   }
 
-   // Copy member output buffers into caller-provided output views
-   for (size_t i = 0; i < outputSize; i++) {
-      std::string tensorName = *(fOutputTensorNames.begin() + i);
-      fGC += SP + "alpaka::memcpy(queue, outputs[" + std::to_string(i) + "], deviceBuf_" + tensorName + ");\n";
+      // Copy member output buffers into caller-provided output views
+      for (size_t i = 0; i < outputSize; i++) {
+         std::string tensorName = *(fOutputTensorNames.begin() + i);
+         fGC += SP + "alpaka::memcpy(queue, outputs[" + std::to_string(i) + "], deviceBuf_" + tensorName + ");\n";
+      }
+      fGC += SP + "alpaka::wait(queue);\n";
+      fGC += "}\n\n";
    }
-   fGC += SP + "alpaka::wait(queue);\n";
-   fGC += "}\n\n";
 
 
    std::string returnType;
@@ -577,6 +707,9 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
       SOFIE::OperatorKind::UNARY_SIN,
       SOFIE::OperatorKind::UNARY_COS,
       SOFIE::OperatorKind::UNARY_ABS,
+      SOFIE::OperatorKind::UNARY_SOFTPLUS,
+      SOFIE::OperatorKind::UNARY_ATAN,
+      SOFIE::OperatorKind::UNARY_FLOOR,
       SOFIE::OperatorKind::NOT,
       SOFIE::OperatorKind::SELU
    };
@@ -585,7 +718,10 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
 
    fGC += "\n//--- ALPAKA Kernels\n";
    for (size_t id = 0; id < fOperators.size(); id++) {
-      if(fOperators[id]->GetKind() == OperatorKind::GEMM || fOperators[id]->GetKind() == OperatorKind::CONV) {
+      if (fLoweredConsumedOperatorIndices.count(id) != 0) continue;
+      auto loweredIt = fLoweredOperators.find(id);
+      ROperator *op = (loweredIt != fLoweredOperators.end()) ? loweredIt->second.get() : fOperators[id].get();
+      if(op->GetKind() == OperatorKind::GEMM || op->GetKind() == OperatorKind::CONV) {
          OpNeedsBlas = true;
       }
 
@@ -615,17 +751,17 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          }
          // Chain followers: skip (their logic is inside the fused kernel)
       } else {
-         if (single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
-            if (registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+         if (single_initialized_operators.find(op->GetKind()) != single_initialized_operators.end()) {
+            if (registered_operators.find(op->GetKind()) == registered_operators.end()) {
                if (fVerbose)
-                  std::cout << "Generating ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
-               fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
-               registered_operators.insert(fOperators[id]->GetKind());
+                  std::cout << "Generating ALPAKA kernel for operator " << toString(op->GetKind()) << std::endl;
+               fGC += op->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
+               registered_operators.insert(op->GetKind());
             }
          } else {
             if (fVerbose)
-               std::cout << "Generating ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
-            fGC += fOperators[id]->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
+               std::cout << "Generating ALPAKA kernel for operator " << toString(op->GetKind()) << std::endl;
+            fGC += op->Generate_GPU_Kernel_ALPAKA(std::to_string(id));
          }
       }
    }
@@ -650,20 +786,26 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
     fGC += "using QueueAcc = alpaka::Queue<Acc, QueueProperty>;\n\n";
     fGC += "using BufF1D = alpaka::Buf<Acc, float, Dim, Idx>;\n";
     fGC += "using BufD1D = alpaka::Buf<Acc, double, Dim, Idx>;\n";
+    fGC += "using BufI81D = alpaka::Buf<Acc, int8_t, Dim, Idx>;\n";
     fGC += "using BufI321D = alpaka::Buf<Acc, int32_t, Dim, Idx>;\n";
     fGC += "using BufI641D = alpaka::Buf<Acc, int64_t, Dim, Idx>;\n";
-    fGC += "using BufUI81D = alpaka::Buf<Acc, uint8_t, Dim, Idx>;\n\n";
+    fGC += "using BufUI81D = alpaka::Buf<Acc, uint8_t, Dim, Idx>;\n";
+    fGC += "using BufUI161D = alpaka::Buf<Acc, uint16_t, Dim, Idx>;\n\n";
     fGC += "// Non-owning device view types (ViewPlainPtr) for the span-based infer interface\n";
     fGC += "using ViewF1D = alpaka::ViewPlainPtr<DevAcc, float, Dim, Idx>;\n";
     fGC += "using ViewConstF1D = alpaka::ViewPlainPtr<DevAcc, const float, Dim, Idx>;\n";
     fGC += "using ViewD1D = alpaka::ViewPlainPtr<DevAcc, double, Dim, Idx>;\n";
     fGC += "using ViewConstD1D = alpaka::ViewPlainPtr<DevAcc, const double, Dim, Idx>;\n";
+    fGC += "using ViewI81D = alpaka::ViewPlainPtr<DevAcc, int8_t, Dim, Idx>;\n";
+    fGC += "using ViewConstI81D = alpaka::ViewPlainPtr<DevAcc, const int8_t, Dim, Idx>;\n";
     fGC += "using ViewI321D = alpaka::ViewPlainPtr<DevAcc, int32_t, Dim, Idx>;\n";
     fGC += "using ViewConstI321D = alpaka::ViewPlainPtr<DevAcc, const int32_t, Dim, Idx>;\n";
     fGC += "using ViewI641D = alpaka::ViewPlainPtr<DevAcc, int64_t, Dim, Idx>;\n";
     fGC += "using ViewConstI641D = alpaka::ViewPlainPtr<DevAcc, const int64_t, Dim, Idx>;\n";
     fGC += "using ViewUI81D = alpaka::ViewPlainPtr<DevAcc, uint8_t, Dim, Idx>;\n";
-    fGC += "using ViewConstUI81D = alpaka::ViewPlainPtr<DevAcc, const uint8_t, Dim, Idx>;\n\n";
+    fGC += "using ViewConstUI81D = alpaka::ViewPlainPtr<DevAcc, const uint8_t, Dim, Idx>;\n";
+    fGC += "using ViewUI161D = alpaka::ViewPlainPtr<DevAcc, uint16_t, Dim, Idx>;\n";
+    fGC += "using ViewConstUI161D = alpaka::ViewPlainPtr<DevAcc, const uint16_t, Dim, Idx>;\n\n";
 
     fGC += "\nalpaka::Platform<Acc> const platform{};\n";
     fGC += "DevAcc devAcc = alpaka::getDevByIdx(platform, 0);\n";
@@ -681,6 +823,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    GenerateInitializedTensorInfo_GPU_ALPAKA();
    GenerateGPU_ALPAKA_Buffers();
    GenerateOperatorDeclarations();
+   if (auto *pass = InstalledCodegenPass())
+      fGC += pass->ContributeSessionDeclarations(*this, ECodegenTarget::ALPAKA);
    // inject profiling session data member
    if (fProfile) {
       fGC += RModelProfilerGPU::GenerateSessionMembers();
@@ -697,6 +841,8 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
             fileName += ".dat";
          if (fWeightFile == WeightFileType::RootBinary)
             fileName += ".root";
+         if (fWeightFile == WeightFileType::Binary)
+            fileName += ".bin";
       }
 
       // ---- build constructor body into a temporary string ----
@@ -713,10 +859,17 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
          MoveInitializedTensorsToBuffers_ALPAKA();
          GenerateDynamicTensorInfo_GPU_ALPAKA();
          for (size_t id = 0; id < fOperators.size(); id++) {
-            if (fSkipOperators.count(id)) continue;
-            fGC += fOperators[id]->GenerateInitCode_GPU_ALPAKA();
-            if (fOperators[id]->GetKind() == OperatorKind::GEMM || fOperators[id]->GetKind() == OperatorKind::CONV) {
-               for (auto &blasCfg : fOperators[id]->GetBlasConfigs()) {
+            if (fSkipOperators.count(id) || fLoweredConsumedOperatorIndices.count(id) != 0) continue;
+            auto loweredIt = fLoweredOperators.find(id);
+            ROperator *op = (loweredIt != fLoweredOperators.end()) ? loweredIt->second.get() : fOperators[id].get();
+            fGC += op->GenerateInitCode_GPU_ALPAKA();
+            if (op->GetKind() == OperatorKind::GEMM || op->GetKind() == OperatorKind::CONV) {
+               // GetBlasConfigs() returns one entry per distinct GEMM call shape the
+               // operator's Generate_GPU_ALPAKA() will issue (usually one; a low-rank
+               // factorized Gemm issues two chained calls of different shapes and so
+               // needs two configs registered). Empty entries (e.g. gemmStridedBatched,
+               // legacy cuBLAS path) need no cuBLASLt layout registration.
+               for (auto &blasCfg : op->GetBlasConfigs()) {
                   if (!blasCfg.empty())
                      fGC += "\nblas.addLayoutConfig(" + blasCfg + ");\n";
                }
@@ -765,9 +918,11 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
    fusedGroupsEmitted.clear();
 
    for (size_t id = 0; id < fOperators.size(); id++) {
-      // Same as the kernel-struct loop above: fused activation ops must still
-      // declare their member variable (e.g. `leakyReluKernel`) even though
-      // their Generate_GPU_ALPAKA call is skipped in the infer-body loop.
+      if (fLoweredConsumedOperatorIndices.count(id) != 0) continue;
+      auto loweredIt = fLoweredOperators.find(id);
+      ROperator *op = (loweredIt != fLoweredOperators.end()) ? loweredIt->second.get() : fOperators[id].get();
+      // As in the kernel-struct loop above: fused activation ops must still declare their
+      // member variable even though their Generate_GPU_ALPAKA call is skipped.
 
       auto gIt = fOpToFusionGroupIdx.find(id);
       size_t gIdx = (gIt != fOpToFusionGroupIdx.end()) ? gIt->second : SIZE_MAX;
@@ -780,28 +935,34 @@ void RModel::GenerateSessionCode_GPU_ALPAKA() {
             fusedGroupsEmitted.insert(gIdx);
          }
       } else {
-         if (single_initialized_operators.find(fOperators[id]->GetKind()) != single_initialized_operators.end()) {
-            if (registered_operators.find(fOperators[id]->GetKind()) == registered_operators.end()) {
+         if (single_initialized_operators.find(op->GetKind()) != single_initialized_operators.end()) {
+            if (registered_operators.find(op->GetKind()) == registered_operators.end()) {
                if (fVerbose)
-                  std::cout << "Declaring ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
-               fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
-               registered_operators.insert(fOperators[id]->GetKind());
+                  std::cout << "Declaring ALPAKA kernel for operator " << toString(op->GetKind()) << std::endl;
+               fGC += op->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
+               registered_operators.insert(op->GetKind());
             }
          } else {
             if (fVerbose)
-               std::cout << "Declaring ALPAKA kernel for operator " << toString(fOperators[id]->GetKind()) << std::endl;
-            fGC += fOperators[id]->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
+               std::cout << "Declaring ALPAKA kernel for operator " << toString(op->GetKind()) << std::endl;
+            fGC += op->Generate_GPU_Kernel_Definitions_ALPAKA(std::to_string(id));
          }
       }
    }
 
    GenerateOutput_GPU_ALPAKA();
 
+   if (auto *pass = InstalledCodegenPass())
+      fGC += pass->ContributeSessionMembers(*this, ECodegenTarget::ALPAKA);
+
    // emit resetState() — zeros all intermediate tensors to reset model state
    if (fUseSession) {
       fGC += "\nvoid resetState(QueueAcc& queue) {\n";
       for (auto &i : fIntermediateTensorInfos) {
          if (fFusionIntermediateTensors.count(i.first)) continue;
+         // Use-based buffer emission drops intermediates with no recorded use;
+         // only tensors that actually received a deviceBuf_ can be reset.
+         if (fAlpakaDeclaredIntermediateBuffers.count(i.first) == 0) continue;
          fGC += SP + "alpaka::memset(queue, deviceBuf_" + i.first + ", 0);\n";
       }
       fGC += SP + "alpaka::wait(queue);\n";
@@ -846,6 +1007,18 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
       fUseWeightFile = true;
       fWeightFile = WeightFileType::RootBinary;
    }
+   if (static_cast<std::underlying_type_t<Options>>(Options::kBinaryWeightFile) & options) {
+      fUseWeightFile = true;
+      fWeightFile = WeightFileType::Binary;
+   }
+   if (static_cast<std::underlying_type_t<Options>>(Options::kTextWeightFile) & options) {
+      fUseWeightFile = true;
+      fWeightFile = WeightFileType::Text;
+   }
+   const auto explicitWeightPolicy = static_cast<std::underlying_type_t<Options>>(Options::kNoWeightFile) |
+                                     static_cast<std::underlying_type_t<Options>>(Options::kRootBinaryWeightFile) |
+                                     static_cast<std::underlying_type_t<Options>>(Options::kBinaryWeightFile) |
+                                     static_cast<std::underlying_type_t<Options>>(Options::kTextWeightFile);
    if (fUseWeightFile && !fUseSession) {
       throw std::runtime_error(
           "sofie: RModel::Generate: cannot use a separate weight file without generating a Session class");
@@ -859,6 +1032,25 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
       fLowRankFactorize = true;
 
    Initialize(batchSize, verbose);
+   const auto explicitFileWeightPolicy =
+      static_cast<std::underlying_type_t<Options>>(Options::kRootBinaryWeightFile) |
+      static_cast<std::underlying_type_t<Options>>(Options::kBinaryWeightFile) |
+      static_cast<std::underlying_type_t<Options>>(Options::kTextWeightFile);
+   if ((options & explicitFileWeightPolicy) != 0)
+      fUseWeightFile = true;
+   auto *pass = InstalledCodegenPass();
+   if ((options & explicitWeightPolicy) == 0 && pass && pass->RequiresWeightFile(*this)) {
+      fUseWeightFile = true;
+      fWeightFile = WeightFileType::Binary;
+   }
+   if (pass)
+      pass->ContributeSupportHeaders(*this, ECodegenTarget::ALPAKA);
+   if (fWeightFile == WeightFileType::Binary)
+      AddNeededCustomHeader("SOFIE/RWeightFile.hxx");
+   if (pass) {
+      pass->BuildLoweredView(*this, ECodegenTarget::ALPAKA);
+      pass->ContributeGeneratedHeaders(*this, ECodegenTarget::ALPAKA);
+   }
    FuseGemmActivations_GPU();   // must run before elementwise fusion (redirects tensors)
    ComputeEltwiseFusionGroups();
 
@@ -866,6 +1058,10 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
    if (!fIsSubGraph) {
       fGC.clear();
       GenerateHeaderInfo_GPU_ALPAKA(hgname);
+      if (pass) {
+         for (const auto &line : pass->DiagnosticComments(*this))
+            fGC += line + "\n";
+      }
    }
 
    if (fVerbose)
@@ -882,6 +1078,13 @@ void RModel::GenerateGPU_ALPAKA(std::underlying_type_t<Options> options, int bat
 void RModel::MoveInitializedTensorsToBuffers_ALPAKA(){
       for (auto &i : fInitializedTensors) {
          if (i.second.IsNotWritable())  continue;
+         if (auto *pass = InstalledCodegenPass();
+             pass && !pass->WantsDeviceUpload(*this, i.first, ECodegenTarget::ALPAKA))
+            continue;
+         const auto type = i.second.type();
+         if (type != ETensorType::FLOAT && type != ETensorType::INT32 && type != ETensorType::INT64 &&
+             type != ETensorType::INT8 && !IsByteBackedAlpakaTensorType(type))
+            continue;
          std::string tensor_name = "tensor_" + i.first;
          auto length = ConvertShapeToLength(i.second.shape());
          std::string slength = std::to_string(length);

@@ -3,6 +3,8 @@
 #include <cctype>
 #include <memory>
 #include <string>
+#include <utility>
+#include <set>
 
 #ifdef SOFIE_SUPPORT_ROOT_BINARY
 #include "TFile.h"
@@ -10,7 +12,15 @@
 
 #include "SOFIE/RModel.hxx"
 #include "SOFIE/RModelProfiler.hxx"
+#include "SOFIE/RWeightFile.hxx"
 #include "SOFIE/SOFIE_common.hxx"
+#include "SOFIE/ROperator_Cast.hxx"
+#include "SOFIE/ROperator_Gemm.hxx"
+#include "SOFIE/ROperator_ONNXQuantizeLinear.hxx"
+#include "SOFIE/RModelCodegenPass.hxx"
+#include "SOFIE/ROperator_Transpose.hxx"
+
+#include <unordered_map>
 
 namespace SOFIE {
 
@@ -51,6 +61,137 @@ std::string TensorMember(std::string const &name)
 }
 
 } // namespace
+
+void RModel::CanonicaliseBatchedMatMulOperands()
+{
+   // Same reasoning as EliminateDeadOperators: a subgraph body can reference an outer
+   // tensor invisibly, so the single-consumer guards below would not be sound.
+   if (!fSubGraphs.empty())
+      return;
+
+   // Runs before the operator Initialize loop, where connectivity exists but shapes do
+   // not, so ordinary shape inference derives every downstream shape from the new perm.
+   std::unordered_map<std::string, std::size_t> producer;
+   std::unordered_map<std::string, std::size_t> readers;
+   for (std::size_t index = 0; index < fOperators.size(); ++index) {
+      for (const auto &output : fOperators[index]->GetOpOutputTensors())
+         producer[std::string(output)] = index;
+      for (const auto &input : fOperators[index]->GetOpInputTensors())
+         ++readers[std::string(input)];
+   }
+   const std::set<std::string> graphOutputs(fOutputTensorNames.begin(), fOutputTensorNames.end());
+
+   for (std::size_t index = 0; index < fOperators.size(); ++index) {
+      auto *gemm = dynamic_cast<ROperator_Gemm<float> *>(fOperators[index].get());
+      // A bias would take this off the strided-batched branch, and a transpose already
+      // set means somebody else owns the layout.
+      if (gemm == nullptr || gemm->GetTransA() != 0 || gemm->GetTransB() != 0 || gemm->HasBias())
+         continue;
+
+      // Walks back from the B operand, through any low-precision staging, to the Transpose
+      // that lays it out. Every tensor on the way must be read only here.
+      std::string cursor = gemm->GetWeightTensorName();
+      ROperator_Transpose<float> *transpose = nullptr;
+      // Deliberately shorter than kQuantizationWalkMaxHops: staging puts at most two
+      // operators between the operand and its Transpose.
+      constexpr int kStagingWalkMaxHops = 3;
+      for (int hop = 0; hop < kStagingWalkMaxHops && !cursor.empty(); ++hop) {
+         if (readers[cursor] != 1 || graphOutputs.count(cursor) != 0)
+            break;
+         auto found = producer.find(cursor);
+         if (found == producer.end())
+            break;
+         auto *op = fOperators[found->second].get();
+         if (auto *candidate = dynamic_cast<ROperator_Transpose<float> *>(op)) {
+            transpose = candidate;
+            break;
+         }
+         if (auto *dequantize = dynamic_cast<ROperator_ONNXDequantizeLinear *>(op)) {
+            cursor = dequantize->GetInputTensor();
+            continue;
+         }
+         if (auto *quantize = dynamic_cast<ROperator_ONNXQuantizeLinear *>(op)) {
+            cursor = quantize->GetInputTensor();
+            continue;
+         }
+         // A Cast stages the operand in a native low-precision graph where the int8
+         // spelling has a fake-quant pair; both retype without moving elements.
+         if (dynamic_cast<ROperator_Cast *>(op) != nullptr) {
+            const auto castInputs = op->GetOpInputTensors();
+            if (castInputs.empty())
+               break;
+            cursor = std::string(castInputs[0]);
+            continue;
+         }
+         break;
+      }
+      if (transpose == nullptr)
+         continue;
+
+      auto perm = transpose->GetPerm();
+      // Rank 2 is the dense path, which already hands cuBLASLt a [N,K] weight.
+      if (perm.size() < 3)
+         continue;
+
+      // B arrives as [.., K, N]; swapping the last two perm entries yields [.., N, K] at
+      // identical cost, with transB restoring the semantics. cuBLASLt accepts only this.
+      std::swap(perm[perm.size() - 2], perm[perm.size() - 1]);
+      transpose->SetPerm(std::move(perm));
+      gemm->SetTransB(1);
+      gemm->MarkBatchedOperandBCanonicalised();
+   }
+}
+
+void RModel::EliminateDeadOperators()
+{
+   // A subgraph body can reference an outer tensor not listed among its operator's
+   // inputs, so a tensor that looks unread here may not be.
+   if (!fSubGraphs.empty())
+      return;
+
+   const std::set<std::string> graphOutputs(fOutputTensorNames.begin(), fOutputTensorNames.end());
+
+   // Consumers are counted over the operators actually emitted, which differ from
+   // fOperators wherever a lowered region replaced one and suppressed those it absorbed.
+   auto emitted = [this](std::size_t index) -> const ROperator * {
+      if (fLoweredConsumedOperatorIndices.count(index) != 0)
+         return nullptr;
+      if (auto lowered = fLoweredOperators.find(index); lowered != fLoweredOperators.end())
+         return lowered->second.get();
+      return fOperators[index].get();
+   };
+
+   // To a fixpoint: dropping one operator can strand the operator that fed it.
+   bool changed = true;
+   while (changed) {
+      changed = false;
+      std::unordered_map<std::string, std::size_t> readers;
+      for (std::size_t index = 0; index < fOperators.size(); ++index) {
+         const auto *op = emitted(index);
+         if (op == nullptr)
+            continue;
+         for (const auto &input : op->GetOpInputTensors())
+            ++readers[std::string(input)];
+      }
+      for (std::size_t index = 0; index < fOperators.size(); ++index) {
+         const auto *op = emitted(index);
+         if (op == nullptr)
+            continue;
+         const auto outputs = op->GetOpOutputTensors();
+         if (outputs.empty())
+            continue;
+         const bool dead = std::all_of(outputs.begin(), outputs.end(), [&](const auto &output) {
+            const std::string name(output);
+            return readers[name] == 0 && graphOutputs.count(name) == 0;
+         });
+         if (dead) {
+            // Same suppression channel the lowering uses; the effect wanted is identical.
+            fLoweredConsumedOperatorIndices.insert(index);
+            changed = true;
+         }
+      }
+   }
+}
 
 std::vector<size_t> RModel::GetTensorShape(const std::string & name) const {
     auto f = fReadyInputTensorInfos.find(name);
@@ -648,6 +789,8 @@ void RModel::Initialize(const std::map<std::string, size_t> & inputParams, bool 
       PrintDynamicTensors();
    }
 
+   CanonicaliseBatchedMatMulOperands();
+
    // Go through model and initialize each operator
    int i = 0;
 
@@ -684,9 +827,12 @@ void RModel::Initialize(const std::map<std::string, size_t> & inputParams, bool 
       i++;
    }
 
-   // loop on initialized tensors and make the integers as constant to be
-   // not written in a weight file and check if the tensors flagged as not writable are really not writable,
-   // i.e. are not used by non constant operators
+   if (auto *pass = InstalledCodegenPass())
+      pass->Analyze(*this);
+
+   // Check whether tensors flagged as not writable are used by runtime operators.
+   // Integer initializers remain embedded for compatibility, except for physical
+   // quantized storage explicitly registered as file-backed model weights.
    for (auto &it : fInitializedTensors) {
       // check if not-writable tensors are really not writable, i.e. are not used by non constant operators
       if (it.second.IsNotWritable() && runtimeInitializedInputs.find(it.first) != runtimeInitializedInputs.end()) {
@@ -695,9 +841,9 @@ void RModel::Initialize(const std::map<std::string, size_t> & inputParams, bool 
             std::cout << "Initialized tensor " << it.first << " is flagged as not writable but is used by non constant operators, set it as writable \n";
          }
       }
-      // if the tensor is an integer we can flag it as constant since it will not be written in a weight file and it is considered equivalent as being created from a Constant operator
-      // only FLOAT tensors are written in a weight file
-      if (it.second.type() !=  ETensorType::FLOAT) {
+      const bool isFileBackedQuantizedStorage =
+         InstalledCodegenPass() != nullptr && InstalledCodegenPass()->HasExternalStorage(*this, it.first);
+      if (it.second.type() != ETensorType::FLOAT && !isFileBackedQuantizedStorage) {
          it.second.SetConstant();
       }
    }
@@ -807,7 +953,7 @@ void RModel::GenerateInitializedTensorInfo()
    for (auto &i : fInitializedTensors) {
       if (i.second.IsNotWritable())  continue;
       size_t length = ConvertShapeToLength(i.second.shape());
-      if (!fUseWeightFile || i.second.IsConstantTensor() || !i.second.IsWeightTensor() || i.second.type() != ETensorType::FLOAT ) {
+      if (!fUseWeightFile || i.second.IsConstantTensor() || !i.second.IsWeightTensor()) {
          if (i.second.type() == ETensorType::FLOAT) {
             // check if NaN of Inf are inside tensor data
             bool hasInfOrNaN = false;
@@ -830,19 +976,31 @@ void RModel::GenerateInitializedTensorInfo()
          } else if (i.second.type() == ETensorType::INT32) {
             fGC += GenerateConstantTensorCode<int32_t>(i);
             fConstantTensorSize += length * sizeof(int32_t);
-         }  else if (i.second.type() == ETensorType::BOOL || i.second.type() == ETensorType::UINT8 ) {
+         } else if (i.second.type() == ETensorType::INT8) {
+            fGC += GenerateConstantTensorCode<int8_t>(i);
+            fConstantTensorSize += length * sizeof(int8_t);
+         } else if (i.second.type() == ETensorType::BOOL || i.second.type() == ETensorType::UINT8 ||
+                    i.second.type() == ETensorType::FLOAT8E4M3FN ||
+                    i.second.type() == ETensorType::FLOAT8E4M3FNUZ ||
+                    i.second.type() == ETensorType::FLOAT8E5M2 ||
+                    i.second.type() == ETensorType::FLOAT8E5M2FNUZ ||
+                    i.second.type() == ETensorType::FLOAT8E8M0) {
             fGC += GenerateConstantTensorCode<uint8_t>(i);
             fConstantTensorSize += length * sizeof(uint8_t);
          }
 
 
       } else {
-         // case of tensors which are read from a file
-         if (i.second.type() == ETensorType::FLOAT) {
-            fGC += "std::vector<float> fTensor_" + i.first + " = std::vector<float>(" + std::to_string(length) + ");\n";
-            fGC += "float * " + TensorMember(i.first) + " = fTensor_" + i.first + ".data();\n";
-            fWeightsTensorSize += length * sizeof(float);
-         }
+         const auto typeName = ConvertTypeToString(i.second.type());
+         if (i.second.type() != ETensorType::FLOAT && i.second.type() != ETensorType::INT8 &&
+             i.second.type() != ETensorType::UINT8 && i.second.type() != ETensorType::INT32 &&
+             i.second.type() != ETensorType::INT64 && i.second.type() != ETensorType::FLOAT8E4M3FN &&
+             i.second.type() != ETensorType::FLOAT8E4M3FNUZ && i.second.type() != ETensorType::FLOAT8E5M2 &&
+             i.second.type() != ETensorType::FLOAT8E5M2FNUZ && i.second.type() != ETensorType::FLOAT8E8M0)
+            throw std::runtime_error("sofie initialized tensor " + i.first + " has a type unsupported by weight files");
+         fGC += "std::vector<" + typeName + "> fTensor_" + i.first + " = std::vector<" + typeName + ">(" + std::to_string(length) + ");\n";
+         fGC += typeName + " * " + TensorMember(i.first) + " = fTensor_" + i.first + ".data();\n";
+         fWeightsTensorSize += length * GetTypeSize(i.second.type());
       }
    }
 }
@@ -1366,6 +1524,9 @@ void RModel::GenerateSessionCode()
          if (fWeightFile == WeightFileType::RootBinary) {
             fileName += ".root";
          }
+         if (fWeightFile == WeightFileType::Binary) {
+            fileName += ".bin";
+         }
          fGC += sessionName + "(std::string filename =\"" + fileName + "\"";
       } else {
          // no need to pass weight file since it is not used
@@ -1446,8 +1607,13 @@ void RModel::GenerateSessionCode()
    for (size_t op_idx = 0; op_idx < fOperators.size(); ++op_idx) {
       if (fVerbose)
          std::cout << "Generating code for operator .... " << op_idx << std::endl;
+      if (!fProfile && fLoweredConsumedOperatorIndices.count(op_idx) != 0) {
+         continue;
+      }
       if (fProfile) {
          allOperatorCode += RModelProfiler::GenerateOperatorCode(*fOperators[op_idx], op_idx);
+      } else if (auto lowered = fLoweredOperators.find(op_idx); lowered != fLoweredOperators.end()) {
+         allOperatorCode += lowered->second->Generate(std::to_string(op_idx));
       } else {
          allOperatorCode += fOperators[op_idx]->Generate(std::to_string(op_idx));
       }
@@ -1514,6 +1680,18 @@ void RModel::Generate(std::underlying_type_t<Options> options, int batchSize, lo
       fUseWeightFile = true;
       fWeightFile = WeightFileType::RootBinary;
    }
+   if (static_cast<std::underlying_type_t<Options>>(Options::kBinaryWeightFile) & options) {
+      fUseWeightFile = true;
+      fWeightFile = WeightFileType::Binary;
+   }
+   if (static_cast<std::underlying_type_t<Options>>(Options::kTextWeightFile) & options) {
+      fUseWeightFile = true;
+      fWeightFile = WeightFileType::Text;
+   }
+   const auto explicitWeightPolicy = static_cast<std::underlying_type_t<Options>>(Options::kNoWeightFile) |
+                                     static_cast<std::underlying_type_t<Options>>(Options::kRootBinaryWeightFile) |
+                                     static_cast<std::underlying_type_t<Options>>(Options::kBinaryWeightFile) |
+                                     static_cast<std::underlying_type_t<Options>>(Options::kTextWeightFile);
    if (fUseWeightFile && !fUseSession) {
       throw std::runtime_error(
          "sofie: RModel::Generate: cannot use a separate weight file without generating a Session class");
@@ -1531,6 +1709,19 @@ void RModel::Generate(std::underlying_type_t<Options> options, int batchSize, lo
 
    // initialize the model including all operators and sub-graphs
    Initialize(batchSize, verbose);
+   auto *pass = InstalledCodegenPass();
+   if ((options & explicitWeightPolicy) == 0 && pass && pass->RequiresWeightFile(*this)) {
+      fUseWeightFile = true;
+      fWeightFile = WeightFileType::Binary;
+   }
+   if (pass)
+      pass->ContributeSupportHeaders(*this, ECodegenTarget::CPU);
+   if (fWeightFile == WeightFileType::Binary)
+      AddNeededCustomHeader("SOFIE/RWeightFile.hxx");
+   if (pass) {
+      pass->BuildLoweredView(*this, ECodegenTarget::CPU);
+      pass->ContributeGeneratedHeaders(*this, ECodegenTarget::CPU);
+   }
 
    // if having dynamic tensor we need to have a Session
    if (!fDynamicTensorInfos.empty()) {
@@ -1589,12 +1780,37 @@ void RModel::ReadInitializedTensorsFromFile(long pos) {
             // skip Constant and shape tensors (not written in a file)
             if (!i.second.IsWeightTensor()) continue;
             std::string tensor_name = "tensor_" + i.first;
-            if (i.second.type() == ETensorType::FLOAT) {
+            if (i.second.type() == ETensorType::FLOAT || i.second.type() == ETensorType::INT8 ||
+                i.second.type() == ETensorType::UINT8 || i.second.type() == ETensorType::INT32 ||
+                i.second.type() == ETensorType::INT64 || IsFP8TensorType(i.second.type())) {
                std::string length = std::to_string(ConvertShapeToLength(i.second.shape()));
                fGC += "   ReadTensorFromStream(f, " + tensor_name + ", \"" + tensor_name + "\", " + length + ");\n";
             } else {
                throw std::runtime_error("sofie tensor " + tensor_name + " with type " + ConvertTypeToString(i.second.type()) + " cannot be read from a file");
             }
+        }
+        fGC += "   f.close();\n";
+    }
+
+    if (fWeightFile == WeightFileType::Binary) {
+        if (!fUseWeightFile) return;
+        if (fIsGNNComponent || pos != 0)
+            throw std::runtime_error("SOFIE binary weight files do not support appended GNN component offsets");
+
+        const auto binaryWeights = CollectBinaryWeightTensors(fInitializedTensors);
+        fGC += "   std::ifstream f(filename, std::ios::binary);\n";
+        fGC += "   if (!f.is_open()) throw std::runtime_error(\"sofie failed to open binary weight file \" + filename);\n";
+        fGC += "   SOFIE::ReadBinaryWeightFileHeader(f, " + std::to_string(binaryWeights.size()) + ");\n";
+        for (const auto &[name, tensor] : binaryWeights) {
+            const auto type = tensor->type();
+            if (!IsBinaryWeightTensorType(type))
+                throw std::runtime_error("sofie tensor " + name + " has a type unsupported by binary weights");
+            std::string shape = "{";
+            for (auto dim : tensor->shape()) shape += std::to_string(dim) + ",";
+            shape += "}";
+            fGC += "   SOFIE::ReadTensorFromBinaryStream(f, tensor_" + name + ", \"tensor_" + name +
+                   "\", static_cast<SOFIE::ETensorType>(" + std::to_string(static_cast<int>(type)) +
+                   "), std::vector<std::size_t>" + shape + ");\n";
         }
         fGC += "   f.close();\n";
     }
@@ -1652,6 +1868,9 @@ long RModel::WriteInitializedTensorsToFile(std::string filename) {
     case WeightFileType::Text:
         fileExtension = ".dat";
         break;
+    case WeightFileType::Binary:
+        fileExtension = ".bin";
+        break;
     }
 
     // If filename is empty, use the model name as the base filename
@@ -1660,7 +1879,16 @@ long RModel::WriteInitializedTensorsToFile(std::string filename) {
     }
 
     // Write the initialized tensors to the file
-    if (fWeightFile == WeightFileType::RootBinary) {
+    if (fWeightFile == WeightFileType::Binary) {
+        if (fIsGNNComponent || fIsGNN)
+            throw std::runtime_error("SOFIE binary weight files do not support appended GNN components");
+        std::ofstream f(filename, std::ios::binary | std::ios::trunc);
+        if (!f.is_open())
+            throw std::runtime_error("sofie failed to open binary weight file " + filename);
+        const auto position = WriteBinaryWeightFile(f, fInitializedTensors);
+        f.close();
+        return position;
+    } else if (fWeightFile == WeightFileType::RootBinary) {
 #ifdef SOFIE_SUPPORT_ROOT_BINARY
         if(fIsGNNComponent || fIsGNN) {
             throw std::runtime_error("SOFIE-GNN yet not supports writing to a ROOT file.");
@@ -1741,6 +1969,32 @@ long RModel::WriteInitializedTensorsToFile(std::string filename) {
                   else
                      f << std::setprecision(std::numeric_limits<float>::max_digits10) << value;
                   f <<  ( (idx < length-1) ? " " : "\n" );
+               }
+            }
+            else if (i.second.type() == ETensorType::INT8) {
+               const int8_t * data = i.second.data<int8_t>();
+               for (size_t idx = 0; idx < length; idx++) {
+                  f << static_cast<int>(data[idx]) <<  ( (idx < length-1) ? " " : "\n" );
+               }
+            }
+            // An FP8 tensor is a byte carrier, so it round-trips through the same
+            // unsigned-byte spelling; the bits are the payload either way.
+            else if (i.second.type() == ETensorType::UINT8 || IsFP8TensorType(i.second.type())) {
+               const uint8_t * data = i.second.data<uint8_t>();
+               for (size_t idx = 0; idx < length; idx++) {
+                  f << static_cast<unsigned int>(data[idx]) <<  ( (idx < length-1) ? " " : "\n" );
+               }
+            }
+            else if (i.second.type() == ETensorType::INT32) {
+               const int32_t * data = i.second.data<int32_t>();
+               for (size_t idx = 0; idx < length; idx++) {
+                  f << data[idx] <<  ( (idx < length-1) ? " " : "\n" );
+               }
+            }
+            else if (i.second.type() == ETensorType::INT64) {
+               const int64_t * data = i.second.data<int64_t>();
+               for (size_t idx = 0; idx < length; idx++) {
+                  f << data[idx] <<  ( (idx < length-1) ? " " : "\n" );
                }
             }
             else {
@@ -1996,9 +2250,13 @@ void RModel::OutputGenerated(std::string filename, bool append) {
                 filename = filename.erase(pos, 4);
                 filename += ".root";
             }
+            if (fWeightFile == WeightFileType::Binary)
+                filename.replace(pos, 4, ".bin");
         } else {
             filename = fName;
-            filename += fWeightFile == WeightFileType::Text ? ".dat" : ".root";
+            if (fWeightFile == WeightFileType::Text) filename += ".dat";
+            else if (fWeightFile == WeightFileType::RootBinary) filename += ".root";
+            else if (fWeightFile == WeightFileType::Binary) filename += ".bin";
         }
         WriteInitializedTensorsToFile(filename);
     }

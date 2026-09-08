@@ -1,4 +1,5 @@
 #include "SOFIE/RModelProfilerGPU.hxx"
+#include "SOFIE/RModelCodegenPass.hxx"
 #include "SOFIE/SOFIE_common.hxx"
 
 namespace SOFIE {
@@ -95,13 +96,14 @@ RModelProfilerGPU::MemoryInfo RModelProfilerGPU::ComputeMemoryInfo(const RModel 
    // CPU intermediate memory pool (0 in the GPU path — intermediates live on device)
    info.intermediateCPUBytes = model.fOtherTensorSize;
 
-   // GPU intermediate device buffers.
-   // Skip fused-kernel intermediates: those tensors share the fused kernel's
-   // input/output buffers and are never separately allocated on the device.
-   for (const auto &it : model.fIntermediateTensorInfos) {
-      if (model.fFusionIntermediateTensors.count(it.first)) continue;
-      size_t len = ConvertShapeToLength(it.second.shape);
-      info.intermediateGPUBytes += len * GetTypeSize(it.second.type);
+   info.intermediateGPUBytes = model.fAlpakaIntermediateDeviceBytes;
+   if (auto *pass = InstalledCodegenPass()) {
+      const auto usage = pass->MemoryUsage(model);
+      info.quantizedPersistentCarrierBytes = usage.persistentBytes;
+      info.quantizedGraphValuePeakBytes = usage.pooledPeakBytes;
+      info.quantizedGraphValueUnpooledBytes = usage.pooledUnpooledBytes;
+      info.quantizedReusableScratchPeakBytes = usage.scratchPeakBytes;
+      info.quantizedWorkspaceCapacityBytes = usage.workspaceBytes;
    }
 
    return info;
@@ -112,7 +114,8 @@ std::string RModelProfilerGPU::GenerateMemoryReport(const MemoryInfo &info)
    auto toMB = [](size_t bytes) -> double { return bytes / (1024.0 * 1024.0); };
 
    size_t totalCPU = info.constantTensorBytes + info.weightTensorBytes + info.intermediateCPUBytes;
-   size_t totalGPU = info.weightDeviceBytes + info.intermediateGPUBytes;
+   size_t totalGPU = info.weightDeviceBytes + info.intermediateGPUBytes +
+                     info.quantizedReusableScratchPeakBytes;
 
    std::string gc;
    gc += "   // Print memory usage breakdown computed at code-generation time.\n";
@@ -140,6 +143,16 @@ std::string RModelProfilerGPU::GenerateMemoryReport(const MemoryInfo &info)
    gc += "      std::cout << \"    Intermediate device bufs  : "
          + std::to_string(info.intermediateGPUBytes) + " bytes  ("
          + std::to_string(toMB(info.intermediateGPUBytes)).substr(0, 6) + " MB)\" << std::endl;\n";
+   gc += "      std::cout << \"    Quantized persistent carriers: "
+         + std::to_string(info.quantizedPersistentCarrierBytes) + " bytes\" << std::endl;\n";
+   gc += "      std::cout << \"    Quantized graph-value peak : "
+         + std::to_string(info.quantizedGraphValuePeakBytes) + " / "
+         + std::to_string(info.quantizedGraphValueUnpooledBytes)
+         + " unpooled bytes\" << std::endl;\n";
+   gc += "      std::cout << \"    Quantized reusable scratch : "
+         + std::to_string(info.quantizedReusableScratchPeakBytes) + " bytes\" << std::endl;\n";
+   gc += "      std::cout << \"    cuBLASLt workspace capacity: "
+         + std::to_string(info.quantizedWorkspaceCapacityBytes) + " bytes\" << std::endl;\n";
    gc += "      std::cout << \"    Total GPU                 : "
          + std::to_string(totalGPU) + " bytes  ("
          + std::to_string(toMB(totalGPU)).substr(0, 6) + " MB)\" << std::endl;\n";

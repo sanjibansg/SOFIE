@@ -36,7 +36,9 @@ public:
    {
       fKind = OperatorKind::RWKV_WKV6;
       fInputTensorNames  = { fNR, fNK, fNV, fNW, fNU };
-      fOutputTensorNames = { fNY };
+      // The state tensor is written only inside the kernel; declaring it an
+      // output keeps the buffer alive under use-based buffer emission.
+      fOutputTensorNames = { fNY, fNState };
    }
 
    std::vector<std::vector<size_t>> ShapeInference(std::vector<std::vector<size_t>> input) override
@@ -72,6 +74,7 @@ public:
       opName = "op_" + opName;
       std::stringstream out;
       out << "\n//---- RWKV_WKV6 " << opName << "\n";
+      // Ts, not T: a bare T would shadow the class template parameter.
       const std::string B  = fB,  H  = fH,  Ts = fT,  Dh = fDh;
       const std::string X  = "tensor_" + fNR;
       const std::string K  = "tensor_" + fNK;

@@ -2,7 +2,11 @@
 #define SOFIE_ROPERATOR_LAYERNORMALIZATION
 
 #include "SOFIE/RModel.hxx"
+#include "SOFIE/RQuantization.hxx"
 #include "SOFIE/SOFIE_common.hxx"
+#include <cstdio>
+#include <cstdlib>
+#include <optional>
 #include <sstream>
 #include <string>
 
@@ -46,6 +50,11 @@ private:
    std::string fAxesLength;
 
    std::string fType;
+
+   // Fold grid: the store applies the absorbed boundary's snap and keeps writing float.
+   // Carrier grid: the store encodes and writes the boundary's code tensor instead.
+   std::optional<QuantizationGrid> fFakeQuantGrid;
+   std::optional<QuantizationGrid> fCarrierGrid;
 
 public:
    ROperator_LayerNormalization() {}
@@ -166,6 +175,25 @@ public:
       //    }
       // }
       model.AddNeededStdLib("cmath");
+   }
+
+   // Absorbs a downstream boundary in either mode: the snap runs before the store, or the
+   // store encodes onto `grid` and writes the boundary's code tensor.
+   bool CanFuseOutputOnGrid(EQuantizedOutputEmit mode) const override
+   {
+      return mode == EQuantizedOutputEmit::Snap || (!fFakeQuantGrid && !fCarrierGrid);
+   }
+
+   // Adopts the boundary's output tensor; the previous output is left for dead-code
+   // elimination.
+   void FuseOutputOnGrid(const std::string &output, const QuantizationGrid &grid,
+                         EQuantizedOutputEmit mode) override
+   {
+      AdoptFusedOutputName(fNY, fOutputTensorNames, output, "LayerNormalization");
+      if (mode == EQuantizedOutputEmit::Snap)
+         fFakeQuantGrid = grid;
+      else
+         fCarrierGrid = grid;
    }
 
    std::string GenerateInitCode() override
@@ -321,18 +349,8 @@ public:
       if (fShapeX.empty())
          throw std::runtime_error("TMVA::SOFIE LayerNormalization called to Generate without being initialized first");
 
-      // -----------------------------------------------------------------------
-      // Parallel block-per-row strategy (for static normalizedLength ≤ 1024):
-      //   • One block per row (axes element).
-      //   • blockSize = next power-of-2 ≥ normalizedLength, capped at 1024.
-      //   • Each thread loads one element, two shared-memory tree reductions
-      //     compute mean then variance; final pass normalises in parallel.
-      // This replaces the previous single-thread-per-row serial scan.
-      // For dynamic shapes or normalizedLength > 1024, fall back to the original
-      // serial kernel (one thread per row, explicit loops).
-      // -----------------------------------------------------------------------
-
-      // Determine whether we can use the parallel path
+      // Static normalizedLength <= 1024 runs one block per row with shared-memory tree
+      // reductions; dynamic shapes or longer rows use the serial one-thread-per-row kernel.
       size_t normLenVal = 0;
       bool canParallel = false;
       try {
@@ -346,11 +364,8 @@ public:
          while (blockSize < normLenVal) blockSize <<= 1;
       }
 
-      // Each thread handles one "row" — one element of the axes dims [0..axis)
-      // and iterates over all normalized dims [axis..size)
-      // axesLength = product of fShapeX[0..axis)
-      // normalizedLength = product of fShapeX[axis..size)
-      // totalElements = axesLength (one thread per row)
+      // axesLength = product of fShapeX[0..axis), normalizedLength = product of
+      // fShapeX[axis..size); a row is one axes element spanning the normalized dims.
 
       std::vector<std::string> inputShape(fSize);
       for (size_t i = 0; i < fSize; i++)
@@ -362,16 +377,14 @@ public:
                                           : std::vector<Dim>{};
       auto axesStrides  = UTILITY::ComputeStrideFromShape(fAxesShape);
 
-      // Build index expressions reusing the same logic as Generate()
-      // input index: axis_0*stride0 + axis_1*stride1 + ... + norm_0*stride_axis + ...
-      // For the kernel we decompose the linear thread index into axis coords,
-      // then loop over normalized dims inside the kernel.
+      // The kernel decomposes the linear thread index into axis coordinates and loops over
+      // the normalized dims, mirroring Generate()'s index expressions.
 
       std::string kname = "LayerNormKernel_" + opName;
       std::string op;
       op  = "\n//------ LAYERNORM_KERNEL_ALPAKA\n";
       op += SP + "struct " + kname + " {\n";
-      op += SP + SP + "template<typename TAcc, typename T>\n";
+      op += SP + SP + "template<typename TAcc, typename T, typename TOut>\n";
       op += SP + SP + "ALPAKA_FN_ACC void operator()(\n";
       op += SP + SP + SP + "TAcc const& acc,\n";
       op += SP + SP + SP + "T const* __restrict__ X,\n";
@@ -382,15 +395,12 @@ public:
          op += SP + SP + SP + "T* __restrict__ out_mean,\n";
       if (!fNInvStdDev.empty())
          op += SP + SP + SP + "T* __restrict__ out_invstd,\n";
-      op += SP + SP + SP + "T* __restrict__ Y,\n";
+      op += SP + SP + SP + "TOut* __restrict__ Y,\n";
       op += SP + SP + SP + "std::size_t const axesLength) const {\n\n";
 
       if (canParallel) {
-         // ---------------------------------------------------------------
-         // PARALLEL PATH: one block per row, blockSize threads per block.
-         // Each thread handles one element in the normalised dimension.
-         // Two shared-memory tree reductions compute mean then variance.
-         // ---------------------------------------------------------------
+         // Parallel path: one block per row, one thread per normalized element; two
+         // shared-memory tree reductions compute mean then variance.
          std::string bs = std::to_string(blockSize);
          std::string nl = fNormalizedLength; // e.g. "64"
          std::string eps = std::to_string(fAttrEpsilon);
@@ -424,11 +434,8 @@ public:
             }
          }
 
-         // Map thread id → index within normalised dims.
-         // For each normalised dim j, the "within-norm" stride is the product of
-         // dimensions after it: normInnerStrides[j-fAxis] computed at code-gen time.
-         // Then:  norm_offset = sum_j( (tid / normInnerStride[j]) % dim[j] * stride[j] )
-         // For the common 1D normalised case this simplifies to: norm_offset = tid * stride[fAxis]
+         // Maps thread id to a normalized-dims offset via the code-gen-time inner strides:
+         // norm_offset = sum_j (tid / normInnerStride[j]) % dim[j] * stride[j].
 
          // Build the norm-dim strides (strides within the flattened normalised space)
          auto normShape = fNormalizedShape;  // dims [fAxis .. fSize-1]
@@ -539,14 +546,28 @@ public:
             op += SP + SP + SP + SP + "out_val += bias[bias_base + b_norm_offset];\n";
          }
 
-         op += SP + SP + SP + SP + "Y[norm_idx] = out_val;\n";
+         // Distinguishes "this path did not run" from a stale linked body; off unless
+         // SOFIE_LAYERNORM_TRACE is set.
+         if (std::getenv("SOFIE_LAYERNORM_TRACE")) {
+            std::fprintf(stderr, "[LN-TRACE] %s parallel-path epilogue, grid=%s\n", kname.c_str(),
+                         fFakeQuantGrid ? "SET" : "unset");
+         }
+
+         if (fCarrierGrid) {
+            op += EncodeToGridStatements("Y[norm_idx]", "out_val", *fCarrierGrid,
+                                         SP + SP + SP + SP);
+         } else if (fFakeQuantGrid) {
+            op += FakeQuantRoundTripStatements("out_snapped", "out_val", *fFakeQuantGrid,
+                                               SP + SP + SP + SP);
+            op += SP + SP + SP + SP + "Y[norm_idx] = static_cast<T>(out_snapped);\n";
+         } else {
+            op += SP + SP + SP + SP + "Y[norm_idx] = out_val;\n";
+         }
          op += SP + SP + SP + "}\n";  // end in_range
 
       } else {
-         // ---------------------------------------------------------------
-         // SERIAL PATH (dynamic shapes or normalizedLength > 1024):
-         // one thread per row, explicit loops over normalized dims.
-         // ---------------------------------------------------------------
+         // Serial path (dynamic shapes or normalizedLength > 1024): one thread per row,
+         // explicit loops over the normalized dims.
          op += SP + SP + SP + "auto const global_thread_idx = alpaka::getIdx<alpaka::Grid, alpaka::Threads>(acc)[0];\n";
          op += SP + SP + SP + "if (global_thread_idx >= axesLength) return;\n";
          op += SP + SP + SP + "auto const grid_thread_extent = alpaka::getWorkDiv<alpaka::Grid, alpaka::Threads>(acc)[0];\n\n";
@@ -658,7 +679,17 @@ public:
             op += ";\n";
             op += SP + SP + SP + SP + SP + "val += bias[b_idx];\n";
          }
-         op += SP + SP + SP + SP + SP + "Y[norm_idx] = val;\n";
+         // The serial fallback applies the same snap and encode as the parallel path.
+         if (fCarrierGrid) {
+            op += EncodeToGridStatements("Y[norm_idx]", "val", *fCarrierGrid,
+                                         SP + SP + SP + SP + SP);
+         } else if (fFakeQuantGrid) {
+            op += FakeQuantRoundTripStatements("val_snapped", "val", *fFakeQuantGrid,
+                                               SP + SP + SP + SP + SP);
+            op += SP + SP + SP + SP + SP + "Y[norm_idx] = static_cast<T>(val_snapped);\n";
+         } else {
+            op += SP + SP + SP + SP + SP + "Y[norm_idx] = val;\n";
+         }
          for (size_t j = fAxis; j < fSize; ++j) op += SP + SP + SP + SP + "}\n";
 
          op += SP + SP + SP + "}\n";  // end row loop

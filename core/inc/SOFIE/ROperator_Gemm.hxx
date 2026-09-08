@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <limits>
 #include <cassert>
+#include <utility>
 
 
 namespace SOFIE{
@@ -21,6 +22,15 @@ namespace SOFIE{
    template <typename T>
    class ROperator_Gemm final : public ROperator
    {
+   public:
+
+      // Computes on codes, but the product/sum lands on a different grid than the operands, so
+      // it needs a scale contract rather than a retyping; the low-precision kernels for this
+      // family exist. Lets the frontier check tell an unabsorbed boundary from a legitimate one.
+      ELowPrecisionCarrierSupport CarrierSupport() const override
+      {
+         return ELowPrecisionCarrierSupport::Arithmetic;
+      }
 
    private:
       bool fIsDynamic = false;
@@ -51,13 +61,15 @@ namespace SOFIE{
       std::vector<Dim> fDimShapeC;
       std::vector<Dim> fShapeY;
       RModel * fModel = nullptr;
+      bool fForceFloatOutput = false;
+      bool fBatchedOperandBCanonicalised = false;
 
    public:
 
       ROperator_Gemm(){}
-      ROperator_Gemm(float alpha, float beta, int_t transA, int_t transB, std::string nameA, std::string nameB, std::string nameY, EActivationType activation=EActivationType::UNDEFINED):
+      ROperator_Gemm(float alpha, float beta, int_t transA, int_t transB, std::string nameA, std::string nameB, std::string nameY, EActivationType activation=EActivationType::UNDEFINED, bool forceFloatOutput=false):
          fAttrAlpha(alpha), fAttrBeta(beta), fAttrTransA(transA), fAttrTransB(transB), fNA(UTILITY::Clean_name(nameA)),
-         fNB(UTILITY::Clean_name(nameB)), fNY(UTILITY::Clean_name(nameY))
+         fNB(UTILITY::Clean_name(nameB)), fNY(UTILITY::Clean_name(nameY)), fForceFloatOutput(forceFloatOutput)
       {
          fActivation = activation;
          fType = "float";
@@ -68,9 +80,10 @@ namespace SOFIE{
          fKind = OperatorKind::GEMM;
       }
 
-      ROperator_Gemm(float alpha, float beta, int_t transA, int_t transB, std::string nameA, std::string nameB, std::string nameC, std::string nameY, EActivationType activation=EActivationType::UNDEFINED):
+      ROperator_Gemm(float alpha, float beta, int_t transA, int_t transB, std::string nameA, std::string nameB, std::string nameC, std::string nameY, EActivationType activation=EActivationType::UNDEFINED, bool forceFloatOutput=false):
          fAttrAlpha(alpha), fAttrBeta(beta), fAttrTransA(transA), fAttrTransB(transB), fNA(UTILITY::Clean_name(nameA)),
-         fNB(UTILITY::Clean_name(nameB)), fNC(UTILITY::Clean_name(nameC)), fNY(UTILITY::Clean_name(nameY)), fActivation(activation)
+         fNB(UTILITY::Clean_name(nameB)), fNC(UTILITY::Clean_name(nameC)), fNY(UTILITY::Clean_name(nameY)), fActivation(activation),
+         fForceFloatOutput(forceFloatOutput)
       {
          fActivation = activation;
          fType = "float";
@@ -79,9 +92,33 @@ namespace SOFIE{
          fOutputTensorNames = { fNY };
          fKind = OperatorKind::GEMM;
       }
+      // Getters for further quantized GEMM lowering-elimination.
+      float GetAlpha() const { return fAttrAlpha; }
+      float GetBeta() const { return fAttrBeta; }
+      int_t GetTransA() const { return fAttrTransA; }
+      int_t GetTransB() const { return fAttrTransB; }
+      // Only legal before Initialize, which is where the operand shapes are read.
+      void SetTransB(int_t transB) { fAttrTransB = transB; }
+      // Set by CanonicaliseBatchedMatMulOperands, distinguishing a re-permuted batched
+      // operand from an ordinary rank-2 Gemm with transB=1.
+      void MarkBatchedOperandBCanonicalised() { fBatchedOperandBCanonicalised = true; }
+      bool IsBatchedOperandBCanonicalised() const { return fBatchedOperandBCanonicalised; }
+      bool HasBias() const { return !fNC.empty(); }
+      const std::string &GetInputTensorName() const { return fNA; }
+      const std::string &GetWeightTensorName() const { return fNB; }
+      const std::string &GetBiasTensorName() const { return fNC; }
+      const std::string &GetOutputTensorName() const { return fNY; }
+      const std::vector<Dim> &GetInputShape() const { return fShapeA; }
+      const std::vector<Dim> &GetWeightShape() const { return fShapeB; }
+      const std::vector<Dim> &GetOutputShape() const { return fShapeY; }
+      std::vector<std::string> GetStdLibs() override { return { std::string("cmath"), std::string("cstdint"), std::string("vector") }; }
 
       std::vector<ETensorType> TypeInference(std::vector<ETensorType> input) override {
          ETensorType out = input[0];
+         if (fForceFloatOutput || out == ETensorType::FLOAT8E4M3FN || out == ETensorType::FLOAT8E4M3FNUZ ||
+             out == ETensorType::FLOAT8E5M2 || out == ETensorType::FLOAT8E5M2FNUZ ||
+             out == ETensorType::FLOAT8E8M0)
+            out = ETensorType::FLOAT;
          return {out};
       }
 
@@ -96,11 +133,8 @@ namespace SOFIE{
             }
          }
 
-         // when there are 3 inputs shape of Y is the one of C
-         if (input.size() == 3){
-            //shape of C is shape of Y
-            return input[2];
-         }
+         // GEMM output shape is determined by op(A) * op(B).  A third input C is
+         // broadcast into that output and does not by itself define the result shape.
          // ioffset cannot be less than 2
          int ioffset = input[0].size()-2;  // in case of tensors with dim > 2
 
@@ -321,10 +355,13 @@ namespace SOFIE{
                shapeY.erase(shapeY.end()-1);
          }
 
+         // Use the same rule as TypeInference: a dense layer with an FP8 operand produces a
+         // FLOAT value.
+         const ETensorType outputType = TypeInference({model.GetTensorType(fNA)})[0];
          if (!fIsDynamic)
-            model.AddIntermediateTensor(fNY, model.GetTensorType(fNA), shapeY);
+            model.AddIntermediateTensor(fNY, outputType, shapeY);
          else
-            model.AddDynamicTensor(fNY, model.GetTensorType(fNA), fShapeY);
+            model.AddDynamicTensor(fNY, outputType, fShapeY);
 
          if (model.Verbose()){
             std::cout << "Gemm (or MatMul) " << " ---> " << fNY << " shape ";
@@ -805,8 +842,10 @@ namespace SOFIE{
             size_t m_sofie    = static_cast<size_t>(std::stoi(n));   // ONNX n
             size_t n_sofie    = static_cast<size_t>(std::stoi(m));   // ONNX m
             size_t k_val      = static_cast<size_t>(std::stoi(k));
-            size_t lda        = m_sofie;             // transA_sofie='n'
-            size_t ldb        = k_val;               // transB_sofie='n'
+            // Leading dimensions follow the swapped flags passed below: cuBLAS wants
+            // lda >= m when transa is 'n' and lda >= k when 't', likewise ldb.
+            size_t lda        = fAttrTransB ? k_val   : m_sofie;
+            size_t ldb        = fAttrTransA ? n_sofie : k_val;
             size_t ldc        = m_sofie;
             size_t sA         = m_sofie * k_val;     // stride per batch for fNB
             size_t sB         = k_val  * n_sofie;    // stride per batch for fNA (= strideA_onnx)

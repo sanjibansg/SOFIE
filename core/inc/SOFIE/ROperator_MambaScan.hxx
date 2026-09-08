@@ -38,7 +38,9 @@ public:
    {
       fKind = OperatorKind::MAMBA_SCAN;
       fInputTensorNames  = { fNU, fNDelta, fNA, fNB, fNC, fNDbias };
-      fOutputTensorNames = { fNY };
+      // The state tensor is written only inside the kernel; declaring it an
+      // output keeps the buffer alive under use-based buffer emission.
+      fOutputTensorNames = { fNY, fNState };
    }
 
    std::vector<std::vector<size_t>> ShapeInference(std::vector<std::vector<size_t>> input) override
