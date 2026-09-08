@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The quantized fixture corpus, in one specification. Every quantization/low-precision
-fixture in input_models/ is emitted here, organized by pipeline axis: dense int8 (both
+fixture in input_models/quantized/ is emitted here, organized by pipeline axis: dense int8 (both
 spellings and frontends), conv, elementwise, gather, FP8 native and Q/DQ, movement and
 decode walks, and the scale-shape/epilogue variants. Values are exact binary fractions and
 small integer codes, so fixtures stay bit-exact against a float reference; four historical
@@ -30,7 +30,7 @@ def emit(name, nodes, inputs, outputs, initializers, opset, ir, extra_opsets=())
     model = helper.make_model(graph, opset_imports=imports)
     model.ir_version = ir
     onnx.checker.check_model(model)
-    path = f"input_models/{name}.onnx"
+    path = f"input_models/quantized/{name}.onnx"
     onnx.save(model, path)
     print(f"wrote {path}")
 

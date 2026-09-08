@@ -51,7 +51,7 @@ set(CAPTURE_STR
 }\n\
 ")
 
-file(GLOB ONNX_FILES "${ONNX_MODELS_DIR}/*.onnx")
+file(GLOB ONNX_FILES "${ONNX_MODELS_DIR}/*.onnx" "${ONNX_MODELS_DIR}/quantized/*.onnx")
 
 set(ALL_CAPTURES "")
 foreach(onnx_file ${ONNX_FILES})
