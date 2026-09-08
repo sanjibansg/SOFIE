@@ -201,7 +201,7 @@ public:
       op += SP + SP + SP + SP + "}\n";
       op += SP + SP + SP + "}\n";
       op += SP + SP + SP + "var /= static_cast<T>(gn_gs * gn_spatial);\n";
-      op += SP + SP + SP + "T const inv_std = static_cast<T>(1) / alpaka::math::sqrt(acc, var + gn_eps);\n\n";
+      op += SP + SP + SP + "T const inv_std = static_cast<T>(1) / sqrt(acc, var + gn_eps);\n\n";
 
       op += SP + SP + SP + "// normalize + scale + bias\n";
       op += SP + SP + SP + "for (std::size_t ci = 0; ci < gn_gs; ++ci) {\n";

@@ -1,6 +1,8 @@
 #ifndef SOFIE_RMODEL
 #define SOFIE_RMODEL
 
+#include <unordered_set>
+
 #include "SOFIE/RModel_Base.hxx"
 #include "SOFIE/SOFIE_common.hxx"
 #include "SOFIE/RModelExtension.hxx"
@@ -46,6 +48,7 @@ private:
    std::unordered_map<std::string, DynamicTensorInfo> fDynamicTensorInfos;
    std::unique_ptr<RModelExtension> fExtension;    ///<!  pass-library state, opaque to this class (transient)
    std::size_t fAlpakaIntermediateDeviceBytes = 0; // transient live intermediate allocation total
+   std::unordered_set<std::string> fAlpakaDeclaredIntermediateBuffers; // intermediates that received a deviceBuf_ declaration (transient)
    std::unordered_map<std::string, std::pair<std::vector<Dim>, bool>> fShapeTensors; // constant tensors describing a shape
    std::unordered_map<std::string, std::string> fAliasTensors; // alias tensors (name -> original tensor name)
    std::unordered_map<std::string, std::string>

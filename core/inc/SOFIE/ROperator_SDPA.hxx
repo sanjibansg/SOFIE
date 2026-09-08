@@ -181,7 +181,7 @@ public:
       out += SP + SP + SP + SP + "T sc = dot * scale;\n";
       if (fHasMask)
          out += SP + SP + SP + SP + "sc += mask[b*H*S*S + h*S*S + s*S + j];\n";
-      out += SP + SP + SP + SP + "T const a_j = alpaka::math::exp(acc, sc - max_score);\n";
+      out += SP + SP + SP + SP + "T const a_j = SOFIE_DEVICE_exp(acc, sc - max_score);\n";
       out += SP + SP + SP + SP + "sum_exp += a_j;\n";
       out += SP + SP + SP + SP + "std::size_t const vBase = b*H*S*Dv + h*S*Dv + j*Dv;\n";
       out += SP + SP + SP + SP + "for (std::size_t d = 0; d < Dv; ++d)\n";
@@ -203,7 +203,7 @@ public:
       opName = "op_" + opName;
       std::string scaleExpr = (fScale != 0.0f)
          ? ("static_cast<" + fType + ">(" + std::to_string(fScale) + "f)")
-         : ("static_cast<" + fType + ">(1) / alpaka::math::sqrt(/* host-side: */ static_cast<" + fType + ">(" + fD + "))");
+         : ("static_cast<" + fType + ">(1) / sqrt(/* host-side: */ static_cast<" + fType + ">(" + fD + "))");
 
       // Scale is computed at dispatch time as a host-side constant passed to kernel
       std::string scaleVal = (fScale != 0.0f)

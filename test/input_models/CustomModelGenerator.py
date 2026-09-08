@@ -108,7 +108,7 @@ def numpy_mamba_scan(u, delta, A, B, C, D_bias):
             dA  = np.exp(dt * A[:, n])              # [B, D]  broadcast over B
             dBu = dt * B[:, n, t][:, np.newaxis] * u[:, :, t]  # [B, D]
             h[:, :, n] = dA * h[:, :, n] + dBu
-        y[:, :, t] = np.einsum('bn,bdn->bd', C[:, :, t], h) + D_bias[np.newaxis, :] * u[:, :, t]
+        y[:, :, t] = (h * C[:, :, t][:, np.newaxis, :]).sum(axis=-1) + D_bias[np.newaxis, :] * u[:, :, t]
     return y
 
 
@@ -142,7 +142,7 @@ wB, wH, wT, wDh = 1, 2, 4, 4
 r_in = rng.standard_normal((wB, wH, wT, wDh)).astype(np.float32)
 k_in = rng.standard_normal((wB, wH, wT, wDh)).astype(np.float32)
 v_in = rng.standard_normal((wB, wH, wT, wDh)).astype(np.float32)
-w_in = rng.standard_normal((wB, wH, wT, wDh)).astype(np.float32) * 0.5  # log-neg decay
+w_in = -np.abs(rng.standard_normal((wB, wH, wT, wDh)).astype(np.float32)) * 0.5  # log-decay (negative)
 u_in = rng.standard_normal((wH, wDh)).astype(np.float32)
 
 
@@ -159,10 +159,10 @@ def numpy_wkv6(r, k, v, w, u):
         # output: y[b,h,t,j] = sum_i r[i] * (s[i,j] + exp(u[i]) * k[i] * v[j])
         kv = kBase[:, :, :, np.newaxis] * vBase[:, :, np.newaxis, :]  # [B,H,Dh,Dh]
         bonus = np.exp(u)[np.newaxis, :, :, np.newaxis] * kv           # [B,H,Dh,Dh]
-        y[:, :, t, :] = np.einsum('bhi,bhij->bhj', rBase, s + bonus)
+        y[:, :, t, :] = (rBase[:, :, :, np.newaxis] * (s + bonus)).sum(axis=-2)
 
-        # state update
-        decay = np.exp(-np.exp(wBase))                # [B, H, Dh]
+        # state update: w is log-decay (negative), decay = exp(w) in (0,1)
+        decay = np.exp(wBase)                         # [B, H, Dh]
         s = decay[:, :, :, np.newaxis] * s + kv
     return y
 
@@ -207,7 +207,7 @@ def numpy_griffin_rglru(x, a):
     for t in range(L):
         a_t = a[:, t, :]        # [B, D]
         x_t = x[:, t, :]
-        h = a_t * h + np.sqrt(np.maximum(1.0 - a_t * a_t, 0.0)) * x_t
+        h = a_t * h + (1.0 - a_t) * x_t
         y[:, t, :] = h
     return y
 
